@@ -32,7 +32,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo secret in §2:
 
-- **username** you sign up with (e.g. `pier`) → entered as `server_alias` at dispatch; hostname (`anchor-pier-01`) and DNS derive from it, nothing to copy
+- **username** you sign up with (e.g. `pier`) → set once as the `TENANT_USER` repo variable; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
@@ -74,7 +74,7 @@ Two tiers, both operator-held — tenants never touch either. The slice IP is as
 
 ```bash
 gh secret set NETCUP_MAIN_BOX_IPV4    # tenant slice IP
-gh variable set TENANT_USER --body "pier"  # pins which alias this repo may dispatch (mismatch fails closed; unset warns)
+gh variable set TENANT_USER --body "pier"  # tenant username: hostname, DNS, artifacts derive from it
 # only if it differs from the customer number:
 # gh secret set NETCUP_SCP_USER_ID
 ```
@@ -90,9 +90,7 @@ is advisory display only.
 
 ## 3. Dispatch and approve (S1)
 
-Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. The ONLY
-identifier in the dispatch inputs is `server_alias` — enter your username
-(e.g. `pier`); hostname and DNS derive from it. Everything sensitive
+Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Dispatch takes the mode (plus action flags) — no identifiers: your username already lives in the repo's `TENANT_USER` variable, and everything sensitive
 resolves from repo secrets inside the run.
 
 The run prints a netcup device-flow URL + `XXXX-XXXX` user code (and sends

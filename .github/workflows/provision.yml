@@ -29,10 +29,6 @@ on:
         default: check
         type: choice
         options: [apply, check, update-ip, destroy]
-      server_alias:
-        description: "Your username (e.g. pier) — the ONLY identifier in dispatch inputs. Hostname (anchor-<you>-01), DNS, IPs, ids all resolve inside runs."
-        required: true
-        type: string
       ack_main_unbound:
         description: "Destroy gate: confirm the main box is already unbound (required for mode=destroy)."
         required: false
@@ -84,7 +80,7 @@ jobs:
         env:
           HEAD_SHA: ${{ github.sha }}
           BASE_REF: ${{ github.event.repository.default_branch }}
-          SERVER_ALIAS: ${{ inputs.server_alias }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -97,7 +93,7 @@ jobs:
           echo "head_full=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "workflow_files=$COUNT" >> "$GITHUB_OUTPUT"
           {
-            echo "### Approval card (C-E) for \`$SERVER_ALIAS\`"
+            echo "### Approval card (C-E) for \`$TENANT_USER\`"
             echo ""
             echo "head: \`$SHORT\` (\`$HEAD_SHA\`) — [compare-diff]($DIFF_LINK)"
             echo "workflow-path files changed: \`$COUNT\`"
@@ -107,7 +103,7 @@ jobs:
             echo ""
             if [ "$COUNT" -eq 0 ]; then
               echo "🟢 UNCHANGED — workflows under .github/workflows match $BASE_REF."
-              echo "piercloud: apply ready for $SERVER_ALIAS @$SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
+              echo "piercloud: apply ready for $TENANT_USER @$SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
             else
               echo "🔴 CHANGED — $COUNT file(s) under .github/workflows differ from $BASE_REF."
               echo "piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->$HEAD_SHA, $COUNT files incl. provision.yml). Do NOT approve. Open $DIFF_LINK or ask the operator what changed. Nothing runs until you approve."
@@ -122,7 +118,7 @@ jobs:
         env:
           HEAD_SHA: ${{ github.sha }}
           HEAD_SHORT: ${{ steps.banner.outputs.head_short }}
-          SERVER_ALIAS: ${{ inputs.server_alias }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
         run: |
           set -euo pipefail
           # Template side of the head_sha approval pin (open design Q4): the
@@ -131,11 +127,11 @@ jobs:
           # future backend can record the last-approved head via
           # actions:read. Failed check = no apply, always. Backend mechanics
           # themselves are out of scope for v0.2.
-          printf 'head_sha=%s head_short=%s alias=%s\n' "$HEAD_SHA" "$HEAD_SHORT" "$SERVER_ALIAS" > head-sha.txt
+          printf 'head_sha=%s head_short=%s alias=%s\n' "$HEAD_SHA" "$HEAD_SHORT" "$TENANT_USER" > head-sha.txt
       - name: Upload head-SHA artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # SHA pin of upload-artifact v4
         with:
-          name: head-sha-${{ inputs.server_alias }}
+          name: head-sha-${{ vars.TENANT_USER }}
           path: head-sha.txt
           # Same horizon as the thumbprint artifact: audit trail, not logs.
           retention-days: 400
@@ -147,7 +143,7 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           HEAD_SHORT: ${{ steps.banner.outputs.head_short }}
           WORKFLOW_FILES: ${{ steps.banner.outputs.workflow_files }}
-          SERVER_ALIAS: ${{ inputs.server_alias }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -158,7 +154,7 @@ jobs:
             exit 0
           fi
           if [ "$WORKFLOW_FILES" -eq 0 ]; then
-            MSG="piercloud: apply ready for $SERVER_ALIAS @$HEAD_SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
+            MSG="piercloud: apply ready for $TENANT_USER @$HEAD_SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
           else
             MSG="piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->${{ github.sha }}, $WORKFLOW_FILES files incl. provision.yml). Do NOT approve. Open ${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }} or ask the operator what changed. Nothing runs until you approve."
           fi
@@ -175,12 +171,12 @@ jobs:
     env:
       # Identifiers resolve from REPO-level secrets inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
-      # No HOSTNAME secret: derived below as anchor-<server_alias>-01.
+      # No HOSTNAME secret: derived below as anchor-<tenant>-01.
       # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
       # (override only if yours differs).
       NETCUP_CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
       NETCUP_OIDC_DISCOVERY_URL: ${{ secrets.NETCUP_OIDC_DISCOVERY_URL }}
-      SERVER_ALIAS: ${{ inputs.server_alias }}
+      TENANT_USER: ${{ vars.TENANT_USER }}
     steps:
       - name: Checkout (no credentials persisted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
@@ -190,33 +186,6 @@ jobs:
           # (.github/scripts/020-provision-anchor.sh) — the device-flow job
           # must check it out to call it (full checkout: tofu below needs
           # the module files too).
-
-      - name: Alias pin check (tenant binding, pre-approval)
-        env:
-          # Env indirection (NOT ${{ }} inline in shell): interpolated
-          # values are never re-parsed, so a hostile alias cannot break
-          # quoting or inject commands — worst case is a failed compare.
-          PIN: ${{ vars.TENANT_USER }}
-          ALIAS: ${{ inputs.server_alias }}
-        run: |
-          set -euo pipefail
-          # The repo IS the tenant identity: vars.TENANT_USER (operator-set
-          # at repo creation, or self-set on template repos) pins which
-          # alias this repo may provision. Runs BEFORE device authorization
-          # so a typo'd/squatted alias fails before anyone taps approve.
-          # Cross-account confusion is structurally impossible (a device-flow
-          # token only ever sees the approver's own servers); this check
-          # binds the shared-zone NAME (DNS squat vector — D10 still guards
-          # the bind itself). Unset pin = loud warning, proceed (bootstrap
-          # path; operator pins it at handover).
-          if [ -n "${PIN:-}" ] && [ "$PIN" != "$ALIAS" ]; then
-            echo "::error::server_alias does not match this repo's tenant pin. Dispatch with your own username."
-            exit 1
-          fi
-          if [ -z "${PIN:-}" ]; then
-            echo "::warning::TENANT_USER repo variable not set — alias check skipped. Operator: pin it at tenant-repo creation."
-          fi
-          echo "Alias pin OK."
 
       - name: Device authorization + poll (ephemeral token dies with runner)
         id: device
@@ -246,7 +215,7 @@ jobs:
           INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
           # C-b: print ONLY the verification URL + user_code (+ alias).
           # Quiet curl flags only; no verbose dumps; no trace-level log variables.
-          echo "alias: $SERVER_ALIAS"
+          echo "alias: $TENANT_USER"
           echo "Open this URL on your phone to approve: $VERIFY_URI"
           echo "Code: $USER_CODE"
           echo "we will never email or message you a code to re-confirm."
@@ -305,6 +274,7 @@ jobs:
           ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
           SCP_USER_ID_IN: ${{ secrets.NETCUP_SCP_USER_ID }}
           CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
         run: |
           set -euo pipefail
           # The numeric server id is the stable key (policy names, tmp tags,
@@ -325,12 +295,15 @@ jobs:
           fi
           echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
           echo "Resolved server_id=$RESOLVED_ID for anchor IP $ANCHOR_IPV4."
-          # Hostname derivation (single place for this job): the username
-          # IS server_alias, so anchor-<you>-01 falls out directly. Same
-          # sanitize one-liner as 030-anchor-dns.sh — keep the two in sync
-          # so TF hostname and DNS record can never diverge.
-          SAN="$(printf '%s' "$SERVER_ALIAS" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
-          [ -n "$SAN" ] || { echo "::error::server_alias sanitizes to empty — dispatch with your username (letters/digits/hyphens)."; exit 1; }
+          # Tenant identity comes from the repo, not the dispatch: TENANT_USER
+          # (operator-set variable) is the username, so there is no alias
+          # input to typo or squat — unset fails closed before anything runs.
+          # Hostname derivation (single place for this job): anchor-<you>-01.
+          # Same sanitize one-liner as 030-anchor-dns.sh — keep the two in
+          # sync so TF hostname and DNS record can never diverge.
+          [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
+          SAN="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+          [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."; exit 1; }
           echo "ANCHOR_HOSTNAME=anchor-${SAN}-01" >> "$GITHUB_ENV"
           echo "Derived hostname anchor-${SAN}-01."
           # SCP user id defaults to the customer number (same value on both
@@ -478,14 +451,14 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-          ALIAS: ${{ inputs.server_alias }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
         run: |
           set -euo pipefail
           if [ -z "$NTFY_TOPIC" ]; then
             echo "NTFY_TOPIC unset — failure stays in the run summary."
             exit 0
           fi
-          MSG="piercloud A1/provision FAILED for $ALIAS — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
+          MSG="piercloud A1/provision FAILED for $TENANT_USER — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
           curl -sS -u ":$NTFY_TOKEN" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
 
   anchor-dns:
@@ -494,7 +467,7 @@ jobs:
     needs: [device-flow]
     if: inputs.mode == 'apply'
     env:
-      SERVER_ALIAS: ${{ inputs.server_alias }}
+      TENANT_USER: ${{ vars.TENANT_USER }}
       ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
       CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
     steps:
@@ -538,7 +511,7 @@ jobs:
       - name: Mode marker (real steps run in the device-flow job)
         run: |
           set -euo pipefail
-          echo "mode=apply for alias '${{ inputs.server_alias }}': tofu plan/apply + A1 window + ssh provision run in the device-flow job (same-runner token handoff)."
+          echo "mode=apply for alias '${{ vars.TENANT_USER }}': tofu plan/apply + A1 window + ssh provision run in the device-flow job (same-runner token handoff)."
 
   check-hygiene:
     name: "mode=check (drift + hygiene skeleton)"
@@ -582,7 +555,7 @@ jobs:
       - name: Skeleton marker (M2 wires the real steps)
         run: |
           set -euo pipefail
-          echo "mode=update-ip skeleton for alias '${{ inputs.server_alias }}': add='${{ inputs.add_ipv4 }} ${{ inputs.add_ipv6 }}' remove='${{ inputs.remove_ipv4 }}'. ADD-before-move enforcement lands in M2."
+          echo "mode=update-ip skeleton for alias '${{ vars.TENANT_USER }}': add='${{ inputs.add_ipv4 }} ${{ inputs.add_ipv6 }}' remove='${{ inputs.remove_ipv4 }}'. ADD-before-move enforcement lands in M2."
 
   destroy-gate:
     name: "mode=destroy (policy + attachment ONLY)"
@@ -624,11 +597,11 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$THUMBPRINT" > thumbprint.txt
-          echo "alias=${{ inputs.server_alias }} head=${{ github.sha }}" >> thumbprint.txt
+          echo "alias=${{ vars.TENANT_USER }} head=${{ github.sha }}" >> thumbprint.txt
       - name: Upload thumbprint artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # SHA pin of upload-artifact v4
         with:
-          name: thumbprint-${{ inputs.server_alias }}
+          name: thumbprint-${{ vars.TENANT_USER }}
           path: thumbprint.txt
           # 400d = artifacts ONLY (H1 rule: never rely on logs alone — repo
           # log retention is a separate setting; runs/checks get deleted).

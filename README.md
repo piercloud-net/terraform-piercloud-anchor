@@ -66,7 +66,8 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    secrets land (values stay write-only, log-masked, invisible to forks).
    *(details: [walkthrough §2](docs/usage.md#2-repo-from-template--repo-secrets-c-e-visibility-rule))*
 3. **Dispatch + approve** — Actions → [`provision.yml`](.github/workflows/provision.yml)
-   `mode=apply` (only `server_alias` in the inputs — your username) →
+   `mode=apply` (no identifiers in the inputs — your username already lives
+   in the repo) →
    approve the device-flow URL + code at netcup's own Keycloak, from any browser. The
    ephemeral token dies with the runner. *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
 4. **A1 provisions** — the run opens its own /32 window, installs `tang`,
@@ -99,8 +100,8 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
 #    Debian-family OS, note the server name and its id. Anchor IPv4 required.
 # 1. "Use this template" on GitHub, set the identifier repo secrets
 #    (username, anchor IP, customer number) — no netcup tokens stored.
-# 2. Dispatch the provision.yml workflow (Actions tab, mode=apply,
-#    server_alias = your username) from any browser, and approve the device-flow
+# 2. Dispatch the provision.yml workflow (Actions tab, mode=apply)
+#    from any browser (no identifiers to enter), and approve the device-flow
 #    code at netcup's Keycloak.
 # 3. Save the tang thumbprint (ntfy + run artifact + committed break-glass
 #    file) in your password manager NOW.

@@ -8,7 +8,7 @@
 # failure fails the run before any thumbprint goes out — we never bind
 # by name against a record we didn't just verify). CI-called, never `scripts/`.
 #
-# WHAT IT DOES: derives the flat anchor name from SERVER_ALIAS (D5:
+# WHAT IT DOES: derives the flat anchor name from TENANT_USER (D5:
 # `anchor-<sanitized>-01.piercloud.net`; NN=01 — a second operator anchor
 # for one alias (-02+) is a future multi-anchor case, not handled here),
 # resolves the zone id at runtime (one fewer stored secret), creates or
@@ -20,7 +20,7 @@
 # module's extra_tang_urls input — no record is minted here for twins.
 #
 # ENV (identifiers arrive via environment — never argv, never logs):
-#   SERVER_ALIAS           dispatch alias, e.g. "pier" -> anchor-pier-01.
+#   TENANT_USER            repo tenant username, e.g. "pier" -> anchor-pier-01.
 #   ANCHOR_IPV4            exact anchor IPv4 the A record must carry.
 #   CLOUDFLARE_DNS_TOKEN   API token with DNS-edit on piercloud.net.
 #                          Absent + this job running (mode=apply) = explicit
@@ -42,7 +42,7 @@ set -euo pipefail
 CF_ZONE="piercloud.net" # public DNS info, not a secret.
 CF_API="https://api.cloudflare.com/client/v4"
 
-alias="${SERVER_ALIAS:?SERVER_ALIAS is required}"
+alias="${TENANT_USER:?TENANT_USER is required}"
 want_ip="${ANCHOR_IPV4:?ANCHOR_IPV4 is required}"
 
 # Fail closed (C-A): without the token this job cannot prove the record,
@@ -60,7 +60,7 @@ echo "::add-mask::$CLOUDFLARE_DNS_TOKEN"
 # collapse, edges trim. Empty after cleaning = refuse.
 san="$(printf '%s' "$alias" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
 if [ -z "$san" ]; then
-  echo "::error::SERVER_ALIAS sanitizes to empty — set an alias with letters/digits/hyphens."
+  echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."
   exit 1
 fi
 record="anchor-${san}-01" # NN=01; -02+ is a future multi-anchor case.
