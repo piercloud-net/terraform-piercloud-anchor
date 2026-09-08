@@ -24,7 +24,7 @@ Every script in this directory follows the same invariants:
 
 | Script | Runs on | Purpose |
 |---|---|---|
-| `010-provision.sh` | the anchor box | install tang + dispatch-managed Gatus monitor (rendered from env, statuses printed), print thumbprint, key-leak assertion, print clevis bind next steps |
+| `010-provision.sh` | the anchor box | install tang (loopback socket) + Caddy edge proxy (dispatch-managed Caddyfile: tang proxy, ACME HTTP-01, dashboard TLS) + dispatch-managed Gatus monitor (rendered from env, statuses printed), print thumbprint, key-leak assertion, print clevis bind next steps |
 
 ## CI-called scripts (`.github/scripts/`) — not human-run
 

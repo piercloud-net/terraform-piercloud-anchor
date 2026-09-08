@@ -11,9 +11,12 @@
 # WHAT IT DOES: derives the flat anchor name from TENANT_USER (D5:
 # `anchor-<sanitized>-01.piercloud.net`; NN=01 — a second operator anchor
 # for one alias (-02+) is a future multi-anchor case, not handled here),
-# resolves the zone id at runtime (one fewer stored secret), creates or
-# overwrites the A record to the exact anchor IPv4 (TTL 300, DNS-only),
-# then re-reads the record and fails unless name + address match exactly.
+# plus the dashboard name `status-<sanitized>.piercloud.net` (per-tenant
+# singleton, no NN), resolves the zone id at runtime (one fewer stored
+# secret), creates or overwrites both A records to the exact anchor IPv4
+# (anchor: TTL 300 DNS-only; dashboard: orange-cloud/proxied), then
+# re-reads each record and fails unless name + address (+ proxied flag)
+# match exactly.
 #
 # SCOPE (D8): the operator zone mints names only for operator-provisioned
 # netcup anchors. A BYO twin anchor keeps its tenant-owned URL via the
@@ -30,8 +33,11 @@
 #                          and never requires the token.
 #
 # Zone `piercloud.net` is hardcoded below: public DNS info, not a secret.
-# `proxied:false` is load-bearing: plain-HTTP tang must not sit behind the
-# orange cloud. `curl -sS` only, no `-v`, no TF_LOG; logs carry jq-selected
+# `proxied:false` on the anchor record is load-bearing: plain-HTTP tang
+# must not sit behind the orange cloud. The dashboard record is proxied:true
+# (orange cloud terminates visitor TLS; Caddy answers the edge on :443) —
+# proxied records take ttl:1 (automatic) or the API refuses the write.
+# `curl -sS` only, no `-v`, no TF_LOG; logs carry jq-selected
 # public fields only (name/type/address/ttl/proxied) — never the token and
 # never whole API responses.
 #
@@ -66,8 +72,7 @@ if [ -z "$san" ]; then
   exit 1
 fi
 record="anchor-${san}-01" # NN=01; -02+ is a future multi-anchor case.
-fqdn="${record}.${CF_ZONE}"
-echo "record: $fqdn -> $want_ip"
+status="status.${san}"    # dashboard singleton: one per tenant, no NN.
 
 auth=(-sS -H "Authorization: Bearer $CLOUDFLARE_DNS_TOKEN" -H "Content-Type: application/json")
 
@@ -77,28 +82,37 @@ if [ -z "$zone_id" ]; then
   exit 1
 fi
 
-existing="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
-rec_id="$(printf '%s' "$existing" | jq -r '.result[0].id // empty')"
-rec_ip="$(printf '%s' "$existing" | jq -r '.result[0].content // empty')"
+upsert_record() { # $1 = left-hand name, $2 = proxied (true/false), $3 = ttl, $4 = comment
+  local name="$1" proxied="$2" ttl="$3" comment="$4"
+  local fqdn existing rec_id rec_ip body verify got_name got_ip got_proxied
+  fqdn="${name}.${CF_ZONE}"
+  echo "record: $fqdn -> $want_ip (proxied=$proxied)"
+  existing="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
+  rec_id="$(printf '%s' "$existing" | jq -r '.result[0].id // empty')"
+  rec_ip="$(printf '%s' "$existing" | jq -r '.result[0].content // empty')"
+  # List-then-write IS the create-or-overwrite: PUT when the name exists,
+  # POST when it doesn't.
+  body="$(jq -n --arg name "$fqdn" --arg ip "$want_ip" --argjson proxied "$proxied" --argjson ttl "$ttl" --arg comment "$comment" '{type:"A", name:$name, content:$ip, ttl:$ttl, proxied:$proxied, comment:$comment}')"
+  if [ -n "$rec_id" ]; then
+    echo "record exists ($rec_ip) — overwriting to the exact anchor address."
+    curl "${auth[@]}" -X PUT --data "$body" "$CF_API/zones/$zone_id/dns_records/$rec_id" > /dev/null
+  else
+    echo "no record yet — creating."
+    curl "${auth[@]}" -X POST --data "$body" "$CF_API/zones/$zone_id/dns_records" > /dev/null
+  fi
+  # Verify-after-write: re-read and exact-match name + address + proxied,
+  # else fail.
+  verify="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
+  got_name="$(printf '%s' "$verify" | jq -r '.result[0].name // empty')"
+  got_ip="$(printf '%s' "$verify" | jq -r '.result[0].content // empty')"
+  got_proxied="$(printf '%s' "$verify" | jq -r '.result[0].proxied // empty')"
+  printf '%s' "$verify" | jq '{name: .result[0].name, type: .result[0].type, content: .result[0].content, ttl: .result[0].ttl, proxied: .result[0].proxied}'
+  if [ "$got_name" != "$fqdn" ] || [ "$got_ip" != "$want_ip" ] || [ "$got_proxied" != "$proxied" ]; then
+    echo "::error::verify-after-write mismatch: want $fqdn -> $want_ip (proxied=$proxied), zone answers $got_name -> $got_ip (proxied=$got_proxied). STOP — investigate before any bind-by-name."
+    exit 1
+  fi
+  echo "verified: $fqdn -> $want_ip (proxied=$proxied)."
+}
 
-# List-then-write IS the create-or-overwrite: PUT when the name exists,
-# POST when it doesn't. TTL 300; proxied:false keeps tang DNS-only.
-body="$(jq -n --arg name "$fqdn" --arg ip "$want_ip" '{type:"A", name:$name, content:$ip, ttl:300, proxied:false, comment:"operator anchor; DNS-only (proxied off)"}')"
-if [ -n "$rec_id" ]; then
-  echo "record exists ($rec_ip) — overwriting to the exact anchor address."
-  curl "${auth[@]}" -X PUT --data "$body" "$CF_API/zones/$zone_id/dns_records/$rec_id" > /dev/null
-else
-  echo "no record yet — creating."
-  curl "${auth[@]}" -X POST --data "$body" "$CF_API/zones/$zone_id/dns_records" > /dev/null
-fi
-
-# Verify-after-write: re-read and exact-match name + address, else fail.
-verify="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
-got_name="$(printf '%s' "$verify" | jq -r '.result[0].name // empty')"
-got_ip="$(printf '%s' "$verify" | jq -r '.result[0].content // empty')"
-printf '%s' "$verify" | jq '{name: .result[0].name, type: .result[0].type, content: .result[0].content, ttl: .result[0].ttl, proxied: .result[0].proxied}'
-if [ "$got_name" != "$fqdn" ] || [ "$got_ip" != "$want_ip" ]; then
-  echo "::error::verify-after-write mismatch: want $fqdn -> $want_ip, zone answers $got_name -> $got_ip. STOP — investigate before any bind-by-name."
-  exit 1
-fi
-echo "verified: $fqdn -> $want_ip (DNS-only, ttl 300)."
+upsert_record "$record" false 300 "operator anchor; DNS-only (proxied off)"
+upsert_record "$status" true 1 "dashboard; orange-cloud (proxied)"

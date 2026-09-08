@@ -31,10 +31,10 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
   draft PRs. Releases are tagged `vX.Y.Z` (+ floating `v0`/`v0.0` during
   0.x; `v1` after 1.0.0).
 - Dependency pins are kept fresh by Renovate (see `renovate.json`): the
-  `@v1` action pins, the Gatus image pin inside `010-provision.sh` (marked
-  with a `# renovate:` directive), and `.opentofu-version`. Minor/patch
+  `@v1` action pins, the Gatus + Caddy image pins inside `010-provision.sh` (marked
+  with `# renovate:` directives), and `.opentofu-version`. Minor/patch
   bumps automerge once CI is green; **major bumps always land as PRs for
-  human review**. A Renovate bump of the Gatus image reaches deployed
+  human review**. A Renovate bump of either image reaches deployed
   anchors when the user re-runs `scripts/010-provision.sh` (the script
   recreates the container when the pinned image changed).
 
