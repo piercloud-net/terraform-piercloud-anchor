@@ -26,7 +26,7 @@ on:
       mode:
         description: "Provisioning mode: apply | check | update-ip | destroy"
         required: true
-        default: check
+        default: apply
         type: choice
         options: [apply, check, update-ip, destroy]
       ack_main_unbound:
