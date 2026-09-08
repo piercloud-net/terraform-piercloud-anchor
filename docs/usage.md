@@ -30,11 +30,17 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 **Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `A1_ROOT_PASSWORD` input (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
-Note:
+Collect these as you go — each feeds one repo secret in §2:
 
-- the **server name** (e.g. `SCPI-1234567`) or numeric **server id**,
-- the **user id** of your SCP account (Account → Users),
-- the **anchor IPv4**.
+- numeric **server id** (server-ready email or SCP; the display name like `SCPI-1234567` is just how you find it) → `NETCUP_SERVER_ID`
+- **hostname** you give the anchor (D6: = DNS label, e.g. `anchor-pier-01`) → `NETCUP_HOSTNAME`
+- **SCP user id** (Account → Users) → `NETCUP_SCP_USER_ID`
+- **customer number** (CCP email) → `NETCUP_CUSTOMER_NUMBER`
+- **anchor IPv4** (server-ready email) → `NETCUP_ANCHOR_IPV4`
+- **main-box IPv4** (the box being unlocked) → `NETCUP_MAIN_BOX_IPV4`
+- **root password** (server-ready email) → `A1_ROOT_PASSWORD`
+
+Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning. (The SSH keys are public material and could travel either way; they live in secrets for uniformity.)
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
 a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
