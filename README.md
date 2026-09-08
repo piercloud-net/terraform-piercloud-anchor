@@ -8,6 +8,13 @@ you find out if the anchor ever goes down.
 **Your disk is ciphertext. You hold the keys. Your host cannot read your data,
 even with root.**
 
+Words you'll meet: **thumbprint** = the anchor's key fingerprint (a short
+string you compare by eye); **bind** = telling your main box to trust that
+thumbprint at boot; **keyslot** = one of the LUKS unlock methods on your disk
+(your passphrase lives in one — it is the true root); **initramfs** = the tiny
+early-boot system that asks the anchor for the key; **A1** = the one-run
+admin session used to install the anchor.
+
 ## Why this exists (NBDE in one paragraph)
 
 Full-disk LUKS encryption has an old problem: an encrypted server cannot boot
@@ -50,22 +57,24 @@ via netcup SCP at order time.
 
 Every step below runs from any browser — laptop or phone; phone browsers work for the whole flow, including the approval tap.
 
-1. **Order the anchor** — in the netcup SCP: the [VPS pico G11s](https://www.netcup.com/en/server/vps/vps-pico-g11s-iv-12m-nue)
+1. **Order the anchor** — in the netcup shop (buying happens there; the SCP manages servers you already own): the [VPS pico G11s](https://www.netcup.com/en/server/vps/vps-pico-g11s-iv-12m-nue)
    (~€1.90/mo VAT-incl, 12-mo term) is plenty; any Debian-family image,
    root password by email. Skip the welcome voucher (pico can't be combined
    with vouchers — the order won't submit). Ordering isn't instant (staff review;
    wait for netcup's email, then first logins (CCP + SCP): new passwords +
    2FA + invoice check). Anchor IPv4
    is REQUIRED (runners have no IPv6; v6-only unsupported). Note the
-   server name (or id), your SCP user id, and the anchor's IP.
+   anchor's IP ("IP address" in netcup's server-ready email). Hostname,
+   DNS, and the slice IP come pre-configured — nothing to pick.
    *(details: [walkthrough §1](docs/usage.md#1-order-the-anchor-piko-class-vps))*
 2. **Repo from template + repo values** — "Use this template", then set
    repo variables (SSH keys) + repo secrets (customer number,
    anchor IP, one-run root password, optional ntfy). No stored netcup API
    tokens of any kind (S1): every run authenticates via your per-run
    approval — the one exception is the one-run A1 root password (write-only
-   secret, killed by `passwd -l root`, deleted after use). Slice IP, DNS,
-   and your username come pre-configured in your repo. Public default once
+   secret, killed by `passwd -l root`, deleted after use). The main-box IP,
+   DNS, and your username come pre-configured in your repo — nothing to
+   enter. Public default once
    values land (write-only, log-masked, invisible to forks).
    *(details: [walkthrough §2](docs/usage.md#2-repo-from-template--repo-secrets-c-e-visibility-rule))*
 3. **Dispatch + approve** — Actions → [`provision.yml`](.github/workflows/provision.yml)
@@ -81,13 +90,28 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    manager NOW**, then finish the
    [day-1 checklist](docs/dr.md#day-1-off-device-checklist).
    *(details: [walkthrough §4](docs/usage.md#4-a1-provisions-thumbprint-lands-three-ways-h1-chain))*
-5. **Configure the monitor** — one file on the anchor:
-   `/etc/gatus/config.yaml`. Pick an alerting channel (ntfy / Telegram /
-   SMTP) and add endpoints for **your main server's services by DNS name**.
-   *(installed by the run — [walkthrough §4](docs/usage.md#4-a1-provisions-thumbprint-lands-three-ways-h1-chain); configure per the file's own comments)*
+5. **Configure the monitor (optional, after the bind)** — log in on the
+   netcup SCP remote console as root and edit one file,
+   `/etc/gatus/config.yaml`. Minimal working push alerting (create the topic
+   name in the [ntfy app](https://ntfy.sh) first — any random name is yours):
+   ```yaml
+   alerting:
+     ntfy:
+       url: https://ntfy.sh
+       topic: my-anchor-alerts
+   endpoints:
+     - name: main https
+       url: https://my-main-server.example.com
+       interval: 60s
+       conditions: ["[STATUS] == 200"]
+       alerts: [{type: ntfy, failure-threshold: 3}]
+   ```
+   then `docker restart gatus`. Probe your main server's services **by DNS
+   name** so the monitor follows migrations automatically. Ntfy / Telegram /
+   SMTP alternatives are documented in the file's own comments.
 6. **Bind your main box** — install `clevis clevis-luks clevis-initramfs`,
    run the printed `clevis luks bind` command against the DNS name
-   (`anchor-<user>-NN.piercloud.net`), confirming the thumbprint matches
+   (`anchor-<alias>-01.piercloud.net`, e.g. `anchor-pier-01.piercloud.net`), confirming the thumbprint matches
    out-of-band — never `-y` blind — then rebuild the initramfs.
    *(details: [walkthrough §5](docs/usage.md#5-bind-your-main-box-clevis))*
 7. **Reboot-test twice + monthly one-tap check.** The unlock prompt may
@@ -99,15 +123,15 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
 ## Quickstart
 
 ```bash
-# 0. Order a small netcup VPS ("piko" class is plenty) in the SCP, install any
-#    Debian-family OS, note the server name and its id. Anchor IPv4 required.
-# 1. "Use this template" on GitHub, set the identifier repo secrets
-#    (username, anchor IP, customer number) — no netcup tokens stored.
+# 0. Order a small netcup VPS ("piko" class is plenty) in the netcup shop, install any
+#    Debian-family OS, note the anchor IP. Anchor IPv4 required.
+# 1. "Use this template" on GitHub, set the repo values
+#    (customer number, anchor IP for dispatch-time check, SSH keys, one-run root password) — no netcup tokens stored.
 # 2. Dispatch the provision.yml workflow (Actions tab, mode=apply)
 #    from any browser (no identifiers to enter), and approve the device-flow
 #    code at netcup's Keycloak.
-# 3. Save the tang thumbprint (ntfy + run artifact + committed break-glass
-#    file) in your password manager NOW.
+# 3. Save the tang thumbprint (run artifact under the Actions run —
+#    ntfy push + committed break-glass file pending) in your password manager NOW.
 ```
 
 Module consumers (registry/GitHub source, `examples/quickstart` as the root
@@ -121,12 +145,15 @@ the `clevis luks bind` on your main box and the reboot test):
 
 ## What YOU must do
 
-1. **Save the thumbprint** in your password manager when the script prints it.
-   You will verify it when binding your main box.
-2. **Wire your main box**: install `clevis clevis-luks clevis-initramfs`, run
-   the printed `clevis luks bind -d <device> tang '{"url":"http://anchor-pier-01.piercloud.net"}'`
+1. **Save the thumbprint** from the run's artifact (Actions → the run →
+   Artifacts) in your password manager the moment provisioning finishes.
+   You will compare it by eye when binding your main box.
+2. **Wire your main box — at its keyboard, not your phone**: install
+   `clevis clevis-luks clevis-initramfs`, run
+   the printed `clevis luks bind -d /dev/sda3 tang '{"url":"http://anchor-pier-01.piercloud.net"}'`
+   (your LUKS device — find it with `lsblk -f`, see walkthrough §5)
    — confirming the thumbprint matches what you saved — then
-   `update-initramfs -u` and test a reboot.
+   `update-initramfs -u` and reboot-test twice.
 3. **Keep the passphrase keyslot.** The tang anchor is convenience and
    availability; the passphrase is the true root. If the anchor dies, you
    unlock with the passphrase.
@@ -184,9 +211,10 @@ rotation is forward security only.
 Visibility (C-E): identifiers in repo secrets always; public default once
 secrets land; the approval card is LOUD about what commit you approve
 (and shows SHA + diff vs default branch today; refuse-on-change pin pending the backend recorder); the repo is authoritative, any UI advisory.
-Thumbprint chain (H1): run artifact (`retention-days: 400` = artifacts
-only — never rely on logs alone) + committed break-glass file via
-reviewable App PR; `mode=check` warns on the repo retention setting.
+Thumbprint chain (H1): run artifact today (Actions → run → Artifacts,
+`retention-days: 400` = artifacts only — never rely on logs alone); ntfy +
+committed break-glass file via reviewable App PR are PENDING; `mode=check`
+warns on the repo retention setting.
 
 ## Versioning & pinning
 

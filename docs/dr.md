@@ -33,14 +33,14 @@ Related: [usage.md](usage.md) (end-to-end flow) ·
 | Stale binding (main box moved, source IP changed) | Clevis fails after a move; canary carries the new IP | `mode=update-ip`: ADD the new IP first, confirm boot, then remove the old (ADD-before-move; operator requests, OWNER executes) | Remove the old IP before the new one boots (cutover lockout) |
 | SCP outage (netcup control plane down) | SCP/API unreachable; anchor itself still answers clevis | **SCP outage: do NOT migrate hosts.** Wait it out — running anchors keep unlocking; nothing needs the API until you change something | Migrate hosts mid-outage (strands the moved box behind a stale rule with zero remediation) |
 | Lost phone | You, noticing | Day-1 kit: recovery codes + root password in the PM emergency kit, printed off-device — recover GitHub/netcup access from any browser, then re-enroll | Keep all second factors on the one device (month-6 lesson — see checklist) |
-| Device grant disabled (netcup turns off the OAuth device flow) | `mode=apply` fails at the approval step | STOP + escalate to the operator. Do not proceed. (C-A — no fallback of any kind is designed or permitted) | Invent a fallback: no one-run tokens, no pasted long-lived secrets, no "temporary" standing credential |
+| Device grant disabled (netcup turns off the OAuth device flow) | `mode=apply` fails at the approval step | STOP + open an issue in your tenant repo. Do not proceed. (C-A — no fallback of any kind is designed or permitted) | Invent a fallback: no one-run tokens, no pasted long-lived secrets, no "temporary" standing credential |
 
 ## Boot-failure decision tree (main box asks for a passphrase)
 
 Your main box dropped to a passphrase prompt instead of unlocking via the
 anchor. Four causes, in order:
 
-1. **Is the anchor up?** Check Gatus / try the anchor's monitoring page.
+1. **Is the anchor up?** Check Gatus from the anchor's SCP console (`curl -s localhost:8080 | head -5` — HTTP 200 = alive).
    No → anchor death: type the passphrase (T0), then rebuild at your desk
    (same-URL `regen` below). Yes → step 2.
 2. **Did anything firewall-shaped change?** Diff the firewall policies in the SCP (`mode=check` drift report planned).
@@ -56,7 +56,7 @@ anchor. Four causes, in order:
 
 ## Same-URL rebuild = `regen` (2-minute DR)
 
-Bind clevis to a DNS name (`anchor-<user>-NN.piercloud.net`, see
+Bind clevis to a DNS name (`anchor-<alias>-01.piercloud.net`, see
 `anchor_hostname`), never the raw IP. A rebuilt anchor at the same URL
 needs only `clevis luks regen -d <device> tang` — same URL, fresh keys,
 no unbind+bind ceremony.
