@@ -30,6 +30,8 @@
 #              -> poll SUCCESS -> PATCH state ON -> poll + TCP/SSH retry ->
 #              export the masked value for the provision step (same-runner
 #              handoff). Skips minting when ROOT_PASSWORD_SECRET is set.
+#              Runs after A1 open (workflow order, issue #59): the closing
+#              SSH-wait needs the runner /32 :22 window.
 #   lock-password
 #              best-effort finally-path: `passwd -l root` over ssh with the
 #              caller-set password. Never fails (the original failure owns
@@ -510,7 +512,8 @@ LOCK_WAIT_SECONDS=15      # backoff step on 409 server.lock.error
 LOCK_WAIT_ROUNDS=40       # ... bounded (~10 min per mutating op)
 TASK_POLL_SECONDS=10
 TASK_WAIT_ROUNDS=60       # ... bounded (~10 min per async op)
-SSH_WAIT_ROUNDS=60        # TCP/SSH retry after power-ON (~10 min)
+SSH_WAIT_ROUNDS=60        # TCP/22 retry after power-ON (each try ceilinged: 60 x (5s probe + 10s sleep) ~= 15 min worst case, then loud abort)
+SSH_TCP_TIMEOUT_SECONDS=5 # per-attempt ceiling on the TCP/22 probe (live #59: bare /dev/tcp blocks on kernel SYN timeout while SYNs go unanswered — 68-min silent hang)
 SSH_PROBE_ROUNDS=12       # sshd takes TCP before auth is ready (short loop)
 
 gen_password() { # -> 28 chars, conservative charset (no shell/JSON specials)
@@ -583,10 +586,17 @@ patch_server() { # $1 = merge-patch body, $2 = label, $3 = query suffix, $4 = uu
 }
 
 wait_ssh() { # TCP/22 then one auth probe with $SSHPASS, bounded
-  local i=0
+  # Live #59: this wait runs AFTER the A1 window opens (workflow order) —
+  # but every attempt is ceilinged anyway. A bare /dev/tcp blocks on kernel
+  # SYN timeout while SYNs go unanswered (68-min silent hang); timeout(1)
+  # bounds each try, the round cap bounds the total, progress logs keep it
+  # visible. Fail-closed: the cap dies loud, never proceeds unproven.
+  local i=0 port="${ANCHOR_SSH_PORT:-22}"
   while [ "$i" -lt "$SSH_WAIT_ROUNDS" ]; do
-    if (echo >/dev/tcp/"$ANCHOR_HOST"/22) >/dev/null 2>&1; then break; fi
-    i=$((i + 1)); sleep 10
+    if timeout "$SSH_TCP_TIMEOUT_SECONDS" bash -c "echo >/dev/tcp/${ANCHOR_HOST}/${port}" >/dev/null 2>&1; then break; fi
+    i=$((i + 1))
+    if [ $((i % 6)) -eq 0 ]; then log "TCP/${port} not open yet (attempt ${i}/${SSH_WAIT_ROUNDS}) — still waiting"; fi
+    sleep 10
   done
   if [ "$i" -ge "$SSH_WAIT_ROUNDS" ]; then
     die "TCP/22 on the anchor never opened after power-ON — refusing to continue blind"
