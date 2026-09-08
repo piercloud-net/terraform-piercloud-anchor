@@ -333,11 +333,12 @@ jobs:
           # Allowlist approach: enumerate the permitted endpoint substrings
           # and fail on anything else netcup-shaped in the CI-called surface
           # (provision.yml + .github/scripts). Permitted today:
-          #   URLs: the SCP REST base, the two A1 egress-IP endpoints, ntfy.
+          #   URLs: the SCP REST base, the two A1 egress-IP endpoints, ntfy,
+          #   and the Cloudflare DNS API (anchor A-record upsert + verify).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com)(/|$)'
           allowed_path='firewall-polic|interfaces|/servers|device|token|auth'
           URL_EXTRACT='https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+'
           PATH_EXTRACT='/api/v[0-9][A-Za-z0-9._~:/?#@!$&()*+,;=%${}-]*'

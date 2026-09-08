@@ -81,7 +81,8 @@ reviewable PR from a separate App identity. Never rely on logs alone (repo
 logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the
 repo retention setting. **Save the thumbprint in your PM NOW** (and finish
 the [day-1 checklist](dr.md#day-1-off-device-checklist)).
->>>>>>> f93206d (docs: M5 phone-first template docs (trust copy, DR, T0/T1/T2) + conventions sync)
+
+The run also creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out.
 
 ## 5. Bind your main box (clevis)
 

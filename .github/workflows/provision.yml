@@ -12,6 +12,11 @@
 # OpenTofu note: the tofu steps wired in M2 REQUIRE required_version >= 1.11
 # (ephemeral values carry the per-run netcup token; the token never lands in
 # state). The module bump itself lands in M3.
+#
+# DNS stage (anchor-dns job + .github/scripts/030-anchor-dns.sh): Cloudflare
+# A-record upsert + verify-after-write runs after A1 close (needs
+# device-flow) and before thumbprint issuance (thumbprint needs anchor-dns)
+# — a DNS failure fails the run before any thumbprint goes out, always.
 
 name: provision
 
@@ -411,6 +416,34 @@ jobs:
           MSG="piercloud A1/provision FAILED for ${{ inputs.server_alias }} — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
           curl -sS -u ":$NTFY_TOKEN" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
 
+  anchor-dns:
+    name: "Anchor DNS upsert + verify (Cloudflare, fail-closed)"
+    runs-on: ubuntu-latest
+    needs: [device-flow]
+    if: inputs.mode == 'apply'
+    env:
+      SERVER_ALIAS: ${{ inputs.server_alias }}
+      ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
+      CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+      - name: Upsert anchor A record + verify-after-write
+        run: |
+          set -euo pipefail
+          # Load-bearing order: this job needs device-flow (A1 close +
+          # sweep are steps inside it), and the thumbprint job needs THIS
+          # job — DNS failure fails the run before any thumbprint goes
+          # out, so we never bind-by-name against a record we didn't just
+          # verify. Absent CLOUDFLARE_DNS_TOKEN on mode=apply = explicit
+          # error from the script (C-A fail-closed: set the org secret,
+          # then re-dispatch). mode=check never runs this job and never
+          # requires the token. Same static global mutex covers this job
+          # (workflow-level concurrency); no new actions (curl + jq only).
+          bash .github/scripts/030-anchor-dns.sh
+
   apply-placeholder:
     name: "mode=apply (stateless skeleton)"
     runs-on: ubuntu-latest
@@ -499,7 +532,7 @@ jobs:
   thumbprint:
     name: "H1 thumbprint chain (artifact)"
     runs-on: ubuntu-latest
-    needs: [device-flow]
+    needs: [device-flow, anchor-dns]
     if: inputs.mode == 'apply'
     steps:
       - name: Checkout (no credentials persisted)

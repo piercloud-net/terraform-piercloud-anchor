@@ -70,6 +70,7 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    approve the device-flow URL + code at netcup's own Keycloak, from any browser. The
    ephemeral token dies with the runner. *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
 4. **A1 provisions** — the run opens its own /32 window, installs `tang`,
+   creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net`),
    prints its **thumbprint** (to ntfy + run artifact + committed
    break-glass file — never logs alone), installs the Gatus monitor, and
    ends with `passwd -l root`. **Save the thumbprint in your password
