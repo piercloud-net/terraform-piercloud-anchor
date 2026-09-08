@@ -36,7 +36,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
-- **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — also used as the SCP user id, unless `SCP_USER_ID` is set (a repo secret, only if yours differs)
+- **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — provider credential only; the SCP user id resolves itself from your approval token (override via `SCP_USER_ID` repo secret only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address" — paste verbatim, `203.0.113.10/22`-style suffix included; the run strips it) → `ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `ANCHOR_ROOT_PASSWORD`
 - nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
