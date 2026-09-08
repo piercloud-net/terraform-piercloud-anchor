@@ -212,6 +212,7 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "# availability history stays continuous across the cutover."
   printf '%s\n' ""
   printf '%s\n' "storage:"
+  printf '%s\n' "  type: sqlite" # explicit: Gatus defaults to memory and panics if a path is set (live 2026-09-08)
   printf '%s\n' "  path: /data/gatus.db   # sqlite in the gatus-data volume: history survives restarts"
   printf '%s\n' ""
   printf '%s\n' "alerting:"
