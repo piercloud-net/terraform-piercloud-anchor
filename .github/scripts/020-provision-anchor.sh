@@ -559,7 +559,12 @@ patch_server() { # $1 = merge-patch body, $2 = label, $3 = query suffix, $4 = uu
   # set the flag and return (caller mints a fresh password candidate);
   # 422 without one = die. Response bodies are NEVER printed here (the
   # password path must not leak the candidate through a policy echo).
-  local body="$1" label="$2" qs="${3:-}" outvar="$4" rej422="${5:-}" i resp code uuid
+  # Dynamic-scope warning (sibling of the api_call HTTP_STATUS trap above):
+  # `uuid` MUST stay non-local here — callers pass outvar=uuid and
+  # `printf -v "$outvar"` must reach THEIR uuid, or 202 tasks are never
+  # polled (live failure: runs 34281922878 + 34282761648 raced ahead of
+  # unconverged power/password sets into a failed SSH auth probe).
+  local body="$1" label="$2" qs="${3:-}" outvar="$4" rej422="${5:-}" i resp code
   i=0
   while [ "$i" -lt "$LOCK_WAIT_ROUNDS" ]; do
     api_call PATCH "/api/v1/servers/${SERVER_ID}${qs}" "$body" resp "application/merge-patch+json"
