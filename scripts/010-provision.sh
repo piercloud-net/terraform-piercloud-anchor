@@ -2,10 +2,11 @@
 #
 # 010-provision.sh — provision the tang/clevis NBDE anchor + uptime monitor.
 #
-# WHERE THIS RUNS: ON the anchor box itself (the netcup VPS you adopted with
-# the terraform-piercloud-anchor module), as root, via the netcup SCP remote
-# console (browser VNC) — or your own SSH session if you added your own SSH
-# key in the SCP. Nothing in this repo ever connects to the anchor.
+# WHERE THIS RUNS: ON the anchor box itself, as root, normally via the A1
+# dispatch (the runner SSHes in under a per-run device-flow approval and pipes
+# this script over stdin with GATUS_*/NTFY_* env prefixed). Fallback: paste it
+# into the netcup SCP remote console by hand — env unset means a self-check-only
+# monitor. Either way the tang keypair is generated ON THIS BOX and never leaves.
 #
 #   curl -fsSL https://raw.githubusercontent.com/piercloud-net/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
 #
@@ -27,6 +28,24 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (netcup SCP remote console, root login)"
 
+ROTATE=0
+case "${1:-}" in
+  "") ;; # normal provision
+  --rotate) ROTATE=1 ;;
+  *) die "usage: $0 [--rotate]" ;;
+esac
+
+gen_keys() { # append a fresh key set on this box (never deletes)
+  if [ -x /usr/libexec/tangd-keygen ]; then
+    /usr/libexec/tangd-keygen "${TANG_KEYS_DIR}"
+  elif [ -x /usr/lib/tang/tangd-keygen ]; then
+    /usr/lib/tang/tangd-keygen "${TANG_KEYS_DIR}"
+  else
+    die "tangd-keygen not found; reinstall the 'tang' package"
+  fi
+  systemctl restart tangd.socket 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # a) tang + tangd.socket (idempotent)
 # ---------------------------------------------------------------------------
@@ -38,17 +57,21 @@ apt-get install -y -qq tang jq >/dev/null
 log "Enabling tangd.socket (port 80)"
 systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 
-# Defensive key generation: some base images ship tang without keys on disk.
+# Defensive key generation: some base images ship tang without keys on disk. # ci-allowlist: prose — on-box keygen note, not a live reference.
 if ! compgen -G "${TANG_KEYS_DIR}/*.jwk" >/dev/null; then
   log "No tang keys found — generating keypair on this box"
-  if [ -x /usr/libexec/tangd-keygen ]; then
-    /usr/libexec/tangd-keygen "${TANG_KEYS_DIR}"
-  elif [ -x /usr/lib/tang/tangd-keygen ]; then
-    /usr/lib/tang/tangd-keygen "${TANG_KEYS_DIR}"
-  else
-    die "tangd-keygen not found; reinstall the 'tang' package"
-  fi
-  systemctl restart tangd.socket 2>/dev/null || true
+  gen_keys
+fi
+
+# Rotation (--rotate): append a FRESH key set next to the old one, so already-
+# bound clients keep booting while you re-bind to the new thumbprint below.
+# AFTER every client has rotated and reboot-verified, delete the OLD .jwk
+# files by hand. Deleting before that locks out unattended boot (passphrase
+# prompt at 3am). Live proof (two consecutive runs) is M0-gated.
+if [ "$ROTATE" = "1" ]; then
+  log "Rotating: generating a fresh key set alongside the old one"
+  gen_keys
+  warn "Re-bind every client to the NEW thumbprint below and reboot-verify each BEFORE deleting old keys."
 fi
 
 # ---------------------------------------------------------------------------
@@ -97,167 +120,133 @@ Do NOT apply that configuration; investigate before proceeding."
 assert_no_key_leak
 
 # ---------------------------------------------------------------------------
-# c) Gatus config (config-as-file; written on first run, never clobbered; a
-#    refreshed template lands as <config>.distrib for the user to diff/merge)
+# c) Gatus config — DISPATCH-MANAGED (2026-09-08: no standing SSH keys, no
+#    console edits; a phone tenant converges monitors via the GATUS_ENDPOINTS
+#    repo secret + re-dispatch). Rendered on EVERY run; hand edits die
+#    (one-time backup below). Env in: GATUS_ENDPOINTS (comma-separated
+#    name=url pairs, http(s) only, v1), NTFY_TOPIC / NTFY_TOKEN (empty =
+#    checks without push + warn).
 # ---------------------------------------------------------------------------
-log "Installing Gatus config (${GATUS_CONFIG})"
-ANCHOR_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+log "Rendering dispatch-managed Gatus config (${GATUS_CONFIG})"
 mkdir -p "$(dirname "${GATUS_CONFIG}")"
-if [ -f "${GATUS_CONFIG}" ]; then
-  log "Gatus config already present - kept as-is (your edits are never touched)"
-  # A newer release may have added settings; refresh the template copy the
-  # user can diff/merge by hand. The LIVE config is NEVER overwritten.
-  if ! cmp -s "${GATUS_CONFIG}" "${GATUS_CONFIG}.distrib"; then
-    cat > "${GATUS_CONFIG}.distrib" <<GCFG
-# Managed by terraform-piercloud-anchor (scripts/010-provision.sh).
-# Template copy: diff against ${GATUS_CONFIG} and merge what you want.
-# Docs: https://gatus.io/docs
-
-storage:
-  path: /data/gatus.db   # sqlite in the gatus-data volume: history survives restarts
-
-alerting:
-  # Pick ONE channel and fill it in, then reference it from each endpoint's
-  # "alerts" list. Gatus PUSHES alerts when an endpoint fails - a dashboard
-  # you never open is useless; the push is the point. Examples:
-  #
-  #   ntfy:      # self-hostable push, simplest
-  #     url: https://ntfy.yourdomain.tld
-  #     topic: piercloud-anchor
-  #   telegram:
-  #     token: <bot-token>
-  #     id: <chat-id>
-  #   smtp:      # plain email
-  #     username: you@example.com
-  #     password: <app-password>
-  #     from: gatus@example.com
-  #     to: ["you@example.com"]
-
-metrics: false
-
-endpoints:
-  # The anchor itself - local only, never firewalled, always accurate.
-  - name: tang (local)
-    url: http://127.0.0.1/adv
+# One-time backup of any pre-managed hand config (never overwritten twice).
+if [ -f "${GATUS_CONFIG}" ] && [ ! -f "${GATUS_CONFIG}.pre-managed.bak" ] && ! grep -q "DISPATCH-MANAGED" "${GATUS_CONFIG}" 2>/dev/null; then
+  cp -p "${GATUS_CONFIG}" "${GATUS_CONFIG}.pre-managed.bak"
+  log "Backed up pre-managed config to ${GATUS_CONFIG}.pre-managed.bak (one-time)"
+fi
+# Tenant endpoints. Bad pairs fail closed: a typo'd monitor you'd trust is
+# worse than none.
+ENDPOINTS_YAML=""
+# Default target: the tenant homepage derives from TENANT_USER — no input
+# needed (pier → https://pier.piercloud.net). Skipped only for hand runs
+# without env (console fallback = self-check only, as documented).
+if [ -n "${TENANT_USER:-}" ]; then
+  case "$TENANT_USER" in ''|*[!a-zA-Z0-9_-]*) die "bad TENANT_USER for homepage URL (chars [a-zA-Z0-9_-] only)";; esac
+  ENDPOINTS_YAML="  - name: main
+    url: https://${TENANT_USER}.piercloud.net
     interval: 60s
     conditions:
-      - "[STATUS] == 200"
-    # alerts:
-    #   - type: ntfy        # <- match the channel you configured above
-
-  # YOUR MAIN SERVER - probe it by DNS NAME, not IP: Gatus never caches DNS,
-  # so when you migrate and flip the record, the monitor follows automatically
-  # and the availability history stays continuous across the cutover.
-  # Uncomment and adapt (HTTPS, TCP, ICMP, DNS record checks all supported):
-  #
-  # - name: main-server https
-  #   url: https://your-main-server.example.com
-  #   interval: 60s
-  #   conditions:
-  #     - "[STATUS] == 200"
-  #   alerts:
-  #     - type: ntfy
-  #       failure-threshold: 3
-  #
-  # - name: main-server ssh
-  #   host: "ssh://your-main-server.example.com:22"
-  #   interval: 60s
-  #   conditions:
-  #     - "[CONNECTED] == true"
-GCFG
-    echo "  Template refreshed: ${GATUS_CONFIG}.distrib (diff + merge by hand)"
+      - \"[STATUS] == 200\"
+"
+  if [ -n "${NTFY_TOPIC:-}" ]; then
+    ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
+      - type: ntfy
+        failure-threshold: 3
+"
+  fi
+fi
+if [ -n "${GATUS_ENDPOINTS:-}" ]; then
+  set -f
+  OLD_IFS="$IFS"; IFS=","
+  # shellcheck disable=SC2086
+  for pair in ${GATUS_ENDPOINTS}; do
+    [ -z "$pair" ] && continue  # tolerate ,, / trailing comma (commas are illegal inside URLs — split there)
+    name="$(printf '%s' "$pair" | cut -d= -f1 | tr -d '[:space:]')"
+    url="$(printf '%s' "$pair" | cut -d= -f2- | tr -d '[:space:]')"
+    case "$name" in ''|*[!a-zA-Z0-9_-]*) die "bad GATUS_ENDPOINTS pair (want name=url, name chars [a-zA-Z0-9_-]): $pair";; esac
+    case "$url" in http://*|https://*) ;; *) die "bad GATUS_ENDPOINTS pair (v1 supports http(s) URLs only): $pair";; esac
+    ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: ${name}
+    url: ${url}
+    interval: 60s
+    conditions:
+      - \"[STATUS] == 200\"
+"
+    if [ -n "${NTFY_TOPIC:-}" ]; then
+      ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
+      - type: ntfy
+        failure-threshold: 3
+"
+    fi
+  done
+  IFS="$OLD_IFS"
+  set +f
+fi
+if [ -n "${NTFY_TOPIC:-}" ]; then
+  # Fail fast on YAML injection: topic/token interpolate into config-as-data.
+  case "$NTFY_TOPIC" in ''|*[!a-zA-Z0-9_-]*) die "bad NTFY_TOPIC (chars [a-zA-Z0-9_-] only): ${NTFY_TOPIC}";; esac
+  case "$NTFY_TOKEN" in *[[:space:]]*|*[![:print:]]*) die "bad NTFY_TOKEN (no whitespace/control characters)";; esac
+  ALERTING_YAML="  ntfy:
+    url: https://ntfy.sh
+    topic: ${NTFY_TOPIC}"
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    ALERTING_YAML="${ALERTING_YAML}
+    token: ${NTFY_TOKEN}"
   fi
 else
-  log "Writing Gatus config (first run)"
-  cat > "${GATUS_CONFIG}" <<GCFG
-# Managed by terraform-piercloud-anchor (scripts/010-provision.sh).
-# Edit freely - re-running the script will NOT overwrite this file.
-# Docs: https://gatus.io/docs
-
-storage:
-  path: /data/gatus.db   # sqlite in the gatus-data volume: history survives restarts
-
-alerting:
-  # Pick ONE channel and fill it in, then reference it from each endpoint's
-  # "alerts" list. Gatus PUSHES alerts when an endpoint fails - a dashboard
-  # you never open is useless; the push is the point. Examples:
-  #
-  #   ntfy:      # self-hostable push, simplest
-  #     url: https://ntfy.yourdomain.tld
-  #     topic: piercloud-anchor
-  #   telegram:
-  #     token: <bot-token>
-  #     id: <chat-id>
-  #   smtp:      # plain email
-  #     username: you@example.com
-  #     password: <app-password>
-  #     from: gatus@example.com
-  #     to: ["you@example.com"]
-
-metrics: false
-
-endpoints:
-  # The anchor itself - local only, never firewalled, always accurate.
-  - name: tang (local)
-    url: http://127.0.0.1/adv
-    interval: 60s
-    conditions:
-      - "[STATUS] == 200"
-    # alerts:
-    #   - type: ntfy        # <- match the channel you configured above
-
-  # YOUR MAIN SERVER - probe it by DNS NAME, not IP: Gatus never caches DNS,
-  # so when you migrate and flip the record, the monitor follows automatically
-  # and the availability history stays continuous across the cutover.
-  # Uncomment and adapt (HTTPS, TCP, ICMP, DNS record checks all supported):
-  #
-  # - name: main-server https
-  #   url: https://your-main-server.example.com
-  #   interval: 60s
-  #   conditions:
-  #     - "[STATUS] == 200"
-  #   alerts:
-  #     - type: ntfy
-  #       failure-threshold: 3
-  #
-  # - name: main-server ssh
-  #   host: "ssh://your-main-server.example.com:22"
-  #   interval: 60s
-  #   conditions:
-  #     - "[CONNECTED] == true"
-GCFG
-  echo
-  cat <<MON
-  The monitor config is at ${GATUS_CONFIG} - this is the one file to edit:
-
-    1. Configure an alerting channel (ntfy / Telegram / SMTP) in "alerting".
-    2. Uncomment the "YOUR MAIN SERVER" endpoints and point them at your
-       server's real DNS names (they follow DNS flips automatically).
-    3. Apply:  docker restart gatus
-    4. Sanity-check:  docker logs gatus   (config errors show there)
-
-  Gatus UI: bound to 127.0.0.1:${GATUS_PORT} on the anchor. Reach it via YOUR
-  OWN SSH tunnel (needs an SSH key YOU added in the netcup SCP; this module
-  provisions no SSH):
-
-      ssh -L ${GATUS_PORT}:127.0.0.1:${GATUS_PORT} root@${ANCHOR_IP:-<anchor-ip>}
-      then open http://localhost:${GATUS_PORT}
-MON
-  echo
+  ALERTING_YAML="  # No push channel: NTFY_TOPIC unset, so failures are checked
+  # but never pushed. Set the NTFY_TOPIC secret + re-dispatch for alerts."
+  warn "NTFY_TOPIC unset — Gatus checks endpoints but cannot push failures anywhere."
+fi
+TMP_CFG="${GATUS_CONFIG}.new"
+{
+  printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
+  printf '%s\n' "# DO NOT EDIT BY HAND — re-rendered on every provision run. Change monitors"
+  printf '%s\n' "# via the GATUS_ENDPOINTS repo secret (+ NTFY_TOPIC secret for push) and"
+  printf '%s\n' "# re-dispatch mode=apply. Docs: https://gatus.io/docs"
+  printf '%s\n' "#"
+  printf '%s\n' "# Probe targets by DNS NAME, not IP: Gatus never caches DNS, so when you"
+  printf '%s\n' "# migrate and flip the record, the monitor follows automatically and the"
+  printf '%s\n' "# availability history stays continuous across the cutover."
+  printf '%s\n' ""
+  printf '%s\n' "storage:"
+  printf '%s\n' "  path: /data/gatus.db   # sqlite in the gatus-data volume: history survives restarts"
+  printf '%s\n' ""
+  printf '%s\n' "alerting:"
+  printf '%s\n' "$ALERTING_YAML"
+  printf '%s\n' ""
+  printf '%s\n' "metrics: false"
+  printf '%s\n' ""
+  printf '%s\n' "endpoints:"
+  printf '%s\n' "  # The anchor itself - local only, never firewalled, always accurate."
+  printf '%s\n' "  - name: tang (local)"
+  printf '%s\n' "    url: http://127.0.0.1/adv"
+  printf '%s\n' "    interval: 60s"
+  printf '%s\n' "    conditions:"
+  printf '%s\n' "      - \"[STATUS] == 200\""
+  printf '%s' "$ENDPOINTS_YAML"
+} >"$TMP_CFG"
+if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
+  log "Gatus config unchanged — no restart"
+  rm -f "$TMP_CFG"
+  GATUS_RESTART=0
+else
+  mv "$TMP_CFG" "${GATUS_CONFIG}"
+  log "Gatus config installed (rendered from dispatch env)"
+  GATUS_RESTART=1
 fi
 
 # ---------------------------------------------------------------------------
-# d) Run Gatus (container recreated when the pinned image changed - so an
+# d) Run Gatus (container recreated when the pinned image changed - so an # ci-allowlist: prose — container-tag wording, not a live reference.
 #    auto-bumped pin actually REACHES deployed anchors on script re-run;
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
-  RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus)
+  RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
     log "Gatus already running on ${GATUS_IMAGE}"
   else
-    log "Gatus image changed (${RUNNING_IMAGE} -> ${GATUS_IMAGE}) - recreating container"
+    log "Gatus image changed (${RUNNING_IMAGE} -> ${GATUS_IMAGE}) - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f gatus >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "gatus"; then
@@ -270,5 +259,23 @@ if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
     --mount type=volume,source=gatus-data,target=/data \
     "${GATUS_IMAGE}" >/dev/null
 fi
+if [ "${GATUS_RESTART:-0}" = "1" ]; then
+  docker restart gatus >/dev/null
+  log "Gatus restarted on new config"
+fi
+# Prove the monitor from the tenant's chair: endpoint statuses print into the
+# run log (the tenant has no shell — this output IS their dashboard check).
+# Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
+# GET /v1/endpoints/statuses); unprotected here because our config ships no
+# security: section (nil Security = middleware never applied).
+ok=0
+for i in 1 2 3 4 5 6; do
+  if curl -sf -o /tmp/gatus-status.json "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then head -c 2000 /tmp/gatus-status.json; echo; ok=1; break; fi
+  sleep 10
+done
+if [ "$ok" != "1" ]; then
+  docker logs gatus 2>&1 | tail -20 || true
+  die "Gatus did not answer /api/v1/endpoints/statuses after restart — refusing to finish blind"
+fi
 
-log "Done. tang is up, the thumbprint is above, Gatus config is at ${GATUS_CONFIG}."
+log "Done. tang is up, the thumbprint is above, Gatus is dispatch-managed (statuses printed above)."

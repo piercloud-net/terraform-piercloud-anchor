@@ -11,8 +11,8 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
   `variables.tf`, `main.tf`, `outputs.tf`); `examples/` holds a runnable
   quickstart; `scripts/` numbered human-run scripts; `docs/` this folder.
   No `modules/` wrapper (registry doc generation requirement).
-- Provider: community `rixlhq/netcup` (`~> 1.2`); OpenTofu `>= 1.10`,
-  pinned via `.opentofu-version`.
+- Provider: community `rixlhq/netcup` (`~> 1.2`); OpenTofu `>= 1.11`
+  (ephemeral values), pinned via `.opentofu-version`.
 - The module **adopts** an existing netcup server (the SCP API cannot create
   or delete servers); the user orders the box manually.
 
@@ -47,6 +47,21 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
   would need live credentials).
 - Prefer `check` blocks for module-level assertions the user can see at plan
   time.
+
+## Automation vs human-run (read precisely)
+
+- `scripts/` files never connect anywhere: they run ON the box, started by
+  a human. API-touching CI workflows (`.github/workflows/provision.yml` +
+  CI-called `.github/scripts/`) coexist with those human-run on-box
+  scripts as the deliberate exception: they open the A1 window and call
+  the netcup API, but hold no credentials to user boxes outside the
+  per-run device-flow (S1 — the token dies with the runner).
+- CI greps (endpoint-allowlist, key-material, secret-print) run from
+  `main`, so a PR cannot weaken its own checks; a line carrying
+  `ci-allowlist: <reason>` (10+ chars) is the only escape hatch.
+- Retention semantics: `retention-days` covers run ARTIFACTS only (the
+  thumbprint chain relies on `retention-days: 400`); repo log retention is
+  a separate repo setting (90d default) — never rely on logs alone.
 
 ## Public-safety rules for content
 

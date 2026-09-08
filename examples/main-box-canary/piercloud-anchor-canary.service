@@ -1,0 +1,11 @@
+[Unit]
+Description=piercloud anchor canary (main-box side, mutual-silence coverage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# LUKS_DEVICE overrides the default root-device guess when yours differs.
+Environment="LUKS_DEVICE=/dev/disk/by-label/cryptroot"
+ExecStart=/usr/local/sbin/piercloud-anchor-canary.sh
+# Never loop-restart a check: the timer re-fires on schedule.
