@@ -46,24 +46,27 @@ a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 
 "Use this template" → your repo. **No stored netcup secrets of any kind
 (S1)** — every run authenticates via your per-run approval below. What
-lives in REPO-level secrets are identifiers only (anchor IP, customer
-number, OIDC URL): values are write-only and log-masked.
-Paste them in your repo — `gh` prompts for each value so nothing touches
-shell history:
+lives in the repo are identifiers only (anchor IP, customer
+number): values are write-only and log-masked. Public values (username,
+SSH keys) live in repo *variables* instead — visible, no secret semantics.
+Set once (variables take `--body`, secrets prompt so nothing touches shell
+history):
 
 ```bash
-# identifiers (order + server-ready emails)
+# variables (visible)
+gh variable set TENANT_USER --body "pier"
+gh variable set A1_SSH_PUBKEY_1 --body "$(cat ~/.ssh/id_ed25519.pub)"  # admin keys (mandate: 2)
+gh variable set A1_SSH_PUBKEY_2 --body "$(cat ~/.ssh/id_ed25519-second.pub)"
+# secrets (write-only)
 gh secret set NETCUP_CUSTOMER_NUMBER  # username on both account emails
 gh secret set NETCUP_ANCHOR_IPV4      # piko IP ("IP address" in server email)
-# one-run provisioning inputs (emailed root password dies after use — delete it)
-gh secret set A1_ROOT_PASSWORD
-gh secret set A1_SSH_PUBKEY_1         # your admin keys (mandate: 2)
-gh secret set A1_SSH_PUBKEY_2
-gh secret set NETCUP_OIDC_DISCOVERY_URL  # https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration
+gh secret set A1_ROOT_PASSWORD        # one-run — delete after use
 # optional push channel (empty = verdict stays in the run summary)
 gh secret set NTFY_TOPIC
 gh secret set NTFY_TOKEN              # publish-scoped
 ```
+
+No discovery-URL setup: the Keycloak doc address is baked into the workflow (public constant, same realm for everyone).
 
 ### Operator values (not for tenants)
 

@@ -175,7 +175,9 @@ jobs:
       # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
       # (override only if yours differs).
       NETCUP_CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
-      NETCUP_OIDC_DISCOVERY_URL: ${{ secrets.NETCUP_OIDC_DISCOVERY_URL }}
+      # Public, constant Keycloak discovery doc (same realm for every tenant):
+      # baked in, not a secret — override by editing this line only.
+      NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
       TENANT_USER: ${{ vars.TENANT_USER }}
     steps:
       - name: Checkout (no credentials persisted)
@@ -356,10 +358,11 @@ jobs:
           TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
         run: |
           set -euo pipefail
-          # New secret names introduced in M2 (repo secrets, never committed):
+          # Secrets used here (repo secrets, never committed):
           # NETCUP_MAIN_BOX_IPV4, NETCUP_ANCHOR_IPV4,
-          # A1_ROOT_PASSWORD (masked one-run input, dead after root lock),
-          # A1_SSH_PUBKEY_1 / A1_SSH_PUBKEY_2 (mandated 2 keys at A1).
+          # A1_ROOT_PASSWORD (masked one-run input, dead after root lock).
+          # Public inputs arrive as repo VARIABLES: A1_SSH_PUBKEY_1/2
+          # (mandated 2 keys at A1), TENANT_USER (hostname/DNS derivation).
           # (NETCUP_SERVER_ID retired: the resolve step derives server_id
           # at runtime from NETCUP_ANCHOR_IPV4 — nothing numeric to copy.)
           tofu plan -input=false -out=tfplan
@@ -404,8 +407,8 @@ jobs:
           ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
           ROOT_PASSWORD: ${{ secrets.A1_ROOT_PASSWORD }}
-          A1_SSH_PUBKEY_1: ${{ secrets.A1_SSH_PUBKEY_1 }}
-          A1_SSH_PUBKEY_2: ${{ secrets.A1_SSH_PUBKEY_2 }}
+          A1_SSH_PUBKEY_1: ${{ vars.A1_SSH_PUBKEY_1 }}
+          A1_SSH_PUBKEY_2: ${{ vars.A1_SSH_PUBKEY_2 }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail
