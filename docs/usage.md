@@ -32,20 +32,16 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 **SCP login (separate credentials):** the server control panel at <https://www.servercontrolpanel.de/SCP/> uses its own password, sent in the "Access data for SCP" email — change it on first login and enable 2FA there too.
 
-**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `ANCHOR_ROOT_PASSWORD` repo secret (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
+**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — ignore the password entirely. Keep the email for the printed SSH fingerprints to verify the host key on first contact. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
 Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
 - **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — the ONE required secret (provider credential only; the SCP user id resolves itself from your approval token — override via `SCP_USER_ID` repo secret only if yours differs)
-- **anchor IPv4** → `ANCHOR_IPV4` — only when discovery needs help (several servers in the account and none named `anchor-<you>-01`): paste the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it). Otherwise skip it — the run discovers the server itself (exactly-one wins, else exact hostname match), and resolves `server_id` from that, so no numeric id to copy anywhere
-- **root password** → `ANCHOR_ROOT_PASSWORD` — legacy fallback only. Leave it UNSET for the passwordless path: the run mints its own one-time root password via the API, power-cycles the box once to set it (fresh boxes: harmless machine-wait; re-provisions: brief downtime), and locks it (`passwd -l root`) when done — nothing emailed survives the run
-- nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
+- nothing else to enter: your username, hostname, anchor IP, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
 
 Create them here: [👉 Repo → Settings → Secrets → New repository secret](../../../settings/secrets/actions/new) (one per value above).
 
 Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../../actions/workflows/provision.yml) (`mode` preselects `apply`).
-
-Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning. (Prefer leaving it unset entirely — the passwordless path above needs no emailed password at all.)
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
 a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
@@ -64,12 +60,8 @@ history). Laptop/CLI path (power users) — phone users can skip this block, it 
 <summary>CLI equivalents</summary>
 
 ```bash
-# secrets (write-only) — normally just the first line:
+# secrets (write-only) — just the first line:
 gh secret set CUSTOMER_NUMBER  # username on both account emails (the ONE required secret)
-# only when discovery needs help (several servers, none named anchor-<you>-01):
-# gh secret set ANCHOR_IPV4      # piko IP ("IP address" in server email)
-# legacy only — leave UNSET for the passwordless path (the run mints its own one-time password):
-# gh secret set ANCHOR_ROOT_PASSWORD        # one-run — delete after use
 # later, when exploring: extra monitor targets + push (see §8)
 gh secret set GATUS_ENDPOINTS         # e.g. blog=https://blog.example.com
 ```

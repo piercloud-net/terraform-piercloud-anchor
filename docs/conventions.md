@@ -63,6 +63,19 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
   thumbprint chain relies on `retention-days: 400`); repo log retention is
   a separate repo setting (90d default) — never rely on logs alone.
 
+## Bootstrap-flow minimalism (reviewers enforce, NEEDS-WORK if violated)
+
+- `docs/usage.md` §1 + `README.md` quickstart carry the happy path
+  ONLY: required secrets, taps, approvals. Zero fallback, legacy, or
+  conditional prose (`only when…`, `legacy`, `leave unset…`) — a tenant
+  reading the bootstrap must never make a decision.
+- Fallbacks live in `docs/dr.md` (operator runbook), referenced only by
+  the run's own fail-closed error message — never preemptively in the
+  bootstrap. Legacy is deleted, not documented: no `ANCHOR_*`
+  fallback paragraphs, no commented-out fallback lines in CLI blocks.
+- Reviewers: any conditional/fallback/legacy content in the bootstrap
+  flow is a NEEDS-WORK finding, same weight as a code defect.
+
 ## Public-safety rules for content
 
 - Nothing sensitive in committed files: no credentials, no hostnames/IPs of

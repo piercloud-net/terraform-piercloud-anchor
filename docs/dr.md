@@ -54,6 +54,14 @@ anchor. Four causes, in order:
    re-bind (or `regen` on the same URL), verifying the new thumbprint
    out-of-band — never `-y` blind.
 
+## Discovery fallback (multi-server accounts only)
+
+Single-server accounts never need this. If a run aborts with
+`expected 1 server, found N`, set `ANCHOR_IPV4` (repo secret) to the
+server-ready email's "IP address" verbatim (`203.0.113.10/22`-style
+suffix included; the run strips it) and re-dispatch. Prefer renaming
+one box to `anchor-<you>-01` so discovery stays automatic.
+
 ## Same-URL rebuild = `regen` (2-minute DR)
 
 Bind clevis to a DNS name (`anchor-<alias>-01.piercloud.net`, see
