@@ -68,10 +68,7 @@ history). Laptop/CLI path (power users) — phone users can skip this block, it 
 gh secret set CUSTOMER_NUMBER  # username on both account emails
 gh secret set ANCHOR_IPV4      # piko IP ("IP address" in server email)
 gh secret set ANCHOR_ROOT_PASSWORD        # one-run — delete after use
-# optional push channel (empty = verdict stays in the run summary)
-gh secret set NTFY_TOPIC
-gh secret set NTFY_TOKEN              # publish-scoped
-# monitor more later (optional): extra targets, comma-separated name=url
+# later, when exploring: extra monitor targets + push (see §8)
 gh secret set GATUS_ENDPOINTS         # e.g. blog=https://blog.example.com
 ```
 
@@ -95,8 +92,7 @@ Only the URL + code (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_L
 
 If your repo has you as a reviewer (power path), GitHub pauses the run first: approve the pending deployment (check the commit matches the banner card), THEN approve the netcup code below. Two taps, in that order — the first approves WHAT runs, the second lets it touch your account. Without a reviewer identity the run proceeds straight to the code, and the LOUD banner is your check.
 
-The run prints a netcup device-flow URL + `XXXX-XXXX` user code (and sends
-them via ntfy). You approve at netcup's own Keycloak (your
+The run prints a netcup device-flow URL + `XXXX-XXXX` user code (plus a push via ntfy, once you set that up later — see §8). You approve at netcup's own Keycloak (your
 session, your 2FA, ~600s window) — the approval is one tap, phone browsers included. The runner polls, receives an ephemeral
 token, provisions, and the token dies with the runner. Only the URL + code
 (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG` (masking note: the access token stays masked; the short-lived code is unmasked-by-design, see above). The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
@@ -173,6 +169,13 @@ Move requests arrive with the new IP; you dispatch the update-ip yourself — a 
 Planned — enforcement (including the canary-fail proof gate) lands with live M0. Design: requires `ack_main_unbound` (confirm the main box is unbound first) +
 canary-fail proof. Tears down the firewall policy + attachment only — the
 server and the tang keys are untouched. Until it lands, delete nothing yourself — open a repo issue.
+
+## 8. Explore later: push alerts + extra monitors (optional, after the bind)
+
+The anchor already watches your homepage and tang itself, and prints statuses into the run log. When you want taps on the shoulder instead:
+
+- install the [ntfy app](https://ntfy.sh), subscribe to any random topic name (yours), then set repo secrets `NTFY_TOPIC` (that name) + `NTFY_TOKEN` only if your ntfy server needs auth (empty for ntfy.sh hosted) — re-dispatch `mode=apply` to take effect.
+- extra targets: `GATUS_ENDPOINTS` repo secret, comma-separated `name=url` (`blog=https://blog.example.com`, HTTP(S) only) + re-dispatch.
 
 ## What this repo never does
 
