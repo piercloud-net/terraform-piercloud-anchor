@@ -39,7 +39,7 @@ Collect these as you go — each feeds one repo value in §2 (secret or variable
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (a repo secret, only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address" — paste verbatim, `203.0.113.10/22`-style suffix included; the run strips it) → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
-- **SSH admin keys** (your own keypair — 2 mandated) → `A1_SSH_PUBKEY_1/2` repo *variables* (public material, no secret semantics)
+- **SSH admin keys** (NOT the "SSH key fingerprints" in the email — those are the *server's* host keys, for verifying first contact only. Your admin keys = two keypairs YOU own, phone + backup: generate with any `ssh-keygen` — laptop, Termux on Android, Blink/ShellFish on iOS — or a password manager that generates SSH keys; paste the two `.pub` halves) → `A1_SSH_PUBKEY_1/2` repo *variables* (public material, no secret semantics)
 - nothing else to enter: your username, hostname, and DNS are pre-set in the repo — dispatch takes no identifiers
 
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
