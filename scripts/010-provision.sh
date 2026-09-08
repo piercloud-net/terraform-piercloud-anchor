@@ -36,6 +36,9 @@ case "${1:-}" in
 esac
 
 gen_keys() { # append a fresh key set on this box (never deletes)
+  # Live 2026-09-08: tangd-keygen requires the dir to exist (usage error
+  # otherwise) — some base images lack /var/db/tang entirely.
+  mkdir -p "${TANG_KEYS_DIR}"
   if [ -x /usr/libexec/tangd-keygen ]; then
     /usr/libexec/tangd-keygen "${TANG_KEYS_DIR}"
   elif [ -x /usr/lib/tang/tangd-keygen ]; then
