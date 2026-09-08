@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 - Phone-first provision with DNS automation (closes #14, closes #8)
 - TAP-TO-APPROVE card on the run summary (closes #18)
 - Approval card in its own job so it renders live (closes #24)
+- Passwordless bootstrap + zero-IP discovery (closes #50)
+- Caddy dashboard TLS + custom-domain pattern (closes #49)
 
 ### 🐛 Bug Fixes
 
@@ -34,10 +36,12 @@ All notable changes to this project will be documented in this file.
 - Post-transfer registry/source addresses (closes #12)
 - Tap target from secrets to dispatch (closes #20)
 - Working tap targets + ntfy out of bootstrap (closes #30, closes #31)
+- Passwordless-first framing in usage.md (closes #50)
 
 ### ⚙️ Miscellaneous Tasks
 
 - Relicense MIT -> Apache-2.0 ([#6](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/6))
+- Allowlist tasks/users SCP endpoints (closes #50)
 
 
 ## [Unreleased]
