@@ -30,7 +30,7 @@ on:
         type: choice
         options: [apply, check, update-ip, destroy]
       server_alias:
-        description: "Friendly alias for this anchor — the ONLY identifier in dispatch inputs. Hostname, IPs, scp_user_id resolve from repo secrets inside runs."
+        description: "Your username (e.g. pier) — the ONLY identifier in dispatch inputs. Hostname (anchor-<you>-01), DNS, IPs, ids all resolve inside runs."
         required: true
         type: string
       ack_main_unbound:
@@ -175,8 +175,9 @@ jobs:
     env:
       # Identifiers resolve from REPO-level secrets inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
-      NETCUP_HOSTNAME: ${{ secrets.NETCUP_HOSTNAME }}
-      NETCUP_SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+      # No HOSTNAME secret: derived below as anchor-<server_alias>-01.
+      # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
+      # (override only if yours differs).
       NETCUP_CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
       NETCUP_OIDC_DISCOVERY_URL: ${{ secrets.NETCUP_OIDC_DISCOVERY_URL }}
       SERVER_ALIAS: ${{ inputs.server_alias }}
@@ -275,6 +276,8 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
+          SCP_USER_ID_IN: ${{ secrets.NETCUP_SCP_USER_ID }}
+          CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
         run: |
           set -euo pipefail
           # The numeric server id is the stable key (policy names, tmp tags,
@@ -295,12 +298,26 @@ jobs:
           fi
           echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
           echo "Resolved server_id=$RESOLVED_ID for anchor IP $ANCHOR_IPV4."
+          # Hostname derivation (single place for this job): the username
+          # IS server_alias, so anchor-<you>-01 falls out directly. Same
+          # sanitize one-liner as 030-anchor-dns.sh — keep the two in sync
+          # so TF hostname and DNS record can never diverge.
+          SAN="$(printf '%s' '${{ inputs.server_alias }}' | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+          [ -n "$SAN" ] || { echo "::error::server_alias sanitizes to empty — dispatch with your username (letters/digits/hyphens)."; exit 1; }
+          echo "ANCHOR_HOSTNAME=anchor-${SAN}-01" >> "$GITHUB_ENV"
+          echo "Derived hostname anchor-${SAN}-01."
+          # SCP user id defaults to the customer number (same value on both
+          # account emails for the owner); explicit NETCUP_SCP_USER_ID wins.
+          SCP_EFF="${SCP_USER_ID_IN:-}"
+          [ -n "$SCP_EFF" ] || SCP_EFF="$CUSTOMER_NUMBER"
+          [ -n "$SCP_EFF" ] || { echo "::error::set NETCUP_CUSTOMER_NUMBER (and NETCUP_SCP_USER_ID only if yours differs)."; exit 1; }
+          echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
 
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           SERVER_ID: ${{ env.SERVER_ID }}
-          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -332,9 +349,9 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           TF_IN_AUTOMATION: "true"
-          TF_VAR_hostname: ${{ secrets.NETCUP_HOSTNAME }}
+          TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
-          TF_VAR_scp_user_id: ${{ secrets.NETCUP_SCP_USER_ID }}
+          TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
           TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
           TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
         run: |
@@ -353,7 +370,7 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           SERVER_ID: ${{ env.SERVER_ID }}
-          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -367,9 +384,9 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           TF_IN_AUTOMATION: "true"
-          TF_VAR_hostname: ${{ secrets.NETCUP_HOSTNAME }}
+          TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
-          TF_VAR_scp_user_id: ${{ secrets.NETCUP_SCP_USER_ID }}
+          TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
           TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
           TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
         run: |
@@ -382,7 +399,7 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           SERVER_ID: ${{ env.SERVER_ID }}
-          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
           ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
@@ -409,7 +426,7 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           SERVER_ID: ${{ env.SERVER_ID }}
-          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -420,7 +437,7 @@ jobs:
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           SERVER_ID: ${{ env.SERVER_ID }}
-          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail

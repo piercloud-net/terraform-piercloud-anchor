@@ -32,11 +32,9 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo secret in §2:
 
-- **hostname** you give the anchor (D6: = DNS label, e.g. `anchor-pier-01`) → `NETCUP_HOSTNAME`. No numeric id to copy anywhere: the run resolves `server_id` itself from the anchor IP (exactly-one match, fail-closed).
-- **SCP user id** (Account → Users) → `NETCUP_SCP_USER_ID`
-- **customer number** (CCP email) → `NETCUP_CUSTOMER_NUMBER`
-- **anchor IPv4** (server-ready email) → `NETCUP_ANCHOR_IPV4`
-- **main-box IPv4** (the box being unlocked) → `NETCUP_MAIN_BOX_IPV4`
+- **username** you sign up with (e.g. `pier`) → entered as `server_alias` at dispatch; hostname (`anchor-pier-01`) and DNS derive from it, nothing to copy
+- **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (only if yours differs)
+- **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
 
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning. (The SSH keys are public material and could travel either way; they live in secrets for uniformity.)
@@ -48,18 +46,15 @@ a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 
 "Use this template" → your repo. **No stored netcup secrets of any kind
 (S1)** — every run authenticates via your per-run approval below. What
-lives in REPO-level secrets are identifiers only (hostname, IPs,
-`scp_user_id`, customer number): values are write-only and log-masked.
+lives in REPO-level secrets are identifiers only (anchor IP, customer
+number, OIDC URL): values are write-only and log-masked.
 Paste them in your repo — `gh` prompts for each value so nothing touches
 shell history:
 
 ```bash
-# identifiers (order + server-ready emails, SCP → Account → Users)
-gh secret set NETCUP_HOSTNAME         # e.g. anchor-pier-01
-gh secret set NETCUP_SCP_USER_ID      # numeric SCP user id
-gh secret set NETCUP_CUSTOMER_NUMBER  # from the CCP email
-gh secret set NETCUP_MAIN_BOX_IPV4    # the box being unlocked (clevis source)
-gh secret set NETCUP_ANCHOR_IPV4      # piko IP
+# identifiers (order + server-ready emails)
+gh secret set NETCUP_CUSTOMER_NUMBER  # username on both account emails
+gh secret set NETCUP_ANCHOR_IPV4      # piko IP ("IP address" in server email)
 # one-run provisioning inputs (emailed root password dies after use — delete it)
 gh secret set A1_ROOT_PASSWORD
 gh secret set A1_SSH_PUBKEY_1         # your admin keys (mandate: 2)
@@ -69,6 +64,18 @@ gh secret set NETCUP_OIDC_DISCOVERY_URL  # https://www.servercontrolpanel.de/rea
 gh secret set NTFY_TOPIC
 gh secret set NTFY_TOKEN              # publish-scoped
 ```
+
+### Operator values (not for tenants)
+
+The tenant's slice IP is assigned by the operator, so the tenant never sets it. Per tenant repo, the operator sets:
+
+```bash
+gh secret set NETCUP_MAIN_BOX_IPV4    # tenant slice IP (operator inventory: pcad.it-infra)
+# only if it differs from the customer number:
+# gh secret set NETCUP_SCP_USER_ID
+```
+
+Slice moves use `mode=update-ip` (ADD-before-move, §7) — the operator requests, the OWNER executes.
 
 Visibility rule (C-E): identifiers in secrets always; public default once
 secrets land (values stay invisible to forks); env gate wherever a tenant
@@ -80,7 +87,8 @@ is advisory display only.
 ## 3. Dispatch and approve (S1)
 
 Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. The ONLY
-identifier in the dispatch inputs is `server_alias`; everything sensitive
+identifier in the dispatch inputs is `server_alias` — enter your username
+(e.g. `pier`); hostname and DNS derive from it. Everything sensitive
 resolves from repo secrets inside the run.
 
 The run prints a netcup device-flow URL + `XXXX-XXXX` user code (and sends
