@@ -30,6 +30,8 @@ All notable changes to this project will be documented in this file.
 - Create tang key dir before keygen (closes #43)
 - Install Docker before running Gatus (closes #45)
 - Explicit sqlite storage type for Gatus (closes #47)
+- Bootstrap probes SSH only after A1 window opens, bounded attempts (closes #59)
+- One firewall rule per edge CIDR, provider-order-proof (closes #61)
 
 ### 📚 Documentation
 
