@@ -32,7 +32,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 **SCP login (separate credentials):** the server control panel at <https://www.servercontrolpanel.de/SCP/> uses its own password, sent in the "Access data for SCP" email — change it on first login and enable 2FA there too.
 
-**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `ANCHOR_ROOT_PASSWORD` repo secret (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
+**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — you can ignore the password entirely (leave `ANCHOR_ROOT_PASSWORD` unset: the run mints its own one-time password via the API and locks root when done). Keep the email for the printed SSH fingerprints to verify the host key on first contact. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
 Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
@@ -45,7 +45,7 @@ Create them here: [👉 Repo → Settings → Secrets → New repository secret]
 
 Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../../actions/workflows/provision.yml) (`mode` preselects `apply`).
 
-Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning. (Prefer leaving it unset entirely — the passwordless path above needs no emailed password at all.)
+Legacy fallback only — leave `ANCHOR_ROOT_PASSWORD` unset and skip this paragraph: dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so a pasted password must live in a write-only, log-masked repo secret, never an input. (Prefer leaving it unset entirely — the passwordless path above needs no emailed password at all.)
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
 a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
