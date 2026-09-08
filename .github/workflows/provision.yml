@@ -271,10 +271,35 @@ jobs:
           # M2: same-job handoff implemented above (token -> GITHUB_ENV);
           # the A1 + tofu steps below consume it on this same runner.
 
+      - name: Resolve server_id from anchor IP (no numeric id from the user)
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
+        run: |
+          set -euo pipefail
+          # The numeric server id is the stable key (policy names, tmp tags,
+          # module adopt) but it appears in no email — so the run resolves it
+          # itself: GET /servers?ip=<anchor-ip> must match EXACTLY ONE server
+          # (OpenAPI: ServerListMinimal{id,name,hostname}). Count != 1 fails
+          # closed with a human-readable cause; the id is an identifier, not
+          # a secret, and is safe to log. Runs before every consumer below.
+          [ -n "${ANCHOR_IPV4:-}" ] || { echo "::error::NETCUP_ANCHOR_IPV4 secret is empty — set it to the piko IP from the server-ready email."; exit 1; }
+          RESP="$(curl -sS -G 'https://www.servercontrolpanel.de/scp-core/api/v1/servers' \
+            --data-urlencode "ip=$ANCHOR_IPV4" \
+            -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
+          COUNT="$(echo "$RESP" | jq -r 'if type == "array" then length else -1 end')"
+          RESOLVED_ID="$(echo "$RESP" | jq -r 'if type == "array" and length == 1 then .[0].id // empty else empty end')"
+          if [ "$COUNT" != "1" ] || [ -z "$RESOLVED_ID" ]; then
+            echo "::error::anchor IP $ANCHOR_IPV4 matched $COUNT servers (need exactly 1). Check NETCUP_ANCHOR_IPV4, or rename duplicates in the SCP. Full list shape unexpected — escalate, no fallback."
+            exit 1
+          fi
+          echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
+          echo "Resolved server_id=$RESOLVED_ID for anchor IP $ANCHOR_IPV4."
+
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -308,16 +333,18 @@ jobs:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ secrets.NETCUP_HOSTNAME }}
-          TF_VAR_server_id: ${{ secrets.NETCUP_SERVER_ID }}
+          TF_VAR_server_id: ${{ env.SERVER_ID }}
           TF_VAR_scp_user_id: ${{ secrets.NETCUP_SCP_USER_ID }}
           TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
           TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
         run: |
           set -euo pipefail
           # New secret names introduced in M2 (repo secrets, never committed):
-          # NETCUP_SERVER_ID, NETCUP_MAIN_BOX_IPV4, NETCUP_ANCHOR_IPV4,
+          # NETCUP_MAIN_BOX_IPV4, NETCUP_ANCHOR_IPV4,
           # A1_ROOT_PASSWORD (masked one-run input, dead after root lock),
           # A1_SSH_PUBKEY_1 / A1_SSH_PUBKEY_2 (mandated 2 keys at A1).
+          # (NETCUP_SERVER_ID retired: the resolve step derives server_id
+          # at runtime from NETCUP_ANCHOR_IPV4 — nothing numeric to copy.)
           tofu plan -input=false -out=tfplan
 
       - name: A1 open (TTL-tagged single-/32 window)
@@ -325,7 +352,7 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -341,7 +368,7 @@ jobs:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ secrets.NETCUP_HOSTNAME }}
-          TF_VAR_server_id: ${{ secrets.NETCUP_SERVER_ID }}
+          TF_VAR_server_id: ${{ env.SERVER_ID }}
           TF_VAR_scp_user_id: ${{ secrets.NETCUP_SCP_USER_ID }}
           TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
           TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
@@ -354,7 +381,7 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
           RUN_ID: ${{ github.run_id }}
           ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
@@ -381,7 +408,7 @@ jobs:
         if: always() && steps.device.outputs.authorized == 'true' && inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -392,7 +419,7 @@ jobs:
         if: always()
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
           RUN_ID: ${{ github.run_id }}
         run: |
