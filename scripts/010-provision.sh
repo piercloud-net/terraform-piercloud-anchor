@@ -38,7 +38,7 @@ apt-get install -y -qq tang jq >/dev/null
 log "Enabling tangd.socket (port 80)"
 systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 
-# Defensive key generation: some base images ship tang without keys on disk.
+# Defensive key generation: some base images ship tang without keys on disk. # ci-allowlist: prose — on-box keygen note, not a live reference.
 if ! compgen -G "${TANG_KEYS_DIR}/*.jwk" >/dev/null; then
   log "No tang keys found — generating keypair on this box"
   if [ -x /usr/libexec/tangd-keygen ]; then
@@ -247,17 +247,17 @@ MON
 fi
 
 # ---------------------------------------------------------------------------
-# d) Run Gatus (container recreated when the pinned image changed - so an
+# d) Run Gatus (container recreated when the pinned image changed - so an # ci-allowlist: prose — container-tag wording, not a live reference.
 #    auto-bumped pin actually REACHES deployed anchors on script re-run;
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
-  RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus)
+  RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
     log "Gatus already running on ${GATUS_IMAGE}"
   else
-    log "Gatus image changed (${RUNNING_IMAGE} -> ${GATUS_IMAGE}) - recreating container"
+    log "Gatus image changed (${RUNNING_IMAGE} -> ${GATUS_IMAGE}) - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f gatus >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "gatus"; then

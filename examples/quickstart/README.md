@@ -20,3 +20,8 @@ tofu apply \
 Then follow the printed `next_step` output (run the provisioning script on
 the anchor's console, save the thumbprint, bind your main box). Full
 walkthrough: [../../docs/usage.md](../../docs/usage.md).
+
+T2 twin-anchor / bind-name opt-ins (all default to single anchor t:1):
+`extra_tang_urls`, `extra_allowed_source_ips`, `anchor_hostname`
+(same-URL rebuild = regen), plus `stateless_readopt` for stateless
+import-apply-discard runs — see `main.tf`.

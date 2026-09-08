@@ -21,6 +21,20 @@ output "firewall_policy_id" {
   value       = var.scp_user_id != null ? netcup_scp_user_firewall_policy.tang[0].id : null
 }
 
+output "bind_name" {
+  description = "DNS name your main box binds (same-URL rebuild = regen with no main-box change). Null when var.anchor_hostname is unset — bind output.ipv4 instead."
+  value       = local.anchor_bind_name
+}
+
+output "regen_hint" {
+  description = "How a rebuild reuses the bind name (null when var.anchor_hostname is unset; no secrets)."
+  value = local.anchor_bind_name != null ? (
+    length(local.twin_tang_urls) > 0
+    ? "Point ${local.anchor_bind_name} at the new anchor IPv4, reinstall, re-bind SSS t-of-2 with the twin URLs, verify the thumbprint out-of-band. Same URL = regen, no main-box unbind."
+    : "Point ${local.anchor_bind_name} at the new anchor IPv4, reinstall, re-bind, verify the thumbprint out-of-band. Same URL = regen, no main-box unbind."
+  ) : null
+}
+
 output "next_step" {
   description = "What to do next: run the provisioning script on the anchor and save the tang thumbprint."
   value       = <<-EOT

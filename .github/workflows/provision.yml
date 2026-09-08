@@ -1,0 +1,535 @@
+# .github/workflows/provision.yml — v0.2 phone-first provisioning (M1 skeleton).
+#
+# Plan milestone M2 (SPEC step 3): A1 hardened window + CI-called entrypoint
+# `.github/scripts/020-provision-anchor.sh` (sweep-pre / open / provision /
+# close / sweep-post) + same-job ephemeral-token handoff + stateless tofu
+# apply. M1 skeleton properties (SHA pins, mutex, C-E banner, H1 artifact)
+# are unchanged.
+#
+# M0 live-evidence (real netcup device-flow drill on a phone) gates done-ness,
+# NOT this scaffolding — M0-pending, recorded in the PR body.
+#
+# OpenTofu note: the tofu steps wired in M2 REQUIRE required_version >= 1.11
+# (ephemeral values carry the per-run netcup token; the token never lands in
+# state). The module bump itself lands in M3.
+
+name: provision
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Provisioning mode: apply | check | update-ip | destroy"
+        required: true
+        default: check
+        type: choice
+        options: [apply, check, update-ip, destroy]
+      server_alias:
+        description: "Friendly alias for this anchor — the ONLY identifier in dispatch inputs. Hostname, IPs, scp_user_id resolve from repo secrets inside runs."
+        required: true
+        type: string
+      ack_main_unbound:
+        description: "Destroy gate: confirm the main box is already unbound (required for mode=destroy)."
+        required: false
+        default: false
+        type: boolean
+      add_ipv4:
+        description: "update-ip: IPv4 source to ADD (ADD-before-move; old kept during transition)."
+        required: false
+        type: string
+      add_ipv6:
+        description: "update-ip: IPv6 source to ADD."
+        required: false
+        type: string
+      remove_ipv4:
+        description: "update-ip: old IPv4 source to remove AFTER confirmed boot."
+        required: false
+        type: string
+      rotate_keys:
+        description: "apply: forward --rotate to the on-box provision step (tang-key rotation)."
+        required: false
+        default: false
+        type: boolean
+
+# Static global mutex: one mutex serializes ALL tenants' policy mutations.
+# Static literal — dynamic values are FORBIDDEN in concurrency.group.
+concurrency:
+  group: piercloud-netcup-policy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  visibility-banner:
+    name: "C-E visibility banner (LOUD on change)"
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.banner.outputs.head_full }}
+      head_short: ${{ steps.banner.outputs.head_short }}
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Approval card — head SHA + compare link + workflow-path file count
+        id: banner
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          BASE_REF: ${{ github.event.repository.default_branch }}
+          SERVER_ALIAS: ${{ inputs.server_alias }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "$HEAD_SHA" | cut -c1-7)"
+          git fetch origin "$BASE_REF" --depth=1 >/dev/null 2>&1 || true
+          COUNT="$(git diff --name-only "origin/$BASE_REF"...HEAD -- .github/workflows 2>/dev/null | wc -l | tr -d ' ')"
+          [ -z "$COUNT" ] && COUNT=0
+          DIFF_LINK="${{ github.server_url }}/${{ github.repository }}/compare/$BASE_REF...$HEAD_SHA"
+          echo "head_short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "head_full=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "workflow_files=$COUNT" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Approval card (C-E) for \`$SERVER_ALIAS\`"
+            echo ""
+            echo "head: \`$SHORT\` (\`$HEAD_SHA\`) — [compare-diff]($DIFF_LINK)"
+            echo "workflow-path files changed: \`$COUNT\`"
+            echo ""
+            # Anti-phishing line, carried verbatim on every approval card.
+            echo "we will never email or message you a code to re-confirm."
+            echo ""
+            if [ "$COUNT" -eq 0 ]; then
+              echo "🟢 UNCHANGED — workflows under .github/workflows match $BASE_REF."
+              echo "piercloud: apply ready for $SERVER_ALIAS @$SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
+            else
+              echo "🔴 CHANGED — $COUNT file(s) under .github/workflows differ from $BASE_REF."
+              echo "piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->$HEAD_SHA, $COUNT files incl. provision.yml). Do NOT approve. Open $DIFF_LINK or ask the operator what changed. Nothing runs until you approve."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # TODO(M2): compare against the last-approved head SHA recorded via
+          # actions:read (backend mechanics, open design Q4); failed check =
+          # no apply, always (C-A). Red-banner acknowledge-checkbox UX for the
+          # no-account path also lands with the notifier wiring.
+
+      - name: Record head SHA for the backend approval pin
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          HEAD_SHORT: ${{ steps.banner.outputs.head_short }}
+          SERVER_ALIAS: ${{ inputs.server_alias }}
+        run: |
+          set -euo pipefail
+          # Template side of the head_sha approval pin (open design Q4): the
+          # run publishes the dispatched head SHA as job outputs (see the
+          # outputs block above) AND as a machine-readable artifact, so the
+          # future backend can record the last-approved head via
+          # actions:read. Failed check = no apply, always. Backend mechanics
+          # themselves are out of scope for v0.2.
+          printf 'head_sha=%s head_short=%s alias=%s\n' "$HEAD_SHA" "$HEAD_SHORT" "$SERVER_ALIAS" > head-sha.txt
+      - name: Upload head-SHA artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # SHA pin of upload-artifact v4
+        with:
+          name: head-sha-${{ inputs.server_alias }}
+          path: head-sha.txt
+          # Same horizon as the thumbprint artifact: audit trail, not logs.
+          retention-days: 400
+          if-no-files-found: error
+
+      - name: ntfy verdict (verbatim strings)
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          HEAD_SHORT: ${{ steps.banner.outputs.head_short }}
+          WORKFLOW_FILES: ${{ steps.banner.outputs.workflow_files }}
+          SERVER_ALIAS: ${{ inputs.server_alias }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Secret names chosen in M1 (design Q5): NTFY_TOPIC + NTFY_TOKEN
+          # (publish-scoped). Values live in repo secrets; nothing is committed.
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "NTFY_TOPIC unset — verdict stays in the run summary (OK for skeleton)."
+            exit 0
+          fi
+          if [ "$WORKFLOW_FILES" -eq 0 ]; then
+            MSG="piercloud: apply ready for $SERVER_ALIAS @$HEAD_SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
+          else
+            MSG="piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->${{ github.sha }}, $WORKFLOW_FILES files incl. provision.yml). Do NOT approve. Open ${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }} or ask the operator what changed. Nothing runs until you approve."
+          fi
+          curl -sS -u ":$NTFY_TOKEN" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+          # TODO(M2): red verdict hides the netcup URL/code behind an
+          # acknowledge-checkbox on the no-account path (open design Q5).
+
+  device-flow:
+    name: "S1 device-flow (C-a..C-f) + A1 window + stateless apply"
+    runs-on: ubuntu-latest
+    needs: [visibility-banner]
+    outputs:
+      thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
+    env:
+      # Identifiers resolve from REPO-level secrets inside runs (C-E) —
+      # never dispatch inputs, never logs (values are write-only, log-masked).
+      NETCUP_HOSTNAME: ${{ secrets.NETCUP_HOSTNAME }}
+      NETCUP_SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+      NETCUP_CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
+      NETCUP_OIDC_DISCOVERY_URL: ${{ secrets.NETCUP_OIDC_DISCOVERY_URL }}
+      SERVER_ALIAS: ${{ inputs.server_alias }}
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+          # M2: the A1 entrypoint lives in this repo
+          # (.github/scripts/020-provision-anchor.sh) — the device-flow job
+          # must check it out to call it (full checkout: tofu below needs
+          # the module files too).
+
+      - name: Device authorization + poll (ephemeral token dies with runner)
+        id: device
+        run: |
+          set -euo pipefail
+          # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
+          # (prior literals were probed, never recorded). Endpoints are
+          # recovered from the Keycloak OIDC discovery document FIRST.
+          DISCO="$(curl -sS "$NETCUP_OIDC_DISCOVERY_URL")"
+          DEVICE_ENDPOINT="$(echo "$DISCO" | jq -r '.device_authorization_endpoint')"
+          TOKEN_ENDPOINT="$(echo "$DISCO" | jq -r '.token_endpoint')"
+          test "$DEVICE_ENDPOINT" != "null" || { echo "::error::discovery doc lacks device_authorization_endpoint — STOP, escalate."; exit 1; }
+          RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" --data-urlencode "client_id=scp" --data-urlencode "scope=offline_access openid")"
+          # C-f: grant disabled (or any refusal) → STOP + escalate.
+          # No downgrade path exists by design (C-A) — this step exits here.
+          if echo "$RESP" | jq -e 'has("error")' >/dev/null; then
+            DESC="$(echo "$RESP" | jq -r '.error_description // .error')"
+            echo "::error::device authorization refused ($DESC). STOP — the device grant may be disabled. Escalate to the operator. No fallback of any kind exists (C-A)."
+            exit 1
+          fi
+          # C-a: the authorization secret below is masked FIRST, on the very
+          # next line after extraction — never printed or dumped (C-a/C-b).
+          DEVICE_CODE="$(echo "$RESP" | jq -r '.device_code')"
+          echo "::add-mask::$DEVICE_CODE" # C-a: masks the device_code; never print it (see C-b)
+          USER_CODE="$(echo "$RESP" | jq -r '.user_code')"
+          VERIFY_URI="$(echo "$RESP" | jq -r '.verification_uri_complete // .verification_uri')"
+          INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
+          # C-b: print ONLY the verification URL + user_code (+ alias).
+          # Quiet curl flags only; no verbose dumps; no trace-level log variables.
+          echo "alias: $SERVER_ALIAS"
+          echo "Open this URL on your phone to approve: $VERIFY_URI"
+          echo "Code: $USER_CODE"
+          echo "we will never email or message you a code to re-confirm."
+          # C-c: honor interval/slow_down; self-stop ~570s with a clean
+          # re-dispatch message (device codes live ~600s).
+          DEADLINE=$((SECONDS + 570))
+          DELAY="$INTERVAL"
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            sleep "$DELAY"
+            # C-a: the poll payload carries the masked device_code — keep the
+            # response out of logs (it may echo the secret back on errors).
+            POLL="$(curl -sS -X POST "$TOKEN_ENDPOINT" --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" --data-urlencode "client_id=scp" --data-urlencode "device_code=$DEVICE_CODE")" # C-a: device_code masked above
+            STATUS="$(echo "$POLL" | jq -r '.error // "ok"')"
+            case "$STATUS" in
+              ok)
+                ACCESS_TOKEN="$(echo "$POLL" | jq -r '.access_token')"
+                echo "::add-mask::$ACCESS_TOKEN"
+                echo "authorized=true" >> "$GITHUB_OUTPUT"
+                # M2 same-job handoff: the token persists ONLY in this
+                # runner's environment (GITHUB_ENV dies with the runner).
+                # Same-job steps below consume it; it never crosses jobs,
+                # never lands in state (C-d: TF 1.11 ephemerals carry it).
+                echo "NETCUP_SCP_ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
+                # C-d: refresh stays in-memory only (same-runner handoff
+                # above); TF 1.11 ephemerals carry it — it never lands in state.
+                echo "Approved. Token held in runner memory only."
+                exit 0
+                ;;
+              authorization_pending)
+                ;;
+              slow_down)
+                DELAY=$((DELAY + 5)) # C-c: cumulative +5s backoff
+                ;;
+              expired_token)
+                echo "::error::device code expired before approval. Re-dispatch the workflow for a fresh code (clean re-dispatch path)."
+                exit 1
+                ;;
+              access_denied)
+                echo "::error::approval denied at netcup. STOP — nothing runs. Escalate to the operator if unexpected."
+                exit 1
+                ;;
+              *)
+                echo "::error::unexpected token response ($STATUS). STOP — escalate. No fallback of any kind exists (C-A)."
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::approval window (~570s) elapsed without approval. Re-dispatch the workflow for a fresh code."
+          exit 1
+          # M2: same-job handoff implemented above (token -> GITHUB_ENV);
+          # the A1 + tofu steps below consume it on this same runner.
+
+      - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # TTL tag piercloud-tmp-<server_id>-<run_id>, description
+          # created_at=<RFC3339-UTC> purpose=A1-ssh. >1 tmp on this server,
+          # or any tmp >2h / orphan at pre-step, fails BEFORE creating
+          # (exit 3, operator notified by the failure step below).
+          .github/scripts/020-provision-anchor.sh sweep-pre
+
+      - name: Set up OpenTofu (>= 1.11 for ephemeral values)
+        if: inputs.mode == 'apply'
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # SHA pin of setup-opentofu v2
+        with:
+          tofu_version: "1.12.2"
+
+      - name: tofu init (stateless — local state dies with the runner)
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          TF_IN_AUTOMATION: "true"
+        run: |
+          set -euo pipefail
+          # No backend block: local state file on the ephemeral runner.
+          # Nothing persists past this run by construction.
+          tofu init -input=false
+
+      - name: tofu plan (ephemeral token, never state)
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          TF_IN_AUTOMATION: "true"
+          TF_VAR_hostname: ${{ secrets.NETCUP_HOSTNAME }}
+          TF_VAR_server_id: ${{ secrets.NETCUP_SERVER_ID }}
+          TF_VAR_scp_user_id: ${{ secrets.NETCUP_SCP_USER_ID }}
+          TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
+          TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
+        run: |
+          set -euo pipefail
+          # New secret names introduced in M2 (repo secrets, never committed):
+          # NETCUP_SERVER_ID, NETCUP_MAIN_BOX_IPV4, NETCUP_ANCHOR_IPV4,
+          # A1_ROOT_PASSWORD (masked one-run input, dead after root lock),
+          # A1_SSH_PUBKEY_1 / A1_SSH_PUBKEY_2 (mandated 2 keys at A1).
+          tofu plan -input=false -out=tfplan
+
+      - name: A1 open (TTL-tagged single-/32 window)
+        id: a1-open
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Dual-endpoint egress-IP pin (exact match or fail) + idempotent
+          # create on run_id + attach — all under the static global mutex
+          # above (one mutex serializes every tenant's policy mutations).
+          .github/scripts/020-provision-anchor.sh open
+
+      - name: tofu apply (steady-state policy, then hand off to A1 ssh)
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          TF_IN_AUTOMATION: "true"
+          TF_VAR_hostname: ${{ secrets.NETCUP_HOSTNAME }}
+          TF_VAR_server_id: ${{ secrets.NETCUP_SERVER_ID }}
+          TF_VAR_scp_user_id: ${{ secrets.NETCUP_SCP_USER_ID }}
+          TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
+          TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
+        run: |
+          set -euo pipefail
+          tofu apply -input=false -auto-approve tfplan
+
+      - name: A1 provision (plain ssh, thumbprint, root lock)
+        id: a1-provision
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          RUN_ID: ${{ github.run_id }}
+          ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
+          PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
+          ROOT_PASSWORD: ${{ secrets.A1_ROOT_PASSWORD }}
+          A1_SSH_PUBKEY_1: ${{ secrets.A1_SSH_PUBKEY_1 }}
+          A1_SSH_PUBKEY_2: ${{ secrets.A1_SSH_PUBKEY_2 }}
+          THUMBPRINT_FILE: thumbprint.txt
+        run: |
+          set -euo pipefail
+          # C-a-shaped explicit mask BEFORE any use: repo secrets are
+          # auto-masked, but the explicit mask covers every expansion path
+          # (same ordering rule as the device_code mask in device-flow).
+          echo "::add-mask::${{ secrets.A1_ROOT_PASSWORD }}"
+          # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
+          # emailed root password arrives as a masked one-run input and is
+          # never printed; the script ends with `passwd -l root`.
+          ARGS=""
+          if [ "${{ inputs.rotate_keys }}" = "true" ]; then ARGS="--rotate"; fi
+          # shellcheck disable=SC2086: ARGS is empty-or-one-known-flag by construction.
+          .github/scripts/020-provision-anchor.sh $ARGS provision
+
+      - name: A1 close (detach-then-delete, always)
+        if: always() && steps.device.outputs.authorized == 'true' && inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          .github/scripts/020-provision-anchor.sh close
+
+      - name: A1 post-sweep (always, every run, all modes)
+        if: always()
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          SERVER_ID: ${{ secrets.NETCUP_SERVER_ID }}
+          SCP_USER_ID: ${{ secrets.NETCUP_SCP_USER_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Sweeps this run's policy at any age + every tmp >2h + orphans.
+          # No token (approval never completed) = clean no-op, so this step
+          # never masks the original failure.
+          .github/scripts/020-provision-anchor.sh sweep-post
+
+      - name: Notify operator on failure (surplus/orphan hint)
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "NTFY_TOPIC unset — failure stays in the run summary."
+            exit 0
+          fi
+          MSG="piercloud A1/provision FAILED for ${{ inputs.server_alias }} — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
+          curl -sS -u ":$NTFY_TOKEN" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+
+  apply-placeholder:
+    name: "mode=apply (stateless skeleton)"
+    runs-on: ubuntu-latest
+    needs: [device-flow]
+    if: inputs.mode == 'apply'
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+      - name: Set up OpenTofu (>= 1.11 for ephemeral values)
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # SHA pin of setup-opentofu v2
+        with:
+          tofu_version: "1.12.2"
+      # M2: the real path (ephemeral exchange → data-source resolve →
+      # plan → apply → state dies with the runner; policy name
+      # piercloud-anchor-${hostname}-${server_id} lands fully in M3) now runs
+      # in the device-flow job on the SAME runner (token never crosses
+      # jobs). This job stays a mode-scope marker.
+      - name: Mode marker (real steps run in the device-flow job)
+        run: |
+          set -euo pipefail
+          echo "mode=apply for alias '${{ inputs.server_alias }}': tofu plan/apply + A1 window + ssh provision run in the device-flow job (same-runner token handoff)."
+
+  check-hygiene:
+    name: "mode=check (drift + hygiene skeleton)"
+    runs-on: ubuntu-latest
+    needs: [device-flow]
+    if: inputs.mode == 'check'
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+      - name: Retention-setting warning (H1)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Run artifacts keep the thumbprint (retention-days: 400 covers artifacts ONLY) — never rely on logs alone; repo log retention is a separate setting."
+          # TODO(M2): read the repo retention setting via the API here and
+          # warn when it is below the 400-day artifact horizon.
+          echo "mode=check skeleton: drift report + orphan list land in M2; hygiene only, nothing to keep alive (S1)."
+      - name: Versions-behind notice
+        run: |
+          set -euo pipefail
+          echo "mode=check skeleton: versions-behind notice (Renovate queue vs pinned SHAs / .opentofu-version) lands in M2."
+          # TODO(M2): compare pinned action SHAs + .opentofu-version against
+          # the Renovate queue and print the behind-count (notice only).
+
+  update-ip-placeholder:
+    name: "mode=update-ip (ADD-before-move skeleton)"
+    runs-on: ubuntu-latest
+    needs: [device-flow]
+    if: inputs.mode == 'update-ip'
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+      # Protocol (enforced in M2): ADD new source first, old kept during
+      # transition, removed after confirmed boot; operator requests, OWNER
+      # executes; batch = N per-tenant approvals, never one operator token.
+      - name: Skeleton marker (M2 wires the real steps)
+        run: |
+          set -euo pipefail
+          echo "mode=update-ip skeleton for alias '${{ inputs.server_alias }}': add='${{ inputs.add_ipv4 }} ${{ inputs.add_ipv6 }}' remove='${{ inputs.remove_ipv4 }}'. ADD-before-move enforcement lands in M2."
+
+  destroy-gate:
+    name: "mode=destroy (policy + attachment ONLY)"
+    runs-on: ubuntu-latest
+    needs: [device-flow]
+    if: inputs.mode == 'destroy'
+    steps:
+      - name: Require ack_main_unbound + canary-fail proof
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.ack_main_unbound }}" != "true" ]; then
+            echo "::error::mode=destroy requires ack_main_unbound=true (main box proven unbound first). Refusing teardown."
+            exit 1
+          fi
+          echo "ack_main_unbound confirmed (skeleton). Destroys policy + attachment ONLY; server + tang keys untouched."
+          # TODO(M2): canary-fail proof check + real teardown steps. Server +
+          # tang keys are never touched by this mode.
+
+  thumbprint:
+    name: "H1 thumbprint chain (artifact)"
+    runs-on: ubuntu-latest
+    needs: [device-flow]
+    if: inputs.mode == 'apply'
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+      - name: Write thumbprint captured by the A1 provision step
+        env:
+          THUMBPRINT: ${{ needs.device-flow.outputs.thumbprint }}
+        run: |
+          set -euo pipefail
+          # The tang thumbprint is public (goes to the password manager +
+          # committed break-glass file + ntfy) — safe to carry as a job
+          # output, unlike the token (which never crosses jobs).
+          if [ -z "$THUMBPRINT" ]; then
+            echo "::error::no thumbprint captured — the A1 provision step did not report one. Refusing to publish an empty artifact (H1: never logs alone)."
+            exit 1
+          fi
+          printf '%s\n' "$THUMBPRINT" > thumbprint.txt
+          echo "alias=${{ inputs.server_alias }} head=${{ github.sha }}" >> thumbprint.txt
+      - name: Upload thumbprint artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # SHA pin of upload-artifact v4
+        with:
+          name: thumbprint-${{ inputs.server_alias }}
+          path: thumbprint.txt
+          # 400d = artifacts ONLY (H1 rule: never rely on logs alone — repo
+          # log retention is a separate setting; runs/checks get deleted).
+          retention-days: 400
+          if-no-files-found: error
+      # NOTE (H1, committed break-glass file): the runner holds
+      # contents:read and cannot push — the committed copy arrives via a
+      # reviewable PR from a separate App identity (mechanism resolves before
+      # the thumbprint chain is called done; stubbed in M1).

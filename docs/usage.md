@@ -1,100 +1,89 @@
 # Usage — end-to-end walkthrough
 
-From zero to an unattended-booting encrypted main box. Time: ~30 minutes,
-mostly netcup web UI.
+From zero to an unattended-booting encrypted main box, runnable END-TO-END
+from any browser — laptop or phone. Time: ~30 minutes, mostly
+netcup web UI + taps.
+
+Flow: order piko → repo from template → workflow dispatch →
+device-flow approval → A1 provisions → thumbprint via ntfy + artifact +
+committed file → clevis bind → monthly one-tap check.
+
+Related: [dr.md](dr.md) (DR table, decision tree, day-1 checklist) ·
+[invariants.md](invariants.md) (S1 / C-A review blockers).
 
 ## 0. What you need
 
 - A netcup account (identity verification happens at order time).
+- A browser (laptop or phone) + a password manager (PM).
 - Your main box: any Debian-family machine with a LUKS-encrypted root.
-- Your main box's public IP (IPv4, optionally IPv6) — the only address that
-  will be allowed to reach tang.
+- Your main box's public IPv4 — the only address allowed to reach tang.
+  Anchor IPv4 is REQUIRED (runners have no IPv6); v6-only is unsupported.
 
 ## 1. Order the anchor ("piko"-class VPS)
 
-In the netcup SCP, order a small VPS (a 1 vCore / 1 GB / 30 GB "piko" is
-plenty for tang + Gatus), any Debian-family image, set the root
-password at order time, and note:
+In the netcup SCP (web UI, TOTP 2FA), order a small VPS — the [VPS pico G11s](https://www.netcup.com/en/server/vps/vps-pico-g11s-iv-12m-nue) (~€1.90/mo VAT-incl, 12-mo term, Nürnberg) is plenty for tang +
+Gatus. Official Debian-family image, root password by email. Do NOT apply a welcome voucher: pico products can't be combined with vouchers (the voucher exceeds the cart minimum), so the order won't submit. Ordering isn't instant: netcup staff manually review new orders — you'll get an email ("Your order will be checked by one of our employees shortly") and a follow-up once it's through. Wait for that before provisioning.
 
-- the **server name** (e.g. `SCPI-1234567`) or the numeric **server id**,
-- the **user id** of your SCP account (Account → Users) — needed for firewall
-  management,
-- the **IPv4** (and IPv6, if you want it) of the anchor.
+**First login (CCP):** the "Your login credentials for the netcup CCP" email holds your customer number + password. Log in at <https://www.customercontrolpanel.de/> (paste both, select "I don't process personal data"), open the personal page (person icon), change the password, then scroll to two-factor authentication and enable it: tap (or right-click) the QR code to save it to your password manager, then copy the temporary code from the PM back to confirm. Finally check the 💵 tab that the invoice is paid — if not, pay it via the 💳 next to "unpaid".
 
-## 2. Create SCP API credentials
+**SCP login (separate credentials):** the server control panel at <https://www.servercontrolpanel.de/SCP/> uses its own password, sent in the "Access data for SCP" email — change it on first login and enable 2FA there too.
 
-In the netcup SCP, create API credentials for the SCP REST API (an access
-token, plus an optional refresh token for automatic renewal). Export them —
-never write them to disk or code:
+**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `A1_ROOT_PASSWORD` input (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
-```bash
-export NETCUP_SCP_ACCESS_TOKEN="..."
-export NETCUP_SCP_REFRESH_TOKEN="..."
-export NETCUP_CUSTOMER_NUMBER="..."   # optional if you pass var.customer_number
-```
+Note:
 
-## 3. Apply the module
+- the **server name** (e.g. `SCPI-1234567`) or numeric **server id**,
+- the **user id** of your SCP account (Account → Users),
+- the **anchor IPv4**.
 
-Use `examples/quickstart` as the root module (copy it, or point `source` at
-the registry/GitHub address):
+Single anchor t:1 is the product (a twin anchor at a different provider is
+a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 
-```bash
-tofu init
-tofu apply \
-  -var server_name="SCPI-1234567" \
-  -var allow_main_box_ipv4="203.0.113.10" \
-  -var allow_main_box_ipv6="2001:db8::10" \
-  -var hostname="anchor-pier-01" \
-  -var scp_user_id=1234
-```
+## 2. Repo from template + repo secrets (C-E visibility rule)
 
-The module adopts the server (it cannot create or delete servers — the netcup
-SCP API doesn't allow it), sets its hostname/autostart, creates the firewall
-policy (TCP/80 from your main box only + explicit egress ACCEPT) and attaches
-it to the anchor's interface. The `next_step` output tells you what's next.
+"Use this template" → your repo. **No stored netcup secrets of any kind
+(S1)** — every run authenticates via your per-run approval below. What
+lives in REPO-level secrets are identifiers only (hostname, IPs,
+`scp_user_id`, customer number): values are write-only and log-masked.
 
-## 4. Run the provisioning script on the anchor
+Visibility rule (C-E): identifiers in secrets always; public default once
+secrets land (values stay invisible to forks); env gate wherever a tenant
+reviewer identity exists. The approval card shows the exact commit
+(short+full head SHA + compare-diff link + workflow file count with an
+UNCHANGED/CHANGED banner). The repo is authoritative for execution; any UI
+is advisory display only.
 
-**Execution channel: the netcup SCP remote console** (server → remote console
-/ browser VNC). Log in as root with the password from step 1. No SSH inbound
-is provisioned anywhere — administration of the anchor is user-direct: the
-SCP console, or your own SSH key added via netcup SCP at order time.
+## 3. Dispatch and approve (S1)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/piercloud-net/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
-```
+Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. The ONLY
+identifier in the dispatch inputs is `server_alias`; everything sensitive
+resolves from repo secrets inside the run.
 
-(Or paste the script into the console. It is idempotent — safe to re-run.)
+The run prints a netcup device-flow URL + `XXXX-XXXX` user code (and sends
+them via ntfy). You approve at netcup's own Keycloak (your
+session, your 2FA, ~600s window) — the approval is one tap, phone browsers included. The runner polls, receives an ephemeral
+token, provisions, and the token dies with the runner. Only the URL + code
+(+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG`, device
+secret masked first. The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
+STOP + escalate (C-A — no fallback exists, none is permitted).
 
-The script: installs `tang`, enables `tangd.socket` (port 80), generates the
-tang keypair **on the box**, prints the **thumbprint**, asserts that no tang
-key material appears in any terraform state in the working directory, and
-installs Docker + **Gatus** (bound to `127.0.0.1:8080`, config at
-`/etc/gatus/config.yaml`, sqlite history in the `gatus-data` volume).
+## 4. A1 provisions, thumbprint lands three ways (H1 chain)
 
-**Save the thumbprint in your password manager NOW.**
+The run opens the hardened A1 self-open /32 SSH window, provisions the
+anchor (mandate: 2 SSH keys at A1; the script ends with `passwd -l root`;
+console-recovery note: rescue disables the netcup firewall — any rescue
+boot → rotate tang keys afterwards), then closes the window
+(detach-then-delete, swept pre + `always()` post, all modes).
 
-## 5. Configure the monitor
+The tang thumbprint reaches you via the H1 chain — run artifact
+(`retention-days: 400` = artifacts ONLY) + committed break-glass file via
+reviewable PR from a separate App identity. Never rely on logs alone (repo
+logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the
+repo retention setting. **Save the thumbprint in your PM NOW** (and finish
+the [day-1 checklist](dr.md#day-1-off-device-checklist)).
+>>>>>>> f93206d (docs: M5 phone-first template docs (trust copy, DR, T0/T1/T2) + conventions sync)
 
-The one file to edit on the anchor is `/etc/gatus/config.yaml` (written on
-first run; re-running the script never overwrites your edits):
-
-1. Configure an alerting channel (ntfy / Telegram / SMTP) in `alerting`.
-2. Uncomment the "YOUR MAIN SERVER" endpoints, pointing them at your
-   server's real DNS names — they follow DNS flips automatically, and the
-   availability history stays continuous across cutovers.
-3. Apply with `docker restart gatus`; check `docker logs gatus` for
-   config errors.
-
-Optional UI: Gatus serves a dashboard on `127.0.0.1:8080`. Reach it via your
-own SSH tunnel (needs an SSH key YOU added in the netcup SCP):
-
-```bash
-ssh -L 8080:127.0.0.1:8080 root@<anchor-ip>
-# open http://localhost:8080
-```
-
-## 6. Bind your main box (clevis)
+## 5. Bind your main box (clevis)
 
 On your **main box**:
 
@@ -104,8 +93,10 @@ apt-get install clevis clevis-luks clevis-initramfs
 clevis luks bind -d <device> tang '{"url":"http://anchor-pier-01.piercloud.net"}'
 ```
 
-**Verify the thumbprint** shown at bind time against the value you saved in
-step 4. If it doesn't match, answer NO and investigate. Then:
+**Verify the thumbprint** shown at bind time against the value you saved
+in step 4 — out-of-band, never `-y` blind. If it doesn't match, answer NO
+and investigate. Binding the DNS name (`anchor_hostname`) means a future
+same-URL rebuild is just `regen` (see [dr.md](dr.md)). Then:
 
 ```bash
 update-initramfs -u
@@ -115,21 +106,41 @@ update-initramfs -u
 line in `/etc/initramfs-tools/initramfs.conf` to bring the network up —
 if the boot prompt never clears, check that first.)
 
-## 7. Reboot test — twice
+Keep the passphrase keyslot forever — it is the true root. Disk unlock
+uses NBDE (clevis→tang) with a passphrase recovery keyslot; tang is
+availability, never the security anchor.
 
-Reboot the main box. A brief passphrase prompt that continues on its own is
-the *success* behavior: clevis reached the anchor, got the key, and unlocked.
-Verify twice (and re-run `010-provision.sh` once from the top and confirm the
-anchor still converges — scripts/README.md invariants).
+## 6. Monthly one-tap `mode=check` (hygiene, not load-bearing)
 
-Disaster-recovery sanity check: stop tang on the anchor (or shut the anchor
-down) and confirm the main box falls back to the passphrase prompt.
+One dispatch: drift report + orphan list +
+retention-setting warning + versions-behind notice. Under S1 there is
+nothing to keep alive (no stored tokens) — missed months degrade
+visibility, never availability.
+
+## 7. Tenant move: `mode=update-ip` (ADD-before-move)
+
+Main box moved and its IP changed? Dispatch `mode=update-ip` with
+`add_ipv4`/`add_ipv6` (optional `remove_ipv4`): the new IP is ADDED first,
+the old kept during transition, removed only after confirmed boot.
+Operator requests, OWNER executes; a batch move = N per-tenant approvals,
+never one operator token.
+
+## 8. Destroy: `mode=destroy` (policy + attachment ONLY)
+
+Requires `ack_main_unbound` (confirm the main box is unbound first) +
+canary-fail proof. Tears down the firewall policy + attachment only — the
+server and the tang keys are untouched.
 
 ## What this repo never does
 
-- No SSH inbound anywhere — the module provisions no SSH keys; admin the
-  anchor from the SCP console or your own key added via netcup SCP.
-- No credentials in code, state, or CI. tang keys are generated on the anchor
-  and never enter terraform state; the script's key-leak assertion guards
-  this. CI greps tracked files for key material.
-- The anchor holds no credential that reaches your main box.
+- No stored netcup tokens, no crons (S1) — every netcup use is
+  human-approved per run via the device flow.
+- No credentials in code, state, or CI. Tang keys are generated on the
+  anchor and never enter terraform state; CI greps tracked files for key
+  material (patterns enforced from `main`).
+- No sovereignty-downgrade fallback, ever (C-A) — failed check = no apply.
+- The anchor holds no credential that reaches your main box (its only
+  cross-box interaction is answering clevis challenges on TCP/80).
+- Workflows never touch rescue/image/snapshot/iso/disk surfaces (CI
+  allowlist grep from `main`); operator tooling never offers tang-key
+  management.

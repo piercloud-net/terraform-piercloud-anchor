@@ -15,6 +15,20 @@ data "netcup_scp_server_interfaces" "anchor" {
   server_id = local.resolved_server_id
 }
 
+# Stateless re-adopt note (no `import` block lives here on purpose): import
+# blocks are root-only, and this module is consumed as a CHILD module
+# (registry use, examples/quickstart) — an embedded block fails every
+# consumer's validate, even with an empty for_each (verified). The
+# canonical conditional-import pattern (for_each, empty = zero) lives in
+# examples/quickstart/main.tf targeting
+# module.tang_anchor.netcup_scp_server.anchor[0]. The device-flow workflow
+# runs this tree AS its root; its mode=apply generates the equivalent
+# one-shot import file at runtime (import-apply-discard) when live testing
+# lands — never a committed block here. Firewall-policy re-adopt is
+# intentionally never imported (its account-side id is not known
+# pre-apply); the first live stateless apply confirms the provider's
+# create-path behavior for the steady-state policy.
+
 # Adopt (do not create) the existing server and patch its mutable attributes.
 # Servers cannot be created or deleted through the SCP API — the user orders
 # the box manually; this resource adopts it and keeps its config in sync.
@@ -35,7 +49,7 @@ resource "netcup_scp_user_firewall_policy" "tang" {
   count = var.scp_user_id != null ? 1 : 0
 
   user_id     = var.scp_user_id
-  name        = "piercloud-anchor-${var.hostname}"
+  name        = local.policy_name
   description = "tang (TCP/80) from the main box only; egress open. Managed by terraform-piercloud-anchor."
 
   rules = concat(
@@ -57,6 +71,7 @@ resource "netcup_scp_user_firewall_policy" "tang" {
         sources           = ["${var.allow_main_box_ipv6}/128"]
       },
     ] : [],
+    local.extra_ingress_rules,
     [
       {
         action    = "ACCEPT"
@@ -81,6 +96,30 @@ resource "netcup_scp_server_interface_firewall" "anchor" {
 }
 
 locals {
+  # Stable policy key: server_id survives hostname renames (renamed from
+  # piercloud-tang-${hostname} during the repo rename; no deployments exist).
+  policy_name = "piercloud-anchor-${var.hostname}-${local.resolved_server_id}"
+
+  # T2 twin-anchor opt-in (both empty by default = single anchor t:1, and
+  # the firewall above collapses to exactly the pre-M3 rule set).
+  # extra_allowed_source_ips feeds additional INGRESS TCP/80 rules above
+  # (one per entry; /32 for IPv4, /128 for IPv6).
+  # extra_tang_urls feeds the SSS bind snippet via outputs (bind_name /
+  # regen_hint): nothing needs to reach this anchor on the twin's behalf,
+  # so twin URLs carry no firewall meaning here.
+  twin_tang_urls   = var.extra_tang_urls
+  anchor_bind_name = var.anchor_hostname
+
+  extra_ingress_rules = [
+    for ip in var.extra_allowed_source_ips : {
+      action            = "ACCEPT"
+      direction         = "INGRESS"
+      protocol          = "TCP"
+      destination_ports = "80"
+      sources           = ["${ip}${strcontains(ip, ":") ? "/128" : "/32"}"]
+    }
+  ]
+
   # First interface of the adopted server; sorted for determinism.
   # try() guards the empty-interface-list case (an unguarded [0] crashes
   # plan with "Invalid index ... empty set"); the firewall resource's count
