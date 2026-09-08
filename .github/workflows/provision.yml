@@ -136,7 +136,7 @@ jobs:
           # themselves are out of scope for v0.2.
           printf 'head_sha=%s head_short=%s alias=%s\n' "$HEAD_SHA" "$HEAD_SHORT" "$TENANT_USER" > head-sha.txt
       - name: Upload head-SHA artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # SHA pin of upload-artifact v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
         with:
           name: head-sha-${{ vars.TENANT_USER }}
           path: head-sha.txt
@@ -651,6 +651,13 @@ jobs:
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          # Operator-plane dashboard-TLS secrets (set at template time — the
+          # tenant pastes nothing, bootstrap stays 1 secret): Cloudflare
+          # Origin CA pair + optional zone-AOP bundle. Deployed key material
+          # for Caddy's :443, NOT a standing API token.
+          CF_ORIGIN_CERT_PEM: ${{ secrets.CF_ORIGIN_CERT_PEM }}
+          CF_ORIGIN_KEY_PEM: ${{ secrets.CF_ORIGIN_KEY_PEM }}
+          CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail
@@ -659,6 +666,12 @@ jobs:
           # (same ordering rule as the device_code mask in device-flow).
           # Guarded: masking an empty value warns without masking anything.
           if [ -n "${{ secrets.ANCHOR_ROOT_PASSWORD }}" ]; then echo "::add-mask::${{ secrets.ANCHOR_ROOT_PASSWORD }}"; fi
+          # Mask FIRST, before any use (repo secrets are auto-masked; the
+          # explicit masks cover every expansion path, multiline PEMs
+          # included). Guarded: masking an empty value warns without masking.
+          if [ -n "${{ secrets.CF_ORIGIN_CERT_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_ORIGIN_CERT_PEM }}"; fi
+          if [ -n "${{ secrets.CF_ORIGIN_KEY_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_ORIGIN_KEY_PEM }}"; fi
+          if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
           # the one-run credential (pasted secret, or the caller-set value
           # minted by bootstrap-password) arrives masked and is never
@@ -870,7 +883,7 @@ jobs:
           printf '%s\n' "$THUMBPRINT" > thumbprint.txt
           echo "alias=${{ vars.TENANT_USER }} head=${{ github.sha }}" >> thumbprint.txt
       - name: Upload thumbprint artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # SHA pin of upload-artifact v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
         with:
           name: thumbprint-${{ vars.TENANT_USER }}
           path: thumbprint.txt

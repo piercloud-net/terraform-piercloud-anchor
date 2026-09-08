@@ -69,6 +69,14 @@
 #                            dispatch-managed monitor config (repo secret — tenant
 #                            service map stays write-only). NTFY_TOPIC/NTFY_TOKEN
 #                            arrive the same way (empty = checks without push).
+#   CF_ORIGIN_CERT_PEM     operator-planted Cloudflare Origin CA certificate
+#   CF_ORIGIN_KEY_PEM      ... and private key (repo secrets, masked at birth
+#   CF_AOP_CA_PEM          in the workflow like the root password; optional
+#                            zone-level AOP client-auth bundle). Deployed key
+#                            material for Caddy's :443 — NOT a standing API
+#                            token (the box presents, never rewrites the zone).
+#                            Empty = dashboard-TLS-pending (Caddy automatic
+#                            HTTPS instead); tang is unaffected either way.
 #   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
 #    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)
 #   TENANT_USER                operator-set username (default monitor target:
@@ -452,7 +460,7 @@ cmd_provision() {
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
-  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")';"
+  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' CF_ORIGIN_CERT_PEM='$(q "${CF_ORIGIN_CERT_PEM:-}")' CF_ORIGIN_KEY_PEM='$(q "${CF_ORIGIN_KEY_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")';"
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi
@@ -462,7 +470,7 @@ cmd_provision() {
     { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s'
   fi
   log "capturing tang thumbprint to the artifact path"
-  thumb="$(ssh_base 'command -v tang-show-keys >/dev/null && tang-show-keys 80 || jose jwk thp -a S256 -r -f /var/db/tang/*.jwk' | head -n 1 | tr -d '[:space:]')"
+  thumb="$(ssh_base 'command -v tang-show-keys >/dev/null && tang-show-keys 8081 || jose jwk thp -a S256 -r -f /var/db/tang/*.jwk' | head -n 1 | tr -d '[:space:]')"
   if [ -z "$thumb" ] || printf '%s' "$thumb" | grep -q '[[:space:]]'; then
     die "thumbprint capture failed (empty or malformed) — refusing to finish without it (H1: never logs alone)"
   fi

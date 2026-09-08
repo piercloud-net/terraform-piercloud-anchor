@@ -5,7 +5,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Gatus docker image pinned in the provisioning script",
+      "description": "Gatus + Caddy docker images pinned in the provisioning script",
       "managerFilePatterns": ["/^scripts/010-provision\\.sh$/"],
       "matchStrings": [
         "\\s*# renovate: depName=(?<depName>\\S+) datasource=(?<datasource>\\S+)\\s*\\n\\s*[A-Z_]+=\"${depName}:(?<currentValue>[^\\s\"]+)\""

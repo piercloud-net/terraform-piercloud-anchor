@@ -34,6 +34,7 @@ Related: [usage.md](usage.md) (end-to-end flow) ·
 | SCP outage (netcup control plane down) | SCP/API unreachable; anchor itself still answers clevis | **SCP outage: do NOT migrate hosts.** Wait it out — running anchors keep unlocking; nothing needs the API until you change something | Migrate hosts mid-outage (strands the moved box behind a stale rule with zero remediation) |
 | Lost phone | You, noticing | Day-1 kit: recovery codes + root password in the PM emergency kit, printed off-device — recover GitHub/netcup access from any browser, then re-enroll | Keep all second factors on the one device (month-6 lesson — see checklist) |
 | Device grant disabled (netcup turns off the OAuth device flow) | `mode=apply` fails at the approval step | STOP + open an issue in your tenant repo. Do not proceed. (C-A — no fallback of any kind is designed or permitted) | Invent a fallback: no one-run tokens, no pasted long-lived secrets, no "temporary" standing credential |
+| Dashboard cert stale (Caddy did not renew) | Gatus `dashboard TLS` endpoint fails its `[CERTIFICATE_EXPIRATION]` condition → ntfy ALERT; ~30d warning window | Re-dispatch `mode=apply` (Caddy retries HTTP-01); if still failing, check the edge checklist below (cache bypass on the challenge path, no WAF/Bot-Fight block). Tang is unaffected throughout (plain HTTP, separate port, zero TLS dependency) | Touch tang or the firewall to "fix" the dashboard; bind anything new while the dashboard is red |
 
 ## Boot-failure decision tree (main box asks for a passphrase)
 
@@ -68,6 +69,41 @@ Bind clevis to a DNS name (`anchor-<alias>-01.piercloud.net`, see
 `anchor_hostname`), never the raw IP. A rebuilt anchor at the same URL
 needs only `clevis luks regen -d <device> tang` — same URL, fresh keys,
 no unbind+bind ceremony.
+
+## Caddy dashboard: edge checklist + cutover reversibility
+
+Caddy (`caddy:2.11.2-alpine`, pinned + Renovate-watched) owns `:80`;
+`tangd.socket` listens on `127.0.0.1:8081`; Gatus stays loopback-only
+(`127.0.0.1:8080`, Caddy proxies the status host to it). The Caddyfile is
+dispatch-managed (same render pattern as the Gatus config): `handle /adv* +
+/rec*` → `127.0.0.1:8081` plain, NO redirect; `/.well-known/acme-challenge/*`
+→ HTTP-01; the exact status hostname (`host status.<tenant>.piercloud.net`,
+rendered from TENANT_USER — `status.invalid` sentinel on hand runs) →
+`127.0.0.1:8080`; explicit per-tenant site
+blocks, NEVER `on_demand` TLS; catch-all aborts. Tang paths are never served
+on the `:443` dashboard vhost (they abort there). Caddy runs with host
+networking (its `127.0.0.1` dials reach tangd/Gatus on the host loopback;
+the netcup firewall stays the ingress gate). Monitoring note: Gatus probes
+tang only through Caddy's `:80` (a bridge-network container cannot dial
+tangd's `127.0.0.1`); tang-direct is proven every run by a host-level curl
+to `:8081/adv` before any proxy proof runs.
+
+Operator edge ceremony (one-time per zone, Cloudflare dashboard — the
+DNS-edit token the run holds cannot set these, so they are deliberately
+manual, verified by eye after each change):
+
+- SSL/TLS mode **Full (Strict)** (edge → origin encrypted, origin cert verified).
+- Cache Rule **Bypass** for `/.well-known/acme-challenge/*` (HTTP-01 must reach the box, never a cached edge hit).
+- No WAF custom rule / Bot Fight Mode block on that path (challenge fetches look like bots).
+- Zone-level **Authenticated Origin Pulls** with our own cert: upload the CA in the zone dashboard, then set the `CF_AOP_CA_PEM` repo secret (public bundle) + re-dispatch — Caddy enforces the edge client cert at the handshake. Until then, edge auth is firewall-allowlist + Host binding (documented degradation, dashboard-only).
+- Origin CA pair: issued in the Cloudflare dashboard per tenant hostname, planted as the `CF_ORIGIN_CERT_PEM` / `CF_ORIGIN_KEY_PEM` repo secrets (operator-plane, set at template time — the tenant pastes nothing), re-dispatch to deploy. Deployed key material, NOT a standing API token: the box presents its origin cert but cannot rewrite the zone.
+
+Cutover reversibility (if Caddy ever wedges and the `:80` proxy with it —
+tang itself stays up on loopback throughout): on the box, `docker stop caddy`,
+remove `/etc/systemd/system/tangd.socket.d/listen.conf`, `systemctl daemon-reload`,
+`systemctl restart tangd.socket`, confirm `systemctl show tangd.socket -p Listen`
+answers `:80` again; then re-dispatch `mode=apply` to re-pin the firewall to
+the pre-Caddy shape. Dashboard stays down until Caddy returns — tang does not wait for it.
 
 ## Rescue-chroot runbook (DR only)
 

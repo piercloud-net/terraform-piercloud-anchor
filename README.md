@@ -35,9 +35,9 @@ server name — it does not create or destroy servers (the netcup SCP API cannot
 — and configures:
 
 - the server's SCP attributes (hostname, OS optimization, autostart),
-- a firewall policy scoped to your main box: **TCP/80 ingress from your main
-  box IP only** (tang speaks plain HTTP by design — ECDH + thumbprint
-  pinning provide the cryptography; the narrow firewall provides the control),
+- a firewall policy scoped to your main box plus the Cloudflare edge: **TCP/80 ingress from your main
+  box IP and the Cloudflare edge ranges only, TCP/443 from the edge only** (tang speaks plain HTTP by design — ECDH + thumbprint
+  pinning provide the cryptography; the narrow firewall provides the control; the dashboard lives behind the orange cloud, so the edge must reach the origin),
   with an explicit egress ACCEPT-all so the anchor can always answer,
 - the firewall attachment on the anchor's network interface.
 

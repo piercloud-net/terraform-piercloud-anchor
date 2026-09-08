@@ -53,7 +53,7 @@ resource "netcup_scp_user_firewall_policy" "tang" {
 
   user_id     = var.scp_user_id
   name        = local.policy_name
-  description = "tang (TCP/80) from the main box only; egress open. Managed by terraform-piercloud-anchor."
+  description = "Caddy origin (TCP/80+443) from the main box + Cloudflare edge only; egress open. Managed by terraform-piercloud-anchor."
 
   rules = concat(
     [
@@ -75,6 +75,26 @@ resource "netcup_scp_user_firewall_policy" "tang" {
       },
     ] : [],
     local.extra_ingress_rules,
+    [
+      # Caddy owns :80 (tang proxy + ACME HTTP-01 arrive via the orange
+      # cloud; the main box still reaches :80 direct for clevis). :443
+      # admits the edge only; :8080/:8081 never leave loopback (on-box
+      # bindings, not firewall rules).
+      {
+        action            = "ACCEPT"
+        direction         = "INGRESS"
+        protocol          = "TCP"
+        destination_ports = "80"
+        sources           = local.cf_edge_cidrs
+      },
+      {
+        action            = "ACCEPT"
+        direction         = "INGRESS"
+        protocol          = "TCP"
+        destination_ports = "443"
+        sources           = local.cf_edge_cidrs
+      },
+    ],
     [
       {
         action    = "ACCEPT"
@@ -108,6 +128,36 @@ locals {
   # Stable policy key: server_id survives hostname renames (renamed from
   # piercloud-tang-${hostname} during the repo rename; no deployments exist).
   policy_name = "piercloud-anchor-${var.hostname}-${local.resolved_server_id}"
+
+  # Cloudflare edge ranges (public constants — same class as the Keycloak
+  # discovery URL baked into the workflow; source: the IP Ranges page
+  # linked from cloudflare.com). Refresh here AND in the Caddy
+  # trusted_proxies line in scripts/010-provision.sh when they change
+  # (stale ranges read as edge 403s at the dashboard, never at tang).
+  cf_edge_cidrs = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+  ]
 
   # T2 twin-anchor opt-in (both empty by default = single anchor t:1, and
   # the firewall above collapses to exactly the pre-M3 rule set).
