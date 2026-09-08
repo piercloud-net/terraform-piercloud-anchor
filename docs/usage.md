@@ -67,15 +67,19 @@ gh secret set NTFY_TOKEN              # publish-scoped
 
 ### Operator values (not for tenants)
 
-The tenant's slice IP is assigned by the operator, so the tenant never sets it. Per tenant repo, the operator sets:
+Two tiers, both operator-held — tenants never touch either. The slice IP is assigned by the operator, so the tenant never sets it:
+
+- **Org secret** (once): `CLOUDFLARE_DNS_TOKEN` — zone-scoped DNS:Edit on `piercloud.net`, visibility all repos. The run upserts each tenant's anchor record with it.
+- **Per tenant repo** (at creation; inventory lives in pcad.it-infra):
 
 ```bash
-gh secret set NETCUP_MAIN_BOX_IPV4    # tenant slice IP (operator inventory: pcad.it-infra)
+gh secret set NETCUP_MAIN_BOX_IPV4    # tenant slice IP
+gh variable set TENANT_USER --body "pier"  # pins which alias this repo may dispatch (fail-closed)
 # only if it differs from the customer number:
 # gh secret set NETCUP_SCP_USER_ID
 ```
 
-Slice moves use `mode=update-ip` (ADD-before-move, §7) — the operator requests, the OWNER executes.
+Self-serve template users set `TENANT_USER` themselves (typo guard); operator-provisioned tenants get it pinned at handover. Slice moves use `mode=update-ip` (ADD-before-move, §7) — the operator requests, the OWNER executes.
 
 Visibility rule (C-E): identifiers in secrets always; public default once
 secrets land (values stay invisible to forks); env gate wherever a tenant

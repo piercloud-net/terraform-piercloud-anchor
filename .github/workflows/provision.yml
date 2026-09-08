@@ -191,6 +191,33 @@ jobs:
           # must check it out to call it (full checkout: tofu below needs
           # the module files too).
 
+      - name: Alias pin check (tenant binding, pre-approval)
+        env:
+          # Env indirection (NOT ${{ }} inline in shell): interpolated
+          # values are never re-parsed, so a hostile alias cannot break
+          # quoting or inject commands — worst case is a failed compare.
+          PIN: ${{ vars.TENANT_USER }}
+          ALIAS: ${{ inputs.server_alias }}
+        run: |
+          set -euo pipefail
+          # The repo IS the tenant identity: vars.TENANT_USER (operator-set
+          # at repo creation, or self-set on template repos) pins which
+          # alias this repo may provision. Runs BEFORE device authorization
+          # so a typo'd/squatted alias fails before anyone taps approve.
+          # Cross-account confusion is structurally impossible (a device-flow
+          # token only ever sees the approver's own servers); this check
+          # binds the shared-zone NAME (DNS squat vector — D10 still guards
+          # the bind itself). Unset pin = loud warning, proceed (bootstrap
+          # path; operator pins it at handover).
+          if [ -n "${PIN:-}" ] && [ "$PIN" != "$ALIAS" ]; then
+            echo "::error::server_alias does not match this repo's tenant pin. Dispatch with your own username."
+            exit 1
+          fi
+          if [ -z "${PIN:-}" ]; then
+            echo "::warning::TENANT_USER repo variable not set — alias check skipped. Operator: pin it at tenant-repo creation."
+          fi
+          echo "Alias pin OK."
+
       - name: Device authorization + poll (ephemeral token dies with runner)
         id: device
         run: |
@@ -302,7 +329,7 @@ jobs:
           # IS server_alias, so anchor-<you>-01 falls out directly. Same
           # sanitize one-liner as 030-anchor-dns.sh — keep the two in sync
           # so TF hostname and DNS record can never diverge.
-          SAN="$(printf '%s' '${{ inputs.server_alias }}' | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+          SAN="$(printf '%s' "$SERVER_ALIAS" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
           [ -n "$SAN" ] || { echo "::error::server_alias sanitizes to empty — dispatch with your username (letters/digits/hyphens)."; exit 1; }
           echo "ANCHOR_HOSTNAME=anchor-${SAN}-01" >> "$GITHUB_ENV"
           echo "Derived hostname anchor-${SAN}-01."
@@ -451,13 +478,14 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          ALIAS: ${{ inputs.server_alias }}
         run: |
           set -euo pipefail
           if [ -z "$NTFY_TOPIC" ]; then
             echo "NTFY_TOPIC unset — failure stays in the run summary."
             exit 0
           fi
-          MSG="piercloud A1/provision FAILED for ${{ inputs.server_alias }} — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
+          MSG="piercloud A1/provision FAILED for $ALIAS — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
           curl -sS -u ":$NTFY_TOKEN" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
 
   anchor-dns:
