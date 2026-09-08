@@ -90,7 +90,7 @@ tofu apply -var server_name="SCPI-123456" \
 
 # 3. Open the netcup SCP -> your server -> remote console (browser VNC),
 #    log in as root, then run the provisioning script:
-curl -fsSL https://raw.githubusercontent.com/cad0p/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
+curl -fsSL https://raw.githubusercontent.com/piercloud-net/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
 
 # 4. Save the printed tang thumbprint in your password manager NOW.
 ```
@@ -139,9 +139,9 @@ Releases are tagged `vX.Y.Z` (with curated GitHub releases; automatic
 prereleases on `main`). Pin the module in your root module like:
 
 ```hcl
-source = "cad0p/anchor/piercloud"
+source = "piercloud-net/anchor/piercloud"
 # or from GitHub directly:
-source = "github.com/cad0p/terraform-piercloud-anchor?ref=v0.1.0"
+source = "github.com/piercloud-net/terraform-piercloud-anchor?ref=v0.1.0"
 ```
 
 During the 0.x series, floating references `?ref=v0` and `?ref=v0.0` exist and

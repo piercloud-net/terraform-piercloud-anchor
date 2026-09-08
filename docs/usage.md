@@ -61,7 +61,7 @@ is provisioned anywhere — administration of the anchor is user-direct: the
 SCP console, or your own SSH key added via netcup SCP at order time.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cad0p/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
+curl -fsSL https://raw.githubusercontent.com/piercloud-net/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
 ```
 
 (Or paste the script into the console. It is idempotent — safe to re-run.)
