@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 - Api_call handoff without subshell (closes #33)
 - Resolve SCP user id from token userinfo (closes #35)
 - Drop non-idempotent autostart (closes #37)
+- Serialize interface firewall after async server update (closes #39)
 
 ### 📚 Documentation
 
