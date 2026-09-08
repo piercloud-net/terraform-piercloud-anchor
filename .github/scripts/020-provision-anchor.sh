@@ -486,9 +486,10 @@ cmd_provision() {
 # flow converges to OFF first. Fresh boxes: harmless machine-wait.
 # Re-provisions: note the brief downtime. Async PATCHes return 202 +
 # TaskInfo: poll GET /tasks/{uuid} to FINISHED. 409 server.lock.error:
-# backoff + retry, bounded. The candidate travels only via the sshpass
-# environment value and jq --arg (never argv, never logs); task bodies are
-# never printed on this path (policy messages could quote the candidate).
+# backoff + retry, bounded. The candidate travels via the sshpass
+# environment value and jq $ENV (same-runner process argv only — masked in
+# logs, never persisted); task bodies are never printed on this path
+# (policy messages could quote the candidate).
 # A crash between set and the provision's `passwd -l root` leaves a
 # caller-known password live: the workflow's failure step runs
 # lock-password below (finally-path, not happy-path). An orphan on a
@@ -505,7 +506,11 @@ SSH_WAIT_ROUNDS=60        # TCP/SSH retry after power-ON (~10 min)
 SSH_PROBE_ROUNDS=12       # sshd takes TCP before auth is ready (short loop)
 
 gen_password() { # -> 28 chars, conservative charset (no shell/JSON specials)
-  LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$BOOTSTRAP_PW_LEN"
+  # The || true is load-bearing: under `set -o pipefail`, tr dies on
+  # SIGPIPE (141) the moment head has its bytes, failing the function
+  # before any mutation. Short reads stay impossible: every caller checks
+  # the length and dies closed on mismatch.
+  LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$BOOTSTRAP_PW_LEN" || true
 }
 
 server_detail() { # -> raw GET /servers/{id} JSON (callers parse; no state filter)
@@ -517,10 +522,6 @@ server_detail() { # -> raw GET /servers/{id} JSON (callers parse; no state filte
 
 server_live_state() { # -> RUNNING | SHUTOFF | ... (empty when unknown)
   server_detail | jq -r '.serverLiveInfo.state // empty'
-}
-
-server_primary_ipv4() { # -> first IPv4 from the server detail (empty when none)
-  server_detail | jq -r '.ipv4Addresses[0].ip // empty'
 }
 
 poll_task() { # $1 = task uuid, $2 = label -> 0 on FINISHED; dies otherwise
@@ -628,7 +629,7 @@ cmd_bootstrap_password() {
   fi
   while [ "$attempt" -lt "$BOOTSTRAP_PW_RETRIES" ]; do
     attempt=$((attempt + 1)); rejected=0
-    body="$(jq -n -c --arg p "$pw" '{rootPassword: $p}')"
+    body="$(PW="$pw" jq -n -c '{rootPassword: $ENV.PW}')"
     patch_server "$body" "password-set" "" uuid rejected
     if [ "$rejected" = "1" ]; then
       pw="$(gen_password)"
@@ -642,6 +643,12 @@ cmd_bootstrap_password() {
   done
   [ "$set_ok" -eq 1 ] || die "password-set refused $BOOTSTRAP_PW_RETRIES candidates in a row — escalate, no fallback"
   body=""
+  # Export BEFORE power-ON: any run that ever set a password can lock it
+  # via the workflow's failure step, even if power-ON/poll/SSH dies below.
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "BOOTSTRAP_ROOT_PASSWORD=$pw" >>"$GITHUB_ENV"
+    echo "BOOTSTRAP_PASSWORD_SET=true" >>"$GITHUB_ENV"
+  fi
   state="$(server_live_state)"
   if [ "$state" != "RUNNING" ]; then
     patch_server '{"state":"ON"}' "power-ON" "" uuid
@@ -652,10 +659,6 @@ cmd_bootstrap_password() {
   export SSHPASS="$pw"
   wait_ssh
   unset SSHPASS
-  if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "BOOTSTRAP_ROOT_PASSWORD=$pw" >>"$GITHUB_ENV"
-    echo "BOOTSTRAP_PASSWORD_SET=true" >>"$GITHUB_ENV"
-  fi
   pw=""; uuid="" # discard from memory (the runner-env copy dies with the runner, same as the token)
   log "bootstrap-password done — caller-set password handed to the provision step (masked, same-runner only)"
 }
