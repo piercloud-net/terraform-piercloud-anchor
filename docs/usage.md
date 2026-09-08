@@ -32,13 +32,13 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 **SCP login (separate credentials):** the server control panel at <https://www.servercontrolpanel.de/SCP/> uses its own password, sent in the "Access data for SCP" email — change it on first login and enable 2FA there too.
 
-**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `A1_ROOT_PASSWORD` repo secret (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
+**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `ANCHOR_ROOT_PASSWORD` repo secret (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
 Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
-- **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (a repo secret, only if yours differs)
-- **anchor IPv4** (server-ready email, under "IP address" — paste verbatim, `203.0.113.10/22`-style suffix included; the run strips it) → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
-- **root password** (server-ready email) → `A1_ROOT_PASSWORD`
+- **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — also used as the SCP user id, unless `SCP_USER_ID` is set (a repo secret, only if yours differs)
+- **anchor IPv4** (server-ready email, under "IP address" — paste verbatim, `203.0.113.10/22`-style suffix included; the run strips it) → `ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
+- **root password** (server-ready email) → `ANCHOR_ROOT_PASSWORD`
 - nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
 
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
@@ -61,9 +61,9 @@ history). Laptop/CLI path (power users) — phone users can skip this block, it 
 
 ```bash
 # secrets (write-only)
-gh secret set NETCUP_CUSTOMER_NUMBER  # username on both account emails
-gh secret set NETCUP_ANCHOR_IPV4      # piko IP ("IP address" in server email)
-gh secret set A1_ROOT_PASSWORD        # one-run — delete after use
+gh secret set CUSTOMER_NUMBER  # username on both account emails
+gh secret set ANCHOR_IPV4      # piko IP ("IP address" in server email)
+gh secret set ANCHOR_ROOT_PASSWORD        # one-run — delete after use
 # optional push channel (empty = verdict stays in the run summary)
 gh secret set NTFY_TOPIC
 gh secret set NTFY_TOKEN              # publish-scoped

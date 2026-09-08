@@ -190,7 +190,7 @@ jobs:
       # No HOSTNAME secret: derived below as anchor-<tenant>-01.
       # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
       # (override only if yours differs).
-      NETCUP_CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
+      CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
       # Public, constant Keycloak discovery doc (same realm for every tenant):
       # baked in, not a secret — override by editing this line only.
       NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
@@ -289,9 +289,9 @@ jobs:
       - name: Resolve server_id from anchor IP (no numeric id from the user)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
-          SCP_USER_ID_IN: ${{ secrets.NETCUP_SCP_USER_ID }}
-          CUSTOMER_NUMBER: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
+          ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
+          SCP_USER_ID_IN: ${{ secrets.SCP_USER_ID }}
+          CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
           TENANT_USER: ${{ vars.TENANT_USER }}
         run: |
           set -euo pipefail
@@ -301,18 +301,18 @@ jobs:
           # (OpenAPI: ServerListMinimal{id,name,hostname}). Count != 1 fails
           # closed with a human-readable cause; the id is an identifier, not
           # a secret, and is safe to log. Runs before every consumer below.
-          [ -n "${ANCHOR_IPV4:-}" ] || { echo "::error::NETCUP_ANCHOR_IPV4 secret is empty — set it to the piko IP from the server-ready email."; exit 1; }
+          [ -n "${ANCHOR_IPV4:-}" ] || { echo "::error::ANCHOR_IPV4 secret is empty — set it to the piko IP from the server-ready email."; exit 1; }
           # The email prints 203.0.113.10/22-style (address + netmask): paste verbatim,
           # the run strips any /suffix and validates a bare IPv4 below.
           IP4="${ANCHOR_IPV4%%/*}"
-          case "$IP4" in ''|*[!0-9.]*) echo "::error::NETCUP_ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix (got '${ANCHOR_IPV4}'). Paste the IP from the server-ready email."; exit 1;; esac
+          case "$IP4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix (got '${ANCHOR_IPV4}'). Paste the IP from the server-ready email."; exit 1;; esac
           RESP="$(curl -sS -G 'https://www.servercontrolpanel.de/scp-core/api/v1/servers' \
             --data-urlencode "ip=$IP4" \
             -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
           COUNT="$(echo "$RESP" | jq -r 'if type == "array" then length else -1 end')"
           RESOLVED_ID="$(echo "$RESP" | jq -r 'if type == "array" and length == 1 then .[0].id // empty else empty end')"
           if [ "$COUNT" != "1" ] || [ -z "$RESOLVED_ID" ]; then
-            echo "::error::anchor IP $ANCHOR_IPV4 matched $COUNT servers (need exactly 1). Check NETCUP_ANCHOR_IPV4, or rename duplicates in the SCP. Full list shape unexpected — escalate, no fallback."
+            echo "::error::anchor IP $ANCHOR_IPV4 matched $COUNT servers (need exactly 1). Check ANCHOR_IPV4, or rename duplicates in the SCP. Full list shape unexpected — escalate, no fallback."
             exit 1
           fi
           echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
@@ -329,10 +329,10 @@ jobs:
           echo "ANCHOR_HOSTNAME=anchor-${SAN}-01" >> "$GITHUB_ENV"
           echo "Derived hostname anchor-${SAN}-01."
           # SCP user id defaults to the customer number (same value on both
-          # account emails for the owner); explicit NETCUP_SCP_USER_ID wins.
+          # account emails for the owner); explicit SCP_USER_ID wins.
           SCP_EFF="${SCP_USER_ID_IN:-}"
           [ -n "$SCP_EFF" ] || SCP_EFF="$CUSTOMER_NUMBER"
-          [ -n "$SCP_EFF" ] || { echo "::error::set NETCUP_CUSTOMER_NUMBER (and NETCUP_SCP_USER_ID only if yours differs)."; exit 1; }
+          [ -n "$SCP_EFF" ] || { echo "::error::set CUSTOMER_NUMBER (and SCP_USER_ID only if yours differs)."; exit 1; }
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
 
       - name: Red-banner acknowledge gate (C-E, no-GitHub path)
@@ -408,18 +408,18 @@ jobs:
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
           TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
-          TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
-          TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
+          TF_VAR_customer_number: ${{ secrets.CUSTOMER_NUMBER }}
+          TF_VAR_allow_main_box_ipv4: ${{ secrets.MAIN_BOX_IPV4 }}
         run: |
           set -euo pipefail
           # Secrets used here (repo secrets, never committed):
-          # NETCUP_MAIN_BOX_IPV4, NETCUP_ANCHOR_IPV4,
-          # A1_ROOT_PASSWORD (masked one-run input, dead after root lock).
+          # MAIN_BOX_IPV4, ANCHOR_IPV4,
+          # ANCHOR_ROOT_PASSWORD (masked one-run input, dead after root lock).
           # Public inputs arrive as repo VARIABLES: TENANT_USER (hostname/DNS
           # derivation). Monitor targets + push arrive as repo SECRETS:
           # GATUS_ENDPOINTS (comma-separated name=url), NTFY_TOPIC/NTFY_TOKEN.
           # (NETCUP_SERVER_ID retired: the resolve step derives server_id
-          # at runtime from NETCUP_ANCHOR_IPV4 — nothing numeric to copy.)
+          # at runtime from ANCHOR_IPV4 — nothing numeric to copy.)
           tofu plan -input=false -out=tfplan
 
       - name: A1 open (TTL-tagged single-/32 window)
@@ -445,8 +445,8 @@ jobs:
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
           TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
-          TF_VAR_customer_number: ${{ secrets.NETCUP_CUSTOMER_NUMBER }}
-          TF_VAR_allow_main_box_ipv4: ${{ secrets.NETCUP_MAIN_BOX_IPV4 }}
+          TF_VAR_customer_number: ${{ secrets.CUSTOMER_NUMBER }}
+          TF_VAR_allow_main_box_ipv4: ${{ secrets.MAIN_BOX_IPV4 }}
         run: |
           set -euo pipefail
           tofu apply -input=false -auto-approve tfplan
@@ -461,9 +461,9 @@ jobs:
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
-          ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
+          ANCHOR_HOST: ${{ secrets.ANCHOR_IPV4 }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
-          ROOT_PASSWORD: ${{ secrets.A1_ROOT_PASSWORD }}
+          ROOT_PASSWORD: ${{ secrets.ANCHOR_ROOT_PASSWORD }}
           TENANT_USER: ${{ vars.TENANT_USER }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -474,7 +474,7 @@ jobs:
           # C-a-shaped explicit mask BEFORE any use: repo secrets are
           # auto-masked, but the explicit mask covers every expansion path
           # (same ordering rule as the device_code mask in device-flow).
-          echo "::add-mask::${{ secrets.A1_ROOT_PASSWORD }}"
+          echo "::add-mask::${{ secrets.ANCHOR_ROOT_PASSWORD }}"
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
           # emailed root password arrives as a masked one-run input and is
           # never printed; the script ends with `passwd -l root`.
@@ -533,7 +533,7 @@ jobs:
     environment: anchor
     env:
       TENANT_USER: ${{ vars.TENANT_USER }}
-      ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
+      ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
       CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
     steps:
       - name: Checkout (no credentials persisted)
