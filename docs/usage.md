@@ -32,7 +32,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo secret in §2:
 
-- numeric **server id** (server-ready email or SCP; the display name like `SCPI-1234567` is just how you find it) → `NETCUP_SERVER_ID`
+- numeric **server id** → `NETCUP_SERVER_ID`. Not in the email: open the server in the SCP — it's the numeric id in the server details (also the number in your browser's address bar with the server open). The `SCPI-…` display name is just the label, not the id.
 - **hostname** you give the anchor (D6: = DNS label, e.g. `anchor-pier-01`) → `NETCUP_HOSTNAME`
 - **SCP user id** (Account → Users) → `NETCUP_SCP_USER_ID`
 - **customer number** (CCP email) → `NETCUP_CUSTOMER_NUMBER`
@@ -56,7 +56,7 @@ shell history:
 
 ```bash
 # identifiers (order + server-ready emails, SCP → Account → Users)
-gh secret set NETCUP_SERVER_ID        # numeric server id
+gh secret set NETCUP_SERVER_ID        # numeric id from SCP server details (not the SCPI name)
 gh secret set NETCUP_HOSTNAME         # e.g. anchor-pier-01
 gh secret set NETCUP_SCP_USER_ID      # numeric SCP user id
 gh secret set NETCUP_CUSTOMER_NUMBER  # from the CCP email
