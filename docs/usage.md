@@ -45,6 +45,26 @@ a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 (S1)** — every run authenticates via your per-run approval below. What
 lives in REPO-level secrets are identifiers only (hostname, IPs,
 `scp_user_id`, customer number): values are write-only and log-masked.
+Paste them in your repo — `gh` prompts for each value so nothing touches
+shell history:
+
+```bash
+# identifiers (order + server-ready emails, SCP → Account → Users)
+gh secret set NETCUP_SERVER_ID        # numeric server id
+gh secret set NETCUP_HOSTNAME         # e.g. anchor-pier-01
+gh secret set NETCUP_SCP_USER_ID      # numeric SCP user id
+gh secret set NETCUP_CUSTOMER_NUMBER  # from the CCP email
+gh secret set NETCUP_MAIN_BOX_IPV4    # the box being unlocked (clevis source)
+gh secret set NETCUP_ANCHOR_IPV4      # piko IP
+# one-run provisioning inputs (emailed root password dies after use — delete it)
+gh secret set A1_ROOT_PASSWORD
+gh secret set A1_SSH_PUBKEY_1         # your admin keys (mandate: 2)
+gh secret set A1_SSH_PUBKEY_2
+gh secret set NETCUP_OIDC_DISCOVERY_URL  # https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration
+# optional push channel (empty = verdict stays in the run summary)
+gh secret set NTFY_TOPIC
+gh secret set NTFY_TOKEN              # publish-scoped
+```
 
 Visibility rule (C-E): identifiers in secrets always; public default once
 secrets land (values stay invisible to forks); env gate wherever a tenant
