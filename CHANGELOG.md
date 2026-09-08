@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Serialize interface firewall after async server update (closes #39)
 - Open the A1 window after steady-state apply (closes #41)
 - Create tang key dir before keygen (closes #43)
+- Install Docker before running Gatus (closes #45)
 
 ### 📚 Documentation
 
