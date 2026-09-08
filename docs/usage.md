@@ -32,7 +32,6 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo value in §2 (secret or variable as marked):
 
-- **username** you sign up with (e.g. `pier`) → pre-set in your repo as `TENANT_USER`; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
