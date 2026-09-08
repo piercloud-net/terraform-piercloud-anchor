@@ -43,10 +43,6 @@ Create them here: [👉 Repo → Settings → Secrets → New repository secret]
 
 Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../../actions/workflows/provision.yml) (`mode` preselects `apply`).
 
-Legacy fallback only — leave `ANCHOR_ROOT_PASSWORD` unset and skip this paragraph: dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so a pasted password must live in a write-only, log-masked repo secret, never an input. (Prefer leaving it unset entirely — the passwordless path above needs no emailed password at all.)
-
-Discovery fallback only — leave `ANCHOR_IPV4` unset unless the run tells you otherwise: the run discovers the server itself (exactly-one wins, else exact hostname match on `anchor-<you>-01`) and resolves `server_id` from that, so no numeric id to copy anywhere. Only when discovery needs help (several servers in the account and none named `anchor-<you>-01`) paste the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it).
-
 Single anchor t:1 is the product (a twin anchor at a different provider is
 a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 
@@ -64,12 +60,8 @@ history). Laptop/CLI path (power users) — phone users can skip this block, it 
 <summary>CLI equivalents</summary>
 
 ```bash
-# secrets (write-only) — normally just the first line:
+# secrets (write-only) — just the first line:
 gh secret set CUSTOMER_NUMBER  # username on both account emails (the ONE required secret)
-# only when discovery needs help (several servers, none named anchor-<you>-01):
-# gh secret set ANCHOR_IPV4      # piko IP ("IP address" in server email)
-# legacy only — leave UNSET for the passwordless path (the run mints its own one-time password):
-# gh secret set ANCHOR_ROOT_PASSWORD        # one-run — delete after use
 # later, when exploring: extra monitor targets + push (see §8)
 gh secret set GATUS_ENDPOINTS         # e.g. blog=https://blog.example.com
 ```
