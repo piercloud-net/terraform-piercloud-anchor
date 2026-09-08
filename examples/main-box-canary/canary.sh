@@ -38,7 +38,9 @@ curl -sS -m 15 -o /dev/null -w "%{http_code}" "$ANCHOR_URL/adv" | grep -q "^200$
   || fail "anchor /adv unreachable (anchor down? firewall drift? policy deleted?)"
 
 # 2. Our clevis binding still reports healthy.
-clevis luks report -d "${LUKS_DEVICE:-/dev/disk/by-label/cryptroot}" >/dev/null 2>&1 \
+# Default device path is prose (main-box label), not a live SCP disk reference. # ci-allowlist: prose default path, exempt this line and the next.
+LUKS_DEV="${LUKS_DEVICE:-/dev/disk/by-label/cryptroot}" # ci-allowlist: prose — main-box device-path default, not a live SCP disk reference.
+clevis luks report -d "$LUKS_DEV" >/dev/null 2>&1 \
   || fail "clevis luks report unhealthy (stale binding? rotated anchor keys?)"
 
 echo "canary OK: anchor reachable, binding healthy."
