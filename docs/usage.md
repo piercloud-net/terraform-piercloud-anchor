@@ -32,7 +32,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo secret in §2:
 
-- **username** you sign up with (e.g. `pier`) → the operator pins it as the repo's `TENANT_USER`; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
+- **username** you sign up with (e.g. `pier`) → pre-set in your repo as `TENANT_USER`; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
@@ -68,22 +68,6 @@ gh secret set NTFY_TOKEN              # publish-scoped
 On phone/web instead of CLI: open the repo → `…` (top right) → Settings → Secrets and variables → Actions. Secrets go under the **Secrets** tab → Repository secrets; keys go under the **Variables** tab → Repository variables (switch tabs, scroll down). Always repository level — never Environment secrets/variables (the workflow doesn't use Environments).
 
 No discovery-URL setup: the Keycloak doc address is baked into the workflow (public constant, same realm for everyone).
-
-### Operator values (not for tenants)
-
-Two tiers, both operator-held — tenants never touch either. The slice IP is assigned by the operator, so the tenant never sets it:
-
-- **Org secret** (once): `CLOUDFLARE_DNS_TOKEN` — zone-scoped DNS:Edit on `piercloud.net`, visibility all repos. The run upserts each tenant's anchor record with it.
-- **Per tenant repo** (at creation; inventory lives in pcad.it-infra):
-
-```bash
-gh secret set NETCUP_MAIN_BOX_IPV4    # tenant slice IP
-gh variable set TENANT_USER --body "pier"  # tenant username: hostname, DNS, artifacts derive from it
-# only if it differs from the customer number:
-# gh secret set NETCUP_SCP_USER_ID
-```
-
-Slice moves use `mode=update-ip` (ADD-before-move, §7) — the operator requests, the OWNER executes.
 
 Visibility rule (C-E): identifiers in secrets always; public default once
 secrets land (values stay invisible to forks); env gate wherever a tenant
@@ -163,8 +147,7 @@ visibility, never availability.
 Planned — the mode currently answers a skeleton; ADD-before-move enforcement lands with live M0. Design: main box moved and its IP changed? Dispatch `mode=update-ip` with
 `add_ipv4`/`add_ipv6` (optional `remove_ipv4`): the new IP is ADDED first,
 the old kept during transition, removed only after confirmed boot.
-Operator requests, OWNER executes; a batch move = N per-tenant approvals,
-never one operator token.
+Move requests arrive with the new IP; you dispatch the update-ip yourself — a batch move = N per-run approvals, never one shared token.
 
 ## 8. Destroy: `mode=destroy` (policy + attachment ONLY)
 
@@ -183,5 +166,5 @@ server and the tang keys are untouched.
 - The anchor holds no credential that reaches your main box (its only
   cross-box interaction is answering clevis challenges on TCP/80).
 - Workflows never touch rescue/image/snapshot/iso/disk surfaces (CI
-  allowlist grep from `main`); operator tooling never offers tang-key
-  management.
+  allowlist grep from `main`); tang-key management is never offered
+  through automation.

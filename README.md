@@ -60,12 +60,12 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    server name (or id), your SCP user id, and the anchor's IP.
    *(details: [walkthrough §1](docs/usage.md#1-order-the-anchor-piko-class-vps))*
 2. **Repo from template + repo values** — "Use this template", then set
-   repo variables (username, SSH keys) + repo secrets (customer number,
+   repo variables (SSH keys) + repo secrets (customer number,
    anchor IP, one-run root password, optional ntfy). No stored netcup API
    tokens of any kind (S1): every run authenticates via your per-run
    approval — the one exception is the one-run A1 root password (write-only
-   secret, killed by `passwd -l root`, deleted after use). Slice IP + DNS
-   token are operator-held, never tenant-touched. Public default once
+   secret, killed by `passwd -l root`, deleted after use). Slice IP, DNS,
+   and your username come pre-configured in your repo. Public default once
    values land (write-only, log-masked, invisible to forks).
    *(details: [walkthrough §2](docs/usage.md#2-repo-from-template--repo-secrets-c-e-visibility-rule))*
 3. **Dispatch + approve** — Actions → [`provision.yml`](.github/workflows/provision.yml)
