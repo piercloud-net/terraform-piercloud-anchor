@@ -494,7 +494,27 @@ jobs:
           # at runtime from ANCHOR_IPV4 — nothing numeric to copy.)
           tofu plan -input=false -out=tfplan
 
-      - name: A1 open (TTL-tagged single-/32 window)
+      - name: tofu apply (steady-state policy, then hand off to A1 ssh)
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          TF_IN_AUTOMATION: "true"
+          TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
+          TF_VAR_server_id: ${{ env.SERVER_ID }}
+          TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
+          TF_VAR_customer_number: ${{ secrets.CUSTOMER_NUMBER }}
+          TF_VAR_allow_main_box_ipv4: ${{ secrets.MAIN_BOX_IPV4 }}
+        run: |
+          set -euo pipefail
+          # ORDER IS LOAD-BEARING (live 2026-09-08): steady state MUST land
+          # BEFORE the A1 window opens. Opening first then applying made the
+          # interface-firewall resource rewrite user_policy_ids=[tang] and
+          # DETACH the runner's /32 window, so the ssh handoff timed out.
+          tofu apply -input=false -auto-approve tfplan
+          # Import-apply-discard: the generated import served its one run.
+          rm -f .workflow-import.tf
+
+      - name: A1 open (TTL-tagged single-/32 window, after steady state)
         id: a1-open
         if: inputs.mode == 'apply'
         env:
@@ -508,22 +528,6 @@ jobs:
           # create on run_id + attach — all under the static global mutex
           # above (one mutex serializes every tenant's policy mutations).
           .github/scripts/020-provision-anchor.sh open
-
-      - name: tofu apply (steady-state policy, then hand off to A1 ssh)
-        if: inputs.mode == 'apply'
-        env:
-          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          TF_IN_AUTOMATION: "true"
-          TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
-          TF_VAR_server_id: ${{ env.SERVER_ID }}
-          TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
-          TF_VAR_customer_number: ${{ secrets.CUSTOMER_NUMBER }}
-          TF_VAR_allow_main_box_ipv4: ${{ secrets.MAIN_BOX_IPV4 }}
-        run: |
-          set -euo pipefail
-          tofu apply -input=false -auto-approve tfplan
-          # Import-apply-discard: the generated import served its one run.
-          rm -f .workflow-import.tf
 
       - name: A1 provision (plain ssh, thumbprint, root lock)
         id: a1-provision
