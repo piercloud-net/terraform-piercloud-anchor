@@ -137,6 +137,24 @@ fi
 # Tenant endpoints. Bad pairs fail closed: a typo'd monitor you'd trust is
 # worse than none.
 ENDPOINTS_YAML=""
+# Default target: the tenant homepage derives from TENANT_USER — no input
+# needed (pier → https://pier.piercloud.net). Skipped only for hand runs
+# without env (console fallback = self-check only, as documented).
+if [ -n "${TENANT_USER:-}" ]; then
+  case "$TENANT_USER" in ''|*[!a-zA-Z0-9_-]*) die "bad TENANT_USER for homepage URL (chars [a-zA-Z0-9_-] only)";; esac
+  ENDPOINTS_YAML="  - name: main
+    url: https://${TENANT_USER}.piercloud.net
+    interval: 60s
+    conditions:
+      - \"[STATUS] == 200\"
+"
+  if [ -n "${NTFY_TOPIC:-}" ]; then
+    ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
+      - type: ntfy
+        failure-threshold: 3
+"
+  fi
+fi
 if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   set -f
   OLD_IFS="$IFS"; IFS=","

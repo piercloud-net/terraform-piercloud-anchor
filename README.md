@@ -93,14 +93,13 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    manager NOW**, then finish the
    [day-1 checklist](docs/dr.md#day-1-off-device-checklist).
    *(details: [walkthrough §4](docs/usage.md#4-a1-provisions-thumbprint-lands-three-ways-h1-chain))*
-5. **Configure the monitor (optional, after the bind)** — no login, no file
-   edit: set the `GATUS_ENDPOINTS` repo secret to comma-separated `name=url`
-   pairs (`main=https://my-main-server.example.com` — create any random topic
-   name in the [ntfy app](https://ntfy.sh) first for push alerts via the
-   `NTFY_TOPIC` secret), then re-dispatch `mode=apply`. The run re-renders
-   `/etc/gatus/config.yaml`, restarts Gatus, and prints the endpoint statuses
-   into the run log — that output IS your dashboard check. Probe **by DNS
-   name** so the monitor follows migrations automatically.
+5. **Monitor (automatic, extend later)** — the run already watches your
+   homepage (`https://<you>.piercloud.net`, derived from your username) plus
+   tang itself, and prints the statuses into the run log. More targets later:
+   set the `GATUS_ENDPOINTS` repo secret to comma-separated `name=url` pairs
+   (`blog=https://blog.example.com`, HTTP(S) only) and re-dispatch
+   `mode=apply`. Probe **by DNS name** so the monitor follows migrations
+   automatically.
 6. **Bind your main box** — install `clevis clevis-luks clevis-initramfs`,
    run the printed `clevis luks bind` command against the DNS name
    (`anchor-<alias>-01.piercloud.net`, e.g. `anchor-pier-01.piercloud.net`), confirming the thumbprint matches
@@ -151,7 +150,8 @@ the `clevis luks bind` on your main box and the reboot test):
    unlock with the passphrase.
 4. **Watch your server from the anchor.** The run installs Gatus on the
    anchor — an independent, always-on vantage point *outside* your main box.
-   Monitors are dispatch-managed: edit the `GATUS_ENDPOINTS` repo secret,
+   Monitors are dispatch-managed: your homepage is watched automatically;
+   extra targets go in the `GATUS_ENDPOINTS` repo secret +
    re-dispatch `mode=apply`, read the statuses in the run log. Probe your
    main server's services **by DNS name** (Gatus never caches DNS,
    so when you migrate and flip the record, the monitor follows automatically

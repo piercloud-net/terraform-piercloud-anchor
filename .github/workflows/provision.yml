@@ -464,6 +464,7 @@ jobs:
           ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
           ROOT_PASSWORD: ${{ secrets.A1_ROOT_PASSWORD }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
