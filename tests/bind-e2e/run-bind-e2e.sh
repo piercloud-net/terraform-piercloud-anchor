@@ -108,11 +108,11 @@ grep -q "host ${STATUS_HOST}" "${WORK}/Caddyfile.ci" || die "render lacks the ex
 log "CI Caddyfile rendered (status host: ${STATUS_HOST})"
 # The shipped shape must still parse after the refactor: render it with
 # production addressing and validate (never served here).
-export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
+( export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
 export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
 export DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 caddy_status_names
-render_caddyfile > "${WORK}/Caddyfile.prodshape"
+render_caddyfile > "${WORK}/Caddyfile.prodshape" )
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --adapter caddyfile
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
@@ -157,6 +157,9 @@ log "PASS: /adv payload identical direct vs through Caddy"
 jose fmt --json="$(cat "${WORK}/via-caddy.json")" -Og payload -SyOg keys -AUo- | jose jwk use -i- -r -u verify -o- > "${WORK}/sigkey.json"
 jose jws ver -i "${WORK}/via-caddy.json" -k "${WORK}/sigkey.json" >/dev/null || die "proxied /adv signature does not verify"
 log "PASS: proxied /adv signature verifies (envelope byte-exact)"
+# Regression guard: the prodshape render above runs in a subshell precisely
+# so this still names the CI tenant (a clobbered name aborts here, by design).
+[ "${STATUS_HOST}" = "status.citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
 STUB_GOT="$(curl -sf -H "Host: ${STATUS_HOST}" "http://127.0.0.1:${CADDY_PORT}/api/v1/endpoints/statuses")" || die "status-host request failed"
 [ "${STUB_GOT}" = "gatus-stub-ok" ] || die "status-host routing broken (got: ${STUB_GOT})"
 log "PASS: exact-Host dashboard routing reaches the stub"
