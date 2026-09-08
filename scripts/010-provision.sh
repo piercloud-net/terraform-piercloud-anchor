@@ -39,6 +39,112 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (netcup SCP remote console, root login)"
 
+# --- BEGIN CADDY RENDER (tests/bind-e2e/run-bind-e2e.sh extracts this span; keep markers) ---
+caddy_status_names() { # STATUS_HOST/STATUS_MATCH from TENANT_USER
+# Dispatch-managed hostnames (same sanitize one-liner as the workflow
+# resolve step and .github/scripts/030-anchor-dns.sh — keep the three in
+# sync). Empty on hand runs without env (console fallback): the :80 tang
+# proxy still renders below, but the :443 dashboard block and the TLS-expiry
+# probe wait for a re-dispatch with TENANT_USER.
+SAN="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+if [ -n "$SAN" ]; then
+  STATUS_HOST="status.${SAN}.piercloud.net"
+else
+  STATUS_HOST=""
+  warn "TENANT_USER unset — dashboard TLS block and TLS-expiry probe skipped (re-dispatch with TENANT_USER to converge them)"
+fi
+# Exact Host value for the :80 dashboard matcher (review: a wildcard span was
+# never verified — render the exact name; hand runs get a never-matching
+# sentinel so the :80 block still validates).
+STATUS_MATCH="${STATUS_HOST:-status.invalid}"
+}
+
+render_caddyfile() { # print the Caddyfile to stdout
+  printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
+  printf '%s\n' "# DO NOT EDIT BY HAND — re-rendered on every provision run. Dashboard TLS"
+  printf '%s\n' "# converges from TENANT_USER + the CF_ORIGIN_* / CF_AOP_CA_* repo secrets;"
+  printf '%s\n' "# re-dispatch mode=apply to converge. Future tenant domains get their own"
+  printf '%s\n' "# explicit site blocks here — NEVER on_demand TLS."
+  printf '%s\n' ""
+  printf '%s\n' "{"
+  printf '%s\n' "	# Loopback admin: \`docker exec caddy caddy reload\` keeps working;"
+  printf '%s\n' "	# admin.disabled:true would refuse the reload, and publishing :2019"
+  printf '%s\n' "	# would expose control — loopback is neither."
+  printf '%s\n' "	admin 127.0.0.1:2019"
+  printf '%s\n' "	servers {"
+  printf '%s\n' "		# Real client IP behind the orange cloud. CF-Connecting-IP only —"
+  printf '%s\n' "		# never X-Forwarded-For (spoofable through the edge)."
+  printf '%s\n' "		trusted_proxies static ${CF_EDGE_CIDRS}"
+  printf '%s\n' "		client_ip_headers CF-Connecting-IP"
+  printf '%s\n' "	}"
+  printf '%s\n' "}"
+  printf '%s\n' ""
+  printf '%s\n' "# Tang front (:80, plain HTTP, NO redirect): ONLY /adv*|/rec* reach"
+  printf '%s\n' "# tangd. ACME HTTP-01 answers here (zone-side cache bypass + no WAF"
+  printf '%s\n' "# block on that path are operator steps, see docs/dr.md). The status"
+  printf '%s\n' "# host on :80 proxies the dashboard plain (no redirect by design);"
+  printf '%s\n' "# TLS lives on :443 below. Everything else aborts."
+  printf '%s\n' "${CADDY_HTTP_ADDR:-:80} {"
+  printf '%s\n' "	log_skip"
+  printf '%s\n' "	header -Server"
+  printf '%s\n' "	handle /.well-known/acme-challenge/* {"
+  printf '%s\n' "		root * ${CADDY_CHALLENGE_DIR}"
+  printf '%s\n' "		file_server"
+  printf '%s\n' "	}"
+  printf '%s\n' "	handle /adv* {"
+  printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
+  printf '%s\n' "	}"
+  printf '%s\n' "	handle /rec* {"
+  printf '%s\n' "		# No in-Caddy rate limit by decision: the pinned official build"
+  printf '%s\n' "		# (caddy:2.11.2-alpine) ships no rate_limit directive — verified via"
+  printf '%s\n' "		# list-modules on the v2.11.2 binary; it lives in a third-party xcaddy"
+  printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
+  printf '%s\n' "		# Flood protection"
+  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
+  printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
+  printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
+  printf '%s\n' "	}"
+  printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
+  printf '%s\n' "	# construction, so handle order cannot misroute)."
+  printf '%s\n' "	@status {"
+  printf '%s\n' "		host ${STATUS_MATCH}"
+  printf '%s\n' "		not path /adv* /rec* /.well-known/acme-challenge/*"
+  printf '%s\n' "	}"
+  printf '%s\n' "	handle @status {"
+  printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
+  printf '%s\n' "	}"
+  printf '%s\n' "	handle {"
+  printf '%s\n' "		abort"
+  printf '%s\n' "	}"
+  printf '%s\n' "}"
+  if [ -n "${STATUS_HOST:-}" ] && [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
+    printf '%s\n' ""
+    printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
+    printf '%s\n' "https://${STATUS_HOST} {"
+    printf '%s\n' "	header -Server"
+    printf '%s\n' "${DASH_TLS_STANZA}"
+    printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
+    printf '%s\n' "	@dashtang path /adv* /rec*"
+    printf '%s\n' "	handle @dashtang {"
+    printf '%s\n' "		abort"
+    printf '%s\n' "	}"
+    printf '%s\n' "	handle {"
+    printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
+    printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
+    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (queued: issue #56)."
+    printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
+    printf '%s\n' "	}"
+    printf '%s\n' "}"
+  elif [ -z "${STATUS_HOST:-}" ]; then
+    printf '%s\n' ""
+    printf '%s\n' "# No TENANT_USER: :443 dashboard block skipped (re-dispatch converges it)."
+  else
+    printf '%s\n' ""
+    printf '%s\n' "# :443 dashboard block skipped by harness (CADDY_SKIP_HTTPS)."
+  fi
+}
+# --- END CADDY RENDER ---
+
 ROTATE=0
 case "${1:-}" in
   "") ;; # normal provision
@@ -153,22 +259,7 @@ assert_no_key_leak
 # ---------------------------------------------------------------------------
 log "Rendering dispatch-managed Gatus config (${GATUS_CONFIG})"
 mkdir -p "$(dirname "${GATUS_CONFIG}")"
-# Dispatch-managed hostnames (same sanitize one-liner as the workflow
-# resolve step and .github/scripts/030-anchor-dns.sh — keep the three in
-# sync). Empty on hand runs without env (console fallback): the :80 tang
-# proxy still renders below, but the :443 dashboard block and the TLS-expiry
-# probe wait for a re-dispatch with TENANT_USER.
-SAN="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
-if [ -n "$SAN" ]; then
-  STATUS_HOST="status.${SAN}.piercloud.net"
-else
-  STATUS_HOST=""
-  warn "TENANT_USER unset — dashboard TLS block and TLS-expiry probe skipped (re-dispatch with TENANT_USER to converge them)"
-fi
-# Exact Host value for the :80 dashboard matcher (review: a wildcard span was
-# never verified — render the exact name; hand runs get a never-matching
-# sentinel so the :80 block still validates).
-STATUS_MATCH="${STATUS_HOST:-status.invalid}"
+caddy_status_names
 # One-time backup of any pre-managed hand config (never overwritten twice).
 if [ -f "${GATUS_CONFIG}" ] && [ ! -f "${GATUS_CONFIG}.pre-managed.bak" ] && ! grep -q "DISPATCH-MANAGED" "${GATUS_CONFIG}" 2>/dev/null; then
   cp -p "${GATUS_CONFIG}" "${GATUS_CONFIG}.pre-managed.bak"
@@ -422,87 +513,7 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
-{
-  printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
-  printf '%s\n' "# DO NOT EDIT BY HAND — re-rendered on every provision run. Dashboard TLS"
-  printf '%s\n' "# converges from TENANT_USER + the CF_ORIGIN_* / CF_AOP_CA_* repo secrets;"
-  printf '%s\n' "# re-dispatch mode=apply to converge. Future tenant domains get their own"
-  printf '%s\n' "# explicit site blocks here — NEVER on_demand TLS."
-  printf '%s\n' ""
-  printf '%s\n' "{"
-  printf '%s\n' "	# Loopback admin: \`docker exec caddy caddy reload\` keeps working;"
-  printf '%s\n' "	# admin.disabled:true would refuse the reload, and publishing :2019"
-  printf '%s\n' "	# would expose control — loopback is neither."
-  printf '%s\n' "	admin 127.0.0.1:2019"
-  printf '%s\n' "	servers {"
-  printf '%s\n' "		# Real client IP behind the orange cloud. CF-Connecting-IP only —"
-  printf '%s\n' "		# never X-Forwarded-For (spoofable through the edge)."
-  printf '%s\n' "		trusted_proxies static ${CF_EDGE_CIDRS}"
-  printf '%s\n' "		client_ip_headers CF-Connecting-IP"
-  printf '%s\n' "	}"
-  printf '%s\n' "}"
-  printf '%s\n' ""
-  printf '%s\n' "# Tang front (:80, plain HTTP, NO redirect): ONLY /adv*|/rec* reach"
-  printf '%s\n' "# tangd. ACME HTTP-01 answers here (zone-side cache bypass + no WAF"
-  printf '%s\n' "# block on that path are operator steps, see docs/dr.md). The status"
-  printf '%s\n' "# host on :80 proxies the dashboard plain (no redirect by design);"
-  printf '%s\n' "# TLS lives on :443 below. Everything else aborts."
-  printf '%s\n' ":80 {"
-  printf '%s\n' "	log_skip"
-  printf '%s\n' "	header -Server"
-  printf '%s\n' "	handle /.well-known/acme-challenge/* {"
-  printf '%s\n' "		root * ${CADDY_CHALLENGE_DIR}"
-  printf '%s\n' "		file_server"
-  printf '%s\n' "	}"
-  printf '%s\n' "	handle /adv* {"
-  printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
-  printf '%s\n' "	}"
-  printf '%s\n' "	handle /rec* {"
-  printf '%s\n' "		# No in-Caddy rate limit by decision: the pinned official build"
-  printf '%s\n' "		# (caddy:2.11.2-alpine) ships no rate_limit directive — verified via"
-  printf '%s\n' "		# list-modules on the v2.11.2 binary; it lives in a third-party xcaddy"
-  printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
-  printf '%s\n' "		# Flood protection"
-  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
-  printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
-  printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
-  printf '%s\n' "	}"
-  printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
-  printf '%s\n' "	# construction, so handle order cannot misroute)."
-  printf '%s\n' "	@status {"
-  printf '%s\n' "		host ${STATUS_MATCH}"
-  printf '%s\n' "		not path /adv* /rec* /.well-known/acme-challenge/*"
-  printf '%s\n' "	}"
-  printf '%s\n' "	handle @status {"
-  printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
-  printf '%s\n' "	}"
-  printf '%s\n' "	handle {"
-  printf '%s\n' "		abort"
-  printf '%s\n' "	}"
-  printf '%s\n' "}"
-  if [ -n "${STATUS_HOST:-}" ]; then
-    printf '%s\n' ""
-    printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
-    printf '%s\n' "https://${STATUS_HOST} {"
-    printf '%s\n' "	header -Server"
-    printf '%s\n' "${DASH_TLS_STANZA}"
-    printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
-    printf '%s\n' "	@dashtang path /adv* /rec*"
-    printf '%s\n' "	handle @dashtang {"
-    printf '%s\n' "		abort"
-    printf '%s\n' "	}"
-    printf '%s\n' "	handle {"
-    printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
-    printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (queued: issue #56)."
-    printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
-    printf '%s\n' "	}"
-    printf '%s\n' "}"
-  else
-    printf '%s\n' ""
-    printf '%s\n' "# No TENANT_USER: :443 dashboard block skipped (re-dispatch converges it)."
-  fi
-} >"$TMP_CADDY"
+render_caddyfile >"$TMP_CADDY"
 CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
   log "Caddyfile unchanged"

@@ -105,6 +105,8 @@ remove `/etc/systemd/system/tangd.socket.d/listen.conf`, `systemctl daemon-reloa
 answers `:80` again; then re-dispatch `mode=apply` to re-pin the firewall to
 the pre-Caddy shape. Dashboard stays down until Caddy returns — tang does not wait for it.
 
+Bind-proof in CI (the keyboard problem): `tests/bind-e2e/` fronts a mock tang with the repo's real rendered Caddyfile and runs `clevis luks bind` + `unlock` through it on every PR touching `scripts/`, `main.tf`, workflows, or the harness — the Caddy-in-front path stays bind-proven without the tenant's keyboard.
+
 ## Rescue-chroot runbook (DR only)
 
 Rescue boot is the last resort, not a workflow: the netcup rescue system
