@@ -41,6 +41,10 @@ Collect these as you go — each feeds one repo secret in §2. Where they go (ph
 - **root password** (server-ready email) → `ANCHOR_ROOT_PASSWORD`
 - nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
 
+Create them here: [👉 Repo → Settings → Secrets → New repository secret](../../settings/secrets/actions/new) (one per value above).
+
+Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../actions/workflows/provision.yml) (`mode` preselects `apply`).
+
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
@@ -82,12 +86,12 @@ reviewer identity exists. The approval card shows the exact commit
 UNCHANGED/CHANGED banner). The repo is authoritative for execution; any UI
 is advisory display only.
 
-Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../actions/workflows/provision.yml) (`mode` preselects `apply`).
-
 ## 3. Dispatch and approve (S1)
 
 Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Dispatch takes the mode (plus action flags) — no identifiers: your username already lives in the repo's `TENANT_USER` variable, and everything sensitive
 resolves from repo secrets inside the run.
+
+Only the URL + code (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG`. The short-lived code is deliberately NOT `::add-mask::`-masked (masks silently break the job-handoff outputs); instead it is never printed beyond the card, never stored, dead in 600s, and useless without your own netcup session. The access token stays masked and never crosses jobs.
 
 If your repo has you as a reviewer (power path), GitHub pauses the run first: approve the pending deployment (check the commit matches the banner card), THEN approve the netcup code below. Two taps, in that order — the first approves WHAT runs, the second lets it touch your account. Without a reviewer identity the run proceeds straight to the code, and the LOUD banner is your check.
 
@@ -95,8 +99,7 @@ The run prints a netcup device-flow URL + `XXXX-XXXX` user code (and sends
 them via ntfy). You approve at netcup's own Keycloak (your
 session, your 2FA, ~600s window) — the approval is one tap, phone browsers included. The runner polls, receives an ephemeral
 token, provisions, and the token dies with the runner. Only the URL + code
-(+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG`, device
-secret masked first. The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
+(+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG` (masking note: the access token stays masked; the short-lived code is unmasked-by-design, see above). The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
 STOP + open an issue in your repo so the operator sees it (C-A — no fallback exists, none is permitted).
 
 ## 4. A1 provisions, thumbprint lands via run artifact (H1 chain)
