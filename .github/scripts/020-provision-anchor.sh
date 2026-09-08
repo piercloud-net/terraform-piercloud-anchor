@@ -119,9 +119,13 @@ require_token() {
 # header, responses are error-truncated before printing so a surprising echo
 # can never leak request state into logs).
 # ---------------------------------------------------------------------------
-api_call() { # method path [body] -> prints response body; sets HTTP_STATUS
-  local method="$1" path="$2" body="${3:-}"
-  local resp_file status
+api_call() { # method path [body] [outvar] -> sets HTTP_STATUS; body to stdout or $outvar
+  # Subshell warning: callers MUST NOT use resp="$(api_call ...)" — command
+  # substitution forks, and HTTP_STATUS set inside would die with it (live
+  # failure 2026-09-08: every call site read an unbound HTTP_STATUS). Pass
+  # the response-variable name instead; printf -v fills it in THIS shell.
+  local method="$1" path="$2" body="${3:-}" outvar="${4:-}"
+  local resp_file status content
   resp_file="$(mktemp)"
   if [ -n "$body" ]; then
     status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
@@ -136,8 +140,13 @@ api_call() { # method path [body] -> prints response body; sets HTTP_STATUS
       -H 'Accept: application/json')"
   fi
   HTTP_STATUS="$status"
-  cat "$resp_file"
+  content="$(cat "$resp_file")" # same trailing-newline strip as $(...) capture — callers already live with it
   rm -f "$resp_file"
+  if [ -n "$outvar" ]; then
+    printf -v "$outvar" '%s' "$content"
+  else
+    printf '%s' "$content"
+  fi
 }
 
 api_ok() { # $1 = status; 2xx (+404-as-gone when $2=gone-ok)
@@ -152,7 +161,7 @@ policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
 
 list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only)
   local resp
-  resp="$(api_call GET "$(policies_path)")"
+  api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
   printf '%s' "$resp" | jq -c \
     'if type == "array" then .
@@ -205,7 +214,7 @@ resolve_mac() {
     printf '%s' "$INTERFACE_MAC"
     return 0
   fi
-  resp="$(api_call GET "/api/v1/servers/${SERVER_ID}/interfaces")"
+  api_call GET "/api/v1/servers/${SERVER_ID}/interfaces" "" resp
   api_ok "$HTTP_STATUS" || die "list server interfaces failed (HTTP $HTTP_STATUS)"
   mac="$(printf '%s' "$resp" | jq -r \
     'if type == "array" then .[0]
@@ -220,7 +229,7 @@ resolve_mac() {
 
 iface_fw_get() { # $1 = mac -> raw interface-firewall JSON
   local resp
-  resp="$(api_call GET "/api/v1/servers/${SERVER_ID}/interfaces/$1/firewall")"
+  api_call GET "/api/v1/servers/${SERVER_ID}/interfaces/$1/firewall" "" resp
   api_ok "$HTTP_STATUS" || die "read interface firewall failed (HTTP $HTTP_STATUS)"
   printf '%s' "$resp"
 }
@@ -232,7 +241,7 @@ iface_fw_put() { # $1 = mac, $2 = user-policy id JSON array -> PUT merged save b
   copied="$(printf '%s' "$current" | jq -c '[.copiedPolicies // [] | .[] | {id: (.id // .)}]')"
   body="$(jq -n -c --argjson u "$ids_json" --argjson c "$copied" --argjson a "$active" \
     '{active: $a, copiedPolicies: $c, userPolicies: ($u | map({id: .}))}')"
-  resp="$(api_call PUT "/api/v1/servers/${SERVER_ID}/interfaces/${mac}/firewall" "$body")"
+  api_call PUT "/api/v1/servers/${SERVER_ID}/interfaces/${mac}/firewall" "$body" resp
   if ! api_ok "$HTTP_STATUS"; then
     die "save interface firewall failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
   fi
@@ -270,7 +279,7 @@ detach_policy() { # $1 = policy id (absent = success no-op)
 
 delete_policy() { # $1 = policy id (404 = already gone, success)
   local id="$1" resp
-  resp="$(api_call DELETE "$(policies_path)/${id}")"
+  api_call DELETE "$(policies_path)/${id}" "" resp
   if ! api_ok "$HTTP_STATUS" "gone-ok"; then
     die "delete policy $id failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
   fi
@@ -342,7 +351,7 @@ cmd_open() {
     desc="created_at=${created_at} purpose=A1-ssh"
     body="$(jq -n -c --arg n "$OWN_NAME" --arg d "$desc" --arg s "${ip}/32" \
       '{name: $n, description: $d, rules: [{action: "ACCEPT", direction: "INGRESS", protocol: "TCP", destination_ports: "22", sources: [$s]}]}')"
-    resp="$(api_call POST "$(policies_path)" "$body")"
+    api_call POST "$(policies_path)" "$body" resp
     if ! api_ok "$HTTP_STATUS"; then
       die "create tmp policy failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
     fi
