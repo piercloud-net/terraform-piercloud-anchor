@@ -156,20 +156,20 @@ cmp "${WORK}/direct.payload" "${WORK}/via.payload" || die "Caddy altered /adv co
 log "PASS: /adv payload identical direct vs through Caddy"
 jose fmt --json="$(cat "${WORK}/via-caddy.json")" -Og payload -SyOg keys -AUo- | jose jwk use -i- -r -u verify -o- > "${WORK}/sigkey.json"
 jose jws ver -i "${WORK}/via-caddy.json" -k "${WORK}/sigkey.json" >/dev/null || die "proxied /adv signature does not verify"
-log "PASS: proxied /adv signature verifies (envelope byte-exact)"
+log "PASS: proxied envelope signature verifies (proxy transparent for this response)"
 # Regression guard: the prodshape render above runs in a subshell precisely
 # so this still names the CI tenant (a clobbered name aborts here, by design).
 [ "${STATUS_HOST}" = "status.citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
 STUB_GOT="$(curl -sf -H "Host: ${STATUS_HOST}" "http://127.0.0.1:${CADDY_PORT}/api/v1/endpoints/statuses")" || die "status-host request failed"
 [ "${STUB_GOT}" = "gatus-stub-ok" ] || die "status-host routing broken (got: ${STUB_GOT})"
 log "PASS: exact-Host dashboard routing reaches the stub"
-if curl -sf -H "Host: evil.invalid" "http://127.0.0.1:${CADDY_PORT}/" -o /dev/null 2>/dev/null; then
-  die "Caddy answered an unknown Host — deputy not closed"
-fi
+rc=0
+curl -s -H "Host: evil.invalid" "http://127.0.0.1:${CADDY_PORT}/" -o /dev/null 2>/dev/null || rc=$?
+[ "${rc}" = "52" ] || die "unknown Host: want curl 52 (abort/empty-reply), got ${rc}"
 log "PASS: unknown Host aborted (deputy-closed in miniature)"
-if curl -sf "http://127.0.0.1:${CADDY_PORT}/" -o /dev/null 2>/dev/null; then
-  die "Caddy answered / on the bare address — catch-all abort broken"
-fi
+rc=0
+curl -s "http://127.0.0.1:${CADDY_PORT}/" -o /dev/null 2>/dev/null || rc=$?
+[ "${rc}" = "52" ] || die "bare /: want curl 52 (abort/empty-reply), got ${rc}"
 log "PASS: catch-all abort on /"
 
 # ---------------------------------------------------------------- 6. volumes
@@ -210,6 +210,7 @@ if clevis luks bind -f -d "${DEV2}" -k "${WORK}/passphrase" tang "{\"url\":\"htt
   die "bind with a wrong thumbprint SUCCEEDED — pin check broken"
 fi
 log "PASS: tampered thumbprint refused"
+grep -qiE 'thumbprint|thp|advertisement|trust|verify|adv' "${WORK}/neg.err" || { cat "${WORK}/neg.err"; die "wrong-thp refusal message unrecognized (pin check may have moved)"; }
 if clevis luks list -d "${DEV2}" 2>/dev/null | grep "tang.*${CADDY_PORT}" >/dev/null; then
   die "refused bind left a tang token behind"
 fi

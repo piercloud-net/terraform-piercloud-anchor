@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """mock-tang.py — minimal Tang server for the CI bind-proof harness.
 
-Serves the two Tang endpoints clevis actually exercises, with REAL
-McCallum-Relyea recovery math (X25519), so `clevis luks bind` +
+Serves the two Tang endpoints clevis actually exercises, with real
+McCallum-Relyea recovery math (P-521), so `clevis luks bind` +
 `clevis luks unlock` / `clevis decrypt` succeed end-to-end:
 
   GET  /adv        JWS-signed advertisement (flattened serialization)

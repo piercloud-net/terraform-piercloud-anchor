@@ -9,9 +9,10 @@ then real `clevis luks bind` / `list` / `encrypt`+`decrypt` / `unlock -n`
 against loopback LUKS volumes, all through the proxy.
 
 Proves: the shipped render still parses (`caddy validate`, CI shape +
-shipped shape); the proxy preserves `/adv` content byte-exact (payload
-compare + proxied-envelope signature verify — raw compare is impossible,
-fresh ECDSA nonce per adv, same as real tangd); exact-Host dashboard
+shipped shape); `/adv` through the proxy is payload-identical and the
+proxied envelope signature verifies (proxy transparent for this
+response) — raw compare is impossible, fresh ECDSA nonce per adv,
+same as real tangd; exact-Host dashboard
 routing; unknown-Host and bare-`/` abort; full bind→unlock through Caddy;
 wrong-thumbprint bind refusal with no token left behind.
 

@@ -541,7 +541,7 @@ jobs:
             if [ -z "$changed" ]; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
               echo "::warning::bind-e2e could not list changed files — running unconditionally"
-            elif printf '%s' "$changed" | grep -qE '^(scripts/|main\.tf|\.github/workflows/|tests/bind-e2e/)'; then
+            elif printf '%s' "$changed" | grep -qE '^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$'; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
