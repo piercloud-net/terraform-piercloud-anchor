@@ -265,6 +265,9 @@ if [ "${GATUS_RESTART:-0}" = "1" ]; then
 fi
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
 # run log (the tenant has no shell — this output IS their dashboard check).
+# Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
+# GET /v1/endpoints/statuses); unprotected here because our config ships no
+# security: section (nil Security = middleware never applied).
 ok=0
 for i in 1 2 3 4 5 6; do
   if curl -sf -o /tmp/gatus-status.json "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then head -c 2000 /tmp/gatus-status.json; echo; ok=1; break; fi
