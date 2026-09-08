@@ -37,14 +37,15 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
 - **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — the ONE required secret (provider credential only; the SCP user id resolves itself from your approval token — override via `SCP_USER_ID` repo secret only if yours differs)
-- **anchor IPv4** → `ANCHOR_IPV4` — only when discovery needs help (several servers in the account and none named `anchor-<you>-01`): paste the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it). Otherwise skip it — the run discovers the server itself (exactly-one wins, else exact hostname match), and resolves `server_id` from that, so no numeric id to copy anywhere
-- nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
+- nothing else to enter: your username, hostname, anchor IP, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
 
 Create them here: [👉 Repo → Settings → Secrets → New repository secret](../../../settings/secrets/actions/new) (one per value above).
 
 Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../../actions/workflows/provision.yml) (`mode` preselects `apply`).
 
 Legacy fallback only — leave `ANCHOR_ROOT_PASSWORD` unset and skip this paragraph: dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so a pasted password must live in a write-only, log-masked repo secret, never an input. (Prefer leaving it unset entirely — the passwordless path above needs no emailed password at all.)
+
+Discovery fallback only — leave `ANCHOR_IPV4` unset unless the run tells you otherwise: the run discovers the server itself (exactly-one wins, else exact hostname match on `anchor-<you>-01`) and resolves `server_id` from that, so no numeric id to copy anywhere. Only when discovery needs help (several servers in the account and none named `anchor-<you>-01`) paste the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it).
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
 a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
