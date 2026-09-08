@@ -65,7 +65,7 @@ gh secret set NTFY_TOPIC
 gh secret set NTFY_TOKEN              # publish-scoped
 ```
 
-On phone/web instead of CLI: open the repo → `…` (top right) → Settings → Secrets and variables → Actions. Secrets go under the **Secrets** tab → Repository secrets; keys go under the **Variables** tab → Repository variables (switch tabs, scroll down). Always repository level — never Environment secrets/variables (the workflow doesn't use Environments).
+On phone/web instead of CLI: open the repo → `…` (top right) → Settings → Secrets and variables → Actions. Secrets go under the **Secrets** tab → Repository secrets; keys go under the **Variables** tab → Repository variables (switch tabs, scroll down). Always repository level for values — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
 No discovery-URL setup: the Keycloak doc address is baked into the workflow (public constant, same realm for everyone).
 
