@@ -96,6 +96,12 @@ resource "netcup_scp_server_interface_firewall" "anchor" {
   active    = true
 
   user_policy_ids = [netcup_scp_user_firewall_policy.tang[0].id]
+
+  # Live 2026-09-08: the server resource's hostname PUT is async (server
+  # lock ~minutes); the parallel interface PUT 409'd with
+  # `server.lock.error`. Serialize: wait for the server update to settle
+  # before touching its interface.
+  depends_on = [netcup_scp_server.anchor]
 }
 
 locals {
