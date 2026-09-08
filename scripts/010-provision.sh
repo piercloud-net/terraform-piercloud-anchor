@@ -239,6 +239,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# c2) Docker runtime (idempotent; distro package, no third-party script)
+# ---------------------------------------------------------------------------
+if ! command -v docker >/dev/null 2>&1; then
+  log "Installing Docker (docker.io distro package)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y -qq docker.io >/dev/null
+fi
+systemctl enable --now docker >/dev/null 2>&1 || true
+# The runner-facing `docker` CLI is the daemon on the same box (root) — the
+# provision runs as root over the A1 window, so no sudo/group gymnastics.
+
+# ---------------------------------------------------------------------------
 # d) Run Gatus (container recreated when the pinned image changed - so an # ci-allowlist: prose — container-tag wording, not a live reference.
 #    auto-bumped pin actually REACHES deployed anchors on script re-run;
 #    config and the sqlite history volume survive the recreation)
