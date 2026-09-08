@@ -32,7 +32,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 Collect these as you go — each feeds one repo secret in §2:
 
-- **username** you sign up with (e.g. `pier`) → set once as the `TENANT_USER` repo variable; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
+- **username** you sign up with (e.g. `pier`) → the operator pins it as the repo's `TENANT_USER`; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
@@ -54,7 +54,6 @@ history):
 
 ```bash
 # variables (visible)
-gh variable set TENANT_USER --body "pier"
 gh variable set A1_SSH_PUBKEY_1 --body "$(cat ~/.ssh/id_ed25519.pub)"  # admin keys (mandate: 2)
 gh variable set A1_SSH_PUBKEY_2 --body "$(cat ~/.ssh/id_ed25519-second.pub)"
 # secrets (write-only)
@@ -65,6 +64,8 @@ gh secret set A1_ROOT_PASSWORD        # one-run — delete after use
 gh secret set NTFY_TOPIC
 gh secret set NTFY_TOKEN              # publish-scoped
 ```
+
+On phone/web instead of CLI: open the repo → `…` (top right) → Settings → Secrets and variables → Actions. Secrets go under the **Secrets** tab → Repository secrets; keys go under the **Variables** tab → Repository variables (switch tabs, scroll down). Always repository level — never Environment secrets/variables (the workflow doesn't use Environments).
 
 No discovery-URL setup: the Keycloak doc address is baked into the workflow (public constant, same realm for everyone).
 
@@ -82,7 +83,7 @@ gh variable set TENANT_USER --body "pier"  # tenant username: hostname, DNS, art
 # gh secret set NETCUP_SCP_USER_ID
 ```
 
-Self-serve template users set `TENANT_USER` themselves (typo guard); operator-provisioned tenants get it pinned at handover. Slice moves use `mode=update-ip` (ADD-before-move, §7) — the operator requests, the OWNER executes.
+Slice moves use `mode=update-ip` (ADD-before-move, §7) — the operator requests, the OWNER executes.
 
 Visibility rule (C-E): identifiers in secrets always; public default once
 secrets land (values stay invisible to forks); env gate wherever a tenant
