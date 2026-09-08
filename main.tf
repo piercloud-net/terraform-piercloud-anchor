@@ -38,7 +38,10 @@ resource "netcup_scp_server" "anchor" {
   server_id       = local.resolved_server_id
   hostname        = var.hostname
   os_optimization = "LINUX"
-  autostart       = true
+  # No autostart here by design (live 2026-09-08): the provider PUTs all
+  # fields on any update and the API 400s `server.autostart.alreadyactive`
+  # when it is already on — which is the netcup default for new servers.
+  # Keep it as-ordered; confirm once in SCP → server → autostart.
 }
 
 # Account-level firewall policy: tang (TCP/80) is reachable only from the
