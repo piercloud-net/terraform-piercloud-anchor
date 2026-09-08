@@ -142,6 +142,7 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   OLD_IFS="$IFS"; IFS=","
   # shellcheck disable=SC2086
   for pair in ${GATUS_ENDPOINTS}; do
+    [ -z "$pair" ] && continue  # tolerate ,, / trailing comma (commas are illegal inside URLs — split there)
     name="$(printf '%s' "$pair" | cut -d= -f1 | tr -d '[:space:]')"
     url="$(printf '%s' "$pair" | cut -d= -f2- | tr -d '[:space:]')"
     case "$name" in ''|*[!a-zA-Z0-9_-]*) die "bad GATUS_ENDPOINTS pair (want name=url, name chars [a-zA-Z0-9_-]): $pair";; esac
@@ -163,6 +164,9 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   set +f
 fi
 if [ -n "${NTFY_TOPIC:-}" ]; then
+  # Fail fast on YAML injection: topic/token interpolate into config-as-data.
+  case "$NTFY_TOPIC" in ''|*[!a-zA-Z0-9_-]*) die "bad NTFY_TOPIC (chars [a-zA-Z0-9_-] only): ${NTFY_TOPIC}";; esac
+  case "$NTFY_TOKEN" in *[[:space:]]*|*[![:print:]]*) die "bad NTFY_TOKEN (no whitespace/control characters)";; esac
   ALERTING_YAML="  ntfy:
     url: https://ntfy.sh
     topic: ${NTFY_TOPIC}"
@@ -245,7 +249,7 @@ fi
 # run log (the tenant has no shell — this output IS their dashboard check).
 ok=0
 for i in 1 2 3 4 5 6; do
-  if curl -sf "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses" | head -c 2000; then echo; ok=1; break; fi
+  if curl -sf -o /tmp/gatus-status.json "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then head -c 2000 /tmp/gatus-status.json; echo; ok=1; break; fi
   sleep 10
 done
 if [ "$ok" != "1" ]; then

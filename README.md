@@ -45,7 +45,7 @@ Then **the dispatched run** ([`provision.yml`](.github/workflows/provision.yml)
 `mode=apply` → device-flow approval) opens its own /32
 window and provisions the anchor: installs `tang`, prints its
 **thumbprint**, and installs Docker + the **Gatus** availability
-monitor — config-as-file, no admin account, no UI bootstrap. The script
+monitor — dispatch-managed config, no admin account, no UI bootstrap. The script
 generates the tang keypair **on the box**; nothing it prints is secret
 except the thumbprint you choose to save.
 
