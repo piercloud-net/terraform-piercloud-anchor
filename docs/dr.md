@@ -77,7 +77,9 @@ Caddy (`caddy:2.11.2-alpine`, pinned + Renovate-watched) owns `:80`;
 (`127.0.0.1:8080`, Caddy proxies the status host to it). The Caddyfile is
 dispatch-managed (same render pattern as the Gatus config): `handle /adv* +
 /rec*` → `127.0.0.1:8081` plain, NO redirect; `/.well-known/acme-challenge/*`
-→ HTTP-01; `Host status.*` → `127.0.0.1:8080`; explicit per-tenant site
+→ HTTP-01; the exact status hostname (`host status.<tenant>.piercloud.net`,
+rendered from TENANT_USER — `status.invalid` sentinel on hand runs) →
+`127.0.0.1:8080`; explicit per-tenant site
 blocks, NEVER `on_demand` TLS; catch-all aborts. Tang paths are never served
 on the `:443` dashboard vhost (they abort there). Caddy runs with host
 networking (its `127.0.0.1` dials reach tangd/Gatus on the host loopback;
