@@ -49,9 +49,12 @@ monitor — config-as-file, no admin account, no UI bootstrap. The script
 generates the tang keypair **on the box**; nothing it prints is secret
 except the thumbprint you choose to save.
 
-The module provisions **no SSH access** — inbound or outbound. You administer
-the anchor from the netcup SCP remote console, or by adding your own SSH key
-via netcup SCP at order time.
+The module provisions **no SSH access and no standing credentials** — inbound
+or outbound. Nobody logs into the anchor: every change arrives through a
+per-run approved dispatch (the runner is the admin path). Re-entry after the
+root lock is per-event (reset the root password in SCP → set the one-run
+secret → re-dispatch); rescue mode stays the last resort (it disables the
+netcup firewall — any rescue boot → rotate tang keys afterwards).
 
 ## The flow, for a first-time user
 
@@ -68,8 +71,8 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    DNS, and the slice IP come pre-configured — nothing to pick.
    *(details: [walkthrough §1](docs/usage.md#1-order-the-anchor-piko-class-vps))*
 2. **Repo from template + repo values** — "Use this template", then set
-   repo variables (SSH keys) + repo secrets (customer number,
-   anchor IP, one-run root password, optional ntfy). No stored netcup API
+   repo secrets (customer number,
+   anchor IP, one-run root password, monitor targets, optional ntfy). No stored netcup API
    tokens of any kind (S1): every run authenticates via your per-run
    approval — the one exception is the one-run A1 root password (write-only
    secret, killed by `passwd -l root`, deleted after use). The main-box IP,
@@ -90,25 +93,14 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    manager NOW**, then finish the
    [day-1 checklist](docs/dr.md#day-1-off-device-checklist).
    *(details: [walkthrough §4](docs/usage.md#4-a1-provisions-thumbprint-lands-three-ways-h1-chain))*
-5. **Configure the monitor (optional, after the bind)** — log in on the
-   netcup SCP remote console as root and edit one file,
-   `/etc/gatus/config.yaml`. Minimal working push alerting (create the topic
-   name in the [ntfy app](https://ntfy.sh) first — any random name is yours):
-   ```yaml
-   alerting:
-     ntfy:
-       url: https://ntfy.sh
-       topic: my-anchor-alerts
-   endpoints:
-     - name: main https
-       url: https://my-main-server.example.com
-       interval: 60s
-       conditions: ["[STATUS] == 200"]
-       alerts: [{type: ntfy, failure-threshold: 3}]
-   ```
-   then `docker restart gatus`. Probe your main server's services **by DNS
-   name** so the monitor follows migrations automatically. Ntfy / Telegram /
-   SMTP alternatives are documented in the file's own comments.
+5. **Configure the monitor (optional, after the bind)** — no login, no file
+   edit: set the `GATUS_ENDPOINTS` repo secret to comma-separated `name=url`
+   pairs (`main=https://my-main-server.example.com` — create any random topic
+   name in the [ntfy app](https://ntfy.sh) first for push alerts via the
+   `NTFY_TOPIC` secret), then re-dispatch `mode=apply`. The run re-renders
+   `/etc/gatus/config.yaml`, restarts Gatus, and prints the endpoint statuses
+   into the run log — that output IS your dashboard check. Probe **by DNS
+   name** so the monitor follows migrations automatically.
 6. **Bind your main box** — install `clevis clevis-luks clevis-initramfs`,
    run the printed `clevis luks bind` command against the DNS name
    (`anchor-<alias>-01.piercloud.net`, e.g. `anchor-pier-01.piercloud.net`), confirming the thumbprint matches
@@ -126,7 +118,7 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
 # 0. Order a small netcup VPS ("piko" class is plenty) in the netcup shop, install any
 #    Debian-family OS, note the anchor IP. Anchor IPv4 required.
 # 1. "Use this template" on GitHub, set the repo values
-#    (customer number, anchor IP for dispatch-time check, SSH keys, one-run root password) — no netcup tokens stored.
+#    (customer number, anchor IP for dispatch-time check, monitor targets, one-run root password) — no netcup tokens stored.
 # 2. Dispatch the provision.yml workflow (Actions tab, mode=apply)
 #    from any browser (no identifiers to enter), and approve the device-flow
 #    code at netcup's Keycloak.
@@ -157,12 +149,14 @@ the `clevis luks bind` on your main box and the reboot test):
 3. **Keep the passphrase keyslot.** The tang anchor is convenience and
    availability; the passphrase is the true root. If the anchor dies, you
    unlock with the passphrase.
-4. **Watch your server from the anchor.** The script installs Gatus on the
+4. **Watch your server from the anchor.** The run installs Gatus on the
    anchor — an independent, always-on vantage point *outside* your main box.
-   Probe your main server's services **by DNS name** (Gatus never caches DNS,
+   Monitors are dispatch-managed: edit the `GATUS_ENDPOINTS` repo secret,
+   re-dispatch `mode=apply`, read the statuses in the run log. Probe your
+   main server's services **by DNS name** (Gatus never caches DNS,
    so when you migrate and flip the record, the monitor follows automatically
    and the availability history stays continuous across the cutover), and
-   configure an alerting channel (ntfy / Telegram / SMTP) so failures are
+   set the `NTFY_TOPIC` secret so failures are
    **pushed** to you, not waiting on a dashboard.
 5. **Understand the anchor**: it is an unencrypted, always-on box whose only
    job is holding an unlock key and answering clevis challenges. It holds

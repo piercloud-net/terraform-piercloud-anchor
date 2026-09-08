@@ -39,7 +39,7 @@ Collect these as you go — each feeds one repo value in §2 (secret or variable
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (a repo secret, only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address" — paste verbatim, `203.0.113.10/22`-style suffix included; the run strips it) → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
-- **SSH admin keys** (NOT the "SSH key fingerprints" in the email — those are the *server's* host keys, for verifying first contact only. Your admin keys = two keypairs YOU own, phone + backup: generate with any `ssh-keygen` — laptop, Termux on Android, Blink/ShellFish on iOS — or a password manager that generates SSH keys; paste the two `.pub` halves) → `A1_SSH_PUBKEY_1/2` repo *variables* (public material, no secret semantics)
+- **monitor targets** (your main server's services, by DNS name — comma-separated `name=url`, e.g. `main=https://example.com,blog=https://blog.example.com`; HTTP(S) only) → `GATUS_ENDPOINTS` repo *secret* (your service map stays write-only)
 - nothing else to enter: your username, hostname, and DNS are pre-set in the repo — dispatch takes no identifiers
 
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
@@ -52,18 +52,15 @@ a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 "Use this template" → your repo. **No stored netcup API tokens of any kind
 (S1)** — every run authenticates via your per-run approval below (the one-run A1 root password is the single exception: write-only, locked out + deleted after use). What
 lives in the repo are identifiers only (anchor IP, customer
-number): values are write-only and log-masked. Public values (username,
-SSH keys) live in repo *variables* instead — visible, no secret semantics.
-Set once (variables take `--body`, secrets prompt so nothing touches shell
+number) plus your monitor targets: values are write-only and log-masked.
+Your username lives in the pre-set `TENANT_USER` variable — nothing to enter.
+Set once via the taps above, or CLI (secrets prompt so nothing touches shell
 history). Laptop/CLI path (power users) — phone users can skip this block, it sets the same values as the taps above:
 
 <details>
 <summary>CLI equivalents</summary>
 
 ```bash
-# variables (visible)
-gh variable set A1_SSH_PUBKEY_1 --body "$(cat ~/.ssh/id_ed25519.pub)"  # admin keys (mandate: 2)
-gh variable set A1_SSH_PUBKEY_2 --body "$(cat ~/.ssh/id_ed25519-second.pub)"
 # secrets (write-only)
 gh secret set NETCUP_CUSTOMER_NUMBER  # username on both account emails
 gh secret set NETCUP_ANCHOR_IPV4      # piko IP ("IP address" in server email)
@@ -71,6 +68,8 @@ gh secret set A1_ROOT_PASSWORD        # one-run — delete after use
 # optional push channel (empty = verdict stays in the run summary)
 gh secret set NTFY_TOPIC
 gh secret set NTFY_TOKEN              # publish-scoped
+# monitor targets, comma-separated name=url (HTTP(S) only)
+gh secret set GATUS_ENDPOINTS         # e.g. main=https://example.com
 ```
 
 </details>
@@ -102,7 +101,7 @@ STOP + open an issue in your repo so the operator sees it (C-A — no fallback e
 ## 4. A1 provisions, thumbprint lands via run artifact (H1 chain)
 
 The run opens the hardened A1 self-open /32 SSH window, provisions the
-anchor (mandate: 2 SSH keys at A1; the script ends with `passwd -l root`;
+anchor (no standing SSH keys by design: the script ends with `passwd -l root`;
 console-recovery note: rescue disables the netcup firewall — any rescue
 boot → rotate tang keys afterwards), then closes the window
 (detach-then-delete, swept pre + `always()` post, all modes). Key rotation:

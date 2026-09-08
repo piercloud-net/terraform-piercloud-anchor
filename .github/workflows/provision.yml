@@ -415,8 +415,9 @@ jobs:
           # Secrets used here (repo secrets, never committed):
           # NETCUP_MAIN_BOX_IPV4, NETCUP_ANCHOR_IPV4,
           # A1_ROOT_PASSWORD (masked one-run input, dead after root lock).
-          # Public inputs arrive as repo VARIABLES: A1_SSH_PUBKEY_1/2
-          # (mandated 2 keys at A1), TENANT_USER (hostname/DNS derivation).
+          # Public inputs arrive as repo VARIABLES: TENANT_USER (hostname/DNS
+          # derivation). Monitor targets + push arrive as repo SECRETS:
+          # GATUS_ENDPOINTS (comma-separated name=url), NTFY_TOPIC/NTFY_TOKEN.
           # (NETCUP_SERVER_ID retired: the resolve step derives server_id
           # at runtime from NETCUP_ANCHOR_IPV4 — nothing numeric to copy.)
           tofu plan -input=false -out=tfplan
@@ -463,8 +464,9 @@ jobs:
           ANCHOR_HOST: ${{ secrets.NETCUP_ANCHOR_IPV4 }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
           ROOT_PASSWORD: ${{ secrets.A1_ROOT_PASSWORD }}
-          A1_SSH_PUBKEY_1: ${{ vars.A1_SSH_PUBKEY_1 }}
-          A1_SSH_PUBKEY_2: ${{ vars.A1_SSH_PUBKEY_2 }}
+          GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail

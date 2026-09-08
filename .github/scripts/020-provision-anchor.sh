@@ -43,7 +43,12 @@
 #                            auto-mask); referenced here ONLY as
 #                            the sshpass environment value — never echoed,
 #                            never logged, never written to disk. # ci-allowlist: prose — on-box credential-hygiene note, not a live storage reference.
-#   A1_SSH_PUBKEY_1/2        the mandated 2 SSH keys installed at A1.
+#   GATUS_ENDPOINTS          comma-separated name=url pairs (http(s), v1) for the
+#                            dispatch-managed monitor config (repo secret — tenant
+#                            service map stays write-only). NTFY_TOPIC/NTFY_TOKEN
+#                            arrive the same way (empty = checks without push).
+#   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
+#    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)
 #   THUMBPRINT_FILE          artifact path for the captured tang thumbprint
 #                            (default ./thumbprint.txt; the value is public).
 #   PINNED_IP                runner IP pinned at open; provision re-fetches
@@ -358,9 +363,12 @@ cmd_open() {
 # provision: re-fetch + pin check -> plain ssh -> thumbprint -> lock root.
 # ---------------------------------------------------------------------------
 ssh_base() {
+  # "$@" is load-bearing: without it every remote command is silently
+  # ignored (the runner would "succeed" while installing, capturing, and
+  # locking nothing). Stdin still flows to the remote command (bash -s).
   sshpass -e ssh -p "${ANCHOR_SSH_PORT:-22}" \
     -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
-    -o BatchMode=no "root@${ANCHOR_HOST}"
+    -o BatchMode=no "root@${ANCHOR_HOST}" "$@"
 }
 
 cmd_provision() {
@@ -370,8 +378,8 @@ cmd_provision() {
   ANCHOR_HOST="${ANCHOR_HOST%%/*}"  # email prints 203.0.113.10/22-style — strip any /suffix
   case "$ANCHOR_HOST" in ''|*[!0-9.]*) die "ANCHOR_HOST is not a bare IPv4 after stripping any /suffix";; esac
   [ -n "${ROOT_PASSWORD:-}" ] || die "ROOT_PASSWORD (masked one-run input) is required for provision"
-  [ -n "${A1_SSH_PUBKEY_1:-}" ] || die "A1_SSH_PUBKEY_1 is required (mandate: 2 SSH keys at A1)"
-  [ -n "${A1_SSH_PUBKEY_2:-}" ] || die "A1_SSH_PUBKEY_2 is required (mandate: 2 SSH keys at A1)"
+  # No standing SSH keys (see header): password dies at root lock, re-entry is
+  # per-event via SCP password-reset + re-dispatch — no credential stands anywhere.
   local fresh thumb out
   out="${THUMBPRINT_FILE:-./thumbprint.txt}"
   if [ -n "${PINNED_IP:-}" ]; then
@@ -390,19 +398,18 @@ cmd_provision() {
   log "anchor host key (first-install TOFU — pin this fingerprint out-of-band):"
   ssh-keyscan -p "${ANCHOR_SSH_PORT:-22}" "$ANCHOR_HOST" 2>/dev/null | ssh-keygen -lf - || true
   export SSHPASS="$ROOT_PASSWORD"
-  log "installing 2 operator SSH keys (idempotent append)"
-  {
-    printf '%s\n' "$A1_SSH_PUBKEY_1"
-    printf '%s\n' "$A1_SSH_PUBKEY_2"
-  } | ssh_base 'umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; while IFS= read -r k; do [ -n "$k" ] && grep -qxF -- "$k" ~/.ssh/authorized_keys || printf "%s\n" "$k" >> ~/.ssh/authorized_keys; done; echo keys-ok'
   log "running on-box provision (plain ssh, no ansible)"
+  # Monitor config rides in as env (single-quote escaped): the tenant converges
+  # monitors from a phone via repo secret + re-dispatch — no key, no console.
+  q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
+  ENV_PREFIX="export GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")';"
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi
   if [ "$ROTATE" -eq 1 ]; then
-    ssh_base 'bash -s -- --rotate' <scripts/010-provision.sh
+    { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s -- --rotate'
   else
-    ssh_base 'bash -s' <scripts/010-provision.sh
+    { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s'
   fi
   log "capturing tang thumbprint to the artifact path"
   thumb="$(ssh_base 'command -v tang-show-keys >/dev/null && tang-show-keys 80 || jose jwk thp -a S256 -r -f /var/db/tang/*.jwk' | head -n 1 | tr -d '[:space:]')"

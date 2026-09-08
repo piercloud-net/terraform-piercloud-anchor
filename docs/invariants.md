@@ -26,9 +26,10 @@ the on-box key material).
 > SSH keys, no Teleport tokens, no API tokens, no agent sockets. Its only
 > cross-box interaction is answering clevis's TCP/80 challenges (firewall-
 > scoped to the main box IP; no SSH inbound from the main box either). Admin
-> of the anchor itself is **user-direct only** (their own SSH key from their
-> own device, or netcup console/rescue). *You administer the anchor; the
-> anchor administers nothing.*
+> of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
+> per-event via SCP password-reset + re-dispatch; netcup console/rescue as
+> last resort). No standing SSH keys exist anywhere. *You administer the anchor;
+> the anchor administers nothing.*
 
 **Rationale.** The anchor is the deliberately weakest link: unencrypted,
 always-on, holds an unlock key, different jurisdiction, cheapest box. If it
