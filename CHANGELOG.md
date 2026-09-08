@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - Open the A1 window after steady-state apply (closes #41)
 - Create tang key dir before keygen (closes #43)
 - Install Docker before running Gatus (closes #45)
+- Explicit sqlite storage type for Gatus (closes #47)
 
 ### 📚 Documentation
 
