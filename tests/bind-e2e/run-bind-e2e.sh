@@ -193,7 +193,9 @@ log "Volumes: ${DEV1} ${DEV2}"
 # ---------------------------------------------------------------- 7-10. bind
 log "Binding ${DEV1} through Caddy"
 clevis luks bind -f -d "${DEV1}" -k "${WORK}/passphrase" tang "{\"url\":\"http://127.0.0.1:${CADDY_PORT}\",\"thp\":\"${THP}\"}"
-clevis luks list -d "${DEV1}" | grep '"pin": "tang"' >/dev/null || { clevis luks list -d "${DEV1}"; die "bind token missing from luks list"; }
+# NOTE: `clevis luks list` prints tokens as `ID: pin 'config'` (not JSON),
+# e.g. `1: tang '{"url":"http://127.0.0.1:18080"}'` — match pin+endpoint.
+clevis luks list -d "${DEV1}" | grep "tang.*${CADDY_PORT}" >/dev/null || { clevis luks list -d "${DEV1}"; die "bind token missing from luks list"; }
 log "PASS: bind + pin listed"
 echo -n "bind-proof-secret" | clevis encrypt tang "{\"url\":\"http://127.0.0.1:${CADDY_PORT}\",\"thp\":\"${THP}\"}" > "${WORK}/s.jwe"
 [ "$(clevis decrypt < "${WORK}/s.jwe")" = "bind-proof-secret" ] || die "JWE roundtrip through Caddy failed"
@@ -208,7 +210,7 @@ if clevis luks bind -f -d "${DEV2}" -k "${WORK}/passphrase" tang "{\"url\":\"htt
   die "bind with a wrong thumbprint SUCCEEDED — pin check broken"
 fi
 log "PASS: tampered thumbprint refused"
-if clevis luks list -d "${DEV2}" 2>/dev/null | grep '"pin": "tang"' >/dev/null; then
+if clevis luks list -d "${DEV2}" 2>/dev/null | grep "tang.*${CADDY_PORT}" >/dev/null; then
   die "refused bind left a tang token behind"
 fi
 log "PASS: refused bind left no token"
