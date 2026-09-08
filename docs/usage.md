@@ -38,7 +38,6 @@ Collect these as you go — each feeds one repo secret in §2. Where they go (ph
 
 - **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — the ONE required secret (provider credential only; the SCP user id resolves itself from your approval token — override via `SCP_USER_ID` repo secret only if yours differs)
 - **anchor IPv4** → `ANCHOR_IPV4` — only when discovery needs help (several servers in the account and none named `anchor-<you>-01`): paste the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it). Otherwise skip it — the run discovers the server itself (exactly-one wins, else exact hostname match), and resolves `server_id` from that, so no numeric id to copy anywhere
-- **root password** → `ANCHOR_ROOT_PASSWORD` — legacy fallback only. Leave it UNSET for the passwordless path: the run mints its own one-time root password via the API, power-cycles the box once to set it (fresh boxes: harmless machine-wait; re-provisions: brief downtime), and locks it (`passwd -l root`) when done — nothing emailed survives the run
 - nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
 
 Create them here: [👉 Repo → Settings → Secrets → New repository secret](../../../settings/secrets/actions/new) (one per value above).
