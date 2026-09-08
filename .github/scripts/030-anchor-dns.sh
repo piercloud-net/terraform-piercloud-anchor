@@ -44,6 +44,8 @@ CF_API="https://api.cloudflare.com/client/v4"
 
 alias="${TENANT_USER:?TENANT_USER is required}"
 want_ip="${ANCHOR_IPV4:?ANCHOR_IPV4 is required}"
+want_ip="${want_ip%%/*}"  # email prints 203.0.113.10/22-style — strip any /suffix
+case "$want_ip" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix."; exit 1;; esac
 
 # Fail closed (C-A): without the token this job cannot prove the record,
 # and the ordering is load-bearing — error out with the fix, never skip.

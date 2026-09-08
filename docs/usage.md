@@ -37,7 +37,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 Collect these as you go — each feeds one repo value in §2 (secret or variable as marked). Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions. Secrets go under the **Secrets** tab → Repository secrets; keys go under the **Variables** tab → Repository variables (switch tabs, scroll down). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (a repo secret, only if yours differs)
-- **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
+- **anchor IPv4** (server-ready email, under "IP address" — paste verbatim, `203.0.113.10/22`-style suffix included; the run strips it) → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
 - **SSH admin keys** (your own keypair — 2 mandated) → `A1_SSH_PUBKEY_1/2` repo *variables* (public material, no secret semantics)
 - nothing else to enter: your username, hostname, and DNS are pre-set in the repo — dispatch takes no identifiers

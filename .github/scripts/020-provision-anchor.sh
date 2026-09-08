@@ -367,6 +367,8 @@ cmd_provision() {
   require_token
   ANCHOR_HOST="${ANCHOR_HOST:-}"
   [ -n "$ANCHOR_HOST" ] || die "ANCHOR_HOST is required for provision"
+  ANCHOR_HOST="${ANCHOR_HOST%%/*}"  # email prints 203.0.113.10/22-style — strip any /suffix
+  case "$ANCHOR_HOST" in ''|*[!0-9.]*) die "ANCHOR_HOST is not a bare IPv4 after stripping any /suffix";; esac
   [ -n "${ROOT_PASSWORD:-}" ] || die "ROOT_PASSWORD (masked one-run input) is required for provision"
   [ -n "${A1_SSH_PUBKEY_1:-}" ] || die "A1_SSH_PUBKEY_1 is required (mandate: 2 SSH keys at A1)"
   [ -n "${A1_SSH_PUBKEY_2:-}" ] || die "A1_SSH_PUBKEY_2 is required (mandate: 2 SSH keys at A1)"

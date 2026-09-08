@@ -302,8 +302,12 @@ jobs:
           # closed with a human-readable cause; the id is an identifier, not
           # a secret, and is safe to log. Runs before every consumer below.
           [ -n "${ANCHOR_IPV4:-}" ] || { echo "::error::NETCUP_ANCHOR_IPV4 secret is empty — set it to the piko IP from the server-ready email."; exit 1; }
+          # The email prints 203.0.113.10/22-style (address + netmask): paste verbatim,
+          # the run strips any /suffix and validates a bare IPv4 below.
+          IP4="${ANCHOR_IPV4%%/*}"
+          case "$IP4" in ''|*[!0-9.]*) echo "::error::NETCUP_ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix (got '${ANCHOR_IPV4}'). Paste the IP from the server-ready email."; exit 1;; esac
           RESP="$(curl -sS -G 'https://www.servercontrolpanel.de/scp-core/api/v1/servers' \
-            --data-urlencode "ip=$ANCHOR_IPV4" \
+            --data-urlencode "ip=$IP4" \
             -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
           COUNT="$(echo "$RESP" | jq -r 'if type == "array" then length else -1 end')"
           RESOLVED_ID="$(echo "$RESP" | jq -r 'if type == "array" and length == 1 then .[0].id // empty else empty end')"
