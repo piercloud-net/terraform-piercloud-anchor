@@ -50,7 +50,7 @@ resource "netcup_scp_user_firewall_policy" "tang" {
 
   user_id     = var.scp_user_id
   name        = local.policy_name
-  description = "tang (TCP/80) from the main box only; egress open. Managed by terraform-piercloud-tang."
+  description = "tang (TCP/80) from the main box only; egress open. Managed by terraform-piercloud-anchor."
 
   rules = concat(
     [
@@ -96,9 +96,9 @@ resource "netcup_scp_server_interface_firewall" "anchor" {
 }
 
 locals {
-  # Stable policy key: server_id survives hostname renames (no deployments
-  # exist yet — safe to change from the old piercloud-tang-${hostname}).
-  policy_name = "piercloud-tang-${var.hostname}-${local.resolved_server_id}"
+  # Stable policy key: server_id survives hostname renames (renamed from
+  # piercloud-tang-${hostname} during the repo rename; no deployments exist).
+  policy_name = "piercloud-anchor-${var.hostname}-${local.resolved_server_id}"
 
   # T2 twin-anchor opt-in (both empty by default = single anchor t:1, and
   # the firewall above collapses to exactly the pre-M3 rule set).

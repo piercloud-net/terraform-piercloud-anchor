@@ -427,7 +427,7 @@ jobs:
           tofu_version: "1.12.2"
       # M2: the real path (ephemeral exchange → data-source resolve →
       # plan → apply → state dies with the runner; policy name
-      # piercloud-tang-${hostname}-${server_id} lands fully in M3) now runs
+      # piercloud-anchor-${hostname}-${server_id} lands fully in M3) now runs
       # in the device-flow job on the SAME runner (token never crosses
       # jobs). This job stays a mode-scope marker.
       - name: Mode marker (real steps run in the device-flow job)

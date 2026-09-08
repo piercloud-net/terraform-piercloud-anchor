@@ -56,7 +56,7 @@ anchor. Four causes, in order:
 
 ## Same-URL rebuild = `regen` (2-minute DR)
 
-Bind clevis to a DNS name (`tang-<user>.piercloud.net`, see
+Bind clevis to a DNS name (`anchor-<user>-NN.piercloud.net`, see
 `anchor_hostname`), never the raw IP. A rebuilt anchor at the same URL
 needs only `clevis luks regen -d <device> tang` — same URL, fresh keys,
 no unbind+bind ceremony.

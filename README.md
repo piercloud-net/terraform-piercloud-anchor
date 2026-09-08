@@ -1,4 +1,4 @@
-# terraform-piercloud-tang
+# terraform-piercloud-anchor
 
 One-click **tang/clevis NBDE anchor** for your server: an OpenTofu module that
 turns a small always-on VPS (netcup) into a network-bound disk-unlock server,
@@ -82,7 +82,7 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    *(installed by the run — [walkthrough §4](docs/usage.md#4-a1-provisions-thumbprint-lands-three-ways-h1-chain); configure per the file's own comments)*
 6. **Bind your main box** — install `clevis clevis-luks clevis-initramfs`,
    run the printed `clevis luks bind` command against the DNS name
-   (`tang-<user>.piercloud.net`), confirming the thumbprint matches
+   (`anchor-<user>-NN.piercloud.net`), confirming the thumbprint matches
    out-of-band — never `-y` blind — then rebuild the initramfs.
    *(details: [walkthrough §5](docs/usage.md#5-bind-your-main-box-clevis))*
 7. **Reboot-test twice + monthly one-tap check.** The unlock prompt may
@@ -108,7 +108,7 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
 Module consumers (registry/GitHub source, `examples/quickstart` as the root
 module) pass the same variables the workflow resolves from repo secrets —
 `server_id` (stable key; policy name
-`piercloud-tang-${hostname}-${server_id}`), `allow_main_box_ipv4`
+`piercloud-anchor-${hostname}-${server_id}`), `allow_main_box_ipv4`
 (`203.0.113.10`-style), `hostname`, `scp_user_id` — with the provider token
 arriving ephemerally per run (never stored). Full walkthrough (including
 the `clevis luks bind` on your main box and the reboot test):
@@ -119,7 +119,7 @@ the `clevis luks bind` on your main box and the reboot test):
 1. **Save the thumbprint** in your password manager when the script prints it.
    You will verify it when binding your main box.
 2. **Wire your main box**: install `clevis clevis-luks clevis-initramfs`, run
-   the printed `clevis luks bind -d <device> tang '{"url":"http://tang-<user>.piercloud.net"}'`
+   the printed `clevis luks bind -d <device> tang '{"url":"http://anchor-pier-01.piercloud.net"}'`
    — confirming the thumbprint matches what you saved — then
    `update-initramfs -u` and test a reboot.
 3. **Keep the passphrase keyslot.** The tang anchor is convenience and
@@ -189,9 +189,9 @@ Releases are tagged `vX.Y.Z` (with curated GitHub releases; automatic
 prereleases on `main`). Pin the module in your root module like:
 
 ```hcl
-source = "cad0p/tang/piercloud"
+source = "piercloud-net/anchor/piercloud"
 # or from GitHub directly:
-source = "github.com/cad0p/terraform-piercloud-tang?ref=v0.1.0"
+source = "github.com/piercloud-net/terraform-piercloud-anchor?ref=v0.1.0"
 ```
 
 During the 0.x series, floating references `?ref=v0` and `?ref=v0.0` exist and

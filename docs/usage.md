@@ -81,6 +81,7 @@ reviewable PR from a separate App identity. Never rely on logs alone (repo
 logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the
 repo retention setting. **Save the thumbprint in your PM NOW** (and finish
 the [day-1 checklist](dr.md#day-1-off-device-checklist)).
+>>>>>>> f93206d (docs: M5 phone-first template docs (trust copy, DR, T0/T1/T2) + conventions sync)
 
 ## 5. Bind your main box (clevis)
 
@@ -89,7 +90,7 @@ On your **main box**:
 ```bash
 apt-get install clevis clevis-luks clevis-initramfs
 # find your LUKS device: lsblk -f
-clevis luks bind -d <device> tang '{"url":"http://tang-<user>.piercloud.net"}'
+clevis luks bind -d <device> tang '{"url":"http://anchor-pier-01.piercloud.net"}'
 ```
 
 **Verify the thumbprint** shown at bind time against the value you saved

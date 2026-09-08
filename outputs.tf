@@ -41,7 +41,7 @@ output "next_step" {
     1. Open the netcup SCP, open your server, then the remote console (browser VNC).
     2. Log in as root (the password you set when ordering the server).
     3. Run:
-       curl -fsSL https://raw.githubusercontent.com/cad0p/terraform-piercloud-tang/main/scripts/010-provision.sh | bash
+       curl -fsSL https://raw.githubusercontent.com/piercloud-net/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
     4. Save the printed tang thumbprint in your password manager NOW.
     5. On your main box, run the printed `clevis luks bind` command.
     Full walkthrough: docs/usage.md

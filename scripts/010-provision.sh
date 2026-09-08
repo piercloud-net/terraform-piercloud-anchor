@@ -3,11 +3,11 @@
 # 010-provision.sh — provision the tang/clevis NBDE anchor + uptime monitor.
 #
 # WHERE THIS RUNS: ON the anchor box itself (the netcup VPS you adopted with
-# the terraform-piercloud-tang module), as root, via the netcup SCP remote
+# the terraform-piercloud-anchor module), as root, via the netcup SCP remote
 # console (browser VNC) — or your own SSH session if you added your own SSH
 # key in the SCP. Nothing in this repo ever connects to the anchor.
 #
-#   curl -fsSL https://raw.githubusercontent.com/cad0p/terraform-piercloud-tang/main/scripts/010-provision.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/piercloud-net/terraform-piercloud-anchor/main/scripts/010-provision.sh | bash
 #
 # Properties (see scripts/README.md): idempotent, human-run, no secrets.
 # The tang keypair is generated ON THIS BOX and never leaves it. This script
@@ -109,7 +109,7 @@ if [ -f "${GATUS_CONFIG}" ]; then
   # user can diff/merge by hand. The LIVE config is NEVER overwritten.
   if ! cmp -s "${GATUS_CONFIG}" "${GATUS_CONFIG}.distrib"; then
     cat > "${GATUS_CONFIG}.distrib" <<GCFG
-# Managed by terraform-piercloud-tang (scripts/010-provision.sh).
+# Managed by terraform-piercloud-anchor (scripts/010-provision.sh).
 # Template copy: diff against ${GATUS_CONFIG} and merge what you want.
 # Docs: https://gatus.io/docs
 
@@ -170,7 +170,7 @@ GCFG
 else
   log "Writing Gatus config (first run)"
   cat > "${GATUS_CONFIG}" <<GCFG
-# Managed by terraform-piercloud-tang (scripts/010-provision.sh).
+# Managed by terraform-piercloud-anchor (scripts/010-provision.sh).
 # Edit freely - re-running the script will NOT overwrite this file.
 # Docs: https://gatus.io/docs
 
