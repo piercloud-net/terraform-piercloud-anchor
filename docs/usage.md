@@ -37,7 +37,7 @@ Collect these as you go — each feeds one repo secret in §2:
 - **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
 
-Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning. (The SSH keys are public material and could travel either way; they live in secrets for uniformity.)
+Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
 a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
