@@ -531,9 +531,17 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch origin main --depth=1 >/dev/null 2>&1 || true
-            changed="$(git diff --name-only origin/main...HEAD 2>/dev/null || true)"
+            # Two-dot endpoint diff (never needs a merge-base, so shallow
+            # PR checkouts cannot break it): everything HEAD brings vs the
+            # main tip. If the file list cannot be determined at all, RUN
+            # (a wasted run costs minutes; a wrongly-skipped run costs the
+            # whole point of this job).
+            changed="$(git diff --name-only origin/main HEAD 2>/dev/null || true)"
             printf '%s\n' "$changed"
-            if printf '%s' "$changed" | grep -qE '^(scripts/|main\.tf|\.github/workflows/|tests/bind-e2e/)'; then
+            if [ -z "$changed" ]; then
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "::warning::bind-e2e could not list changed files — running unconditionally"
+            elif printf '%s' "$changed" | grep -qE '^(scripts/|main\.tf|\.github/workflows/|tests/bind-e2e/)'; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
