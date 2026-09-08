@@ -205,8 +205,8 @@ jobs:
           # must check it out to call it (full checkout: tofu below needs
           # the module files too).
 
-      - name: Device authorization + poll (ephemeral token dies with runner)
-        id: device
+      - name: Device authorization request (code card renders now)
+        id: device-request
         run: |
           set -euo pipefail
           # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
@@ -250,6 +250,21 @@ jobs:
             echo "alias: $TENANT_USER — approving lets this run touch your netcup account ONCE; the token dies with the runner."
             echo "we will never email or message you a code to re-confirm."
           } >> "$GITHUB_STEP_SUMMARY"
+          # Handoff to the poll step (split: the summary above renders the
+          # moment THIS step ends; the poll loop below must not hold it).
+          echo "device_code=$DEVICE_CODE" >> "$GITHUB_OUTPUT"
+          echo "token_endpoint=$TOKEN_ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "interval=$INTERVAL" >> "$GITHUB_OUTPUT"
+
+      - name: Poll for approval (code already on the run summary)
+        id: device
+        env:
+          DEVICE_CODE: ${{ steps.device-request.outputs.device_code }}
+          TOKEN_ENDPOINT: ${{ steps.device-request.outputs.token_endpoint }}
+          INTERVAL: ${{ steps.device-request.outputs.interval }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$DEVICE_CODE" # re-mask: the secret crosses steps via outputs (masked in logs either way)
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
           # re-dispatch message (device codes live ~600s).
           DEADLINE=$((SECONDS + 570))
