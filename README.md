@@ -72,11 +72,9 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    *(details: [walkthrough §1](docs/usage.md#1-order-the-anchor-piko-class-vps))*
 2. **Repo from template + repo values** — "Use this template", then set
    repo secrets (customer number — the one required secret —
-   monitor targets, optional ntfy; anchor IP + one-run root password only
-   as legacy fallback when discovery needs help). No stored netcup API
+   monitor targets, optional ntfy). No stored netcup API
    tokens of any kind (S1): every run authenticates via your per-run
-   approval — the one exception is the one-run A1 root password (write-only
-   secret, killed by `passwd -l root`, deleted after use). The main-box IP,
+   approval. The main-box IP,
    DNS, and your username come pre-configured in your repo — nothing to
    enter. Public default once
    values land (write-only, log-masked, invisible to forks).
@@ -116,10 +114,9 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
 
 ```bash
 # 0. Order a small netcup VPS ("piko" class is plenty) in the netcup shop, install any
-#    Debian-family OS, note the anchor IP. Anchor IPv4 required.
+#    Debian-family OS. The run discovers the server itself — no IP to copy.
 # 1. "Use this template" on GitHub, set the repo values
-#    (customer number — the one required secret — plus monitor targets;
-#    anchor IP + one-run root password only as legacy fallback) — no netcup tokens stored.
+#    (customer number — the one required secret — plus monitor targets) — no netcup tokens stored.
 # 2. Dispatch the provision.yml workflow (Actions tab, mode=apply)
 #    from any browser (no identifiers to enter), and approve the device-flow
 #    code at netcup's Keycloak.
