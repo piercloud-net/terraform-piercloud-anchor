@@ -267,12 +267,16 @@ jobs:
     environment: anchor
     outputs:
       thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
+      anchor_ipv4: ${{ steps.resolve.outputs.anchor_ipv4 }}
     env:
       # Identifiers resolve from REPO-level secrets inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
       # No HOSTNAME secret: derived below as anchor-<tenant>-01.
       # No SCP_USER_ID secret by default: resolved from the token via OIDC
       # userinfo in the resolve step (override only if yours differs).
+      # ANCHOR_IPV4 / ANCHOR_ROOT_PASSWORD are optional (issue #50): unset
+      # means zero-IP discovery + a caller-set one-time password; set keeps
+      # the legacy pasted-IP / pasted-password path byte-for-byte.
       CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
       TENANT_USER: ${{ vars.TENANT_USER }}
     steps:
@@ -350,7 +354,8 @@ jobs:
           # M2: same-job handoff implemented above (token -> GITHUB_ENV);
           # the A1 + tofu steps below consume it on this same runner.
 
-      - name: Resolve server_id from anchor IP (no numeric id from the user)
+      - name: Resolve server + approver guard + zero-IP discovery
+        id: resolve
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
@@ -361,26 +366,8 @@ jobs:
           set -euo pipefail
           # The numeric server id is the stable key (policy names, tmp tags,
           # module adopt) but it appears in no email — so the run resolves it
-          # itself: GET /servers?ip=<anchor-ip> must match EXACTLY ONE server
-          # (OpenAPI: ServerListMinimal{id,name,hostname}). Count != 1 fails
-          # closed with a human-readable cause; the id is an identifier, not
-          # a secret, and is safe to log. Runs before every consumer below.
-          [ -n "${ANCHOR_IPV4:-}" ] || { echo "::error::ANCHOR_IPV4 secret is empty — set it to the piko IP from the server-ready email."; exit 1; }
-          # The email prints 203.0.113.10/22-style (address + netmask): paste verbatim,
-          # the run strips any /suffix and validates a bare IPv4 below.
-          IP4="${ANCHOR_IPV4%%/*}"
-          case "$IP4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix (got '${ANCHOR_IPV4}'). Paste the IP from the server-ready email."; exit 1;; esac
-          RESP="$(curl -sS -G 'https://www.servercontrolpanel.de/scp-core/api/v1/servers' \
-            --data-urlencode "ip=$IP4" \
-            -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
-          COUNT="$(echo "$RESP" | jq -r 'if type == "array" then length else -1 end')"
-          RESOLVED_ID="$(echo "$RESP" | jq -r 'if type == "array" and length == 1 then .[0].id // empty else empty end')"
-          if [ "$COUNT" != "1" ] || [ -z "$RESOLVED_ID" ]; then
-            echo "::error::anchor IP $ANCHOR_IPV4 matched $COUNT servers (need exactly 1). Check ANCHOR_IPV4, or rename duplicates in the SCP. Full list shape unexpected — escalate, no fallback."
-            exit 1
-          fi
-          echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
-          echo "Resolved server_id=$RESOLVED_ID for anchor IP $ANCHOR_IPV4."
+          # itself. Runs before every consumer below; ids are identifiers,
+          # not secrets, and are safe to log.
           # Tenant identity comes from the repo, not the dispatch: TENANT_USER
           # (operator-set variable) is the username, so there is no alias
           # input to typo or squat — unset fails closed before anything runs.
@@ -390,8 +377,9 @@ jobs:
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
           SAN="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
           [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."; exit 1; }
-          echo "ANCHOR_HOSTNAME=anchor-${SAN}-01" >> "$GITHUB_ENV"
-          echo "Derived hostname anchor-${SAN}-01."
+          HOSTNAME="anchor-${SAN}-01"
+          echo "ANCHOR_HOSTNAME=$HOSTNAME" >> "$GITHUB_ENV"
+          echo "Derived hostname $HOSTNAME."
           # SCP user id: NEVER the customer number (live 403 proved they
           # differ). Resolved from the token itself via OIDC userinfo
           # (same source shipping CLIs use: userinfo "id" is the numeric
@@ -406,6 +394,100 @@ jobs:
             echo "Resolved SCP user id=$SCP_EFF from token userinfo."
           fi
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
+          # Approver guard (issue #50): the device approval the tenant
+          # already tapped is the ONLY authorization moment — prove it came
+          # from the tenant's own account before anything mutates. The
+          # customer number IS the SCP username, so the approver's user
+          # record must carry it. Wrong-account approval aborts LOUD here.
+          [ -n "${CUSTOMER_NUMBER:-}" ] || { echo "::error::CUSTOMER_NUMBER secret is empty — it is the one required secret (paste the customer number from either account email)."; exit 1; }
+          API_USER="$(curl -sS "https://www.servercontrolpanel.de/scp-core/api/v1/users/$SCP_EFF" \
+            -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" | jq -r '.username // empty')"
+          [ -n "$API_USER" ] || { echo "::error::could not read the approver's user record (GET /users/$SCP_EFF) — token scope may have changed. Escalate, no fallback."; exit 1; }
+          if [ "$API_USER" != "$CUSTOMER_NUMBER" ]; then
+            echo "::error::WRONG-ACCOUNT APPROVAL: this run was approved from netcup account '$API_USER', but the repo expects the customer-number account. STOP — nothing runs. Re-dispatch and approve from the account that owns the anchor."
+            exit 1
+          fi
+          echo "Approver guard ok: the approval came from the tenant's own account."
+          # Zero-IP discovery (issue #50): the approver's server list picks
+          # the anchor — no pasted IP needed. Ranking: exactly-one
+          # (convention-free) > exact hostname (deterministic) > pasted IP
+          # (today's fallback). NEVER most-recent (no creationTime in the
+          # list, race-prone), NEVER state-filtered (the anchor may be
+          # stopped). Stopped servers still list — do not filter them out.
+          # Base without the versioned tail (keep every request path fully
+          # qualified below so the CI endpoint allowlist keeps matching).
+          SCP="https://www.servercontrolpanel.de/scp-core"
+          fetch_list() { curl -sS "$SCP/api/v1/servers" -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN"; }
+          list_count() { printf '%s' "$1" | jq -r 'if type == "array" then length else -1 end' 2>/dev/null || printf '%s' "-1"; }
+          LIST="$(fetch_list)"
+          COUNT="$(list_count "$LIST")"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Server list empty — a fresh order may still be propagating; polling with backoff."
+            for i in 1 2 3 4 5 6; do
+              sleep 10
+              LIST="$(fetch_list)"
+              COUNT="$(list_count "$LIST")"
+              if [ "$COUNT" -gt 0 ]; then break; fi
+              echo "Still empty (attempt $i/6)..."
+            done
+          fi
+          # Negative COUNT with a pasted IP flows past ranking into the
+          # legacy ?ip= branch below (same API, independent shape); without
+          # an IP there is nothing to fall back to — fail closed.
+          if [ "$COUNT" -lt 0 ] && [ -z "${ANCHOR_IPV4:-}" ]; then
+            echo "::error::server list came back in an unexpected shape — escalate, no fallback."
+            exit 1
+          fi
+          RESOLVED_ID=""
+          if [ "$COUNT" -eq 1 ]; then
+            RESOLVED_ID="$(printf '%s' "$LIST" | jq -r '.[0].id // empty')"
+            echo "Discovery: exactly one server in the account — adopting id $RESOLVED_ID (convention-free)."
+          elif [ "$COUNT" -gt 1 ]; then
+            MATCHES="$(printf '%s' "$LIST" | jq -r --arg h "$HOSTNAME" '[.[] | select(.hostname == $h) | .id]')"
+            if [ "$(printf '%s' "$MATCHES" | jq 'length')" -eq 1 ]; then
+              RESOLVED_ID="$(printf '%s' "$MATCHES" | jq -r '.[0]')"
+              echo "Discovery: $COUNT servers, exactly one named $HOSTNAME — adopting id $RESOLVED_ID."
+            fi
+          fi
+          if [ -z "$RESOLVED_ID" ]; then
+            if [ -n "${ANCHOR_IPV4:-}" ]; then
+              # Legacy fallback, byte-for-byte today's behavior: the pasted
+              # IP resolves via ?ip= (exact-one, fail closed).
+              IP4="${ANCHOR_IPV4%%/*}"
+              case "$IP4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix. Paste the IP from the server-ready email."; exit 1;; esac
+              RESP="$(curl -sS -G "$SCP/api/v1/servers" --data-urlencode "ip=$IP4" \
+                -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
+              IP_COUNT="$(printf '%s' "$RESP" | jq -r 'if type == "array" then length else -1 end' 2>/dev/null || printf '%s' "-1")"
+              RESOLVED_ID="$(printf '%s' "$RESP" | jq -r 'if type == "array" and length == 1 then .[0].id // empty else empty end')"
+              if [ "$IP_COUNT" != "1" ] || [ -z "$RESOLVED_ID" ]; then
+                echo "::error::anchor IP matched $IP_COUNT servers (need exactly 1). Check ANCHOR_IPV4, or rename duplicates in the SCP. Full list shape unexpected — escalate, no fallback."
+                exit 1
+              fi
+              echo "Discovery fell back to the pasted IP (legacy path): server_id=$RESOLVED_ID."
+            else
+              echo "::error::expected 1 server, found $COUNT — and none is named $HOSTNAME. Your account's servers (id / name / hostname / nickname):"
+              printf '%s' "$LIST" | jq -r '.[] | "\(.id) / \(.name) / \(.hostname) / \(.nickname)"'
+              echo "::error::set the ANCHOR_IPV4 secret to the anchor IP and re-dispatch (or rename the anchor to $HOSTNAME so discovery can pick it). No cross-tenant data: the token sees this account only."
+              exit 1
+            fi
+          fi
+          echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
+          # SSH/DNS target: the pasted IP wins when set (legacy,
+          # byte-for-byte); else the server detail's first IPv4 (IPv6-only
+          # resolves via detail/interfaces, never q — and fails closed here
+          # because runners have no IPv6 path).
+          if [ -n "${ANCHOR_IPV4:-}" ]; then
+            HOST4="${ANCHOR_IPV4%%/*}"
+            case "$HOST4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix."; exit 1;; esac
+          else
+            DETAIL="$(curl -sS "$SCP/api/v1/servers/$RESOLVED_ID" -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
+            HOST4="$(printf '%s' "$DETAIL" | jq -r '.ipv4Addresses[0].ip // empty')"
+            [ -n "$HOST4" ] || { echo "::error::server $RESOLVED_ID reports no IPv4 address (IPv6-only is unsupported — runners have no IPv6). Attach an IPv4, or set ANCHOR_IPV4 and re-dispatch."; exit 1; }
+            echo "Discovery: anchor IPv4 from server detail, no pasted IP needed."
+          fi
+          echo "ANCHOR_HOST=$HOST4" >> "$GITHUB_ENV"
+          echo "anchor_ipv4=$HOST4" >> "$GITHUB_OUTPUT"
+          echo "Resolved server_id=$RESOLVED_ID (ssh/dns target set)."
 
       - name: Red-banner acknowledge gate (C-E, no-GitHub path)
         if: needs.visibility-banner.outputs.workflows_changed == 'true'
@@ -434,6 +516,30 @@ jobs:
           # or any tmp >2h / orphan at pre-step, fails BEFORE creating
           # (exit 3, operator notified by the failure step below).
           .github/scripts/020-provision-anchor.sh sweep-pre
+
+      - name: Passwordless bootstrap (caller-set one-time root password)
+        if: inputs.mode == 'apply'
+        env:
+          NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          SERVER_ID: ${{ env.SERVER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
+          RUN_ID: ${{ github.run_id }}
+          ANCHOR_HOST: ${{ env.ANCHOR_HOST }}
+          ROOT_PASSWORD_SECRET: ${{ secrets.ANCHOR_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Pasted secret present -> the script skips minting (legacy path:
+          # same SSH, same thumbprint, same lock as today). Empty -> mint a
+          # caller-set password + power-cycle + set + power-on + SSH-wait,
+          # exporting the masked value for the provision step below
+          # (same-runner handoff, dies with the runner). The power-cycle is
+          # the one honest tax: vendor docs require OFF for password-set
+          # (fresh boxes: harmless machine-wait; re-provisions: brief
+          # downtime). Concurrent runs serialize on 409 lock-backoff. Sits
+          # AFTER the red-banner gate by design (destructive ops need a
+          # reviewed tree) and BEFORE tofu (steady state converges on a
+          # powered-ON box, as today).
+          .github/scripts/020-provision-anchor.sh bootstrap-password
 
       - name: Set up OpenTofu (>= 1.11 for ephemeral values)
         if: inputs.mode == 'apply'
@@ -537,9 +643,10 @@ jobs:
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
-          ANCHOR_HOST: ${{ secrets.ANCHOR_IPV4 }}
+          ANCHOR_HOST: ${{ env.ANCHOR_HOST }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
           ROOT_PASSWORD: ${{ secrets.ANCHOR_ROOT_PASSWORD }}
+          BOOTSTRAP_ROOT_PASSWORD: ${{ env.BOOTSTRAP_ROOT_PASSWORD }}
           TENANT_USER: ${{ vars.TENANT_USER }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -550,14 +657,34 @@ jobs:
           # C-a-shaped explicit mask BEFORE any use: repo secrets are
           # auto-masked, but the explicit mask covers every expansion path
           # (same ordering rule as the device_code mask in device-flow).
-          echo "::add-mask::${{ secrets.ANCHOR_ROOT_PASSWORD }}"
+          # Guarded: masking an empty value warns without masking anything.
+          if [ -n "${{ secrets.ANCHOR_ROOT_PASSWORD }}" ]; then echo "::add-mask::${{ secrets.ANCHOR_ROOT_PASSWORD }}"; fi
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
-          # emailed root password arrives as a masked one-run input and is
-          # never printed; the script ends with `passwd -l root`.
+          # the one-run credential (pasted secret, or the caller-set value
+          # minted by bootstrap-password) arrives masked and is never
+          # printed; the script ends with `passwd -l root`.
           ARGS=""
           if [ "${{ inputs.rotate_keys }}" = "true" ]; then ARGS="--rotate"; fi
           # shellcheck disable=SC2086: ARGS is empty-or-one-known-flag by construction.
           .github/scripts/020-provision-anchor.sh $ARGS provision
+
+      - name: Best-effort root lock (passwordless finally-path)
+        if: failure() && inputs.mode == 'apply'
+        env:
+          SERVER_ID: ${{ env.SERVER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
+          RUN_ID: ${{ github.run_id }}
+          ANCHOR_HOST: ${{ env.ANCHOR_HOST }}
+          BOOTSTRAP_ROOT_PASSWORD: ${{ env.BOOTSTRAP_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # A crash between password-set and the provision's `passwd -l root`
+          # leaves a caller-known password live: always attempt the lock
+          # here (finally-path, not happy-path). Never fails the run — the
+          # original failure owns the verdict. No-ops when nothing was
+          # minted (legacy path) or the box is unreachable (warns loud with
+          # the SCP-reset + re-dispatch recovery).
+          .github/scripts/020-provision-anchor.sh lock-password || true
 
       - name: A1 close (detach-then-delete, always)
         if: always() && steps.device.outputs.authorized == 'true' && inputs.mode == 'apply'
@@ -610,7 +737,9 @@ jobs:
     environment: anchor
     env:
       TENANT_USER: ${{ vars.TENANT_USER }}
-      ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
+      # Resolved-or-pasted target from the device-flow job (discovery-first;
+      # the pasted secret wins when set, so the legacy path is byte-for-byte).
+      ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
       CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
     steps:
       - name: Checkout (no credentials persisted)
