@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 <!-- Add your curated release notes here. -->
 <!-- USER-EDITABLE SECTION END -->
 
+### 🚀 Features
+
+- Phone-first provision with DNS automation (closes #14, closes #8)
+
 ### 📚 Documentation
 
 - Post-transfer registry/source addresses (closes #12)
