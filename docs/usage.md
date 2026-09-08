@@ -30,12 +30,13 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 **Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `A1_ROOT_PASSWORD` repo secret (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
-Collect these as you go — each feeds one repo secret in §2:
+Collect these as you go — each feeds one repo value in §2 (secret or variable as marked):
 
 - **username** you sign up with (e.g. `pier`) → pre-set in your repo as `TENANT_USER`; hostname (`anchor-pier-01`) and DNS derive from it — nothing to enter per dispatch
 - **customer number** (same value on both account emails) → `NETCUP_CUSTOMER_NUMBER` — also used as the SCP user id, unless `NETCUP_SCP_USER_ID` is set (only if yours differs)
 - **anchor IPv4** (server-ready email, under "IP address") → `NETCUP_ANCHOR_IPV4` — the run also resolves `server_id` from it, so no numeric id to copy anywhere
 - **root password** (server-ready email) → `A1_ROOT_PASSWORD`
+- **SSH admin keys** (your own keypair — 2 mandated) → `A1_SSH_PUBKEY_1/2` repo *variables* (public material, no secret semantics)
 
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
 

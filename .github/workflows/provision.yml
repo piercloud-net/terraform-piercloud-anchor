@@ -51,6 +51,11 @@ on:
         required: false
         default: false
         type: boolean
+      acknowledge_changed_workflows:
+        description: "Red-banner gate: check ONLY after reviewing the workflow diff yourself (required when the banner shows CHANGED)."
+        required: false
+        default: false
+        type: boolean
 
 # Static global mutex: one mutex serializes ALL tenants' policy mutations.
 # Static literal — dynamic values are FORBIDDEN in concurrency.group.
@@ -68,6 +73,7 @@ jobs:
     outputs:
       head_sha: ${{ steps.banner.outputs.head_full }}
       head_short: ${{ steps.banner.outputs.head_short }}
+      workflows_changed: ${{ steps.banner.outputs.workflows_changed }}
     steps:
       - name: Checkout (no credentials persisted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
@@ -102,17 +108,18 @@ jobs:
             echo "we will never email or message you a code to re-confirm."
             echo ""
             if [ "$COUNT" -eq 0 ]; then
+              echo "workflows_changed=false" >> "$GITHUB_OUTPUT"
               echo "🟢 UNCHANGED — workflows under .github/workflows match $BASE_REF."
               echo "piercloud: apply ready for $TENANT_USER @$SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
             else
+              echo "workflows_changed=true" >> "$GITHUB_OUTPUT"
               echo "🔴 CHANGED — $COUNT file(s) under .github/workflows differ from $BASE_REF."
               echo "piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->$HEAD_SHA, $COUNT files incl. provision.yml). Do NOT approve. Open $DIFF_LINK or ask the operator what changed. Nothing runs until you approve."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # TODO(M2): compare against the last-approved head SHA recorded via
-          # actions:read (backend mechanics, open design Q4); failed check =
-          # no apply, always (C-A). Red-banner acknowledge-checkbox UX for the
-          # no-account path also lands with the notifier wiring.
+          # Last-approved pin via actions:read stays backend mechanics (open
+          # design Q4); failed check = no apply, always (C-A). The red-banner
+          # acknowledge gate below enforces the checkbox half starting now.
 
       - name: Record head SHA for the backend approval pin
         env:
@@ -324,6 +331,20 @@ jobs:
           [ -n "$SCP_EFF" ] || { echo "::error::set NETCUP_CUSTOMER_NUMBER (and NETCUP_SCP_USER_ID only if yours differs)."; exit 1; }
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
 
+      - name: Red-banner acknowledge gate (C-E, no-GitHub path)
+        if: needs.visibility-banner.outputs.workflows_changed == 'true'
+        run: |
+          set -euo pipefail
+          # Red banner = workflows changed: the run stops here unless the
+          # dispatcher checked acknowledge_changed_workflows AFTER reviewing
+          # the diff themselves. Boolean input (true/false only) — safe in
+          # the test. Green banners skip this step entirely.
+          if [ "${{ inputs.acknowledge_changed_workflows }}" != "true" ]; then
+            echo "::error::workflows CHANGED since baseline and acknowledge_changed_workflows is unchecked. Review the diff from the banner card first, then re-dispatch with the box checked. Nothing runs until you do."
+            exit 1
+          fi
+          echo "Red-banner acknowledged — proceeding."
+
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
@@ -354,6 +375,26 @@ jobs:
           # No backend block: local state file on the ephemeral runner.
           # Nothing persists past this run by construction.
           tofu init -input=false
+
+      - name: Stateless import (re-adopt, import-apply-discard)
+        if: inputs.mode == 'apply'
+        env:
+          SERVER_ID: ${{ env.SERVER_ID }}
+        run: |
+          set -euo pipefail
+          # Stateless re-adopt: the ephemeral runner holds no state, so every
+          # apply re-imports the adopted server before planning — otherwise a
+          # stateless re-run would duplicate the firewall policy instead of
+          # converging. Server only: the policy id is account-side and not
+          # known pre-apply (first live apply confirms the create path).
+          # Generated at runtime, never committed; removed post-apply below.
+          cat > .workflow-import.tf <<EOF
+          import {
+            to = netcup_scp_server.anchor[0]
+            id = "$SERVER_ID"
+          }
+          EOF
+          echo "Wrote .workflow-import.tf for server $SERVER_ID."
 
       - name: tofu plan (ephemeral token, never state)
         if: inputs.mode == 'apply'
@@ -404,6 +445,8 @@ jobs:
         run: |
           set -euo pipefail
           tofu apply -input=false -auto-approve tfplan
+          # Import-apply-discard: the generated import served its one run.
+          rm -f .workflow-import.tf
 
       - name: A1 provision (plain ssh, thumbprint, root lock)
         id: a1-provision

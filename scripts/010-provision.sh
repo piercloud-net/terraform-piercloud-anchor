@@ -27,6 +27,24 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (netcup SCP remote console, root login)"
 
+ROTATE=0
+case "${1:-}" in
+  "") ;; # normal provision
+  --rotate) ROTATE=1 ;;
+  *) die "usage: $0 [--rotate]" ;;
+esac
+
+gen_keys() { # append a fresh key set on this box (never deletes)
+  if [ -x /usr/libexec/tangd-keygen ]; then
+    /usr/libexec/tangd-keygen "${TANG_KEYS_DIR}"
+  elif [ -x /usr/lib/tang/tangd-keygen ]; then
+    /usr/lib/tang/tangd-keygen "${TANG_KEYS_DIR}"
+  else
+    die "tangd-keygen not found; reinstall the 'tang' package"
+  fi
+  systemctl restart tangd.socket 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # a) tang + tangd.socket (idempotent)
 # ---------------------------------------------------------------------------
@@ -41,14 +59,18 @@ systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 # Defensive key generation: some base images ship tang without keys on disk. # ci-allowlist: prose — on-box keygen note, not a live reference.
 if ! compgen -G "${TANG_KEYS_DIR}/*.jwk" >/dev/null; then
   log "No tang keys found — generating keypair on this box"
-  if [ -x /usr/libexec/tangd-keygen ]; then
-    /usr/libexec/tangd-keygen "${TANG_KEYS_DIR}"
-  elif [ -x /usr/lib/tang/tangd-keygen ]; then
-    /usr/lib/tang/tangd-keygen "${TANG_KEYS_DIR}"
-  else
-    die "tangd-keygen not found; reinstall the 'tang' package"
-  fi
-  systemctl restart tangd.socket 2>/dev/null || true
+  gen_keys
+fi
+
+# Rotation (--rotate): append a FRESH key set next to the old one, so already-
+# bound clients keep booting while you re-bind to the new thumbprint below.
+# AFTER every client has rotated and reboot-verified, delete the OLD .jwk
+# files by hand. Deleting before that locks out unattended boot (passphrase
+# prompt at 3am). Live proof (two consecutive runs) is M0-gated.
+if [ "$ROTATE" = "1" ]; then
+  log "Rotating: generating a fresh key set alongside the old one"
+  gen_keys
+  warn "Re-bind every client to the NEW thumbprint below and reboot-verify each BEFORE deleting old keys."
 fi
 
 # ---------------------------------------------------------------------------

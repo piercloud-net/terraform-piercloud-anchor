@@ -7,6 +7,9 @@
 crash.log
 crash.*.log
 
+# Workflow-generated stateless import (import-apply-discard) — runtime only
+.workflow-import.tf
+
 # Local overrides / scratch
 .local/
 *.auto.tfvars
