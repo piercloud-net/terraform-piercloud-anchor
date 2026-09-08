@@ -169,44 +169,23 @@ jobs:
           # TODO(M2): red verdict hides the netcup URL/code behind an
           # acknowledge-checkbox on the no-account path (open design Q5).
 
-  device-flow:
-    name: "S1 device-flow (C-a..C-f) + A1 window + stateless apply"
+  device-request:
+    name: "Device code request (card renders on job completion)"
     runs-on: ubuntu-latest
     needs: [visibility-banner]
-    # C-E power path: required-reviewer gate lives in repo SETTINGS
-    # (environment `anchor` → tenant GitHub user), not in code. Where a
-    # tenant reviewer identity exists, this pauses the run for their tap
-    # BEFORE any token exists (execution approval); the device approval at
-    # netcup follows (account approval). Two taps, correct order. Where no
-    # reviewer exists (no-GitHub path), the environment auto-creates with
-    # no rules and runs proceed — the LOUD banner is the mechanism there.
-    # Banner stays ungated so the card exists to review first.
-    environment: anchor
     outputs:
-      thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
+      device_code: ${{ steps.request.outputs.device_code }}
+      token_endpoint: ${{ steps.request.outputs.token_endpoint }}
+      interval: ${{ steps.request.outputs.interval }}
     env:
-      # Identifiers resolve from REPO-level secrets inside runs (C-E) —
-      # never dispatch inputs, never logs (values are write-only, log-masked).
-      # No HOSTNAME secret: derived below as anchor-<tenant>-01.
-      # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
-      # (override only if yours differs).
-      CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
-      # Public, constant Keycloak discovery doc (same realm for every tenant):
-      # baked in, not a secret — override by editing this line only.
+      # Public, constant Keycloak discovery doc (same realm for every tenant).
       NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
       TENANT_USER: ${{ vars.TENANT_USER }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
     steps:
-      - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
-        with:
-          persist-credentials: false
-          # M2: the A1 entrypoint lives in this repo
-          # (.github/scripts/020-provision-anchor.sh) — the device-flow job
-          # must check it out to call it (full checkout: tofu below needs
-          # the module files too).
-
-      - name: Device authorization request (code card renders now)
-        id: device-request
+      - name: Request code + write approval card
+        id: request
         run: |
           set -euo pipefail
           # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
@@ -218,7 +197,7 @@ jobs:
           test "$DEVICE_ENDPOINT" != "null" || { echo "::error::discovery doc lacks device_authorization_endpoint — STOP, escalate."; exit 1; }
           RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" --data-urlencode "client_id=scp" --data-urlencode "scope=offline_access openid")"
           # C-f: grant disabled (or any refusal) → STOP + escalate.
-          # No downgrade path exists by design (C-A) — this step exits here.
+          # No downgrade path exists by design (C-A) — this job exits here.
           if echo "$RESP" | jq -e 'has("error")' >/dev/null; then
             DESC="$(echo "$RESP" | jq -r '.error_description // .error')"
             echo "::error::device authorization refused ($DESC). STOP — the device grant may be disabled. Escalate to the operator. No fallback of any kind exists (C-A)."
@@ -237,9 +216,10 @@ jobs:
           echo "Open this URL on your phone to approve: $VERIFY_URI"
           echo "Code: $USER_CODE"
           echo "we will never email or message you a code to re-confirm."
-          # Prominent phone card: the run page shows job summaries without
-          # opening logs. verification_uri_complete pre-fills the code — one
-          # tap, no typing. Staleness guard appended on every terminal branch.
+          # Live card: this job ENDS here, so the summary below renders on
+          # the run page while the code is still live. verification_uri_complete
+          # pre-fills the code — one tap, no typing. Staleness guards land in
+          # the poll job on every terminal branch.
           {
             echo "### 📲 Approve at netcup (code expires in ~10 min)"
             echo ""
@@ -250,18 +230,57 @@ jobs:
             echo "alias: $TENANT_USER — approving lets this run touch your netcup account ONCE; the token dies with the runner."
             echo "we will never email or message you a code to re-confirm."
           } >> "$GITHUB_STEP_SUMMARY"
-          # Handoff to the poll step (split: the summary above renders the
-          # moment THIS step ends; the poll loop below must not hold it).
+          # Live push (the true phone channel): ntfy carries the real code
+          # out-of-band the moment it exists. Unset topic = summary only.
+          if [ -n "$NTFY_TOPIC" ]; then
+            curl -sS -u ":$NTFY_TOKEN" -d "piercloud: approve $TENANT_USER: $VERIFY_URI code $USER_CODE (expires 10 min). We never email codes." "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+          fi
+          # Handoff to the poll job (device_code only: short-lived,
+          # user-mediated, already log-printed. The ACCESS token is minted
+          # and consumed inside the poll job — it never crosses jobs (C-d).
           echo "device_code=$DEVICE_CODE" >> "$GITHUB_OUTPUT"
           echo "token_endpoint=$TOKEN_ENDPOINT" >> "$GITHUB_OUTPUT"
           echo "interval=$INTERVAL" >> "$GITHUB_OUTPUT"
 
+  device-flow:
+    name: "S1 device-flow (C-a..C-f) + A1 window + stateless apply"
+    runs-on: ubuntu-latest
+    needs: [visibility-banner, device-request]
+    # C-E power path: required-reviewer gate lives in repo SETTINGS
+    # (environment `anchor` → tenant GitHub user), not in code. Where a
+    # tenant reviewer identity exists, this pauses the run for their tap
+    # BEFORE any token exists (execution approval); the device approval at
+    # netcup follows (account approval). Two taps, correct order. Where no
+    # reviewer exists (no-GitHub path), the environment auto-creates with
+    # no rules and runs proceed — the LOUD banner is the mechanism there.
+    # Banner stays ungated so the card exists to review first.
+    environment: anchor
+    outputs:
+      thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
+    env:
+      # Identifiers resolve from REPO-level secrets inside runs (C-E) —
+      # never dispatch inputs, never logs (values are write-only, log-masked).
+      # No HOSTNAME secret: derived below as anchor-<tenant>-01.
+      # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
+      # (override only if yours differs).
+      CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
+      TENANT_USER: ${{ vars.TENANT_USER }}
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+          # M2: the A1 entrypoint lives in this repo
+          # (.github/scripts/020-provision-anchor.sh) — the device-flow job
+          # must check it out to call it (full checkout: tofu below needs
+          # the module files too).
+
       - name: Poll for approval (code already on the run summary)
         id: device
         env:
-          DEVICE_CODE: ${{ steps.device-request.outputs.device_code }}
-          TOKEN_ENDPOINT: ${{ steps.device-request.outputs.token_endpoint }}
-          INTERVAL: ${{ steps.device-request.outputs.interval }}
+          DEVICE_CODE: ${{ needs.device-request.outputs.device_code }}
+          TOKEN_ENDPOINT: ${{ needs.device-request.outputs.token_endpoint }}
+          INTERVAL: ${{ needs.device-request.outputs.interval }}
         run: |
           set -euo pipefail
           echo "::add-mask::$DEVICE_CODE" # re-mask: the secret crosses steps via outputs (masked in logs either way)
