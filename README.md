@@ -59,11 +59,14 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    is REQUIRED (runners have no IPv6; v6-only unsupported). Note the
    server name (or id), your SCP user id, and the anchor's IP.
    *(details: [walkthrough §1](docs/usage.md#1-order-the-anchor-piko-class-vps))*
-2. **Repo from template + repo secrets** — "Use this template", then set
-   REPO-level secrets with the identifiers only (hostname, IPs,
-   `scp_user_id`, customer number). No stored netcup secrets of any kind:
-   every run authenticates via your per-run approval. Public default once
-   secrets land (values stay write-only, log-masked, invisible to forks).
+2. **Repo from template + repo values** — "Use this template", then set
+   repo variables (username, SSH keys) + repo secrets (customer number,
+   anchor IP, one-run root password, optional ntfy). No stored netcup API
+   tokens of any kind (S1): every run authenticates via your per-run
+   approval — the one exception is the one-run A1 root password (write-only
+   secret, killed by `passwd -l root`, deleted after use). Slice IP + DNS
+   token are operator-held, never tenant-touched. Public default once
+   values land (write-only, log-masked, invisible to forks).
    *(details: [walkthrough §2](docs/usage.md#2-repo-from-template--repo-secrets-c-e-visibility-rule))*
 3. **Dispatch + approve** — Actions → [`provision.yml`](.github/workflows/provision.yml)
    `mode=apply` (no identifiers in the inputs — your username already lives
@@ -72,8 +75,8 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    ephemeral token dies with the runner. *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
 4. **A1 provisions** — the run opens its own /32 window, installs `tang`,
    creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net`),
-   prints its **thumbprint** (to ntfy + run artifact + committed
-   break-glass file — never logs alone), installs the Gatus monitor, and
+   prints its **thumbprint** (to run artifact today — ntfy push + committed
+   break-glass file pending; never logs alone), installs the Gatus monitor, and
    ends with `passwd -l root`. **Save the thumbprint in your password
    manager NOW**, then finish the
    [day-1 checklist](docs/dr.md#day-1-off-device-checklist).
@@ -180,7 +183,7 @@ rotation is forward security only.
 
 Visibility (C-E): identifiers in repo secrets always; public default once
 secrets land; the approval card is LOUD about what commit you approve
-(and refuses on change); the repo is authoritative, any UI advisory.
+(and shows SHA + diff vs default branch today; refuse-on-change pin pending the backend recorder); the repo is authoritative, any UI advisory.
 Thumbprint chain (H1): run artifact (`retention-days: 400` = artifacts
 only — never rely on logs alone) + committed break-glass file via
 reviewable App PR; `mode=check` warns on the repo retention setting.

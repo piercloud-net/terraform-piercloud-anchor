@@ -10,7 +10,7 @@ export NETCUP_SCP_REFRESH_TOKEN="..."
 
 tofu init
 tofu apply \
-  -var server_name="SCPI-1234567" \
+  -var server_id=1234567 \
   -var allow_main_box_ipv4="203.0.113.10" \
   -var allow_main_box_ipv6="2001:db8::10" \
   -var hostname="anchor-pier-01" \

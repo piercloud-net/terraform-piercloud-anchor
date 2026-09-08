@@ -28,7 +28,7 @@ Gatus. Official Debian-family image, root password by email. Do NOT apply a welc
 
 **SCP login (separate credentials):** the server control panel at <https://www.servercontrolpanel.de/SCP/> uses its own password, sent in the "Access data for SCP" email — change it on first login and enable 2FA there too.
 
-**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `A1_ROOT_PASSWORD` input (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
+**Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — the password becomes the one-run `A1_ROOT_PASSWORD` repo secret (or the console login), and the printed SSH fingerprints let you verify the host key on first contact. The run locks root (`passwd -l root`) when done, so the emailed password dies after provisioning — delete it. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
 Collect these as you go — each feeds one repo secret in §2:
 
@@ -44,8 +44,8 @@ a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 
 ## 2. Repo from template + repo secrets (C-E visibility rule)
 
-"Use this template" → your repo. **No stored netcup secrets of any kind
-(S1)** — every run authenticates via your per-run approval below. What
+"Use this template" → your repo. **No stored netcup API tokens of any kind
+(S1)** — every run authenticates via your per-run approval below (the one-run A1 root password is the single exception: write-only, locked out + deleted after use). What
 lives in the repo are identifiers only (anchor IP, customer
 number): values are write-only and log-masked. Public values (username,
 SSH keys) live in repo *variables* instead — visible, no secret semantics.
@@ -110,11 +110,13 @@ The run opens the hardened A1 self-open /32 SSH window, provisions the
 anchor (mandate: 2 SSH keys at A1; the script ends with `passwd -l root`;
 console-recovery note: rescue disables the netcup firewall — any rescue
 boot → rotate tang keys afterwards), then closes the window
-(detach-then-delete, swept pre + `always()` post, all modes).
+(detach-then-delete, swept pre + `always()` post, all modes). Key rotation:
+dispatch `mode=apply` with `rotate_keys=true` (forwards `--rotate` to the
+provisioning script: dots out old tang keys per netcup procedure).
 
 The tang thumbprint reaches you via the H1 chain — run artifact
-(`retention-days: 400` = artifacts ONLY) + committed break-glass file via
-reviewable PR from a separate App identity. Never rely on logs alone (repo
+(`retention-days: 400` = artifacts ONLY; committed break-glass file via
+reviewable App PR pending). Never rely on logs alone (repo
 logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the
 repo retention setting. **Save the thumbprint in your PM NOW** (and finish
 the [day-1 checklist](dr.md#day-1-off-device-checklist)).
@@ -150,14 +152,14 @@ availability, never the security anchor.
 
 ## 6. Monthly one-tap `mode=check` (hygiene, not load-bearing)
 
-One dispatch: drift report + orphan list +
+Planned — check mode currently answers a skeleton; the full drift/orphan/retention/versions report lands with live M0. Design: one dispatch:
 retention-setting warning + versions-behind notice. Under S1 there is
 nothing to keep alive (no stored tokens) — missed months degrade
 visibility, never availability.
 
 ## 7. Tenant move: `mode=update-ip` (ADD-before-move)
 
-Main box moved and its IP changed? Dispatch `mode=update-ip` with
+Planned — the mode currently answers a skeleton; ADD-before-move enforcement lands with live M0. Design: main box moved and its IP changed? Dispatch `mode=update-ip` with
 `add_ipv4`/`add_ipv6` (optional `remove_ipv4`): the new IP is ADDED first,
 the old kept during transition, removed only after confirmed boot.
 Operator requests, OWNER executes; a batch move = N per-tenant approvals,
@@ -165,7 +167,7 @@ never one operator token.
 
 ## 8. Destroy: `mode=destroy` (policy + attachment ONLY)
 
-Requires `ack_main_unbound` (confirm the main box is unbound first) +
+Planned — enforcement (including the canary-fail proof gate) lands with live M0. Design: requires `ack_main_unbound` (confirm the main box is unbound first) +
 canary-fail proof. Tears down the firewall policy + attachment only — the
 server and the tang keys are untouched.
 

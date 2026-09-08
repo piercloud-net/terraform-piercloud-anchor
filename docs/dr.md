@@ -28,8 +28,8 @@ Related: [usage.md](usage.md) (end-to-end flow) ·
 | Situation | Detection | Do | Do NOT |
 |---|---|---|---|
 | Anchor death (box down, tangd wedged) | Gatus ALERTs (T1); main box falls back to passphrase prompt at boot | Unlock with the passphrase keyslot; rebuild the anchor, re-bind or `regen` (same-URL fast path below) at your desk | Panic-migrate the main box anywhere |
-| Firewall policy deleted | Main-box canary (`mode=check` drift report + orphan list) | Re-run [`provision.yml`](../.github/workflows/provision.yml) `mode=apply`; it re-converges the policy | Hand-edit policies in the SCP and forget them (drift returns) |
-| Firewall drift (rule changed out-of-band) | Canary failure + `mode=check` drift report | Same as above: dispatched re-apply | Assume the anchor is "just slow" — check the drift report first |
+| Firewall policy deleted | Main-box canary (drift report planned — compare policies in the SCP until then) | Re-run [`provision.yml`](../.github/workflows/provision.yml) `mode=apply`; it re-converges the policy | Hand-edit policies in the SCP and forget them (drift returns) |
+| Firewall drift (rule changed out-of-band) | Canary failure (+ `mode=check` drift report when live) | Same as above: dispatched re-apply | Assume the anchor is "just slow" — check the drift report first |
 | Stale binding (main box moved, source IP changed) | Clevis fails after a move; canary carries the new IP | `mode=update-ip`: ADD the new IP first, confirm boot, then remove the old (ADD-before-move; operator requests, OWNER executes) | Remove the old IP before the new one boots (cutover lockout) |
 | SCP outage (netcup control plane down) | SCP/API unreachable; anchor itself still answers clevis | **SCP outage: do NOT migrate hosts.** Wait it out — running anchors keep unlocking; nothing needs the API until you change something | Migrate hosts mid-outage (strands the moved box behind a stale rule with zero remediation) |
 | Lost phone | You, noticing | Day-1 kit: recovery codes + root password in the PM emergency kit, printed off-device — recover GitHub/netcup access from any browser, then re-enroll | Keep all second factors on the one device (month-6 lesson — see checklist) |
@@ -43,8 +43,8 @@ anchor. Four causes, in order:
 1. **Is the anchor up?** Check Gatus / try the anchor's monitoring page.
    No → anchor death: type the passphrase (T0), then rebuild at your desk
    (same-URL `regen` below). Yes → step 2.
-2. **Did anything firewall-shaped change?** Run `mode=check` (any browser)
-   and read the drift report + orphan list. Drift or a deleted
+2. **Did anything firewall-shaped change?** Diff the firewall policies in the SCP (`mode=check` drift report planned).
+   Drift or a deleted
    policy → `mode=apply` re-converges it, reboot, done. Clean → step 3.
 3. **Did the main box move (new IP)?** Stale binding: the anchor only
    answers the IPs in the policy. `mode=update-ip` with ADD-before-move,
