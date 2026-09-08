@@ -82,6 +82,8 @@ reviewer identity exists. The approval card shows the exact commit
 UNCHANGED/CHANGED banner). The repo is authoritative for execution; any UI
 is advisory display only.
 
+Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../actions/workflows/provision.yml) (`mode` preselects `apply`).
+
 ## 3. Dispatch and approve (S1)
 
 Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Dispatch takes the mode (plus action flags) — no identifiers: your username already lives in the repo's `TENANT_USER` variable, and everything sensitive
