@@ -19,7 +19,21 @@
 #   provision  re-fetch egress IP pre-SSH (mismatch -> abort to sweep) ->
 #              plain ssh (no ansible): install 2 keys, pipe 010-provision.sh
 #              (--rotate passes through), capture thumbprint to artifact path,
-#              `passwd -l root` last.
+#              `passwd -l root` last. Prefers the pasted ROOT_PASSWORD when
+#              set (legacy path, byte-for-byte); else the caller-set
+#              BOOTSTRAP_ROOT_PASSWORD minted by bootstrap-password below.
+#   bootstrap-password
+#              passwordless bootstrap (issue #50): mint a one-time root
+#              password (masked at birth) -> PATCH state OFF (mandatory per
+#              vendor docs) -> poll task SUCCESS -> set via
+#              ServerSetRootPasswordPatch (422 = fresh candidate, bounded)
+#              -> poll SUCCESS -> PATCH state ON -> poll + TCP/SSH retry ->
+#              export the masked value for the provision step (same-runner
+#              handoff). Skips minting when ROOT_PASSWORD_SECRET is set.
+#   lock-password
+#              best-effort finally-path: `passwd -l root` over ssh with the
+#              caller-set password. Never fails (the original failure owns
+#              the verdict); no-ops when nothing was minted.
 #   close      detach-then-delete the run's own tmp policy, always in that
 #              order; missing policy is a success no-op (idempotent).
 #   sweep-post delete this run's policy at any age + every tmp older than 2h
@@ -43,6 +57,14 @@
 #                            auto-mask); referenced here ONLY as
 #                            the sshpass environment value — never echoed,
 #                            never logged, never written to disk. # ci-allowlist: prose — on-box credential-hygiene note, not a live storage reference.
+#   ROOT_PASSWORD_SECRET   pasted-secret sentinel for bootstrap-password:
+#                            non-empty means the tenant pasted the one-run
+#                            secret, so minting is skipped (legacy path).
+#   BOOTSTRAP_ROOT_PASSWORD  caller-set one-time password minted by
+#                            bootstrap-password (add-masked at birth, unset
+#                            after use); consumed by provision (fallback) and
+#                            lock-password (finally-path). Same-runner
+#                            handoff only — dies with the runner.
 #   GATUS_ENDPOINTS          comma-separated name=url pairs (http(s), v1) for the
 #                            dispatch-managed monitor config (repo secret — tenant
 #                            service map stays write-only). NTFY_TOPIC/NTFY_TOKEN
@@ -93,17 +115,24 @@ done
 CMD="${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 case "$CMD" in
-  sweep-pre | open | provision | close | sweep-post) ;;
-  *) die "usage: $0 [--rotate] {sweep-pre|open|provision|close|sweep-post}" ;;
+  sweep-pre | open | provision | close | sweep-post | bootstrap-password | lock-password) ;;
+  *) die "usage: $0 [--rotate] {sweep-pre|open|provision|close|sweep-post|bootstrap-password|lock-password}" ;;
 esac
 
 NETCUP_API_BASE="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
 SERVER_ID="${SERVER_ID:-}"
 SCP_USER_ID="${SCP_USER_ID:-}"
 RUN_ID="${RUN_ID:-}"
-[ -n "$SERVER_ID" ] || die "SERVER_ID is required"
-[ -n "$SCP_USER_ID" ] || die "SCP_USER_ID is required"
-[ -n "$RUN_ID" ] || die "RUN_ID is required (idempotency key)"
+# lock-password is the SSH-only finally-path (no API use): it must run even
+# when resolve never produced ids, so it is exempt from the id guards.
+case "$CMD" in
+  lock-password) ;;
+  *)
+    [ -n "$SERVER_ID" ] || die "SERVER_ID is required"
+    [ -n "$SCP_USER_ID" ] || die "SCP_USER_ID is required"
+    [ -n "$RUN_ID" ] || die "RUN_ID is required (idempotency key)"
+    ;;
+esac
 
 TMP_PREFIX="piercloud-tmp-${SERVER_ID}-"
 OWN_NAME="piercloud-tmp-${SERVER_ID}-${RUN_ID}"
@@ -119,19 +148,21 @@ require_token() {
 # header, responses are error-truncated before printing so a surprising echo
 # can never leak request state into logs).
 # ---------------------------------------------------------------------------
-api_call() { # method path [body] [outvar] -> sets HTTP_STATUS; body to stdout or $outvar
+api_call() { # method path [body] [outvar] [content-type] -> sets HTTP_STATUS; body to stdout or $outvar
   # Subshell warning: callers MUST NOT use resp="$(api_call ...)" — command
   # substitution forks, and HTTP_STATUS set inside would die with it (live
   # failure 2026-09-08: every call site read an unbound HTTP_STATUS). Pass
   # the response-variable name instead; printf -v fills it in THIS shell.
-  local method="$1" path="$2" body="${3:-}" outvar="${4:-}"
+  # Server PATCHes speak application/merge-patch+json (live spec); firewall
+  # CRUD stays on the application/json default.
+  local method="$1" path="$2" body="${3:-}" outvar="${4:-}" ctype="${5:-application/json}"
   local resp_file status content
   resp_file="$(mktemp)"
   if [ -n "$body" ]; then
     status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
       -X "$method" "${NETCUP_API_BASE}${path}" \
       -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
-      -H 'Content-Type: application/json' -H 'Accept: application/json' \
+      -H "Content-Type: $ctype" -H 'Accept: application/json' \
       -d "$body")"
   else
     status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
@@ -388,7 +419,14 @@ cmd_provision() {
   [ -n "$ANCHOR_HOST" ] || die "ANCHOR_HOST is required for provision"
   ANCHOR_HOST="${ANCHOR_HOST%%/*}"  # email prints 203.0.113.10/22-style — strip any /suffix
   case "$ANCHOR_HOST" in ''|*[!0-9.]*) die "ANCHOR_HOST is not a bare IPv4 after stripping any /suffix";; esac
-  [ -n "${ROOT_PASSWORD:-}" ] || die "ROOT_PASSWORD (masked one-run input) is required for provision"
+  # Credential source: pasted ROOT_PASSWORD wins (legacy path, byte-for-byte
+  # today's behavior); empty means bootstrap-password minted a caller-set
+  # one-time value earlier in this run (passwordless path).
+  EFFECTIVE_PASSWORD="${ROOT_PASSWORD:-${BOOTSTRAP_ROOT_PASSWORD:-}}"
+  [ -n "$EFFECTIVE_PASSWORD" ] || die "no root password: set the ANCHOR_ROOT_PASSWORD secret (legacy) or run bootstrap-password first (passwordless)"
+  if [ -z "${ROOT_PASSWORD:-}" ]; then
+    log "passwordless path: using the caller-set one-time password minted this run"
+  fi
   # No standing SSH keys (see header): password dies at root lock, re-entry is
   # per-event via SCP password-reset + re-dispatch — no credential stands anywhere.
   local fresh thumb out
@@ -403,12 +441,13 @@ cmd_provision() {
     log "pre-SSH re-fetch matches the pinned /32"
   fi
   command -v sshpass >/dev/null || {
-    log "installing sshpass on the runner (password transport for the emailed one-run credential)"
+    log "installing sshpass on the runner (password transport for the one-run credential)"
     sudo apt-get install -y -qq sshpass >/dev/null
   }
   log "anchor host key (first-install TOFU — pin this fingerprint out-of-band):"
   ssh-keyscan -p "${ANCHOR_SSH_PORT:-22}" "$ANCHOR_HOST" 2>/dev/null | ssh-keygen -lf - || true
-  export SSHPASS="$ROOT_PASSWORD"
+  export SSHPASS="$EFFECTIVE_PASSWORD"
+  EFFECTIVE_PASSWORD=""
   log "running on-box provision (plain ssh, no ansible)"
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via repo secret + re-dispatch — no key, no console.
@@ -434,8 +473,224 @@ cmd_provision() {
   fi
   log "thumbprint captured (value in artifact, not in this log)"
   ssh_base 'passwd -l root'
-  log "root password locked (passwd -l root); the emailed one-run credential is now dead"
+  log "root password locked (passwd -l root); the one-run credential is now dead"
   unset SSHPASS
+}
+
+# ---------------------------------------------------------------------------
+# bootstrap-password: mint a caller-set one-time root password, power-cycle
+# the server around the set (issue #50 — tenant pastes 1 secret).
+#
+# Power-OFF is mandatory per vendor docs (offline shadow surgery; absolute
+# — no guest-agent write path, guest-agent is GET-only telemetry), so the
+# flow converges to OFF first. Fresh boxes: harmless machine-wait.
+# Re-provisions: note the brief downtime. Async PATCHes return 202 +
+# TaskInfo: poll GET /tasks/{uuid} to FINISHED. 409 server.lock.error:
+# backoff + retry, bounded. The candidate travels only via the sshpass
+# environment value and jq --arg (never argv, never logs); task bodies are
+# never printed on this path (policy messages could quote the candidate).
+# A crash between set and the provision's `passwd -l root` leaves a
+# caller-known password live: the workflow's failure step runs
+# lock-password below (finally-path, not happy-path). An orphan on a
+# powered-OFF box is unreachable — the next re-dispatch mints fresh and
+# overwrites it (recovery = set again + power on + re-dispatch).
+# ---------------------------------------------------------------------------
+BOOTSTRAP_PW_LEN=28       # inside the 24-32 window; caller-supplied value
+BOOTSTRAP_PW_RETRIES=3    # 422 (policy refused the value) -> fresh candidate
+LOCK_WAIT_SECONDS=15      # backoff step on 409 server.lock.error
+LOCK_WAIT_ROUNDS=40       # ... bounded (~10 min per mutating op)
+TASK_POLL_SECONDS=10
+TASK_WAIT_ROUNDS=60       # ... bounded (~10 min per async op)
+SSH_WAIT_ROUNDS=60        # TCP/SSH retry after power-ON (~10 min)
+SSH_PROBE_ROUNDS=12       # sshd takes TCP before auth is ready (short loop)
+
+gen_password() { # -> 28 chars, conservative charset (no shell/JSON specials)
+  LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$BOOTSTRAP_PW_LEN"
+}
+
+server_detail() { # -> raw GET /servers/{id} JSON (callers parse; no state filter)
+  local resp
+  api_call GET "/api/v1/servers/${SERVER_ID}" "" resp
+  api_ok "$HTTP_STATUS" || die "read server $SERVER_ID failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
+  printf '%s' "$resp"
+}
+
+server_live_state() { # -> RUNNING | SHUTOFF | ... (empty when unknown)
+  server_detail | jq -r '.serverLiveInfo.state // empty'
+}
+
+server_primary_ipv4() { # -> first IPv4 from the server detail (empty when none)
+  server_detail | jq -r '.ipv4Addresses[0].ip // empty'
+}
+
+poll_task() { # $1 = task uuid, $2 = label -> 0 on FINISHED; dies otherwise
+  local uuid="$1" label="$2" i resp state
+  i=0
+  while [ "$i" -lt "$TASK_WAIT_ROUNDS" ]; do
+    api_call GET "/api/v1/tasks/${uuid}" "" resp
+    api_ok "$HTTP_STATUS" || die "poll $label task failed (HTTP $HTTP_STATUS): refusing to continue blind"
+    state="$(printf '%s' "$resp" | jq -r '.state // empty')"
+    case "$state" in
+      FINISHED) log "$label task FINISHED"; return 0 ;;
+      PENDING | RUNNING) ;; # still converging
+      *) die "$label task ended in state ${state:-unknown} — investigate in the SCP logs, then re-dispatch (recovery = set again + power on)" ;;
+    esac
+    i=$((i + 1))
+    sleep "$TASK_POLL_SECONDS"
+  done
+  die "$label task still not FINISHED after ~10 min — refusing to continue blind"
+}
+
+patch_server() { # $1 = merge-patch body, $2 = label, $3 = query suffix, $4 = uuid outvar, [$5 = 422-flag var]
+  # 200 = applied now (uuid empty); 202 = async (uuid set, caller polls).
+  # 409 server.lock.error = backoff + retry, bounded. 422 with a flag var =
+  # set the flag and return (caller mints a fresh password candidate);
+  # 422 without one = die. Response bodies are NEVER printed here (the
+  # password path must not leak the candidate through a policy echo).
+  local body="$1" label="$2" qs="${3:-}" outvar="$4" rej422="${5:-}" i resp code uuid
+  i=0
+  while [ "$i" -lt "$LOCK_WAIT_ROUNDS" ]; do
+    api_call PATCH "/api/v1/servers/${SERVER_ID}${qs}" "$body" resp "application/merge-patch+json"
+    case "$HTTP_STATUS" in
+      200) log "$label applied immediately (200)"; printf -v "$outvar" '%s' ""; return 0 ;;
+      202)
+        uuid="$(printf '%s' "$resp" | jq -r '.uuid // empty')"
+        [ -n "$uuid" ] || die "$label accepted but no task uuid returned — refusing to continue blind"
+        printf -v "$outvar" '%s' "$uuid"; return 0 ;;
+      422)
+        if [ -n "$rej422" ]; then printf -v "$rej422" '%s' "1"; return 0; fi
+        die "$label rejected (HTTP 422) — value refused, escalate, no fallback" ;;
+      409)
+        code="$(printf '%s' "$resp" | jq -r '.code // empty')"
+        if [ "$code" = "server.lock.error" ]; then
+          log "$label: server locked (attempt $((i + 1))) — backing off ${LOCK_WAIT_SECONDS}s"
+          i=$((i + 1)); sleep "$LOCK_WAIT_SECONDS"; continue
+        fi
+        die "$label rejected (HTTP 409, code ${code:-unknown}) — escalate, no fallback" ;;
+      *) die "$label failed (HTTP $HTTP_STATUS) — investigate in the SCP logs, then re-dispatch" ;;
+    esac
+  done
+  die "$label: server stayed locked past the backoff budget — operator must look before re-dispatch"
+}
+
+wait_ssh() { # TCP/22 then one auth probe with $SSHPASS, bounded
+  local i=0
+  while [ "$i" -lt "$SSH_WAIT_ROUNDS" ]; do
+    if (echo >/dev/tcp/"$ANCHOR_HOST"/22) >/dev/null 2>&1; then break; fi
+    i=$((i + 1)); sleep 10
+  done
+  if [ "$i" -ge "$SSH_WAIT_ROUNDS" ]; then
+    die "TCP/22 on the anchor never opened after power-ON — refusing to continue blind"
+  fi
+  log "TCP/22 open — one auth probe proving the fresh password is live"
+  i=0
+  while [ "$i" -lt "$SSH_PROBE_ROUNDS" ]; do
+    if sshpass -e ssh -p "${ANCHOR_SSH_PORT:-22}" \
+      -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+      -o BatchMode=no "root@${ANCHOR_HOST}" true 2>/dev/null; then
+      log "auth probe ok — fresh password is live"
+      return 0
+    fi
+    i=$((i + 1)); sleep 10
+  done
+  die "SSH auth probe failed after power-ON — the set may not have converged. Recovery: set again + power on + re-dispatch."
+}
+
+cmd_bootstrap_password() {
+  require_token
+  # Legacy sentinel: a pasted one-run secret keeps today's behavior
+  # byte-for-byte (same SSH, same thumbprint artifact, same lock) —
+  # nothing below runs.
+  if [ -n "${ROOT_PASSWORD_SECRET:-}" ]; then
+    log "pasted one-run secret present — skipping passwordless bootstrap (legacy path)"
+    return 0
+  fi
+  ANCHOR_HOST="${ANCHOR_HOST:-}"
+  [ -n "$ANCHOR_HOST" ] || die "ANCHOR_HOST is required for bootstrap-password (discovered IPv4 or pasted IP)"
+  ANCHOR_HOST="${ANCHOR_HOST%%/*}"
+  case "$ANCHOR_HOST" in ''|*[!0-9.]*) die "ANCHOR_HOST is not a bare IPv4 after stripping any /suffix";; esac
+  command -v sshpass >/dev/null || {
+    log "installing sshpass on the runner (auth probe transport for the caller-set password)"
+    sudo apt-get install -y -qq sshpass >/dev/null
+  }
+  local pw="" state="" uuid="" body="" attempt=0 rejected=0 set_ok=0
+  pw="$(gen_password)"
+  [ "${#pw}" -eq "$BOOTSTRAP_PW_LEN" ] || die "password generator short-read — refusing to continue"
+  echo "::add-mask::$pw" # mask FIRST, before any use (same rule as device secrets)
+  log "one-time password minted (${BOOTSTRAP_PW_LEN} chars, masked) — converging power state"
+  state="$(server_live_state)"
+  log "server live state: ${state:-unknown}"
+  if [ "$state" != "SHUTOFF" ]; then
+    patch_server '{"state":"OFF"}' "power-OFF" "?stateOption=POWEROFF" uuid
+    if [ -n "$uuid" ]; then poll_task "$uuid" "power-OFF"; fi
+  else
+    log "server already OFF — skipping power-OFF"
+  fi
+  while [ "$attempt" -lt "$BOOTSTRAP_PW_RETRIES" ]; do
+    attempt=$((attempt + 1)); rejected=0
+    body="$(jq -n -c --arg p "$pw" '{rootPassword: $p}')"
+    patch_server "$body" "password-set" "" uuid rejected
+    if [ "$rejected" = "1" ]; then
+      pw="$(gen_password)"
+      [ "${#pw}" -eq "$BOOTSTRAP_PW_LEN" ] || die "password generator short-read — refusing to continue"
+      echo "::add-mask::$pw"
+      log "password-set: policy refused the candidate (422) — fresh candidate minted (attempt $attempt/$BOOTSTRAP_PW_RETRIES)"
+      continue
+    fi
+    if [ -n "$uuid" ]; then poll_task "$uuid" "password-set"; fi
+    set_ok=1; break
+  done
+  [ "$set_ok" -eq 1 ] || die "password-set refused $BOOTSTRAP_PW_RETRIES candidates in a row — escalate, no fallback"
+  body=""
+  state="$(server_live_state)"
+  if [ "$state" != "RUNNING" ]; then
+    patch_server '{"state":"ON"}' "power-ON" "" uuid
+    if [ -n "$uuid" ]; then poll_task "$uuid" "power-ON"; fi
+  else
+    log "server already RUNNING — skipping power-ON"
+  fi
+  export SSHPASS="$pw"
+  wait_ssh
+  unset SSHPASS
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "BOOTSTRAP_ROOT_PASSWORD=$pw" >>"$GITHUB_ENV"
+    echo "BOOTSTRAP_PASSWORD_SET=true" >>"$GITHUB_ENV"
+  fi
+  pw=""; uuid="" # discard from memory (the runner-env copy dies with the runner, same as the token)
+  log "bootstrap-password done — caller-set password handed to the provision step (masked, same-runner only)"
+}
+
+# ---------------------------------------------------------------------------
+# lock-password: best-effort finally-path for the caller-set password.
+# The workflow runs this when the job fails after a password went live.
+# Never fails (the original failure owns the verdict); no-ops when nothing
+# was minted. No token needed (SSH only).
+# ---------------------------------------------------------------------------
+cmd_lock_password() {
+  ANCHOR_HOST="${ANCHOR_HOST:-}"
+  [ -n "$ANCHOR_HOST" ] || { warn "lock-password: no ANCHOR_HOST — nothing to lock"; return 0; }
+  ANCHOR_HOST="${ANCHOR_HOST%%/*}"
+  case "$ANCHOR_HOST" in ''|*[!0-9.]*) warn "lock-password: ANCHOR_HOST is not a bare IPv4 — nothing to lock"; return 0;; esac
+  if [ -z "${BOOTSTRAP_ROOT_PASSWORD:-}" ]; then
+    log "lock-password: no caller-set password in this run — nothing to lock"
+    return 0
+  fi
+  command -v sshpass >/dev/null || {
+    sudo apt-get install -y -qq sshpass >/dev/null || {
+      warn "lock-password: sshpass unavailable — the caller-set password stays live: reset it in the SCP, then re-dispatch"
+      return 0
+    }
+  }
+  export SSHPASS="$BOOTSTRAP_ROOT_PASSWORD"
+  if sshpass -e ssh -p "${ANCHOR_SSH_PORT:-22}" \
+    -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+    -o BatchMode=no "root@${ANCHOR_HOST}" 'passwd -l root' 2>/dev/null; then
+    log "lock-password: orphan password locked (passwd -l root)"
+  else
+    warn "lock-password: box unreachable — the caller-set password stays live: reset it in the SCP (or re-dispatch: a fresh password overwrites it), then re-dispatch"
+  fi
+  unset SSHPASS
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -496,4 +751,6 @@ case "$CMD" in
   provision) cmd_provision ;;
   close) cmd_close ;;
   sweep-post) cmd_sweep_post ;;
+  bootstrap-password) cmd_bootstrap_password ;;
+  lock-password) cmd_lock_password ;;
 esac
