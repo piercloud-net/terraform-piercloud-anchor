@@ -75,25 +75,36 @@ resource "netcup_scp_user_firewall_policy" "tang" {
       },
     ] : [],
     local.extra_ingress_rules,
+    # Caddy owns :80 (tang proxy + ACME HTTP-01 arrive via the orange
+    # cloud; the main box still reaches :80 direct for clevis). :443
+    # admits the edge only; :8080/:8081 never leave loopback (on-box
+    # bindings, not firewall rules).
+    # Live 2026-09-08 (issue #61): the rixlhq/netcup provider models
+    # `sources` as an order-significant List, but the SCP API echoes it
+    # back in nondeterministic order — any multi-source rule fails apply
+    # with "inconsistent result after apply". One rule per CIDR keeps
+    # every `sources` a singleton, where order is trivially stable.
+    # Equivalence: ACCEPT iff (port, proto, direction match AND the source
+    # is in the edge set) — a union of singleton rules accepts exactly the
+    # same packets as one rule carrying the whole set; the default posture
+    # (deny otherwise) and every other rule are untouched.
     [
-      # Caddy owns :80 (tang proxy + ACME HTTP-01 arrive via the orange
-      # cloud; the main box still reaches :80 direct for clevis). :443
-      # admits the edge only; :8080/:8081 never leave loopback (on-box
-      # bindings, not firewall rules).
-      {
+      for cidr in local.cf_edge_cidrs : {
         action            = "ACCEPT"
         direction         = "INGRESS"
         protocol          = "TCP"
         destination_ports = "80"
-        sources           = local.cf_edge_cidrs
-      },
-      {
+        sources           = [cidr]
+      }
+    ],
+    [
+      for cidr in local.cf_edge_cidrs : {
         action            = "ACCEPT"
         direction         = "INGRESS"
         protocol          = "TCP"
         destination_ports = "443"
-        sources           = local.cf_edge_cidrs
-      },
+        sources           = [cidr]
+      }
     ],
     [
       {
