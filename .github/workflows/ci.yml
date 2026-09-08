@@ -339,7 +339,10 @@ jobs:
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
           allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com)(/|$)'
-          allowed_path='firewall-polic|interfaces|/servers|device|token|auth'
+          # Passwordless bootstrap (issue #50) extends the surface with task
+          # polling (/tasks) and the approver guard (/users/{id}); the
+          # provisioning-only stems above stay intact (sanity check enforces).
+          allowed_path='firewall-polic|interfaces|/servers|tasks|/users|device|token|auth'
           URL_EXTRACT='https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+'
           PATH_EXTRACT='/api/v[0-9][A-Za-z0-9._~:/?#@!$&()*+,;=%${}-]*'
           MAIN_V="$(grep -E "^[[:space:]]*allowed_url=" /tmp/contract-ci.yml | head -n1 | cut -d"'" -f2 || true)"; [ -n "$MAIN_V" ] || { echo "::error::could not determine allowed_url from contract source"; exit 1; }; allowed_url="$MAIN_V"
