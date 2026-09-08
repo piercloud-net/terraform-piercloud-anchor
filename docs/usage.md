@@ -41,6 +41,10 @@ Collect these as you go — each feeds one repo secret in §2. Where they go (ph
 - **root password** (server-ready email) → `ANCHOR_ROOT_PASSWORD`
 - nothing else to enter: your username, hostname, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
 
+Create them here: [👉 Repo → Settings → Secrets → New repository secret](../../settings/secrets/actions/new) (one per value above).
+
+Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../actions/workflows/provision.yml) (`mode` preselects `apply`).
+
 Why is the one-run password a *stored* secret instead of a dispatch input? Dispatch inputs persist on the run record, visible to anyone who can view the repo — and this template defaults public — so an input would publish the password. A repo secret is write-only and log-masked; combined with `passwd -l root` at the end of the run plus deleting the secret afterwards, the password's validity dies with the provisioning.
 
 Single anchor t:1 is the product (a twin anchor at a different provider is
@@ -81,8 +85,6 @@ reviewer identity exists. The approval card shows the exact commit
 (short+full head SHA + compare-diff link + workflow file count with an
 UNCHANGED/CHANGED banner). The repo is authoritative for execution; any UI
 is advisory display only.
-
-Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../actions/workflows/provision.yml) (`mode` preselects `apply`).
 
 ## 3. Dispatch and approve (S1)
 
