@@ -237,6 +237,19 @@ jobs:
           echo "Open this URL on your phone to approve: $VERIFY_URI"
           echo "Code: $USER_CODE"
           echo "we will never email or message you a code to re-confirm."
+          # Prominent phone card: the run page shows job summaries without
+          # opening logs. verification_uri_complete pre-fills the code — one
+          # tap, no typing. Staleness guard appended on every terminal branch.
+          {
+            echo "### 📲 Approve at netcup (code expires in ~10 min)"
+            echo ""
+            echo "[👉 TAP TO APPROVE]($VERIFY_URI)"
+            echo ""
+            echo "Code: \`$USER_CODE\` (already filled if you tapped the link)"
+            echo ""
+            echo "alias: $TENANT_USER — approving lets this run touch your netcup account ONCE; the token dies with the runner."
+            echo "we will never email or message you a code to re-confirm."
+          } >> "$GITHUB_STEP_SUMMARY"
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
           # re-dispatch message (device codes live ~600s).
           DEADLINE=$((SECONDS + 570))
@@ -260,6 +273,8 @@ jobs:
                 # C-d: refresh stays in-memory only (same-runner handoff
                 # above); TF 1.11 ephemerals carry it — it never lands in state.
                 echo "Approved. Token held in runner memory only."
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "✅ Approved — the code above is dead. Provisioning continues." >> "$GITHUB_STEP_SUMMARY"
                 exit 0
                 ;;
               authorization_pending)
@@ -268,10 +283,12 @@ jobs:
                 DELAY=$((DELAY + 5)) # C-c: cumulative +5s backoff
                 ;;
               expired_token)
+                echo "❌ Code expired — the card above is dead. Re-dispatch the workflow for a fresh code (clean re-dispatch path)." >> "$GITHUB_STEP_SUMMARY"
                 echo "::error::device code expired before approval. Re-dispatch the workflow for a fresh code (clean re-dispatch path)."
                 exit 1
                 ;;
               access_denied)
+                echo "❌ Approval denied — nothing runs. The card above is dead." >> "$GITHUB_STEP_SUMMARY"
                 echo "::error::approval denied at netcup. STOP — nothing runs. Escalate to the operator if unexpected."
                 exit 1
                 ;;
