@@ -11,7 +11,7 @@
 # WHAT IT DOES: derives the flat anchor name from TENANT_USER (D5:
 # `anchor-<sanitized>-01.piercloud.net`; NN=01 — a second operator anchor
 # for one alias (-02+) is a future multi-anchor case, not handled here),
-# plus the dashboard name `status-<sanitized>.piercloud.net` (per-tenant
+# plus the dashboard name `status.<sanitized>.piercloud.net` (per-tenant
 # singleton, no NN), resolves the zone id at runtime (one fewer stored
 # secret), creates or overwrites both A records to the exact anchor IPv4
 # (anchor: TTL 300 DNS-only; dashboard: orange-cloud/proxied), then

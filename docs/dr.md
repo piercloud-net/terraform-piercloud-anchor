@@ -79,7 +79,12 @@ dispatch-managed (same render pattern as the Gatus config): `handle /adv* +
 /rec*` → `127.0.0.1:8081` plain, NO redirect; `/.well-known/acme-challenge/*`
 → HTTP-01; `Host status.*` → `127.0.0.1:8080`; explicit per-tenant site
 blocks, NEVER `on_demand` TLS; catch-all aborts. Tang paths are never served
-on the `:443` dashboard vhost (they abort there).
+on the `:443` dashboard vhost (they abort there). Caddy runs with host
+networking (its `127.0.0.1` dials reach tangd/Gatus on the host loopback;
+the netcup firewall stays the ingress gate). Monitoring note: Gatus probes
+tang only through Caddy's `:80` (a bridge-network container cannot dial
+tangd's `127.0.0.1`); tang-direct is proven every run by a host-level curl
+to `:8081/adv` before any proxy proof runs.
 
 Operator edge ceremony (one-time per zone, Cloudflare dashboard — the
 DNS-edit token the run holds cannot set these, so they are deliberately

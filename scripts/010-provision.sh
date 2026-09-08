@@ -160,12 +160,15 @@ mkdir -p "$(dirname "${GATUS_CONFIG}")"
 # probe wait for a re-dispatch with TENANT_USER.
 SAN="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
 if [ -n "$SAN" ]; then
-  TANG_HOST="anchor-${SAN}-01.piercloud.net"
   STATUS_HOST="status.${SAN}.piercloud.net"
 else
-  TANG_HOST=""; STATUS_HOST=""
+  STATUS_HOST=""
   warn "TENANT_USER unset — dashboard TLS block and TLS-expiry probe skipped (re-dispatch with TENANT_USER to converge them)"
 fi
+# Exact Host value for the :80 dashboard matcher (review: a wildcard span was
+# never verified — render the exact name; hand runs get a never-matching
+# sentinel so the :80 block still validates).
+STATUS_MATCH="${STATUS_HOST:-status.invalid}"
 # One-time backup of any pre-managed hand config (never overwritten twice).
 if [ -f "${GATUS_CONFIG}" ] && [ ! -f "${GATUS_CONFIG}.pre-managed.bak" ] && ! grep -q "DISPATCH-MANAGED" "${GATUS_CONFIG}" 2>/dev/null; then
   cp -p "${GATUS_CONFIG}" "${GATUS_CONFIG}.pre-managed.bak"
@@ -255,15 +258,12 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "metrics: false"
   printf '%s\n' ""
   printf '%s\n' "endpoints:"
-  printf '%s\n' "  # The anchor itself, twice: tang direct (bypasses Caddy) AND through"
-  printf '%s\n' "  # Caddy's :80 (proves the proxy path). Gatus runs in a container"
-  printf '%s\n' "  # (its own loopback), so both reach the host via the hostanchor"
-  printf '%s\n' "  # mapping on \`docker run\` below — never firewalled, always accurate."
-  printf '%s\n' "  - name: tang (direct)"
-  printf '%s\n' "    url: http://hostanchor:${TANG_PORT}/adv"
-  printf '%s\n' "    interval: 60s"
-  printf '%s\n' "    conditions:"
-  printf '%s\n' "      - \"[STATUS] == 200\""
+  printf '%s\n' "  # The anchor through Caddy's :80 (proves the proxy path clevis"
+  printf '%s\n' "  # traffic takes). Probes reach the host via the hostanchor mapping on \`docker run\` below;"
+  printf '%s\n' "  # never firewalled, always accurate. There is deliberately NO direct endpoint"
+  printf '%s\n' "  # here: tangd binds 127.0.0.1 only, which a bridge-network container can never"
+  printf '%s\n' "  # dial; instead every run proves tang direct with a host-level curl to :8081/adv"
+  printf '%s\n' "  # (see the proxy proofs at the end)."
   printf '%s\n' "  - name: tang (via Caddy)"
   printf '%s\n' "    url: http://hostanchor/adv"
   printf '%s\n' "    interval: 60s"
@@ -461,7 +461,8 @@ TMP_CADDY="${CADDY_CONFIG}.new"
   printf '%s\n' "		# No in-Caddy rate limit by decision: the pinned official build"
   printf '%s\n' "		# (caddy:2.11.2-alpine) ships no rate_limit directive — verified via"
   printf '%s\n' "		# list-modules on the v2.11.2 binary; it lives in a third-party xcaddy"
-  printf '%s\n' "		# plugin, which would break the pinned-build call. Flood protection"
+  printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
+  printf '%s\n' "		# Flood protection"
   printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
   printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
@@ -469,7 +470,7 @@ TMP_CADDY="${CADDY_CONFIG}.new"
   printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
   printf '%s\n' "	# construction, so handle order cannot misroute)."
   printf '%s\n' "	@status {"
-  printf '%s\n' "		host status.*"
+  printf '%s\n' "		host ${STATUS_MATCH}"
   printf '%s\n' "		not path /adv* /rec* /.well-known/acme-challenge/*"
   printf '%s\n' "	}"
   printf '%s\n' "	handle @status {"
@@ -493,7 +494,7 @@ TMP_CADDY="${CADDY_CONFIG}.new"
     printf '%s\n' "	handle {"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed."
+    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
     printf '%s\n' "}"
@@ -556,8 +557,14 @@ if [ -n "${AOP_TLS}" ]; then
 fi
 if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
+  # --network host (NOT -p publishing): Caddy dials 127.0.0.1:8081/:8080 for
+  # tangd/Gatus on the HOST loopback — in the default bridge netns those dials
+  # would hit the container's own loopback (502 everywhere, tang dead). Host
+  # networking keeps the loopback dials valid; the netcup firewall policy
+  # (main /32 + edge ranges) stays the ingress gate. Loopback admin :2019
+  # likewise binds host loopback: `docker exec` reload works, outside cannot reach.
   docker run -d --name caddy --restart unless-stopped \
-    -p 80:80 -p 443:443 \
+    --network host \
     --memory 256m \
     -e GOMEMLIMIT=230MiB -e GOMAXPROCS=1 \
     $CADDY_MOUNT_ARGS \
@@ -577,7 +584,18 @@ if [ "${CADDY_RESTART:-0}" = "1" ]; then
   docker exec caddy caddy reload --config /etc/caddy/Caddyfile
   log "Caddy reloaded on new config"
 fi
-# Prove the proxy from the box: tang through Caddy's :80, dashboard by Host.
+# Prove tang DIRECT on loopback first (this host curl is the direct proof that
+# replaces a Gatus direct endpoint — see the render comment above), then tang
+# through Caddy's :80, dashboard by Host.
+ok=0
+for i in 1 2 3 4 5 6; do
+  if curl -sf http://127.0.0.1:${TANG_PORT}/adv -o /tmp/tang-direct.json && grep -q '"kty"' /tmp/tang-direct.json; then ok=1; break; fi
+  sleep 10
+done
+if [ "$ok" != "1" ]; then
+  die "tangd does not answer direct on 127.0.0.1:${TANG_PORT} (/adv) — refusing to finish blind"
+fi
+log "tangd answers direct on loopback (OK)"
 ok=0
 for i in 1 2 3 4 5 6; do
   if curl -sf http://127.0.0.1/adv -o /tmp/caddy-adv.json && grep -q '"kty"' /tmp/caddy-adv.json; then ok=1; break; fi
@@ -591,7 +609,7 @@ log "Caddy :80 proxies tang (OK)"
 if [ -n "${STATUS_HOST:-}" ]; then
   # Dashboard proof goes through the Host matcher to Gatus's own statuses API
   # (deterministic body: our rendered endpoint name, not UI branding bytes).
-  if curl -sf -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses -o /tmp/caddy-dash.json && grep -q 'tang (direct)' /tmp/caddy-dash.json; then
+  if curl -sf -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses -o /tmp/caddy-dash.json && grep -q 'tang (via Caddy)' /tmp/caddy-dash.json; then
     log "Caddy :80 serves the dashboard vhost for ${STATUS_HOST} (OK)"
   else
     docker logs caddy 2>&1 | tail -20 || true
