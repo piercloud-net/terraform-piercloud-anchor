@@ -271,8 +271,8 @@ jobs:
       # Identifiers resolve from REPO-level secrets inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
       # No HOSTNAME secret: derived below as anchor-<tenant>-01.
-      # No SCP_USER_ID secret by default: falls back to CUSTOMER_NUMBER below
-      # (override only if yours differs).
+      # No SCP_USER_ID secret by default: resolved from the token via OIDC
+      # userinfo in the resolve step (override only if yours differs).
       CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
       TENANT_USER: ${{ vars.TENANT_USER }}
     steps:
@@ -392,11 +392,19 @@ jobs:
           [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."; exit 1; }
           echo "ANCHOR_HOSTNAME=anchor-${SAN}-01" >> "$GITHUB_ENV"
           echo "Derived hostname anchor-${SAN}-01."
-          # SCP user id defaults to the customer number (same value on both
-          # account emails for the owner); explicit SCP_USER_ID wins.
-          SCP_EFF="${SCP_USER_ID_IN:-}"
-          [ -n "$SCP_EFF" ] || SCP_EFF="$CUSTOMER_NUMBER"
-          [ -n "$SCP_EFF" ] || { echo "::error::set CUSTOMER_NUMBER (and SCP_USER_ID only if yours differs)."; exit 1; }
+          # SCP user id: NEVER the customer number (live 403 proved they
+          # differ). Resolved from the token itself via OIDC userinfo
+          # (same source shipping CLIs use: userinfo "id" is the numeric
+          # SCP id); explicit SCP_USER_ID secret wins when set.
+          if [ -n "${SCP_USER_ID_IN:-}" ]; then
+            SCP_EFF="$SCP_USER_ID_IN"
+            echo "SCP user id from explicit secret."
+          else
+            SCP_EFF="$(curl -sS 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/userinfo' \
+              -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" | jq -r '.id // empty')"
+            [ -n "$SCP_EFF" ] || { echo "::error::userinfo returned no numeric id — token scope may lack openid, or the grant changed. Escalate, no fallback."; exit 1; }
+            echo "Resolved SCP user id=$SCP_EFF from token userinfo."
+          fi
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
 
       - name: Red-banner acknowledge gate (C-E, no-GitHub path)
