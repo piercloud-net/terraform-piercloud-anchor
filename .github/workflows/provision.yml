@@ -166,6 +166,15 @@ jobs:
     name: "S1 device-flow (C-a..C-f) + A1 window + stateless apply"
     runs-on: ubuntu-latest
     needs: [visibility-banner]
+    # C-E power path: required-reviewer gate lives in repo SETTINGS
+    # (environment `anchor` → tenant GitHub user), not in code. Where a
+    # tenant reviewer identity exists, this pauses the run for their tap
+    # BEFORE any token exists (execution approval); the device approval at
+    # netcup follows (account approval). Two taps, correct order. Where no
+    # reviewer exists (no-GitHub path), the environment auto-creates with
+    # no rules and runs proceed — the LOUD banner is the mechanism there.
+    # Banner stays ungated so the card exists to review first.
+    environment: anchor
     outputs:
       thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
     env:
@@ -469,6 +478,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [device-flow]
     if: inputs.mode == 'apply'
+    # Same gate as device-flow: tenant approves DNS writes too (operator
+    # token, tenant decision). Settings-side, see above.
+    environment: anchor
     env:
       TENANT_USER: ${{ vars.TENANT_USER }}
       ANCHOR_IPV4: ${{ secrets.NETCUP_ANCHOR_IPV4 }}

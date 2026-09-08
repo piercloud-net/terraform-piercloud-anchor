@@ -81,6 +81,8 @@ is advisory display only.
 Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Dispatch takes the mode (plus action flags) — no identifiers: your username already lives in the repo's `TENANT_USER` variable, and everything sensitive
 resolves from repo secrets inside the run.
 
+If your repo has you as a reviewer (power path), GitHub pauses the run first: approve the pending deployment (check the commit matches the banner card), THEN approve the netcup code below. Two taps, in that order — the first approves WHAT runs, the second lets it touch your account. Without a reviewer identity the run proceeds straight to the code, and the LOUD banner is your check.
+
 The run prints a netcup device-flow URL + `XXXX-XXXX` user code (and sends
 them via ntfy). You approve at netcup's own Keycloak (your
 session, your 2FA, ~600s window) — the approval is one tap, phone browsers included. The runner polls, receives an ephemeral
