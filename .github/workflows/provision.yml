@@ -319,6 +319,7 @@ jobs:
                 # C-d: refresh stays in-memory only (same-runner handoff
                 # above); TF 1.11 ephemerals carry it — it never lands in state.
                 echo "Approved. Token held in runner memory only."
+                echo "::notice::netcup approval received for $TENANT_USER — token in runner memory, provisioning continues."
                 echo "" >> "$GITHUB_STEP_SUMMARY"
                 echo "✅ Approved — the code above is dead. Provisioning continues." >> "$GITHUB_STEP_SUMMARY"
                 exit 0
