@@ -206,7 +206,12 @@ jobs:
           # C-a: the authorization secret below is masked FIRST, on the very
           # next line after extraction — never printed or dumped (C-a/C-b).
           DEVICE_CODE="$(echo "$RESP" | jq -r '.device_code')"
-          echo "::add-mask::$DEVICE_CODE" # C-a: masks the device_code; never print it (see C-b)
+          # C-a: NO ::add-mask:: here by design — GitHub silently drops masked
+          # values from GITHUB_OUTPUT ("Skip output since it may contain
+          # secret"), which would hand the poll job an empty code and fail
+          # every run. Containment instead: the code is never printed, never
+          # leaves this job except via outputs to the poll step, lives 600s,
+          # and is useless without the tenant's own netcup session (C-b).
           USER_CODE="$(echo "$RESP" | jq -r '.user_code')"
           VERIFY_URI="$(echo "$RESP" | jq -r '.verification_uri_complete // .verification_uri')"
           INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
@@ -283,16 +288,18 @@ jobs:
           INTERVAL: ${{ needs.device-request.outputs.interval }}
         run: |
           set -euo pipefail
-          echo "::add-mask::$DEVICE_CODE" # re-mask: the secret crosses steps via outputs (masked in logs either way)
+          # No re-mask (see request job): masked values can't cross via outputs;
+          # the code arrives unmasked by design and is never printed anywhere.
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
           # re-dispatch message (device codes live ~600s).
           DEADLINE=$((SECONDS + 570))
           DELAY="$INTERVAL"
           while [ "$SECONDS" -lt "$DEADLINE" ]; do
             sleep "$DELAY"
-            # C-a: the poll payload carries the masked device_code — keep the
-            # response out of logs (it may echo the secret back on errors).
-            POLL="$(curl -sS -X POST "$TOKEN_ENDPOINT" --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" --data-urlencode "client_id=scp" --data-urlencode "device_code=$DEVICE_CODE")" # C-a: device_code masked above
+            # C-a: the poll payload carries the device_code (unmasked by design,
+            # see request job) — keep the response out of logs (it may echo
+            # the code back on errors).
+            POLL="$(curl -sS -X POST "$TOKEN_ENDPOINT" --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" --data-urlencode "client_id=scp" --data-urlencode "device_code=$DEVICE_CODE")" # C-a: code never printed (C-b)
             STATUS="$(echo "$POLL" | jq -r '.error // "ok"')"
             case "$STATUS" in
               ok)
