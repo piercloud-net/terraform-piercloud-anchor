@@ -74,7 +74,7 @@ Two tiers, both operator-held — tenants never touch either. The slice IP is as
 
 ```bash
 gh secret set NETCUP_MAIN_BOX_IPV4    # tenant slice IP
-gh variable set TENANT_USER --body "pier"  # pins which alias this repo may dispatch (fail-closed)
+gh variable set TENANT_USER --body "pier"  # pins which alias this repo may dispatch (mismatch fails closed; unset warns)
 # only if it differs from the customer number:
 # gh secret set NETCUP_SCP_USER_ID
 ```
