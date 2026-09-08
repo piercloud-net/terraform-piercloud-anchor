@@ -42,6 +42,7 @@ All notable changes to this project will be documented in this file.
 
 - Relicense MIT -> Apache-2.0 ([#6](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/6))
 - Allowlist tasks/users SCP endpoints (closes #50)
+- Mock-tang bind-proof e2e through real Caddy render (closes #57)
 
 
 ## [Unreleased]
