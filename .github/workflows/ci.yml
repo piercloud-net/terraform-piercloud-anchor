@@ -518,3 +518,31 @@ jobs:
           fi
           [ "$fail" -eq 0 ]
           echo "no sovereignty-downgrade print patterns (OK)"
+
+  bind-e2e:
+    name: bind-proof e2e (Caddy fronting mock tang)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - name: Gate on changed paths (provisioning surface or harness)
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin main --depth=1 >/dev/null 2>&1 || true
+            changed="$(git diff --name-only origin/main...HEAD 2>/dev/null || true)"
+            printf '%s\n' "$changed"
+            if printf '%s' "$changed" | grep -qE '^(scripts/|main\.tf|\.github/workflows/|tests/bind-e2e/)'; then
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=no" >> "$GITHUB_OUTPUT"
+              echo "::notice::bind-e2e skipped (no relevant paths changed)"
+            fi
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run the bind-proof harness (cred-free, no secrets, no cloud)
+        if: steps.gate.outputs.run == 'yes'
+        timeout-minutes: 9
+        run: sudo bash tests/bind-e2e/run-bind-e2e.sh
