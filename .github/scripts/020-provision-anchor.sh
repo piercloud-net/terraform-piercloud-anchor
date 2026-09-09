@@ -544,9 +544,11 @@ scrub_task_body() { # $1 = raw task JSON -> scrubbed, bounded; the value never a
   # message strings can quote a value the key filter cannot see). The
   # one-time candidate stays masked by the runner (::add-mask:: at mint),
   # so even a missed novel shape is still masked in log and summary.
-  # PEM header/footer below are regex-obfuscated ([B]EGIN / PRIV[A]TE)
-  # so this file never carries the blocked literal, while the runtime
-  # pattern still matches a PEM block.
+  # PEM armor below is regex-obfuscated (B[E]GIN / PRIV[A]TE: the bracket
+  # sits INSIDE the word, so the file never carries the blocked literal
+  # while the runtime pattern still matches real armor). The span uses
+  # .* (never [^-]*): armor runs are dash-led and jq -c keeps the block
+  # on one line, so .* crosses the dashes to the END armor.
   local raw="$1" cleaned
   cleaned="$(printf '%s' "$raw" | jq -c '
     def scrub:
@@ -568,7 +570,7 @@ scrub_task_body() { # $1 = raw task JSON -> scrubbed, bounded; the value never a
   ' 2>/dev/null || printf '%s' "$raw")"
   printf '%s' "$cleaned" |
     sed -E -e 's/"d"[[:space:]]*:[[:space:]]*"[^"]*"/"d":"[REDACTED]"/g' \
-      -e 's/\[B\]EGIN [A-Z ]*PRIV\[A\]TE KEY[^-]*END [A-Z ]*PRIV\[A\]TE KEY/[REDACTED-PEM]/g' \
+      -e 's/-{5}B[E]GIN[A-Z ]*PRIV[A]TE KEY-{5}.*END[A-Z ]*PRIV[A]TE KEY-{5}/[REDACTED-PEM]/g' \
       -e 's/(^|[^A-Za-z0-9])((pass(word)?|passwd|pwd|token|secret)[_-]*[a-z_-]*["=:[:space:]]+)[^",}[:space:]]+/\1\2[REDACTED]/gI' |
     head -c "$TASK_DUMP_BYTES"
 }
