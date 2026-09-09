@@ -554,3 +554,11 @@ jobs:
         if: steps.gate.outputs.run == 'yes'
         timeout-minutes: 9
         run: sudo bash tests/bind-e2e/run-bind-e2e.sh
+
+  scrub-canary:
+    name: scrub-canary (redactor proof)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - name: Run the scrub canaries (cred-free, no live values, no cloud)
+        run: bash tests/scrub-canary/run-scrub-canary.sh

@@ -498,8 +498,10 @@ cmd_provision() {
 # TaskInfo: poll GET /tasks/{uuid} to FINISHED. 409 server.lock.error:
 # backoff + retry, bounded. The candidate travels via the sshpass
 # environment value and jq $ENV (same-runner process argv only — masked in
-# logs, never persisted); task bodies are never printed on this path
-# (policy messages could quote the candidate).
+# logs, never persisted); task bodies print only on poll failure, scrubbed
+# and bounded (2KB), so a policy message quoting the candidate cannot leak
+# it (key filter + embedded-value backstop + runner mask; the value never
+# appears, only metadata).
 # A crash between set and the provision's `passwd -l root` leaves a
 # caller-known password live: the workflow's failure step runs
 # lock-password below (finally-path, not happy-path). An orphan on a
@@ -535,22 +537,79 @@ server_live_state() { # -> RUNNING | SHUTOFF | ... (empty when unknown)
   server_detail | jq -r '.serverLiveInfo.state // empty'
 }
 
+TASK_DUMP_BYTES=2048 # failure-dump bound: uuid + scrubbed body (read-only logging)
+
+scrub_task_body() { # $1 = raw task JSON -> scrubbed, bounded; the value never appears, only metadata
+  # Key filter (structured echo) + embedded-value backstop (free-form
+  # message strings can quote a value the key filter cannot see). The
+  # one-time candidate stays masked by the runner (::add-mask:: at mint),
+  # so even a missed novel shape is still masked in log and summary.
+  # PEM armor below is regex-obfuscated (B[E]GIN / PRIV[A]TE: the bracket
+  # sits INSIDE the word, so the file never carries the blocked literal
+  # while the runtime pattern still matches real armor). The span uses
+  # .* (never [^-]*): armor runs are dash-led and jq -c keeps the block
+  # on one line, so .* crosses the dashes to the END armor.
+  local raw="$1" cleaned
+  cleaned="$(printf '%s' "$raw" | jq -c '
+    def scrub:
+      if type == "object" then
+        with_entries(
+          .value |= scrub
+          | if (.key | test("pass|passwd|pwd|token|secret|private|jwk|auth|cred"; "i")) then
+              .value = "[REDACTED]"
+            else
+              .
+            end
+        )
+      elif type == "array" then
+        map(scrub)
+      else
+        .
+      end;
+    try scrub catch .
+  ' 2>/dev/null || printf '%s' "$raw")"
+  printf '%s' "$cleaned" |
+    sed -E -e 's/"d"[[:space:]]*:[[:space:]]*"[^"]*"/"d":"[REDACTED]"/g' \
+      -e 's/-{5}B[E]GIN[A-Z ]*PRIV[A]TE KEY-{5}.*END[A-Z ]*PRIV[A]TE KEY-{5}/[REDACTED-PEM]/g' \
+      -e 's/(^|[^A-Za-z0-9])((pass(word)?|passwd|pwd|token|secret)[_-]*[a-z_-]*["=:[:space:]]+)[^",}[:space:]]+/\1\2[REDACTED]/gI' |
+    head -c "$TASK_DUMP_BYTES"
+}
+
+log_task_dump() { # $1 = uuid, $2 = label, $3 = state, $4 = raw body -> step log + job summary (scrubbed, bounded)
+  local uuid="$1" label="$2" state="$3" raw="$4" scrubbed
+  scrubbed="$(scrub_task_body "$raw")"
+  {
+    printf 'A1 TASK_DUMP: %s task %s ended in state %s\n' "$label" "$uuid" "${state:-unknown}"
+    printf '%s\n' "$scrubbed"
+  } >&2
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      printf '### A1 task failure: %s `%s` state `%s`\n' "$label" "$uuid" "${state:-unknown}"
+      printf '```json\n%s\n```\n' "$scrubbed"
+    } >>"$GITHUB_STEP_SUMMARY" || true
+  fi
+}
+
 poll_task() { # $1 = task uuid, $2 = label -> 0 on FINISHED; dies otherwise
   local uuid="$1" label="$2" i resp state
   i=0
   while [ "$i" -lt "$TASK_WAIT_ROUNDS" ]; do
     api_call GET "/api/v1/tasks/${uuid}" "" resp
-    api_ok "$HTTP_STATUS" || die "poll $label task failed (HTTP $HTTP_STATUS): refusing to continue blind"
+    api_ok "$HTTP_STATUS" || die "poll $label task $uuid failed (HTTP $HTTP_STATUS): refusing to continue blind"
     state="$(printf '%s' "$resp" | jq -r '.state // empty')"
     case "$state" in
-      FINISHED) log "$label task FINISHED"; return 0 ;;
+      FINISHED) log "$label task $uuid FINISHED"; return 0 ;;
       PENDING | RUNNING) ;; # still converging
-      *) die "$label task ended in state ${state:-unknown} — investigate in the SCP logs, then re-dispatch (recovery = set again + power on)" ;;
+      *)
+        log_task_dump "$uuid" "$label" "$state" "$resp"
+        die "$label task $uuid ended in state ${state:-unknown} — investigate in the SCP logs, then re-dispatch (recovery = set again + power on)"
+        ;;
     esac
     i=$((i + 1))
     sleep "$TASK_POLL_SECONDS"
   done
-  die "$label task still not FINISHED after ~10 min — refusing to continue blind"
+  log_task_dump "$uuid" "$label" "TIMEOUT" "$resp"
+  die "$label task $uuid still not FINISHED after ~10 min — refusing to continue blind"
 }
 
 patch_server() { # $1 = merge-patch body, $2 = label, $3 = query suffix, $4 = uuid outvar, [$5 = 422-flag var]
