@@ -88,15 +88,31 @@ tang only through Caddy's `:80` (a bridge-network container cannot dial
 tangd's `127.0.0.1`); tang-direct is proven every run by a host-level curl
 to `:8081/adv` before any proxy proof runs.
 
-Operator edge ceremony (one-time per zone, Cloudflare dashboard — the
-DNS-edit token the run holds cannot set these, so they are deliberately
-manual, verified by eye after each change):
+Operator edge ceremony (operator-plane, verified by eye after each change;
+the DNS-edit token the anchor run holds cannot set these, so it stays outside
+the public repo — codification target: the private operator control plane).
+**Two TLS legs must both be up — they fail independently, and the dashboard
+host is two labels deep:**
+
+- **Leg 1 — visitor → edge.** `status.<tenant>.piercloud.net` is two labels
+  deep, so Cloudflare's free Universal SSL (apex + one label) does NOT cover
+  it. Enable **Advanced Certificate Manager** ($10/mo per zone) and
+  **Total TLS**, or order an advanced certificate carrying the wildcard SANs
+  (`*.pier.piercloud.net`, later `*.user.piercloud.net`; up to 50 SANs per
+  cert). Without this the edge aborts the handshake
+  (`SSLV3_ALERT_HANDSHAKE_FAILURE`).
+- **Leg 2 — edge → origin.** Full (Strict) needs a valid origin cert on the
+  box. Do NOT rely on Caddy auto-TLS (HTTP-01) for proxied two-label hosts:
+  Always-Use-HTTPS redirects the challenge to https, and the https follow-up
+  needs the origin cert ACME is still trying to obtain — a catch-22 (live
+  2026-09-10, issue #88). Plant the pair (below); a run that cannot handshake
+  `:443` logs the WARNING variant of the dashboard check, not a failure.
 
 - SSL/TLS mode **Full (Strict)** (edge → origin encrypted, origin cert verified).
 - Cache Rule **Bypass** for `/.well-known/acme-challenge/*` (HTTP-01 must reach the box, never a cached edge hit).
 - No WAF custom rule / Bot Fight Mode block on that path (challenge fetches look like bots).
 - Zone-level **Authenticated Origin Pulls** with our own cert: upload the CA in the zone dashboard, then set the `CF_AOP_CA_PEM` repo secret (public bundle) + re-dispatch — Caddy enforces the edge client cert at the handshake. Until then, edge auth is firewall-allowlist + Host binding (documented degradation, dashboard-only).
-- Origin CA pair: issued in the Cloudflare dashboard per tenant hostname, planted as the `CF_ORIGIN_CERT_PEM` / `CF_ORIGIN_KEY_PEM` repo secrets (operator-plane, set at template time — the tenant pastes nothing), re-dispatch to deploy. Deployed key material, NOT a standing API token: the box presents its origin cert but cannot rewrite the zone.
+- Origin CA pair: issue in the Cloudflare dashboard, plant as the `CF_ORIGIN_CERT_PEM` / `CF_ORIGIN_KEY_PEM` repo secrets (operator-plane, set at template time — the tenant pastes nothing), re-dispatch to deploy. Origin CA supports **leftmost wildcards** (one level) and up to 200 SANs, so ONE wildcard pair — e.g. `*.pier.piercloud.net` (plus `*.piercloud.net` / the apex if wanted) — serves every present and future tenant host on this anchor; no per-hostname pairs. Caddy renders it unchanged (`tls <cert> <key>`); validity can be up to 15 years (Cloudflare sends no expiry notifications — calendar it anyway). Deployed key material, NOT a standing API token: the box presents its origin cert but cannot rewrite the zone.
 
 Cutover reversibility (if Caddy ever wedges and the `:80` proxy with it —
 tang itself stays up on loopback throughout): on the box, `docker stop caddy`,
