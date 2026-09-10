@@ -16,7 +16,13 @@
 #
 set -euo pipefail
 
+# Legacy/upstream-default keydir. The authoritative dir is resolved after the
+# tang install below, from the INSTALLED unit: Debian/Ubuntu patch upstream's
+# jwkdir default to /var/lib/tang, so keys generated only here are read by
+# nobody (tangd answers HTTP 500) while the on-box thumbprint, computed from
+# these files, still looks fine — live 2026-09-10 (#78).
 TANG_KEYS_DIR="/var/db/tang"
+LEGACY_TANG_KEYS_DIR="/var/db/tang"
 TANG_PORT="8081"
 # renovate: depName=twinproduction/gatus datasource=docker
 GATUS_IMAGE="twinproduction/gatus:v5.36.0"
@@ -152,9 +158,34 @@ case "${1:-}" in
   *) die "usage: $0 [--rotate]" ;;
 esac
 
+# --- keys must live where the INSTALLED unit reads them -------------------
+# The unit pins both the keydir (ExecStart's last argument) and the user that
+# runs tangd; ask the unit itself instead of assuming a distro layout.
+unit_keydir() {
+  systemctl cat 'tangd@.service' 2>/dev/null \
+    | sed -n 's/^ExecStart=[^[:space:]]*[[:space:]]\{1,\}\(\/[^[:space:]]*\)[[:space:]]*$/\1/p' \
+    | tail -n1
+}
+unit_user() {
+  systemctl cat 'tangd@.service' 2>/dev/null \
+    | sed -n 's/^User=\([^[:space:]]*\)[[:space:]]*$/\1/p' | tail -n1
+}
+# Keys are private material: owned by the unit's user (Debian: _tang:_tang)
+# with dir 0750 / files 0640. If that user is absent, fall back to root plus
+# world-readable so tangd can still read (the unit runs as a fixed user).
+own_keys() {
+  local u="${TANG_UNIT_USER:-_tang}"
+  getent passwd "${u}" >/dev/null 2>&1 || u="root"
+  chown -R "${u}:${u}" "${TANG_KEYS_DIR}" 2>/dev/null || true
+  chmod 0750 "${TANG_KEYS_DIR}" 2>/dev/null || true
+  chmod 0640 "${TANG_KEYS_DIR}"/*.jwk 2>/dev/null || true
+  [ "${u}" = "root" ] && chmod 0644 "${TANG_KEYS_DIR}"/*.jwk 2>/dev/null || true
+  return 0
+}
+
 gen_keys() { # append a fresh key set on this box (never deletes)
   # Live 2026-09-08: tangd-keygen requires the dir to exist (usage error
-  # otherwise) — some base images lack /var/db/tang entirely. # ci-allowlist: prose — base-image note, not a live image reference.
+  # otherwise) — some base images lack it entirely. # ci-allowlist: prose — base-image note, not a live image reference.
   mkdir -p "${TANG_KEYS_DIR}"
   if [ -x /usr/libexec/tangd-keygen ]; then
     /usr/libexec/tangd-keygen "${TANG_KEYS_DIR}"
@@ -163,6 +194,7 @@ gen_keys() { # append a fresh key set on this box (never deletes)
   else
     die "tangd-keygen not found; reinstall the 'tang' package"
   fi
+  own_keys
   systemctl restart tangd.socket 2>/dev/null || true
 }
 
@@ -174,19 +206,37 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq tang jq >/dev/null
 
+# Resolve the keydir/user from the installed unit and migrate keys written by
+# earlier runs, so the published thumbprint survives (never regenerate over
+# live keys). See the TANG_KEYS_DIR note at the top for why this matters.
+TANG_UNIT_USER="$(unit_user || true)"
+UNIT_KEYDIR="$(unit_keydir || true)"
+# Accept only an absolute path — own_keys() chown/chmod -R's this directory.
+case "${UNIT_KEYDIR}" in
+  /?*) TANG_KEYS_DIR="${UNIT_KEYDIR}" ;;
+  *) [ -d /var/lib/tang ] && TANG_KEYS_DIR="/var/lib/tang" ;;
+esac
+log "tang keydir: ${TANG_KEYS_DIR} (unit user: ${TANG_UNIT_USER:-unknown})"
+if [ "${TANG_KEYS_DIR}" != "${LEGACY_TANG_KEYS_DIR}" ] && compgen -G "${LEGACY_TANG_KEYS_DIR}/*.jwk" >/dev/null; then
+  mkdir -p "${TANG_KEYS_DIR}"
+  for f in "${LEGACY_TANG_KEYS_DIR}"/*.jwk; do
+    [ -e "${TANG_KEYS_DIR}/$(basename "$f")" ] || cp -p "$f" "${TANG_KEYS_DIR}/"
+  done
+  log "Migrated existing tang keys ${LEGACY_TANG_KEYS_DIR} -> ${TANG_KEYS_DIR} (thumbprint preserved)"
+fi
+own_keys
+
 log "Moving tangd.socket to 127.0.0.1:${TANG_PORT} (Caddy owns :80 from here on)"
 mkdir -p /etc/systemd/system/tangd.socket.d
 printf '[Socket]\nListenStream=\nListenStream=127.0.0.1:%s\n' "${TANG_PORT}" > /etc/systemd/system/tangd.socket.d/listen.conf
 systemctl daemon-reload
 systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 systemctl restart tangd.socket 2>/dev/null || true
-# Live 2026-09-10 (#73): restarting the socket unit does NOT move an active
-# or wedged tangd.service — the old instance keeps the old socket fd, so
-# nothing serves the new loopback listener and the /adv probe below fails
-# for its whole retry budget. Cycle the service explicitly (a manual start
-# inherits the socket unit's fds, rebinding tangd to the new address).
-systemctl reset-failed tangd.service 2>/dev/null || true
-systemctl restart tangd.service 2>/dev/null || true
+# Serve model on Debian/Ubuntu (verified live 2026-09-10, #75): the tang
+# package ships tangd.socket + tangd@.service with Accept=yes — there is NO
+# plain tangd.service, and a connection spawns a per-connection instance.
+# So the socket cycle above is the whole restart; the instances are spawned
+# on demand and must be diagnosed through the socket unit.
 # Prove no double-bind: tangd must listen ONLY on loopback (Caddy owns :80).
 # Exact match is deliberate: any extra listener (including a lingering :80)
 # fails closed instead of half-covering the proxy cutover. Live 2026-09-10
@@ -612,22 +662,71 @@ fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
 # through Caddy's :80, dashboard by Host.
+# The /adv body is a flattened JWS: upstream tang (v11..v15, src/keys.c
+# jwk_sign) packs {"payload": b64u({"keys":[...]}), "protected": ...,
+# "signature": ...} — the literal string "kty" exists ONLY inside the
+# base64url payload, so a raw grep can never match a serving tang. Live
+# 2026-09-10 (#77): that grep failed every run while the real fault was the
+# key directory above. Assert the wire shape with jq and, when jose is
+# present, that the payload parses as a JWK set (the same parse upstream's
+# tang-show-keys performs).
+adv_ok() {
+  jq -e 'has("payload") and has("protected") and has("signature")' "$1" >/dev/null 2>&1 || return 1
+  if command -v jose >/dev/null 2>&1; then
+    jose fmt --json="$(cat "$1")" -g payload -y -o- 2>/dev/null \
+      | jose jwk use -i- -r -u verify -o- >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+probe_tang_direct() {
+  curl -sf --max-time 5 "http://127.0.0.1:${TANG_PORT}/adv" -o /tmp/tang-direct.json \
+    && adv_ok /tmp/tang-direct.json
+}
 ok=0
 for i in 1 2 3 4 5 6; do
-  if curl -sf http://127.0.0.1:${TANG_PORT}/adv -o /tmp/tang-direct.json && grep -q '"kty"' /tmp/tang-direct.json; then ok=1; break; fi
+  probe_tang_direct && { ok=1; break; }
   sleep 10
 done
 if [ "$ok" != "1" ]; then
-  log "tangd direct-probe failed — capturing unit state for the next run"
-  systemctl --no-pager -l status tangd.socket tangd.service 2>&1 | tail -30 || true
-  journalctl -u tangd.socket -u tangd.service -n 30 --no-pager 2>&1 | tail -40 || true
-  if command -v ss >/dev/null 2>&1; then ss -ltnp 2>/dev/null | grep -E ":${TANG_PORT}|:80 " || true; fi
+  # Live 2026-09-10 (#75): a socket that was reconfigured in place can be left
+  # "not functional until restarted"; a full stop/start is the documented cure.
+  log "Direct probe failed — cycling the socket once and re-probing"
+  systemctl stop tangd.socket 2>/dev/null || true
+  systemctl start tangd.socket 2>/dev/null || true
+  sleep 2
+  for i in 1 2 3; do
+    probe_tang_direct && { ok=1; break; }
+    sleep 5
+  done
+fi
+if [ "$ok" != "1" ]; then
+  # The socket is Accept=yes on this distro (tangd@.service, instance per
+  # connection), so the failure lives in the instance path: dump everything
+  # (verbose curl, unit files, instance journal, package, keys, manual spawn)
+  # so the next run's log is enough to write the real fix. # ci-allowlist: prose — on-box instance note, not a live image reference.
+  log "tangd direct-probe failed — capturing listener, instance and package state"
+  curl -sv --max-time 5 "http://127.0.0.1:${TANG_PORT}/adv" 2>&1 | tail -25 || true
+  systemctl --no-pager -l status tangd.socket 2>&1 | tail -18 || true
+  systemctl list-units 'tangd*' --all --no-pager 2>&1 | tail -12 || true
+  log "unit file tangd.socket:"; systemctl cat tangd.socket 2>&1 | tail -25 || true
+  log "unit file tangd@.service:"; systemctl cat 'tangd@.service' 2>&1 | tail -25 || true
+  log "instance journal:"; journalctl -u 'tangd@*' -n 60 --no-pager 2>&1 | tail -60 || true
+  log "advertisement body (first 200 bytes):"; head -c 200 /tmp/tang-direct.json 2>/dev/null || true; echo
+  log "package:"; dpkg -l tang 2>&1 | tail -3 || true
+  dpkg -L tang 2>&1 | grep -E 'systemd|libexec|lib/tang|/s?bin/' | head -12 || true
+  log "keydir + user (${TANG_KEYS_DIR} / ${TANG_UNIT_USER:-unknown}):"
+  ls -la "${TANG_KEYS_DIR}" 2>&1 | head -8 || true; ls -la "${LEGACY_TANG_KEYS_DIR}" 2>&1 | head -4 || true
+  getent passwd "${TANG_UNIT_USER:-_tang}" 2>&1 || true
+  TBIN=/usr/libexec/tangd; [ -x "$TBIN" ] || TBIN=/usr/lib/tang/tangd
+  log "manual spawn ($TBIN):"
+  "$TBIN" --help >/tmp/tangd-help.txt 2>&1; log "help exit=$?"; head -c 400 /tmp/tangd-help.txt || true; echo
+  timeout 5 "$TBIN" "${TANG_KEYS_DIR}" </dev/null >/tmp/tangd-try.txt 2>&1; log "manual exit=$?"; head -c 300 /tmp/tangd-try.txt || true; echo
   die "tangd does not answer direct on 127.0.0.1:${TANG_PORT} (/adv) — refusing to finish blind"
 fi
 log "tangd answers direct on loopback (OK)"
 ok=0
 for i in 1 2 3 4 5 6; do
-  if curl -sf http://127.0.0.1/adv -o /tmp/caddy-adv.json && grep -q '"kty"' /tmp/caddy-adv.json; then ok=1; break; fi
+  if curl -sf --max-time 5 http://127.0.0.1/adv -o /tmp/caddy-adv.json && adv_ok /tmp/caddy-adv.json; then ok=1; break; fi
   sleep 10
 done
 if [ "$ok" != "1" ]; then

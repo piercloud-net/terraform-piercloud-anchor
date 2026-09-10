@@ -475,7 +475,7 @@ cmd_provision() {
     { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s'
   fi
   log "capturing tang thumbprint to the artifact path"
-  thumb="$(ssh_base 'command -v tang-show-keys >/dev/null && tang-show-keys 8081 || jose jwk thp -a S256 -r -f /var/db/tang/*.jwk' | head -n 1 | tr -d '[:space:]')"
+  thumb="$(ssh_base 'KD="$(systemctl cat tangd@.service 2>/dev/null | sed -n "s/^ExecStart=.*[[:space:]]\(.*\)$/\1/p" | tail -n1)"; [ -n "${KD}" ] || KD=/var/lib/tang; if command -v tang-show-keys >/dev/null 2>&1; then tang-show-keys 8081; else jose jwk thp -a S256 -r -f "${KD}"/*.jwk; fi' | head -n 1 | tr -d '[:space:]')"
   if [ -z "$thumb" ] || printf '%s' "$thumb" | grep -q '[[:space:]]'; then
     die "thumbprint capture failed (empty or malformed) — refusing to finish without it (H1: never logs alone)"
   fi
