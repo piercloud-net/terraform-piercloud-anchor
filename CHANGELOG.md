@@ -34,6 +34,8 @@ All notable changes to this project will be documented in this file.
 - One firewall rule per edge CIDR, provider-order-proof (closes #61)
 - Poll SCP 202 tasks, uuid shadowed by local (closes #63)
 - Dump task uuid + scrubbed body on async failure (closes #66)
+- Set root password while RUNNING (agent-based reset, no power cycle) (closes #68)
+- Tolerate the systemd socket-type suffix on tangd Listen (closes #71)
 
 ### 📚 Documentation
 
