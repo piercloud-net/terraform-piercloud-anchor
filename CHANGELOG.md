@@ -43,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - Dashboard vhost checks in the pre-DNS / auto-TLS state (closes #83)
 - Read the DNS proxied flag without jq's false-as-empty trap (closes #85)
 - Converge tang key material to one bindable set (closes #87)
+- Probe the Caddy :443 origin with SNI (closes #92)
 
 ### 📚 Documentation
 
@@ -50,6 +51,7 @@ All notable changes to this project will be documented in this file.
 - Tap target from secrets to dispatch (closes #20)
 - Working tap targets + ntfy out of bootstrap (closes #30, closes #31)
 - Passwordless-first framing in usage.md (closes #50)
+- Two-leg edge/origin TLS ceremony + wildcard Origin CA pair (closes #90)
 
 ### ⚙️ Miscellaneous Tasks
 
