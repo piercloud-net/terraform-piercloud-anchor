@@ -250,10 +250,15 @@ RT_DIR="${WORK}/real-tang"
 RT_PORT=18083
 mkdir -p "${RT_DIR}"
 [ -x /usr/libexec/tangd-keygen ] || die "real tang not installed (no /usr/libexec/tangd-keygen)"
-/usr/libexec/tangd -h 2>&1 | grep -q -- --listen || die "this runner's tangd has no --listen mode (need tang >= 14; pin runs-on)"
-/usr/libexec/tangd-keygen "${RT_DIR}" >/dev/null
-/usr/libexec/tangd-keygen "${RT_DIR}" >/dev/null
-[ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "4" ] || die "expected two keygen rounds to leave four .jwk files"
+/usr/libexec/tangd -h >"${WORK}/tangd-help.txt" 2>&1 || true
+grep -q -- --listen "${WORK}/tangd-help.txt" || { sed -n '1,12p' "${WORK}/tangd-help.txt"; die "this runner's tangd has no --listen mode (need tang >= 14)"; }
+for round in 1 2; do
+  if ! /usr/libexec/tangd-keygen "${RT_DIR}" >"${WORK}/keygen${round}.log" 2>&1; then
+    sed -n '1,20p' "${WORK}/keygen${round}.log"
+    die "tangd-keygen round ${round} failed (log above; check the tang package's key user)"
+  fi
+done
+[ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "4" ] || { ls -la "${RT_DIR}"; die "expected two keygen rounds to leave four .jwk files"; }
 eval "$(sed -n '/# --- collapse:start ---/,/# --- collapse:end ---/p' "${PROVISION_SH}")"
 declare -f collapse_keys >/dev/null || die "collapse_keys() not found in ${PROVISION_SH} — update this harness"
 warn() { printf '\n==> WARN: %s\n' "$*"; }
