@@ -37,6 +37,7 @@ All notable changes to this project will be documented in this file.
 - Set root password while RUNNING (agent-based reset, no power cycle) (closes #68)
 - Tolerate the systemd socket-type suffix on tangd Listen (closes #71)
 - Cycle tangd.service after the socket move (closes #73)
+- Serve tang keys from the unit keydir + assert the JWS advertisement (closes #75, closes #77, closes #78)
 
 ### 📚 Documentation
 
