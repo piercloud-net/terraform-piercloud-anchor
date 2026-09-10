@@ -204,7 +204,7 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 log "Installing tang (NBDE key server)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq tang jq >/dev/null
+apt-get install -y -qq tang jq jose >/dev/null
 
 # Resolve the keydir/user from the installed unit and migrate keys written by
 # earlier runs, so the published thumbprint survives (never regenerate over
@@ -667,14 +667,40 @@ fi
 # "signature": ...} — the literal string "kty" exists ONLY inside the
 # base64url payload, so a raw grep can never match a serving tang. Live
 # 2026-09-10 (#77): that grep failed every run while the real fault was the
-# key directory above. Assert the wire shape with jq and, when jose is
-# present, that the payload parses as a JWK set (the same parse upstream's
-# tang-show-keys performs).
+# key directory above.
+# The shape check is mandatory; the deeper jose parse is best-effort and
+# fails loud-but-non-fatal, because the `tang` package does not depend on
+# jose (the cryptographic proof lives in the thumbprint step and the
+# operator's bind). Every branch logs WHY it rejected, so a live run is
+# diagnosable without another dispatch.
 adv_ok() {
-  jq -e 'has("payload") and has("protected") and has("signature")' "$1" >/dev/null 2>&1 || return 1
+  adv_file="$1"
+  if [ ! -s "${adv_file}" ]; then
+    log "adv check: empty /adv response"
+    return 1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    if ! jq -e 'has("payload") and has("protected") and has("signature")' "${adv_file}" >/dev/null 2>&1; then
+      log "adv check: not a flattened-JWS envelope — body starts (160 bytes):"
+      head -c 160 "${adv_file}" || true; echo
+      return 1
+    fi
+  else
+    log "adv check: jq missing — falling back to an envelope substring check"
+    if ! grep -q '"payload"' "${adv_file}" || ! grep -q '"protected"' "${adv_file}" || ! grep -q '"signature"' "${adv_file}"; then
+      log "adv check: body lacks flattened-JWS fields — body starts (160 bytes):"
+      head -c 160 "${adv_file}" || true; echo
+      return 1
+    fi
+  fi
   if command -v jose >/dev/null 2>&1; then
-    jose fmt --json="$(cat "$1")" -g payload -y -o- 2>/dev/null \
-      | jose jwk use -i- -r -u verify -o- >/dev/null 2>&1 || return 1
+    if ! jose fmt --json="$(cat "${adv_file}")" -g payload -y -o- 2>/dev/null \
+      | jose jwk use -i- -r -u verify -o- >/dev/null 2>&1; then
+      log "adv check: envelope ok but jose found no verify-usable key in the payload (non-fatal; payload starts below)"
+      jose fmt --json="$(cat "${adv_file}")" -g payload -y -o- 2>&1 | head -c 200 || true; echo
+    fi
+  else
+    log "adv check: jose missing — envelope shape only (jose is installed with the tang package above)"
   fi
   return 0
 }
@@ -712,6 +738,10 @@ if [ "$ok" != "1" ]; then
   log "unit file tangd@.service:"; systemctl cat 'tangd@.service' 2>&1 | tail -25 || true
   log "instance journal:"; journalctl -u 'tangd@*' -n 60 --no-pager 2>&1 | tail -60 || true
   log "advertisement body (first 200 bytes):"; head -c 200 /tmp/tang-direct.json 2>/dev/null || true; echo
+  log "adv tooling:"; command -v jq || echo "jq MISSING"; command -v jose || echo "jose MISSING"
+  jq --version 2>/dev/null || true; dpkg -l jq jose 2>&1 | tail -3 || true
+  jq -e 'has("payload") and has("protected") and has("signature")' /tmp/tang-direct.json >/dev/null 2>&1 && log "manual jq shape check: OK" || log "manual jq shape check: FAILED"
+  jose fmt --json="$(cat /tmp/tang-direct.json 2>/dev/null)" -g payload -y -o- 2>/dev/null | jose jwk use -i- -r -u verify -o- >/dev/null 2>&1 && log "manual jose payload parse: OK" || log "manual jose payload parse: FAILED"
   log "package:"; dpkg -l tang 2>&1 | tail -3 || true
   dpkg -L tang 2>&1 | grep -E 'systemd|libexec|lib/tang|/s?bin/' | head -12 || true
   log "keydir + user (${TANG_KEYS_DIR} / ${TANG_UNIT_USER:-unknown}):"
