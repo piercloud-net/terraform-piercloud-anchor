@@ -39,6 +39,7 @@ All notable changes to this project will be documented in this file.
 - Cycle tangd.service after the socket move (closes #73)
 - Serve tang keys from the unit keydir + assert the JWS advertisement (closes #75, closes #77, closes #78)
 - Make the /adv probe self-diagnosing and tool-gap tolerant (closes #79)
+- Accept the JWS general serialization in the /adv probe (closes #81)
 
 ### 📚 Documentation
 
