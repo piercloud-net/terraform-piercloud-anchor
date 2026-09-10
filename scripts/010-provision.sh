@@ -779,14 +779,31 @@ log "Caddy :80 proxies tang (OK)"
 if [ -n "${STATUS_HOST:-}" ]; then
   # Dashboard proof goes through the Host matcher to Gatus's own statuses API
   # (deterministic body: our rendered endpoint name, not UI branding bytes).
+  # Two legitimate states (live 2026-09-10, #83): under CADDY_SKIP_HTTPS the
+  # :80 vhost proxies straight to Gatus; with automatic HTTPS (no operator
+  # origin pair yet) Caddy answers :80 with the HTTP->HTTPS redirect for that
+  # name. Both prove the Host matched the dashboard vhost; an unmatched host
+  # hits the render's `handle { abort }` (empty reply, code 000) instead.
   if curl -sf -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses -o /tmp/caddy-dash.json && grep -q 'tang (via Caddy)' /tmp/caddy-dash.json; then
     log "Caddy :80 serves the dashboard vhost for ${STATUS_HOST} (OK)"
   else
-    docker logs caddy 2>&1 | tail -20 || true
-    die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} — refusing to finish blind"
+    dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
+    case "${dash_code}" in
+      301|302|307|308)
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the proxied edge record is upserted by the DNS stage after close)" ;;
+      *)
+        docker logs caddy 2>&1 | tail -20 || true
+        die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
+    esac
   fi
   if curl -skf -H "Host: ${STATUS_HOST}" https://127.0.0.1/ -o /dev/null; then
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
+  elif [ ! -s "${CADDY_ORIGIN_CRT}" ]; then
+    # No operator origin pair: auto-TLS cannot issue for a name whose public
+    # record is only upserted by the DNS stage after this job. Origin TLS is
+    # proven there (verify-after-write + orange-cloud) and by the edge, so
+    # this is loud, not fatal; with the pair deployed it stays fail-closed.
+    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — auto-TLS stopgap, no operator origin pair; the proxied edge record is upserted after close (docs/dr.md)"
   else
     docker logs caddy 2>&1 | tail -20 || true
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
