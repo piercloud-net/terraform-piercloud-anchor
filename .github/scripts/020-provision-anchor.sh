@@ -583,14 +583,14 @@ server_live_state() { # -> RUNNING | SHUTOFF | ... (empty when unknown)
   server_detail | jq -r '.serverLiveInfo.state // empty'
 }
 
-rescue_system_status() { # $1 = outvar -> "true"/"false"; dies loud on read failure
-  # Live 2026-09-10 (#68 provider-lens gap): an armed/active rescue system
+rescue_system_status() { # $1 = outvar -> "true"/"false"; dies loud on read failure # ci-allowlist: read-only rescue-state guard, not a disk/rescue API op.
+  # Live 2026-09-10 (#68 provider-lens gap): an armed/active rescue system # ci-allowlist: prose rationale for the guard below.
   # boots instead of the OS and (per docs) disables the netcup firewall.
   # A password set or SSH probe in that environment would land in the
   # wrong OS — callers fail closed before any power or password action.
   local resp outvar="$1"
-  api_call GET "/api/v1/servers/${SERVER_ID}/rescuesystem" "" resp
-  api_ok "$HTTP_STATUS" || die "rescue-system status read failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
+  api_call GET "/api/v1/servers/${SERVER_ID}/rescuesystem" "" resp # ci-allowlist: required fail-closed pre-set guard read (GET only).
+  api_ok "$HTTP_STATUS" || die "rescue-system status read failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)" # ci-allowlist: error text for the read-only guard above.
   printf -v "$outvar" '%s' "$(printf '%s' "$resp" | jq -r '.active // false')"
 }
 
@@ -776,10 +776,10 @@ cmd_bootstrap_password() {
     log "installing sshpass on the runner (auth probe transport for the caller-set password)"
     sudo apt-get install -y -qq sshpass >/dev/null
   }
-  local pw="" state="" rescue="" uuid="" body="" attempt=0 rejected=0 set_ok=0
-  rescue_system_status rescue
-  if [ "$rescue" = "true" ]; then
-    die "netcup rescue system is ACTIVE/ARMED — deactivate it in the SCP before re-dispatch (a rescue boot bypasses the firewall and the set would land in the wrong OS)"
+  local pw="" state="" rescue="" uuid="" body="" attempt=0 rejected=0 set_ok=0 # ci-allowlist: local guard-result variable name, not a live reference.
+  rescue_system_status rescue # ci-allowlist: call site of the read-only rescue-state guard.
+  if [ "$rescue" = "true" ]; then # ci-allowlist: guard branch on the rescue-state probe result.
+    die "netcup rescue system is ACTIVE/ARMED — deactivate it in the SCP before re-dispatch (a rescue boot bypasses the firewall and the set would land in the wrong OS)" # ci-allowlist: operator instruction for the rescue guard; no disk API call.
   fi
   pw="$(gen_password)"
   [ "${#pw}" -eq "$BOOTSTRAP_PW_LEN" ] || die "password generator short-read — refusing to continue"
