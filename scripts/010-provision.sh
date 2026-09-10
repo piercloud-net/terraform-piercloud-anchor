@@ -668,7 +668,7 @@ fi
 # base64url payload, so a raw grep can never match a serving tang. Live
 # 2026-09-10 (#77): that grep failed every run while the real fault was the
 # key directory above.
-# A tang with MORE THAN ONE key set on disk signs with every sign key and
+# A tang with MORE THAN ONE key set installed signs with every sign key and
 # jose then emits the JWS GENERAL serialization — {"payload": ...,
 # "signatures": [{"protected": ..., "signature": ...}, ...]} — with no
 # top-level protected/signature. Live 2026-09-10 (#79, reproduced locally

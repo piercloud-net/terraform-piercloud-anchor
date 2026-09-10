@@ -165,7 +165,7 @@ eval "$(sed -n '/^adv_ok() {$/,/^}$/p' "${PROVISION_SH}")"
 declare -f adv_ok >/dev/null || die "adv_ok() not found in ${PROVISION_SH} — update this harness"
 adv_ok "${WORK}/direct.jws" || die "provision /adv assertion rejects the mock's direct advertisement"
 adv_ok "${WORK}/via-caddy.json" || die "provision /adv assertion rejects the Caddy-proxied advertisement"
-# A tang with more than one key set on disk signs with every sign key, and
+# A tang with more than one key set installed signs with every sign key, and
 # jose then emits JWS GENERAL serialization (live 2026-09-10, #79: the real
 # box had four .jwk files and answered that way while this single-key mock
 # stays flattened). Both shapes must pass the probe.
