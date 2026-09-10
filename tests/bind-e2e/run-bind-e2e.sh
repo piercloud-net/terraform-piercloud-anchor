@@ -266,7 +266,7 @@ own_keys() { :; } # the real one chowns to the unit user; this proof is root-onl
 TANG_KEYS_DIR="${RT_DIR}"
 TANG_PORT="${RT_PORT}"
 TANG_UNIT_USER="$(id -un)"
-TANG_KEEP_THP="$(for f in "${RT_DIR}"/*.jwk; do if [ "$(jq -r '.alg // empty' "$f")" = ES512 ]; then jose jwk thp -a S256 -i "$f"; fi; done | LC_ALL=C sort | head -n1 || true)"
+TANG_KEEP_THP="$(for f in "${RT_DIR}"/*.jwk; do if [ "$(jq -r '.alg // empty' "$f")" = ES512 ]; then printf '%s\n' "$(jose jwk thp -a S256 -i "$f")"; fi; done | LC_ALL=C sort | head -n1 || true)"
 [ -n "${TANG_KEEP_THP}" ] || die "could not compute a signing-key thumbprint from the generated keys"
 collapse_keys
 [ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "2" ] || die "collapse did not leave exactly two keys"
@@ -283,7 +283,7 @@ if ! ( TANG_KEEP_THP="" collapse_keys ) >"${WORK}/collapse-fallback.log" 2>&1; t
 grep -q 'no sign key matches the published thumbprint' "${WORK}/collapse-fallback.log" || { cat "${WORK}/collapse-fallback.log"; die "fallback path did not warn about the re-publish"; }
 [ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "2" ] || die "fallback collapse did not leave exactly two keys"
 TANG_KEEP_THP="$(cat "${RT_DIR}/.published-thp")"
-[ "$(for f in "${RT_DIR}"/*.jwk; do if [ "$(jq -r '.alg' "$f")" = ES512 ]; then jose jwk thp -a S256 -i "$f"; fi; done | LC_ALL=C sort)" = "${TANG_KEEP_THP}" ] || die "re-published thumbprint is not the surviving sign key"
+[ "$(for f in "${RT_DIR}"/*.jwk; do if [ "$(jq -r '.alg' "$f")" = ES512 ]; then printf '%s\n' "$(jose jwk thp -a S256 -i "$f")"; fi; done | LC_ALL=C sort)" = "${TANG_KEEP_THP}" ] || die "re-published thumbprint is not the surviving sign key"
 /usr/libexec/tangd -l -p "${RT_PORT}" "${RT_DIR}" & RT_PID=$!
 ok=0
 for i in $(seq 1 20); do
