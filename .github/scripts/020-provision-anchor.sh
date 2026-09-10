@@ -524,7 +524,7 @@ LOCK_WAIT_SECONDS=15      # backoff step on 409 server.lock.error
 LOCK_WAIT_ROUNDS=40       # ... bounded (~10 min per mutating op)
 TASK_POLL_SECONDS=10
 TASK_WAIT_ROUNDS=60       # ... bounded (~10 min per async op)
-AGENT_WAIT_ROUNDS=60      # guest-agent .available wait on the RUNNING box before the set (60 x 10s ~= 10 min worst case, then loud abort — same budget as the other async waits)
+AGENT_WAIT_ROUNDS=60      # guest-agent .available probes on the RUNNING box before the set (10s sleep each; ~10 min when probes answer promptly, ceilinged by the 30s curl --max-time per probe)
 AGENT_WAIT_SECONDS=10     # ... sleep between guest-agent status probes
 SSH_WAIT_ROUNDS=60        # TCP/22 retry on the running box (each try ceilinged: 60 x (5s probe + 10s sleep) ~= 15 min worst case, then loud abort)
 SSH_TCP_TIMEOUT_SECONDS=5 # per-attempt ceiling on the TCP/22 probe (live #59: bare /dev/tcp blocks on kernel SYN timeout while SYNs go unanswered — 68-min silent hang)
@@ -588,10 +588,19 @@ rescue_system_status() { # $1 = outvar -> "true"/"false"; dies loud on read fail
   # boots instead of the OS and (per docs) disables the netcup firewall.
   # A password set or SSH probe in that environment would land in the
   # wrong OS — callers fail closed before any power or password action.
-  local resp outvar="$1"
+  local resp outvar="$1" parsed
   api_call GET "/api/v1/servers/${SERVER_ID}/rescuesystem" "" resp # ci-allowlist: required fail-closed pre-set guard read (GET only).
   api_ok "$HTTP_STATUS" || die "rescue-system status read failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)" # ci-allowlist: error text for the read-only guard above.
-  printf -v "$outvar" '%s' "$(printf '%s' "$resp" | jq -r '.active // false')"
+  # Parse-failure must NOT leave an empty value (that would read as
+  # not-active and fail OPEN — script-logic lens, 2026-09-10): accept
+  # exactly true/false, anything else is unproven and dies.
+  parsed="$(printf '%s' "$resp" | jq -r '.active // false' 2>/dev/null || true)"
+  case "$parsed" in
+    true | false) ;;
+    *) die "rescue-system status unparseable (HTTP $HTTP_STATUS) — refusing to continue blind: $(printf '%s' "$resp" | head -c 300)" # ci-allowlist: error text for the read-only guard above.
+       ;;
+  esac
+  printf -v "$outvar" '%s' "$parsed"
 }
 
 wait_guest_agent() { # GET /servers/{id}/guest-agent/status -> .available true; bounded, fail-closed
@@ -614,7 +623,7 @@ wait_guest_agent() { # GET /servers/{id}/guest-agent/status -> .available true; 
     if [ $((i % 6)) -eq 0 ]; then log "guest agent not available yet (attempt ${i}/${AGENT_WAIT_ROUNDS}) — still waiting"; fi
     sleep "$AGENT_WAIT_SECONDS"
   done
-  die "guest agent still not available after $AGENT_WAIT_ROUNDS probes (~$((AGENT_WAIT_ROUNDS * AGENT_WAIT_SECONDS / 60)) min) on a RUNNING box — ensure the image has qemu-guest-agent installed and the box finished booting, then re-dispatch" # ci-allowlist: names the guest-tools package to install, not a disk-API call.
+  die "guest agent still not available after $AGENT_WAIT_ROUNDS probes on a RUNNING box — ensure the image has qemu-guest-agent installed and the box finished booting, then re-dispatch" # ci-allowlist: names the guest-tools package to install, not a disk-API call.
 }
 
 TASK_DUMP_BYTES=2048 # failure-dump bound: uuid + scrubbed body (read-only logging)
