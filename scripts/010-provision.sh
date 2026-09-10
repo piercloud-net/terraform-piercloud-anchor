@@ -234,10 +234,14 @@ collapse_keys() {
   [ -n "${keep_thp}" ] || keep_thp="$(cat "${TANG_KEYS_DIR}/.published-thp" 2>/dev/null || true)"
   [ -n "${keep_thp}" ] || keep_thp="$(tang-show-keys "${TANG_PORT}" 2>/dev/null | tr -s '[:space:]' '\n' | grep -m1 . || true)"
   if [ -n "${keep_thp}" ]; then
-    for f in "${signs[@]}"; do [ "$(key_thp "$f")" = "${keep_thp}" ] && keep_sign="$f"; done
+    # `if` not `&&`: a trailing failing test would leave the loop status 1, and
+    # a pipeline whose FIRST element exits 1 is fatal under set -e + pipefail
+    # (silent death — hit in CI, order-dependent).
+    for f in "${signs[@]}"; do if [ "$(key_thp "$f")" = "${keep_thp}" ]; then keep_sign="$f"; fi; done
   fi
   if [ -z "${keep_sign}" ]; then
-    keep_sign="$(printf '%s\n' "${signs[@]}" | LC_ALL=C sort | head -n1)"
+    keep_sign="$(printf '%s\n' "${signs[@]}" | LC_ALL=C sort | head -n1 || true)"
+    [ -n "${keep_sign}" ] || die "could not choose a sign key among ${#signs[@]} candidates (inventory: $(key_inventory "${TANG_KEYS_DIR}"/*.jwk))"
     keep_name="$(basename "${keep_sign}")"
     warn "no sign key matches the published thumbprint '${keep_thp:-none}' — keeping ${keep_name} deterministically and re-publishing (inventory: $(key_inventory "${TANG_KEYS_DIR}"/*.jwk))"
   fi

@@ -266,13 +266,24 @@ own_keys() { :; } # the real one chowns to the unit user; this proof is root-onl
 TANG_KEYS_DIR="${RT_DIR}"
 TANG_PORT="${RT_PORT}"
 TANG_UNIT_USER="$(id -un)"
-TANG_KEEP_THP="$(for f in "${RT_DIR}"/*.jwk; do [ "$(jq -r '.alg // empty' "$f")" = ES512 ] && printf '%s\n' "$(jose jwk thp -a S256 -i "$f")"; done | LC_ALL=C sort | head -n1)"
+TANG_KEEP_THP="$(for f in "${RT_DIR}"/*.jwk; do if [ "$(jq -r '.alg // empty' "$f")" = ES512 ]; then jose jwk thp -a S256 -i "$f"; fi; done | LC_ALL=C sort | head -n1 || true)"
 [ -n "${TANG_KEEP_THP}" ] || die "could not compute a signing-key thumbprint from the generated keys"
 collapse_keys
 [ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "2" ] || die "collapse did not leave exactly two keys"
 [ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' -exec jq -r '.alg' {} \; | LC_ALL=C sort | tr '\n' ' ')" = "ECMR ES512 " ] || die "collapse left the wrong key roles"
 [ "$(ls -d "${RT_DIR}".orphaned-* 2>/dev/null | wc -l | tr -d ' ')" = "1" ] || die "collapse did not quarantine the extras"
 [ "$(cat "${RT_DIR}/.published-thp")" = "${TANG_KEEP_THP}" ] || die "collapse changed the published thumbprint"
+# Fallback path: a third keygen round + no recorded/kept thumbprint must be
+# collapsed deterministically and re-published loudly. This is where the
+# pipeline that silently died under set -e + pipefail lived (its first element
+# was a loop that could exit 1 — order-dependent, hence the CI flake).
+/usr/libexec/tangd-keygen "${RT_DIR}" >"${WORK}/keygen3.log" 2>&1 || { sed -n '1,20p' "${WORK}/keygen3.log"; die "tangd-keygen round 3 failed"; }
+rm -f "${RT_DIR}/.published-thp"
+if ! ( TANG_KEEP_THP="" collapse_keys ) >"${WORK}/collapse-fallback.log" 2>&1; then cat "${WORK}/collapse-fallback.log"; die "fallback collapse failed"; fi
+grep -q 'no sign key matches the published thumbprint' "${WORK}/collapse-fallback.log" || { cat "${WORK}/collapse-fallback.log"; die "fallback path did not warn about the re-publish"; }
+[ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "2" ] || die "fallback collapse did not leave exactly two keys"
+TANG_KEEP_THP="$(cat "${RT_DIR}/.published-thp")"
+[ "$(for f in "${RT_DIR}"/*.jwk; do if [ "$(jq -r '.alg' "$f")" = ES512 ]; then jose jwk thp -a S256 -i "$f"; fi; done | LC_ALL=C sort)" = "${TANG_KEEP_THP}" ] || die "re-published thumbprint is not the surviving sign key"
 /usr/libexec/tangd -l -p "${RT_PORT}" "${RT_DIR}" & RT_PID=$!
 ok=0
 for i in $(seq 1 20); do
