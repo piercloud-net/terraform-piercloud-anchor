@@ -165,11 +165,18 @@ eval "$(sed -n '/^adv_ok() {$/,/^}$/p' "${PROVISION_SH}")"
 declare -f adv_ok >/dev/null || die "adv_ok() not found in ${PROVISION_SH} — update this harness"
 adv_ok "${WORK}/direct.jws" || die "provision /adv assertion rejects the mock's direct advertisement"
 adv_ok "${WORK}/via-caddy.json" || die "provision /adv assertion rejects the Caddy-proxied advertisement"
+# A tang with more than one key set installed signs with every sign key, and
+# jose then emits JWS GENERAL serialization (live 2026-09-10, #79: the real
+# box had four .jwk files and answered that way while this single-key mock
+# stays flattened). Both shapes must pass the probe.
+jq -c '{payload: .payload, signatures: [{protected: .protected, signature: .signature}]}' \
+  "${WORK}/direct.jws" > "${WORK}/direct-general.jws"
+adv_ok "${WORK}/direct-general.jws" || die "provision /adv assertion rejects JWS general serialization (multi-key tang)"
 # Adversarial: the assertion must NOT accept a raw JWK set (the shape the old
 # unverified '"kty"' grep was written against) — the signed envelope is the wire format.
 printf '%s' '{"keys":[{"kty":"EC"}]}' > "${WORK}/not-an-adv.json"
 adv_ok "${WORK}/not-an-adv.json" && die "provision /adv assertion accepts a raw JWK set — wire-shape guard broken"
-log "PASS: provision /adv assertion accepts direct + proxied advertisements and rejects raw JWK sets"
+log "PASS: provision /adv assertion accepts flattened + general advertisements and rejects raw JWK sets"
 # Regression guard: the prodshape render above runs in a subshell precisely
 # so this still names the CI tenant (a clobbered name aborts here, by design).
 [ "${STATUS_HOST}" = "status.citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
