@@ -105,7 +105,10 @@ upsert_record() { # $1 = left-hand name, $2 = proxied (true/false), $3 = ttl, $4
   verify="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
   got_name="$(printf '%s' "$verify" | jq -r '.result[0].name // empty')"
   got_ip="$(printf '%s' "$verify" | jq -r '.result[0].content // empty')"
-  got_proxied="$(printf '%s' "$verify" | jq -r '.result[0].proxied // empty')"
+  # NOT `.proxied // empty`: jq's alternative operator treats false as empty,
+  # so a DNS-only record (proxied=false) read as "" and this check aborted a
+  # fully provisioned run (live 2026-09-10, #85). tostring keeps false.
+  got_proxied="$(printf '%s' "$verify" | jq -r '(.result[0] // {}) | .proxied | tostring')"
   printf '%s' "$verify" | jq '{name: .result[0].name, type: .result[0].type, content: .result[0].content, ttl: .result[0].ttl, proxied: .result[0].proxied}'
   if [ "$got_name" != "$fqdn" ] || [ "$got_ip" != "$want_ip" ] || [ "$got_proxied" != "$proxied" ]; then
     echo "::error::verify-after-write mismatch: want $fqdn -> $want_ip (proxied=$proxied), zone answers $got_name -> $got_ip (proxied=$got_proxied). STOP — investigate before any bind-by-name."

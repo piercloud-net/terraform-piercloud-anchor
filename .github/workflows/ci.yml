@@ -555,6 +555,29 @@ jobs:
         timeout-minutes: 9
         run: sudo bash tests/bind-e2e/run-bind-e2e.sh
 
+  jq-boolean-guard:
+    name: jq boolean-read guard (false != empty)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - name: Boolean fields must not be read with jq's `// empty`
+        run: |
+          set -euo pipefail
+          # Live 2026-09-10 (#85): the DNS verify read `proxied=false` as "" via
+          # ` // empty` on a boolean and aborted an otherwise complete run. jq's
+          # `//` alternative operator treats BOTH null and false as empty, so
+          # boolean fields must go through tostring (or an explicit has()/if
+          # check). Comment lines are skipped so this guard can name the shape.
+          hits="$(git ls-files '*.sh' '*.yml' \
+            | xargs -r grep -nE '\.(proxied|enabled|active|available)[[:space:]]*//[[:space:]]*empty' \
+            | grep -vE ':[0-9]+:[[:space:]]*#' || true)"
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error::boolean field read with '// empty' — jq treats false as empty (use tostring)"
+            exit 1
+          fi
+          echo "no boolean field is read with jq's '// empty'"
+
   scrub-canary:
     name: scrub-canary (redactor proof)
     runs-on: ubuntu-latest
