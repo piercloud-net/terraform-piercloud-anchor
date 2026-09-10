@@ -668,6 +668,13 @@ fi
 # base64url payload, so a raw grep can never match a serving tang. Live
 # 2026-09-10 (#77): that grep failed every run while the real fault was the
 # key directory above.
+# A tang with MORE THAN ONE key set on disk signs with every sign key and
+# jose then emits the JWS GENERAL serialization — {"payload": ...,
+# "signatures": [{"protected": ..., "signature": ...}, ...]} — with no
+# top-level protected/signature. Live 2026-09-10 (#79, reproduced locally
+# with Debian trixie tang 15-2 + jose 14-2 and two keygen rounds): the box
+# answered in that shape while CI's single-key mock stays flattened, so the
+# probe must accept BOTH.
 # The shape check is mandatory; the deeper jose parse is best-effort and
 # fails loud-but-non-fatal, because the `tang` package does not depend on
 # jose (the cryptographic proof lives in the thumbprint step and the
@@ -680,15 +687,20 @@ adv_ok() {
     return 1
   fi
   if command -v jq >/dev/null 2>&1; then
-    if ! jq -e 'has("payload") and has("protected") and has("signature")' "${adv_file}" >/dev/null 2>&1; then
-      log "adv check: not a flattened-JWS envelope — body starts (160 bytes):"
+    if ! jq -e 'has("payload") and ((has("protected") and has("signature")) or (has("signatures") and (.signatures | type == "array") and (.signatures | length > 0)))' "${adv_file}" >/dev/null 2>&1; then
+      log "adv check: not a JWS advertisement (flattened or general) — body starts (160 bytes):"
       head -c 160 "${adv_file}" || true; echo
+      jq -r 'keys | join(",")' "${adv_file}" 2>&1 | head -2 || true
       return 1
     fi
   else
     log "adv check: jq missing — falling back to an envelope substring check"
-    if ! grep -q '"payload"' "${adv_file}" || ! grep -q '"protected"' "${adv_file}" || ! grep -q '"signature"' "${adv_file}"; then
-      log "adv check: body lacks flattened-JWS fields — body starts (160 bytes):"
+    has_payload=0; has_flat=0; has_general=0
+    grep -q '"payload"' "${adv_file}" && has_payload=1
+    { grep -q '"protected"' "${adv_file}" && grep -q '"signature"' "${adv_file}"; } && has_flat=1
+    grep -q '"signatures"' "${adv_file}" && has_general=1
+    if [ "${has_payload}" != "1" ] || { [ "${has_flat}" != "1" ] && [ "${has_general}" != "1" ]; }; then
+      log "adv check: body lacks JWS fields — body starts (160 bytes):"
       head -c 160 "${adv_file}" || true; echo
       return 1
     fi
