@@ -183,6 +183,89 @@ own_keys() {
   return 0
 }
 
+# --- collapse:start --- (CI extracts this span verbatim; tests/bind-e2e)
+# One bindable key set, deterministically (live 2026-09-10, #87): two
+# historical keygen rounds left two sign keys, so /adv used the JWS GENERAL
+# serialization (signatures[]) and the published thumbprint depended on
+# readdir order. clevis verifies with `jose jws ver -a` (every verify key
+# must validate a signature) and pins `thp=` to a SIGNING key, so the anchor
+# must serve exactly one sign key (ES512) + one exchange key (ECMR).
+# Detection is by JWK `alg`, never mtime (a keygen pair can straddle a
+# second, two runs can share one). Extras are QUARANTINED to a sibling dir,
+# never deleted (restore: move back, clear .published-thp if needed, re-run).
+# `--rotate` is the only flow that may keep several sets: it drops
+# .rotation-pending and normal runs leave the directory alone until the
+# operator has re-bound every client and removed the marker.
+key_alg() { jq -r '.alg // empty' "$1" 2>/dev/null || true; }
+key_thp() { jose jwk thp -a S256 -i "$1" 2>/dev/null || true; }
+key_inventory() {
+  local f
+  for f in "$@"; do [ -e "$f" ] || continue; printf '%s(%s,%s) ' "$(basename "$f")" "$(key_alg "$f")" "$(key_thp "$f")"; done
+}
+collapse_keys() {
+  local signs=() excs=() f alg keep_thp keep_sign="" keep_exc="" best="" best_d="" d qdir keep_name
+  for f in "${TANG_KEYS_DIR}"/*.jwk; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in .*) continue ;; esac
+    alg="$(key_alg "$f")"
+    case "$alg" in
+      ES512) signs+=("$f") ;;
+      ECMR)  excs+=("$f") ;;
+      *) warn "keydir: $(basename "$f") has alg='${alg}' (want ES512/ECMR) — leaving it untouched" ;;
+    esac
+  done
+  if [ "${#signs[@]}" -eq 0 ] || [ "${#excs[@]}" -eq 0 ]; then
+    die "keydir ${TANG_KEYS_DIR} lacks a sign (ES512) or exchange (ECMR) key — an unbindable anchor is worse than a failed run (inventory: $(key_inventory "${TANG_KEYS_DIR}"/*.jwk))"
+  fi
+  if [ -e "${TANG_KEYS_DIR}/.rotation-pending" ]; then
+    warn "rotation pending (.rotation-pending): keeping ${#signs[@]} sign key(s); dot out or quarantine the old set and remove the marker once every client re-bound (docs/dr.md)"
+    return 0
+  fi
+  if [ "${#signs[@]}" -eq 1 ] && [ "${#excs[@]}" -eq 1 ]; then
+    printf '%s\n' "$(key_thp "${signs[0]}")" > "${TANG_KEYS_DIR}/.published-thp"
+    log "keydir: exactly one key set (sign $(basename "${signs[0]}"), exchange $(basename "${excs[0]}"))"
+    return 0
+  fi
+  # Keep the sign key the world already knows, never guess between two:
+  # TANG_KEEP_THP (operator override) -> .published-thp (recorded here) ->
+  # the first verify key tang-show-keys reports (what the artifact used) ->
+  # deterministic basename order.
+  keep_thp="${TANG_KEEP_THP:-}"
+  [ -n "${keep_thp}" ] || keep_thp="$(cat "${TANG_KEYS_DIR}/.published-thp" 2>/dev/null || true)"
+  [ -n "${keep_thp}" ] || keep_thp="$(tang-show-keys "${TANG_PORT}" 2>/dev/null | tr -s '[:space:]' '\n' | grep -m1 . || true)"
+  if [ -n "${keep_thp}" ]; then
+    # `if` not `&&`: a trailing failing test would leave the loop status 1, and
+    # a pipeline whose FIRST element exits 1 is fatal under set -e + pipefail
+    # (silent death — hit in CI, order-dependent).
+    for f in "${signs[@]}"; do if [ "$(key_thp "$f")" = "${keep_thp}" ]; then keep_sign="$f"; fi; done
+  fi
+  if [ -z "${keep_sign}" ]; then
+    keep_sign="$(printf '%s\n' "${signs[@]}" | LC_ALL=C sort | head -n1 || true)"
+    [ -n "${keep_sign}" ] || die "could not choose a sign key among ${#signs[@]} candidates (inventory: $(key_inventory "${TANG_KEYS_DIR}"/*.jwk))"
+    keep_name="$(basename "${keep_sign}")"
+    warn "no sign key matches the published thumbprint '${keep_thp:-none}' — keeping ${keep_name} deterministically and re-publishing (inventory: $(key_inventory "${TANG_KEYS_DIR}"/*.jwk))"
+  fi
+  for f in "${excs[@]}"; do
+    d="$(( $(date -r "$f" +%s) - $(date -r "${keep_sign}" +%s) ))"; d="${d#-}"
+    if [ -z "${best_d}" ] || [ "$d" -lt "${best_d}" ]; then best="$f"; best_d="$d"; fi
+  done
+  keep_exc="${best}"
+  qdir="${TANG_KEYS_DIR}.orphaned-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "${qdir}"
+  for f in "${signs[@]}" "${excs[@]}"; do
+    if [ "$f" != "${keep_sign}" ] && [ "$f" != "${keep_exc}" ]; then
+      mv -f -- "$f" "${qdir}/"
+      log "quarantined $(basename "$f") [$(key_alg "${qdir}/$(basename "$f")"), thp $(key_thp "${qdir}/$(basename "$f")")] -> ${qdir} (restore: mv it back and re-run)"
+    fi
+  done
+  printf '%s\n' "$(key_thp "${keep_sign}")" > "${TANG_KEYS_DIR}/.published-thp"
+  chmod 0700 "${qdir}" 2>/dev/null || true
+  chown -R "${TANG_UNIT_USER:-_tang}:${TANG_UNIT_USER:-_tang}" "${qdir}" 2>/dev/null || true
+  own_keys
+  log "keydir collapsed: serving sign $(basename "${keep_sign}") + exchange $(basename "${keep_exc}"); re-published thumbprint $(key_thp "${keep_sign}")"
+}
+# --- collapse:end ---
+
 gen_keys() { # append a fresh key set on this box (never deletes)
   # Live 2026-09-08: tangd-keygen requires the dir to exist (usage error
   # otherwise) — some base images lack it entirely. # ci-allowlist: prose — base-image note, not a live image reference.
@@ -217,13 +300,18 @@ case "${UNIT_KEYDIR}" in
   *) [ -d /var/lib/tang ] && TANG_KEYS_DIR="/var/lib/tang" ;;
 esac
 log "tang keydir: ${TANG_KEYS_DIR} (unit user: ${TANG_UNIT_USER:-unknown})"
-if [ "${TANG_KEYS_DIR}" != "${LEGACY_TANG_KEYS_DIR}" ] && compgen -G "${LEGACY_TANG_KEYS_DIR}/*.jwk" >/dev/null; then
+if [ "${TANG_KEYS_DIR}" != "${LEGACY_TANG_KEYS_DIR}" ] \
+   && ! compgen -G "${TANG_KEYS_DIR}/*.jwk" >/dev/null \
+   && compgen -G "${LEGACY_TANG_KEYS_DIR}/*.jwk" >/dev/null; then
   mkdir -p "${TANG_KEYS_DIR}"
   for f in "${LEGACY_TANG_KEYS_DIR}"/*.jwk; do
-    [ -e "${TANG_KEYS_DIR}/$(basename "$f")" ] || cp -p "$f" "${TANG_KEYS_DIR}/"
+    cp -p "$f" "${TANG_KEYS_DIR}/"
   done
   log "Migrated existing tang keys ${LEGACY_TANG_KEYS_DIR} -> ${TANG_KEYS_DIR} (thumbprint preserved)"
 fi
+# One-shot by design: only migrate into an EMPTY keydir. Copying per-file
+# would resurrect keys quarantined by collapse_keys() below (same basename
+# absent from the keydir) and re-create a multi-set anchor on every run.
 own_keys
 
 log "Moving tangd.socket to 127.0.0.1:${TANG_PORT} (Caddy owns :80 from here on)"
@@ -264,9 +352,14 @@ fi
 # prompt at 3am). Live proof (two consecutive runs) is M0-gated.
 if [ "$ROTATE" = "1" ]; then
   log "Rotating: generating a fresh key set alongside the old one"
+  touch "${TANG_KEYS_DIR}/.rotation-pending"
   gen_keys
-  warn "Re-bind every client to the NEW thumbprint below and reboot-verify each BEFORE deleting old keys."
+  warn "Re-bind every client to the NEW thumbprint below and reboot-verify each BEFORE dotting out or removing the old keys; then remove ${TANG_KEYS_DIR}/.rotation-pending (the single-set collapse stays paused while it exists)."
 fi
+
+# Normal runs converge to exactly one bindable key set; --rotate pauses this
+# via the .rotation-pending marker it drops above (see the block comment).
+collapse_keys
 
 # ---------------------------------------------------------------------------
 # b) thumbprint — the ONE value you must save

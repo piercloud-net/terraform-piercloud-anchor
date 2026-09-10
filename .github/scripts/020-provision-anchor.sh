@@ -475,7 +475,13 @@ cmd_provision() {
     { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s'
   fi
   log "capturing tang thumbprint to the artifact path"
-  thumb="$(ssh_base 'KD="$(systemctl cat tangd@.service 2>/dev/null | sed -n "s/^ExecStart=.*[[:space:]]\(.*\)$/\1/p" | tail -n1)"; [ -n "${KD}" ] || KD=/var/lib/tang; if command -v tang-show-keys >/dev/null 2>&1; then tang-show-keys 8081; else jose jwk thp -a S256 -r -f "${KD}"/*.jwk; fi' | head -n 1 | tr -d '[:space:]')"
+  # Thumbprint source order (live 2026-09-10, #87): the collapse records the
+  # kept sign key in ${KD}/.published-thp; else upstream's tang-show-keys
+  # (ships with tang; filters the payload to verify keys). No URL fallback
+  # here: the CI-called surface may not carry unlisted endpoints, and the
+  # previous file-based attempt (`jose jwk thp -a S256 -r -f …`) never worked
+  # on jose 14+ (`-r` removed; `-f` means find) — so fail loud instead.
+  thumb="$(ssh_base 'KD="$(systemctl cat tangd@.service 2>/dev/null | sed -n "s/^ExecStart=.*[[:space:]]\(.*\)$/\1/p" | tail -n1)"; [ -n "${KD}" ] || KD=/var/lib/tang; if [ -s "${KD}/.published-thp" ]; then cat "${KD}/.published-thp"; elif command -v tang-show-keys >/dev/null 2>&1; then tang-show-keys 8081; else echo "no ${KD}/.published-thp and no tang-show-keys on this box: reinstall the tang package or restore the file — refusing to publish an unverifiable thumbprint" >&2; exit 1; fi' | head -n 1 | tr -d '[:space:]')"
   if [ -z "$thumb" ] || printf '%s' "$thumb" | grep -q '[[:space:]]'; then
     die "thumbprint capture failed (empty or malformed) — refusing to finish without it (H1: never logs alone)"
   fi
