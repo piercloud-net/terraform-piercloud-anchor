@@ -36,6 +36,7 @@ All notable changes to this project will be documented in this file.
 - Dump task uuid + scrubbed body on async failure (closes #66)
 - Set root password while RUNNING (agent-based reset, no power cycle) (closes #68)
 - Tolerate the systemd socket-type suffix on tangd Listen (closes #71)
+- Cycle tangd.service after the socket move (closes #73)
 
 ### 📚 Documentation
 
