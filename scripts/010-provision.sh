@@ -180,13 +180,11 @@ printf '[Socket]\nListenStream=\nListenStream=127.0.0.1:%s\n' "${TANG_PORT}" > /
 systemctl daemon-reload
 systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 systemctl restart tangd.socket 2>/dev/null || true
-# Live 2026-09-10 (#73): restarting the socket unit does NOT move an active
-# or wedged tangd.service — the old instance keeps the old socket fd, so
-# nothing serves the new loopback listener and the /adv probe below fails
-# for its whole retry budget. Cycle the service explicitly (a manual start
-# inherits the socket unit's fds, rebinding tangd to the new address).
-systemctl reset-failed tangd.service 2>/dev/null || true
-systemctl restart tangd.service 2>/dev/null || true
+# Serve model on Debian/Ubuntu (verified live 2026-09-10, #75): the tang
+# package ships tangd.socket + tangd@.service with Accept=yes — there is NO
+# plain tangd.service, and a connection spawns a per-connection instance.
+# So the socket cycle above is the whole restart; the instances are spawned
+# on demand and must be diagnosed through the socket unit.
 # Prove no double-bind: tangd must listen ONLY on loopback (Caddy owns :80).
 # Exact match is deliberate: any extra listener (including a lingering :80)
 # fails closed instead of half-covering the proxy cutover. Live 2026-09-10
@@ -612,16 +610,46 @@ fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
 # through Caddy's :80, dashboard by Host.
+probe_tang_direct() {
+  curl -sf --max-time 5 "http://127.0.0.1:${TANG_PORT}/adv" -o /tmp/tang-direct.json \
+    && grep -q '"kty"' /tmp/tang-direct.json
+}
 ok=0
 for i in 1 2 3 4 5 6; do
-  if curl -sf http://127.0.0.1:${TANG_PORT}/adv -o /tmp/tang-direct.json && grep -q '"kty"' /tmp/tang-direct.json; then ok=1; break; fi
+  probe_tang_direct && { ok=1; break; }
   sleep 10
 done
 if [ "$ok" != "1" ]; then
-  log "tangd direct-probe failed — capturing unit state for the next run"
-  systemctl --no-pager -l status tangd.socket tangd.service 2>&1 | tail -30 || true
-  journalctl -u tangd.socket -u tangd.service -n 30 --no-pager 2>&1 | tail -40 || true
-  if command -v ss >/dev/null 2>&1; then ss -ltnp 2>/dev/null | grep -E ":${TANG_PORT}|:80 " || true; fi
+  # Live 2026-09-10 (#75): a socket that was reconfigured in place can be left
+  # "not functional until restarted"; a full stop/start is the documented cure.
+  log "Direct probe failed — cycling the socket once and re-probing"
+  systemctl stop tangd.socket 2>/dev/null || true
+  systemctl start tangd.socket 2>/dev/null || true
+  sleep 2
+  for i in 1 2 3; do
+    probe_tang_direct && { ok=1; break; }
+    sleep 5
+  done
+fi
+if [ "$ok" != "1" ]; then
+  # The socket is Accept=yes on this distro (tangd@.service, instance per
+  # connection), so the failure lives in the instance path: dump everything
+  # (verbose curl, unit files, instance journal, package, keys, manual spawn)
+  # so the next run's log is enough to write the real fix. # ci-allowlist: prose — on-box instance note, not a live image reference.
+  log "tangd direct-probe failed — capturing listener, instance and package state"
+  curl -sv --max-time 5 "http://127.0.0.1:${TANG_PORT}/adv" 2>&1 | tail -25 || true
+  systemctl --no-pager -l status tangd.socket 2>&1 | tail -18 || true
+  systemctl list-units 'tangd*' --all --no-pager 2>&1 | tail -12 || true
+  log "unit file tangd.socket:"; systemctl cat tangd.socket 2>&1 | tail -25 || true
+  log "unit file tangd@.service:"; systemctl cat 'tangd@.service' 2>&1 | tail -25 || true
+  log "instance journal:"; journalctl -u 'tangd@*' -n 60 --no-pager 2>&1 | tail -60 || true
+  log "package:"; dpkg -l tang 2>&1 | tail -3 || true
+  dpkg -L tang 2>&1 | grep -E 'systemd|libexec|lib/tang|/s?bin/' | head -12 || true
+  log "keys + user:"; ls -la /var/db/tang 2>&1 | head -8 || true; getent passwd tang 2>&1 || true
+  TBIN=/usr/libexec/tangd; [ -x "$TBIN" ] || TBIN=/usr/lib/tang/tangd
+  log "manual spawn ($TBIN):"
+  "$TBIN" --help >/tmp/tangd-help.txt 2>&1; log "help exit=$?"; head -c 400 /tmp/tangd-help.txt || true; echo
+  timeout 5 "$TBIN" /var/db/tang </dev/null >/tmp/tangd-try.txt 2>&1; log "manual exit=$?"; head -c 300 /tmp/tangd-try.txt || true; echo
   die "tangd does not answer direct on 127.0.0.1:${TANG_PORT} (/adv) — refusing to finish blind"
 fi
 log "tangd answers direct on loopback (OK)"
