@@ -889,7 +889,11 @@ if [ -n "${STATUS_HOST:-}" ]; then
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
     esac
   fi
-  if curl -skf -H "Host: ${STATUS_HOST}" https://127.0.0.1/ -o /dev/null; then
+  # SNI must be the real hostname: curl sends no SNI for an IP-literal URL
+  # and Caddy selects the origin cert by SNI, so a Host header alone fails a
+  # healthy box once the operator origin pair is deployed (live 2026-09-10,
+  # issue #92). --resolve keeps the TCP connect on loopback.
+  if curl -skf --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
   elif [ ! -s "${CADDY_ORIGIN_CRT}" ]; then
     # No operator origin pair: auto-TLS cannot issue for a name whose public
