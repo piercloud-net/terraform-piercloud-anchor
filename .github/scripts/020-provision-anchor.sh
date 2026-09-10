@@ -509,11 +509,14 @@ cmd_provision() {
 # appears, only metadata).
 # A crash between set and the provision's `passwd -l root` leaves a
 # caller-known password live: the workflow's failure step runs
-# lock-password below (finally-path, not happy-path), and the export
-# below lands right after the set — BEFORE the SSH-wait — so it covers
-# every path past that point. A lock-password miss on a running box
-# leaves the value live; the next re-dispatch mints fresh and overwrites
-# it (recovery = set again + re-dispatch).
+# lock-password below (finally-path, not happy-path). The export below
+# lands right after an OBSERVED successful set and before the SSH-wait,
+# so the failure-path lock is armed on every path after that observation;
+# if the poll itself dies before observing FINISHED the set is unproven
+# and the lock has no candidate to try (fail-closed, but unresolved until
+# the next re-dispatch overwrites it). A lock-password miss on a running
+# box leaves the value live; the next re-dispatch mints fresh and
+# overwrites it (recovery = set again + re-dispatch).
 # ---------------------------------------------------------------------------
 BOOTSTRAP_PW_LEN=28       # inside the 24-32 window; caller-supplied value
 BOOTSTRAP_PW_RETRIES=3    # 422 (policy refused the value) -> fresh candidate
@@ -521,7 +524,7 @@ LOCK_WAIT_SECONDS=15      # backoff step on 409 server.lock.error
 LOCK_WAIT_ROUNDS=40       # ... bounded (~10 min per mutating op)
 TASK_POLL_SECONDS=10
 TASK_WAIT_ROUNDS=60       # ... bounded (~10 min per async op)
-AGENT_WAIT_ROUNDS=30      # guest-agent .available wait on the RUNNING box before the set (30 x 10s ~= 5 min worst case, then loud abort)
+AGENT_WAIT_ROUNDS=60      # guest-agent .available wait on the RUNNING box before the set (60 x 10s ~= 10 min worst case, then loud abort — same budget as the other async waits)
 AGENT_WAIT_SECONDS=10     # ... sleep between guest-agent status probes
 SSH_WAIT_ROUNDS=60        # TCP/22 retry on the running box (each try ceilinged: 60 x (5s probe + 10s sleep) ~= 15 min worst case, then loud abort)
 SSH_TCP_TIMEOUT_SECONDS=5 # per-attempt ceiling on the TCP/22 probe (live #59: bare /dev/tcp blocks on kernel SYN timeout while SYNs go unanswered — 68-min silent hang)
@@ -578,6 +581,17 @@ server_detail() { # -> raw GET /servers/{id} JSON (callers parse; no state filte
 
 server_live_state() { # -> RUNNING | SHUTOFF | ... (empty when unknown)
   server_detail | jq -r '.serverLiveInfo.state // empty'
+}
+
+rescue_system_status() { # $1 = outvar -> "true"/"false"; dies loud on read failure
+  # Live 2026-09-10 (#68 provider-lens gap): an armed/active rescue system
+  # boots instead of the OS and (per docs) disables the netcup firewall.
+  # A password set or SSH probe in that environment would land in the
+  # wrong OS — callers fail closed before any power or password action.
+  local resp outvar="$1"
+  api_call GET "/api/v1/servers/${SERVER_ID}/rescuesystem" "" resp
+  api_ok "$HTTP_STATUS" || die "rescue-system status read failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
+  printf -v "$outvar" '%s' "$(printf '%s' "$resp" | jq -r '.active // false')"
 }
 
 wait_guest_agent() { # GET /servers/{id}/guest-agent/status -> .available true; bounded, fail-closed
@@ -762,7 +776,11 @@ cmd_bootstrap_password() {
     log "installing sshpass on the runner (auth probe transport for the caller-set password)"
     sudo apt-get install -y -qq sshpass >/dev/null
   }
-  local pw="" state="" uuid="" body="" attempt=0 rejected=0 set_ok=0
+  local pw="" state="" rescue="" uuid="" body="" attempt=0 rejected=0 set_ok=0
+  rescue_system_status rescue
+  if [ "$rescue" = "true" ]; then
+    die "netcup rescue system is ACTIVE/ARMED — deactivate it in the SCP before re-dispatch (a rescue boot bypasses the firewall and the set would land in the wrong OS)"
+  fi
   pw="$(gen_password)"
   [ "${#pw}" -eq "$BOOTSTRAP_PW_LEN" ] || die "password generator short-read — refusing to continue"
   echo "::add-mask::$pw" # mask FIRST, before any use (same rule as device secrets)
