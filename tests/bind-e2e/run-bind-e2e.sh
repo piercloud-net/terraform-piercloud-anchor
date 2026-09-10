@@ -157,6 +157,19 @@ log "PASS: /adv payload identical direct vs through Caddy"
 jose fmt --json="$(cat "${WORK}/via-caddy.json")" -Og payload -SyOg keys -AUo- | jose jwk use -i- -r -u verify -o- > "${WORK}/sigkey.json"
 jose jws ver -i "${WORK}/via-caddy.json" -k "${WORK}/sigkey.json" >/dev/null || die "proxied /adv signature does not verify"
 log "PASS: proxied envelope signature verifies (proxy transparent for this response)"
+# The provision script's own /adv assertion, extracted and executed here (never
+# a copy) so a wire-shape regression fails CI instead of a live run. Live
+# 2026-09-10 (#77): a raw '\"kty\"' grep shipped unverified and killed runs
+# while tang was healthy; the advertisement is a flattened JWS.
+eval "$(sed -n '/^adv_ok() {$/,/^}$/p' "${PROVISION_SH}")"
+declare -f adv_ok >/dev/null || die "adv_ok() not found in ${PROVISION_SH} — update this harness"
+adv_ok "${WORK}/direct.jws" || die "provision /adv assertion rejects the mock's direct advertisement"
+adv_ok "${WORK}/via-caddy.json" || die "provision /adv assertion rejects the Caddy-proxied advertisement"
+# Adversarial: the assertion must NOT accept a raw JWK set (the shape the old
+# unverified '"kty"' grep was written against) — the signed envelope is the wire format.
+printf '%s' '{"keys":[{"kty":"EC"}]}' > "${WORK}/not-an-adv.json"
+adv_ok "${WORK}/not-an-adv.json" && die "provision /adv assertion accepts a raw JWK set — wire-shape guard broken"
+log "PASS: provision /adv assertion accepts direct + proxied advertisements and rejects raw JWK sets"
 # Regression guard: the prodshape render above runs in a subshell precisely
 # so this still names the CI tenant (a clobbered name aborts here, by design).
 [ "${STATUS_HOST}" = "status.citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
