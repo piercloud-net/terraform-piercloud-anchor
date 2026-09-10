@@ -475,7 +475,13 @@ cmd_provision() {
     { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s'
   fi
   log "capturing tang thumbprint to the artifact path"
-  thumb="$(ssh_base 'KD="$(systemctl cat tangd@.service 2>/dev/null | sed -n "s/^ExecStart=.*[[:space:]]\(.*\)$/\1/p" | tail -n1)"; [ -n "${KD}" ] || KD=/var/lib/tang; if command -v tang-show-keys >/dev/null 2>&1; then tang-show-keys 8081; else jose jwk thp -a S256 -r -f "${KD}"/*.jwk; fi' | head -n 1 | tr -d '[:space:]')"
+  # Thumbprint source order (live 2026-09-10, #87): the collapse records the
+  # kept sign key in ${KD}/.published-thp; else upstream's tang-show-keys
+  # (ships with tang; filters the payload to verify keys); else the same
+  # pipeline inline — the previous `jose jwk thp -a S256 -r -f …` was invalid
+  # on jose 14+ (`-r` removed; `-f` means find) and could never have produced
+  # a value, let alone a verify-capable one.
+  thumb="$(ssh_base 'KD="$(systemctl cat tangd@.service 2>/dev/null | sed -n "s/^ExecStart=.*[[:space:]]\(.*\)$/\1/p" | tail -n1)"; [ -n "${KD}" ] || KD=/var/lib/tang; if [ -s "${KD}/.published-thp" ]; then cat "${KD}/.published-thp"; elif command -v tang-show-keys >/dev/null 2>&1; then tang-show-keys 8081; else ADV="$(curl -sSf http://127.0.0.1:8081/adv 2>/dev/null || true)"; [ -n "${ADV}" ] || { echo "no .published-thp, no tang-show-keys and no /adv answer on 8081: cannot derive a thumbprint" >&2; exit 1; }; jose fmt --json "${ADV}" -g payload -y -o- | jose jwk use -i- -r -u verify -o- | jose jwk thp -i- -a S256; fi' | head -n 1 | tr -d '[:space:]')"
   if [ -z "$thumb" ] || printf '%s' "$thumb" | grep -q '[[:space:]]'; then
     die "thumbprint capture failed (empty or malformed) — refusing to finish without it (H1: never logs alone)"
   fi

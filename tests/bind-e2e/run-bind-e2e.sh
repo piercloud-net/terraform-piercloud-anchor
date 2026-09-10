@@ -36,6 +36,8 @@ die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
   # Best-effort teardown in reverse bring-up order; never masks the failure.
+  [ -n "${RT_PID:-}" ] && kill "${RT_PID}" 2>/dev/null || true
+  cryptsetup close real-tang 2>/dev/null || true
   [ -n "${CADDY_PID:-}" ] && kill "${CADDY_PID}" 2>/dev/null || true
   [ -n "${MOCK_PID:-}" ] && kill "${MOCK_PID}" 2>/dev/null || true
   [ -n "${STUB_PID:-}" ] && kill "${STUB_PID}" 2>/dev/null || true
@@ -53,8 +55,9 @@ trap cleanup EXIT
 log "Installing harness deps (apt)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq clevis clevis-luks cryptsetup jose curl python3 python3-cryptography >/dev/null
+apt-get install -y -qq clevis clevis-luks cryptsetup jose curl jq python3 python3-cryptography tang >/dev/null
 command -v clevis >/dev/null || die "clevis missing after apt"
+command -v jq >/dev/null || die "jq missing after apt (the collapse proof and the provision probe need it)"
 command -v cryptsetup >/dev/null || die "cryptsetup missing after apt"
 python3 -c "import cryptography" 2>/dev/null || die "python3-cryptography missing after apt"
 # Drift canary: the runner's jose must still speak the mock's curve. If a
@@ -235,6 +238,54 @@ if clevis luks list -d "${DEV2}" 2>/dev/null | grep "tang.*${CADDY_PORT}" >/dev/
   die "refused bind left a tang token behind"
 fi
 log "PASS: refused bind left no token"
+
+# ------------------------------------------- 12. real-tang key collapse (#87)
+# Two historical keygen rounds left the live anchor advertising a JWS GENERAL
+# advertisement and an ambiguous thumbprint. The provision script's collapse
+# span is executed here VERBATIM (extracted, never a copy) against real tang:
+# two keygen rounds -> one sign + one exchange key, extras quarantined,
+# strict-flattened /adv, exactly one thumbprint, and a real clevis bind/unlock.
+log "Real tangd: two keygen rounds must collapse to one bindable set"
+RT_DIR="${WORK}/real-tang"
+RT_PORT=18083
+mkdir -p "${RT_DIR}"
+[ -x /usr/libexec/tangd-keygen ] || die "real tang not installed (no /usr/libexec/tangd-keygen)"
+/usr/libexec/tangd -h 2>&1 | grep -q -- --listen || die "this runner's tangd has no --listen mode (need tang >= 14; pin runs-on)"
+/usr/libexec/tangd-keygen "${RT_DIR}" >/dev/null
+/usr/libexec/tangd-keygen "${RT_DIR}" >/dev/null
+[ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "4" ] || die "expected two keygen rounds to leave four .jwk files"
+eval "$(sed -n '/# --- collapse:start ---/,/# --- collapse:end ---/p' "${PROVISION_SH}")"
+declare -f collapse_keys >/dev/null || die "collapse_keys() not found in ${PROVISION_SH} — update this harness"
+warn() { printf '\n==> WARN: %s\n' "$*"; }
+own_keys() { :; } # the real one chowns to the unit user; this proof is root-only
+TANG_KEYS_DIR="${RT_DIR}"
+TANG_PORT="${RT_PORT}"
+TANG_UNIT_USER="$(id -un)"
+TANG_KEEP_THP="$(for f in "${RT_DIR}"/*.jwk; do [ "$(jq -r '.alg // empty' "$f")" = ES512 ] && printf '%s\n' "$(jose jwk thp -a S256 -i "$f")"; done | LC_ALL=C sort | head -n1)"
+[ -n "${TANG_KEEP_THP}" ] || die "could not compute a signing-key thumbprint from the generated keys"
+collapse_keys
+[ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' | wc -l | tr -d ' ')" = "2" ] || die "collapse did not leave exactly two keys"
+[ "$(find "${RT_DIR}" -maxdepth 1 -name '*.jwk' -exec jq -r '.alg' {} \; | LC_ALL=C sort | tr '\n' ' ')" = "ECMR ES512 " ] || die "collapse left the wrong key roles"
+[ "$(ls -d "${RT_DIR}".orphaned-* 2>/dev/null | wc -l | tr -d ' ')" = "1" ] || die "collapse did not quarantine the extras"
+[ "$(cat "${RT_DIR}/.published-thp")" = "${TANG_KEEP_THP}" ] || die "collapse changed the published thumbprint"
+/usr/libexec/tangd -l -p "${RT_PORT}" "${RT_DIR}" & RT_PID=$!
+ok=0
+for i in $(seq 1 20); do
+  if curl -sf -m 3 "http://127.0.0.1:${RT_PORT}/adv" -o "${WORK}/real-adv.json"; then ok=1; break; fi
+  sleep 0.5
+done
+[ "${ok}" = "1" ] || { cat "${WORK}/caddy.log" 2>/dev/null || true; die "real tangd did not serve /adv on ${RT_PORT}"; }
+jq -e 'has("payload") and has("protected") and has("signature") and (has("signatures") | not)' "${WORK}/real-adv.json" >/dev/null \
+  || die "collapsed tang still advertises JWS general serialization (signatures[])"
+[ "$(tang-show-keys "${RT_PORT}" | tr -s '[:space:]' '\n' | grep -c .)" = "1" ] || die "tang-show-keys reports more than one thumbprint after collapse"
+[ "$(tang-show-keys "${RT_PORT}")" = "${TANG_KEEP_THP}" ] || die "tang-show-keys thumbprint differs from the collapse's published value"
+clevis luks bind -f -d "${DEV2}" -k "${WORK}/passphrase" tang "{\"url\":\"http://127.0.0.1:${RT_PORT}\",\"thp\":\"${TANG_KEEP_THP}\"}" >/dev/null \
+  || die "real-tang bind failed after the collapse"
+clevis luks unlock -d "${DEV2}" -n real-tang || die "real-tang unlock failed after the collapse"
+[ -e /dev/mapper/real-tang ] || die "real-tang unlock did not open the mapper device"
+cryptsetup close real-tang 2>/dev/null || true
+kill "${RT_PID}" 2>/dev/null || true
+log "PASS: real tang collapsed two keygen rounds to one flattened, bindable key set (bind + unlock round-trip)"
 
 ELAPSED=$(( $(date +%s) - START ))
 log "BIND-E2E GREEN in ${ELAPSED}s: bind + unlock + roundtrip through the real Caddyfile; negatives hold."
