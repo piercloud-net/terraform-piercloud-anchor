@@ -182,10 +182,17 @@ systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 systemctl restart tangd.socket 2>/dev/null || true
 # Prove no double-bind: tangd must listen ONLY on loopback (Caddy owns :80).
 # Exact match is deliberate: any extra listener (including a lingering :80)
-# fails closed instead of half-covering the proxy cutover.
-LISTENING="$(systemctl show tangd.socket -p Listen --value 2>/dev/null | tr -d '[:space:]' || true)"
-log "tangd.socket listens: ${LISTENING}"
-[ "${LISTENING}" = "127.0.0.1:${TANG_PORT}" ] || die "tangd.socket listens on '${LISTENING}', want exactly '127.0.0.1:${TANG_PORT}' — refusing to continue with an unexpected listener (tang and Caddy must never both bind :80)"
+# fails closed instead of half-covering the proxy cutover. Live 2026-09-10
+# (#71): `systemctl show -p Listen` appends the socket type on this systemd
+# version ('127.0.0.1:8081(Stream)'), so exactly two raw forms are accepted —
+# the bare address and the one-listener form with the (Stream) suffix. Any
+# other shape (multiple listeners, another type, :80) dies with the raw value.
+RAW_LISTEN="$(systemctl show tangd.socket -p Listen --value 2>/dev/null | tr -d '[:space:]' || true)"
+log "tangd.socket listens: ${RAW_LISTEN}"
+case "${RAW_LISTEN}" in
+  "127.0.0.1:${TANG_PORT}" | "127.0.0.1:${TANG_PORT}(Stream)") ;;
+  *) die "tangd.socket listens on '${RAW_LISTEN}', want exactly one listener '127.0.0.1:${TANG_PORT}' (a (Stream) suffix is tolerated) — refusing to continue with an unexpected listener (tang and Caddy must never both bind :80)" ;;
+esac
 
 # Defensive key generation: some base images ship tang without keys on disk. # ci-allowlist: prose — on-box keygen note, not a live reference.
 if ! compgen -G "${TANG_KEYS_DIR}/*.jwk" >/dev/null; then
