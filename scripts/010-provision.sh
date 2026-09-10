@@ -180,6 +180,13 @@ printf '[Socket]\nListenStream=\nListenStream=127.0.0.1:%s\n' "${TANG_PORT}" > /
 systemctl daemon-reload
 systemctl enable --now tangd.socket >/dev/null 2>&1 || true
 systemctl restart tangd.socket 2>/dev/null || true
+# Live 2026-09-10 (#73): restarting the socket unit does NOT move an active
+# or wedged tangd.service — the old instance keeps the old socket fd, so
+# nothing serves the new loopback listener and the /adv probe below fails
+# for its whole retry budget. Cycle the service explicitly (a manual start
+# inherits the socket unit's fds, rebinding tangd to the new address).
+systemctl reset-failed tangd.service 2>/dev/null || true
+systemctl restart tangd.service 2>/dev/null || true
 # Prove no double-bind: tangd must listen ONLY on loopback (Caddy owns :80).
 # Exact match is deliberate: any extra listener (including a lingering :80)
 # fails closed instead of half-covering the proxy cutover. Live 2026-09-10
@@ -611,6 +618,10 @@ for i in 1 2 3 4 5 6; do
   sleep 10
 done
 if [ "$ok" != "1" ]; then
+  log "tangd direct-probe failed — capturing unit state for the next run"
+  systemctl --no-pager -l status tangd.socket tangd.service 2>&1 | tail -30 || true
+  journalctl -u tangd.socket -u tangd.service -n 30 --no-pager 2>&1 | tail -40 || true
+  if command -v ss >/dev/null 2>&1; then ss -ltnp 2>/dev/null | grep -E ":${TANG_PORT}|:80 " || true; fi
   die "tangd does not answer direct on 127.0.0.1:${TANG_PORT} (/adv) — refusing to finish blind"
 fi
 log "tangd answers direct on loopback (OK)"
