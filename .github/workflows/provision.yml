@@ -624,21 +624,21 @@ jobs:
           set -euo pipefail
           # Pasted secret present -> the script skips minting (legacy path:
           # same SSH, same thumbprint, same lock as today). Empty -> mint a
-          # caller-set password + power-cycle + set + power-on + SSH-wait,
-          # exporting the masked value for the provision step below
-          # (same-runner handoff, dies with the runner). The power-cycle is
-          # the one honest tax: vendor docs require OFF for password-set
-          # (fresh boxes: harmless machine-wait; re-provisions: brief
-          # downtime). Concurrent runs serialize on 409 lock-backoff. Sits
-          # AFTER the A1 open step by design (live #59): the closing
-          # SSH-wait needs the runner /32 :22 window — steady-state
-          # firewall admits 80/443 only, so probing earlier hangs on
-          # dropped SYNs with zero output. After tofu apply per #41
-          # (apply rewrites the interface policy and would detach an
-          # earlier window). The power-cycle lands after steady state;
-          # account-side config and the SCP-side window are unaffected
-          # by it. Still behind the red-banner gate (destructive ops
-          # need a reviewed tree).
+          # caller-set password, ensure the box is RUNNING (live 2026-09-10
+          # #68: the set is guest-agent-based and completes only on a
+          # running VM — the stale vendor docs' OFF step is gone, so no
+          # power cycle and no downtime), wait for the agent to report
+          # available, set it, then SSH-wait — exporting the masked value
+          # right after the set, before the SSH-wait, for the provision
+          # step below (same-runner handoff, dies with the runner).
+          # Concurrent runs serialize on 409 lock-backoff. Sits AFTER the
+          # A1 open step by design (live #59): the closing SSH-wait needs
+          # the runner /32 :22 window — steady-state firewall admits
+          # 80/443 only, so probing earlier hangs on dropped SYNs with
+          # zero output. After tofu apply per #41 (apply rewrites the
+          # interface policy and would detach an earlier window). Still
+          # behind the red-banner gate (destructive ops need a reviewed
+          # tree).
           .github/scripts/020-provision-anchor.sh bootstrap-password
 
       - name: A1 provision (plain ssh, thumbprint, root lock)

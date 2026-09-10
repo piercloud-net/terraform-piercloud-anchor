@@ -24,14 +24,17 @@
 #              BOOTSTRAP_ROOT_PASSWORD minted by bootstrap-password below.
 #   bootstrap-password
 #              passwordless bootstrap (issue #50): mint a one-time root
-#              password (masked at birth) -> PATCH state OFF (mandatory per
-#              vendor docs) -> poll task SUCCESS -> set via
+#              password (masked at birth) -> ensure RUNNING (power ON only
+#              when needed; live 2026-09-10 #68: the set is guest-agent
+#              based and completes only on a running VM — no power cycle)
+#              -> wait for guest-agent status .available -> set via
 #              ServerSetRootPasswordPatch (422 = fresh candidate, bounded)
-#              -> poll SUCCESS -> PATCH state ON -> poll + TCP/SSH retry ->
-#              export the masked value for the provision step (same-runner
-#              handoff). Skips minting when ROOT_PASSWORD_SECRET is set.
-#              Runs after A1 open (workflow order, issue #59): the closing
-#              SSH-wait needs the runner /32 :22 window.
+#              -> poll SUCCESS -> export the masked value BEFORE the
+#              SSH-wait (same-runner handoff; the workflow's finally-path
+#              lock then covers every later death) -> TCP/SSH retry.
+#              Skips minting when ROOT_PASSWORD_SECRET is set. Runs after
+#              A1 open (workflow order, issue #59): the closing SSH-wait
+#              needs the runner /32 :22 window.
 #   lock-password
 #              best-effort finally-path: `passwd -l root` over ssh with the
 #              caller-set password. Never fails (the original failure owns
@@ -488,25 +491,29 @@ cmd_provision() {
 }
 
 # ---------------------------------------------------------------------------
-# bootstrap-password: mint a caller-set one-time root password, power-cycle
-# the server around the set (issue #50 — tenant pastes 1 secret).
-#
-# Power-OFF is mandatory per vendor docs (offline shadow surgery; absolute
-# — no guest-agent write path, guest-agent is GET-only telemetry), so the
-# flow converges to OFF first. Fresh boxes: harmless machine-wait.
-# Re-provisions: note the brief downtime. Async PATCHes return 202 +
-# TaskInfo: poll GET /tasks/{uuid} to FINISHED. 409 server.lock.error:
-# backoff + retry, bounded. The candidate travels via the sshpass
-# environment value and jq $ENV (same-runner process argv only — masked in
-# logs, never persisted); task bodies print only on poll failure, scrubbed
-# and bounded (2KB), so a policy message quoting the candidate cannot leak
-# it (key filter + embedded-value backstop + runner mask; the value never
+# bootstrap-password: mint a caller-set one-time root password and set it
+# on the RUNNING box via the guest agent (issue #50 — tenant pastes 1
+# secret). Live 2026-09-10 (#68): netcup's SetRootPasswordTask is
+# guest-agent-based and completes ONLY while the VM is RUNNING — every
+# SHUTOFF set errored (error.internalserver, passwordChangeFailed: true,
+# SCP log "Root password could not be changed"); the helpcenter "must be
+# powered off" is stale. So: no power cycle — power ON only when the box
+# is not RUNNING, then wait (bounded, fail-closed) for the agent to
+# report available before the set. Async PATCHes return 202 + TaskInfo:
+# poll GET /tasks/{uuid} to FINISHED. 409 server.lock.error: backoff +
+# retry, bounded. The candidate travels via the sshpass environment
+# value and jq $ENV (same-runner process argv only — masked in logs,
+# never persisted); task bodies print only on poll failure, scrubbed and
+# bounded (2KB), so a policy message quoting the candidate cannot leak it
+# (key filter + embedded-value backstop + runner mask; the value never
 # appears, only metadata).
 # A crash between set and the provision's `passwd -l root` leaves a
 # caller-known password live: the workflow's failure step runs
-# lock-password below (finally-path, not happy-path). An orphan on a
-# powered-OFF box is unreachable — the next re-dispatch mints fresh and
-# overwrites it (recovery = set again + power on + re-dispatch).
+# lock-password below (finally-path, not happy-path), and the export
+# below lands right after the set — BEFORE the SSH-wait — so it covers
+# every path past that point. A lock-password miss on a running box
+# leaves the value live; the next re-dispatch mints fresh and overwrites
+# it (recovery = set again + re-dispatch).
 # ---------------------------------------------------------------------------
 BOOTSTRAP_PW_LEN=28       # inside the 24-32 window; caller-supplied value
 BOOTSTRAP_PW_RETRIES=3    # 422 (policy refused the value) -> fresh candidate
@@ -514,16 +521,52 @@ LOCK_WAIT_SECONDS=15      # backoff step on 409 server.lock.error
 LOCK_WAIT_ROUNDS=40       # ... bounded (~10 min per mutating op)
 TASK_POLL_SECONDS=10
 TASK_WAIT_ROUNDS=60       # ... bounded (~10 min per async op)
-SSH_WAIT_ROUNDS=60        # TCP/22 retry after power-ON (each try ceilinged: 60 x (5s probe + 10s sleep) ~= 15 min worst case, then loud abort)
+AGENT_WAIT_ROUNDS=30      # guest-agent .available wait on the RUNNING box before the set (30 x 10s ~= 5 min worst case, then loud abort)
+AGENT_WAIT_SECONDS=10     # ... sleep between guest-agent status probes
+SSH_WAIT_ROUNDS=60        # TCP/22 retry on the running box (each try ceilinged: 60 x (5s probe + 10s sleep) ~= 15 min worst case, then loud abort)
 SSH_TCP_TIMEOUT_SECONDS=5 # per-attempt ceiling on the TCP/22 probe (live #59: bare /dev/tcp blocks on kernel SYN timeout while SYNs go unanswered — 68-min silent hang)
 SSH_PROBE_ROUNDS=12       # sshd takes TCP before auth is ready (short loop)
 
-gen_password() { # -> 28 chars, conservative charset (no shell/JSON specials)
+gen_password() { # -> BOOTSTRAP_PW_LEN chars (28), conservative charset, >=1 upper+lower+digit
   # The || true is load-bearing: under `set -o pipefail`, tr dies on
   # SIGPIPE (141) the moment head has its bytes, failing the function
   # before any mutation. Short reads stay impossible: every caller checks
   # the length and dies closed on mismatch.
-  LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$BOOTSTRAP_PW_LEN" || true
+  # netcup policy (SCP UI hint, live 2026-09-10): >=1 uppercase, >=1
+  # lowercase, >=1 digit — a random draw can be class-less and burn a 422
+  # candidate. Splice one random char of each MISSING class into a random
+  # position; positions are never reused and later splices never touch an
+  # already-used position, so a class fixed by a splice is permanent (a
+  # class can be spliced at most once). A class that was present but got
+  # clobbered by a later splice in the same pass is caught by the next
+  # pass — at most 3 splices exist in total (3 classes), so <=4 passes:
+  # 3 splice passes + 1 clean re-check. Each splice replaces one char, so
+  # the length stays exactly BOOTSTRAP_PW_LEN.
+  local pw cls pos ch used round splices
+  pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$BOOTSTRAP_PW_LEN" || true)"
+  if [ "${#pw}" -ne "$BOOTSTRAP_PW_LEN" ]; then
+    printf '%s' "$pw" # short read: the caller's length check dies closed before any mutation
+    return 0
+  fi
+  used=" "
+  round=0
+  while [ "$round" -lt 4 ]; do
+    round=$((round + 1)); splices=0
+    for cls in 'A-Z' 'a-z' '0-9'; do
+      if [ "$(LC_ALL=C tr -d "$cls" <<<"$pw")" = "$pw" ]; then
+        while :; do
+          pos=$((RANDOM % ${#pw}))
+          case "$used" in *" $pos "*) ;; *) break ;; esac
+        done
+        used="${used}${pos} "
+        ch="$(LC_ALL=C tr -dc "$cls" </dev/urandom | head -c 1 || true)"
+        pw="${pw:0:$pos}${ch}${pw:$((pos + 1))}"
+        splices=$((splices + 1))
+      fi
+    done
+    [ "$splices" -eq 0 ] && break
+  done
+  printf '%s' "$pw"
 }
 
 server_detail() { # -> raw GET /servers/{id} JSON (callers parse; no state filter)
@@ -535,6 +578,29 @@ server_detail() { # -> raw GET /servers/{id} JSON (callers parse; no state filte
 
 server_live_state() { # -> RUNNING | SHUTOFF | ... (empty when unknown)
   server_detail | jq -r '.serverLiveInfo.state // empty'
+}
+
+wait_guest_agent() { # GET /servers/{id}/guest-agent/status -> .available true; bounded, fail-closed
+  # Live 2026-09-10 (#68): the root-password set is a guest-agent round
+  # trip and completes only on a RUNNING box; a set issued before the
+  # agent reports available errors with error.internalserver
+  # (passwordChangeFailed: true). Fail closed if it never shows up — a
+  # guest without qemu-guest-agent, or an unfinished boot, is operator
+  # action, never a reason to set blind.
+  local i=0 resp available
+  while [ "$i" -lt "$AGENT_WAIT_ROUNDS" ]; do
+    api_call GET "/api/v1/servers/${SERVER_ID}/guest-agent/status" "" resp
+    api_ok "$HTTP_STATUS" || die "guest-agent status failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
+    available="$(printf '%s' "$resp" | jq -r '.available // false')"
+    if [ "$available" = "true" ]; then
+      log "guest agent available — the running box can apply the password set"
+      return 0
+    fi
+    i=$((i + 1))
+    if [ $((i % 6)) -eq 0 ]; then log "guest agent not available yet (attempt ${i}/${AGENT_WAIT_ROUNDS}) — still waiting"; fi
+    sleep "$AGENT_WAIT_SECONDS"
+  done
+  die "guest agent still not available after $AGENT_WAIT_ROUNDS probes (~$((AGENT_WAIT_ROUNDS * AGENT_WAIT_SECONDS / 60)) min) on a RUNNING box — ensure the image has qemu-guest-agent installed and the box finished booting, then re-dispatch" # ci-allowlist: names the guest-tools package to install, not a disk-API call.
 }
 
 TASK_DUMP_BYTES=2048 # failure-dump bound: uuid + scrubbed body (read-only logging)
@@ -602,7 +668,7 @@ poll_task() { # $1 = task uuid, $2 = label -> 0 on FINISHED; dies otherwise
       PENDING | RUNNING) ;; # still converging
       *)
         log_task_dump "$uuid" "$label" "$state" "$resp"
-        die "$label task $uuid ended in state ${state:-unknown} — investigate in the SCP logs, then re-dispatch (recovery = set again + power on)"
+        die "$label task $uuid ended in state ${state:-unknown} — investigate in the SCP logs, then re-dispatch (recovery: ensure RUNNING, re-dispatch)"
         ;;
     esac
     i=$((i + 1))
@@ -663,7 +729,7 @@ wait_ssh() { # TCP/22 then one auth probe with $SSHPASS, bounded
     sleep 10
   done
   if [ "$i" -ge "$SSH_WAIT_ROUNDS" ]; then
-    die "TCP/22 on the anchor never opened after power-ON — refusing to continue blind"
+    die "TCP/22 on the anchor never opened on the running box — refusing to continue blind"
   fi
   log "TCP/22 open — one auth probe proving the fresh password is live"
   i=0
@@ -676,7 +742,7 @@ wait_ssh() { # TCP/22 then one auth probe with $SSHPASS, bounded
     fi
     i=$((i + 1)); sleep 10
   done
-  die "SSH auth probe failed after power-ON — the set may not have converged. Recovery: set again + power on + re-dispatch."
+  die "SSH auth probe failed on the running box — the set may not have converged. Recovery: set again + re-dispatch."
 }
 
 cmd_bootstrap_password() {
@@ -700,15 +766,16 @@ cmd_bootstrap_password() {
   pw="$(gen_password)"
   [ "${#pw}" -eq "$BOOTSTRAP_PW_LEN" ] || die "password generator short-read — refusing to continue"
   echo "::add-mask::$pw" # mask FIRST, before any use (same rule as device secrets)
-  log "one-time password minted (${BOOTSTRAP_PW_LEN} chars, masked) — converging power state"
+  log "one-time password minted (${BOOTSTRAP_PW_LEN} chars, masked) — ensuring RUNNING state (agent-based set)"
   state="$(server_live_state)"
   log "server live state: ${state:-unknown}"
-  if [ "$state" != "SHUTOFF" ]; then
-    patch_server '{"state":"OFF"}' "power-OFF" "?stateOption=POWEROFF" uuid
-    if [ -n "$uuid" ]; then poll_task "$uuid" "power-OFF"; fi
+  if [ "$state" != "RUNNING" ]; then
+    patch_server '{"state":"ON"}' "power-ON" "" uuid
+    if [ -n "$uuid" ]; then poll_task "$uuid" "power-ON"; fi
   else
-    log "server already OFF — skipping power-OFF"
+    log "server already RUNNING — skipping power-ON"
   fi
+  wait_guest_agent
   while [ "$attempt" -lt "$BOOTSTRAP_PW_RETRIES" ]; do
     attempt=$((attempt + 1)); rejected=0
     body="$(PW="$pw" jq -n -c '{rootPassword: $ENV.PW}')"
@@ -725,18 +792,12 @@ cmd_bootstrap_password() {
   done
   [ "$set_ok" -eq 1 ] || die "password-set refused $BOOTSTRAP_PW_RETRIES candidates in a row — escalate, no fallback"
   body=""
-  # Export BEFORE power-ON: any run that ever set a password can lock it
-  # via the workflow's failure step, even if power-ON/poll/SSH dies below.
+  # Export immediately AFTER a successful set and BEFORE the SSH-wait: any
+  # run that ever set a password can lock it via the workflow's failure
+  # step, even if the SSH-wait (or anything later) dies below.
   if [ -n "${GITHUB_ENV:-}" ]; then
     echo "BOOTSTRAP_ROOT_PASSWORD=$pw" >>"$GITHUB_ENV"
     echo "BOOTSTRAP_PASSWORD_SET=true" >>"$GITHUB_ENV"
-  fi
-  state="$(server_live_state)"
-  if [ "$state" != "RUNNING" ]; then
-    patch_server '{"state":"ON"}' "power-ON" "" uuid
-    if [ -n "$uuid" ]; then poll_task "$uuid" "power-ON"; fi
-  else
-    log "server already RUNNING — skipping power-ON"
   fi
   export SSHPASS="$pw"
   wait_ssh

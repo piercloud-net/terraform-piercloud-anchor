@@ -94,7 +94,7 @@ STOP + open an issue in your repo so the operator sees it (C-A — no fallback e
 
 ## 4. A1 provisions, thumbprint lands via run artifact (H1 chain)
 
-The run first sets its own one-time root password when none was pasted (one power-cycle — machine-wait, no tap needed; concurrent runs serialize on a lock-wait), then opens the hardened A1 self-open /32 SSH window and provisions the
+The run first sets its own one-time root password when none was pasted (applied on the running box via the guest agent — no reboot, no tap needed; concurrent runs serialize on a lock-wait), then opens the hardened A1 self-open /32 SSH window and provisions the
 anchor (no standing SSH keys by design: the script ends with `passwd -l root`;
 console-recovery note: rescue disables the netcup firewall — any rescue
 boot → rotate tang keys afterwards), then closes the window
