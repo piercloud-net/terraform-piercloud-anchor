@@ -41,6 +41,8 @@ All notable changes to this project will be documented in this file.
 - Make the /adv probe self-diagnosing and tool-gap tolerant (closes #79)
 - Accept the JWS general serialization in the /adv probe (closes #81)
 - Dashboard vhost checks in the pre-DNS / auto-TLS state (closes #83)
+- Read the DNS proxied flag without jq's false-as-empty trap (closes #85)
+- Converge tang key material to one bindable set (closes #87)
 
 ### 📚 Documentation
 
