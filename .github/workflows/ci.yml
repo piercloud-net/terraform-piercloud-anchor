@@ -519,6 +519,73 @@ jobs:
           [ "$fail" -eq 0 ]
           echo "no sovereignty-downgrade print patterns (OK)"
 
+  unit-tests-scripts:
+    name: unit-tests (scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+        with:
+          persist-credentials: false
+      - name: Gate on changed paths (CI scripts or harnesses)
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin main --depth=1 >/dev/null 2>&1 || true
+            # Two-dot endpoint diff (same rationale as bind-e2e's gate):
+            # never needs a merge-base, so shallow PR checkouts cannot
+            # break it. An empty/undeterminable file list RUNS (a wasted
+            # run costs seconds; a wrongly-skipped run would let a
+            # 020-provision-anchor.sh regression land unseen).
+            changed="$(git diff --name-only origin/main HEAD 2>/dev/null || true)"
+            printf '%s\n' "$changed"
+            if [ -z "$changed" ]; then
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "::warning::unit-tests could not list changed files — running unconditionally"
+            elif printf '%s' "$changed" | grep -qE '^(\.github/scripts/|\.github/workflows/|tests/(scp-token-refresh|sweep-pre-classify)/)'; then
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=no" >> "$GITHUB_OUTPUT"
+              echo "::notice::unit-tests skipped (no CI script or harness paths changed)"
+            fi
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run the committed script harnesses (cheap first)
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # Committed harnesses, run as-is (no flags, no edits): cred-free,
+          # offline (stubbed curl / API boundary). Cheap-first ordering puts
+          # the fastest failure (scp-token-refresh, ~0.4s) up front.
+          bash tests/scp-token-refresh/run-test.sh
+          bash tests/sweep-pre-classify/run-test.sh
+      - name: bash -n + shellcheck -S warning over the CI-called scripts
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # The harnesses exercise 020-provision-anchor.sh behaviour; this
+          # step guards the whole CI-called script surface. shellcheck
+          # -S warning FAILS the job by design: the tree passes clean at
+          # that level today (verified against shellcheck 0.9.0 — the
+          # ubuntu-latest version), so a finding is a regression, not
+          # advisory chatter (info/style severities stay out of scope).
+          for f in .github/scripts/*.sh; do
+            bash -n "$f"
+          done
+          shellcheck -S warning .github/scripts/*.sh
+          echo "scripts parse and pass shellcheck -S warning (OK)"
+      - name: provision.yml still parses as YAML
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # Ruby's psych (stdlib) ships on ubuntu-latest, so this needs no
+          # action or install step — it catches a malformed workflow file
+          # before GitHub's own loader would silently refuse provision.yml.
+          ruby -ryaml -e 'YAML.load_file(ARGV[0])' .github/workflows/provision.yml
+          echo "provision.yml parses (OK)"
+
   bind-e2e:
     name: bind-proof e2e (Caddy fronting mock tang)
     runs-on: ubuntu-latest
