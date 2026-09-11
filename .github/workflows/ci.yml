@@ -550,7 +550,7 @@ jobs:
             # large list makes grep's early exit SIGPIPE the writer
             # (pipeline rc 141), which silently turns this match into
             # run=no on exactly the big PRs that need the harnesses.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|tests/(scp-token-refresh|sweep-pre-classify)/)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes)/)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -568,6 +568,7 @@ jobs:
           # the fastest failure (scp-token-refresh, ~0.4s) up front.
           bash tests/scp-token-refresh/run-test.sh
           bash tests/sweep-pre-classify/run-test.sh
+          bash tests/sweep-post-shapes/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |

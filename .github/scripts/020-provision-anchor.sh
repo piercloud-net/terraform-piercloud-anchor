@@ -242,10 +242,11 @@ require_token() {
 # with it (C-d trust model unchanged).
 # Token-response guard (review security N0): a crafted/compromised token
 # response must never forge extra $GITHUB_ENV lines (e.g. a second line
-# NETCUP_API_BASE=http://attacker, inherited by every later step) nor smuggle
-# control bytes into the 0600 refresh-token handoff file. Same semantics as
-# the workflow's guard_line: reject newline/CR, then any non-printable
-# character. Fail closed BEFORE masking or persisting either value.
+# redirecting NETCUP_API_BASE to an attacker-controlled base, inherited by
+# every later step) nor smuggle control bytes into the 0600 refresh-token
+# handoff file. Same semantics as the workflow's guard_line: reject
+# newline/CR, then any non-printable character. Fail closed BEFORE masking or
+# persisting either value.
 guard_token_value() { # $1 label, $2 value
   case "$2" in
     *[$'\n\r']*) die "SCP token response $1 contains a newline/CR — refusing the handoff write (injection guard)" ;;
@@ -313,8 +314,9 @@ scp_token_refresh() {
   # security N0, live-proven): the poll step guards the FIRST token response,
   # but this refresh path (every 401 after ~5 min) did not — an injected
   # newline in .access_token forged a second $GITHUB_ENV line (e.g.
-  # NETCUP_API_BASE=http://attacker), which every later step then inherited,
-  # sending the Bearer token to the attacker while the run stayed green. If
+  # NETCUP_API_BASE to an attacker-controlled base), which every later step
+  # then inherited, sending the Bearer token to the attacker while the run
+  # stayed green. If
   # either value fails the guard, NOTHING is written — no mask, no env
   # append, no refresh-token file.
   guard_token_value "access_token" "$at"
@@ -1232,14 +1234,27 @@ cmd_sweep_post() {
   # attached policy is never touched.
   local steady attached mac
   mac="$(resolve_mac)"
-  # Attached-list parse (review security MEDIUM/LOW): every other reader uses
-  # (.id // .), while `(.id | tostring)` here turned a string-shaped/missing
-  # id into ["null"], so
-  # EVERY steady policy looked unattached and the attached (live) one got
-  # deleted. Require a real userPolicies array and stringify BOTH sides of the
-  # comparison: an unparseable/missing attached list is ambiguous, and
-  # ambiguity must NEVER delete (hard failure instead).
-  attached="$(iface_fw_get "$mac" | jq -ce 'if (.userPolicies | type) == "array" then [.userPolicies[] | if (.id // .) == null then error("userPolicies entry without an id") else ((.id // .) | tostring) end] else error("userPolicies missing or not an array") end')" \
+  # Attached-list parse (review security N1, live-proven): dispatch on the
+  # ENTRY type and hard-fail on anything ambiguous. The previous `(.id // .)`
+  # fallback made an id-less/null/empty-id entry resolve to the WHOLE OBJECT;
+  # the live steady-state policy then looked unattached and close_policy
+  # deleted it (cleartext/dashboard outage until re-apply). Tolerated: an
+  # array of {"id":number}/{"id":string}/bare number/bare string entries,
+  # all stringified (the comparison below is against stringified steady
+  # ids). Ambiguous = missing key, non-array userPolicies, null/boolean/
+  # object entries, id null/empty/non-scalar → jq errors and NOTHING is
+  # detached or deleted (die).
+  attached="$(iface_fw_get "$mac" | jq -ce '
+    if (.userPolicies | type) == "array" then
+      [.userPolicies[] |
+        if type == "object" then
+          (.id | if . == null or . == "" then error("userPolicies entry without a usable id")
+                 elif type == "string" or type == "number" then tostring
+                 else error("userPolicies entry with a non-scalar id") end)
+        elif type == "string" or type == "number" then
+          (if . == "" then error("userPolicies entry with an empty id") else tostring end)
+        else error("userPolicies entry of an ambiguous type") end]
+    else error("userPolicies missing or not an array") end')" \
     || die "could not parse the attached-policy list for $SERVER_ID/$mac — refusing the steady-state orphan sweep on unproven attachment state"
   steady="$(list_steady_policies)"
   while IFS= read -r entry; do
