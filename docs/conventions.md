@@ -78,6 +78,29 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
 - Reviewers: any conditional/fallback/legacy content in the bootstrap
   flow is a NEEDS-WORK finding, same weight as a code defect.
 
+## Review protocol (independent review, security first)
+
+- Every change gets an independent review before merge (CI-gated Renovate
+  minor/patch automerges excepted — see Release discipline): an independent
+  reviewer is a separate instance (human or agent) that did not author the
+  change and reviews the artifact, not the author's account of it.
+- **Security is the first lens**, ahead of correctness and style:
+  credential custody (S1 / C-A — standing secrets, token lifetime, where
+  secrets travel), exposure windows (firewall / temporary access),
+  injection of external data into shell, HCL, `$GITHUB_ENV` /
+  `$GITHUB_OUTPUT`, and fail-open behaviour — a green run that leaves a
+  security property broken is a defect, not a warning.
+- Findings must be **reproduced** before reporting: a failing command, a
+  payload, or a reverted-fix test. Evidence, not assertion.
+- Fixes to findings — and any commit pushed after a verdict — get a
+  **verify pass by a reviewer instance seeded with the finding** (for agent
+  reviewers, a fresh instance; a commit that answers no finding is checked
+  against the verdict it invalidates) before live proof / merge; a verdict
+  applies only to the commit it reviewed.
+- Review verdicts are recorded in the PR so the trail is auditable.
+- Precedent: verdicts are recorded as PR comments naming the reviewed
+  commit SHA.
+
 ## Public-safety rules for content
 
 - Nothing sensitive in committed files: no credentials, no hostnames/IPs of
