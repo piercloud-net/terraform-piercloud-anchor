@@ -83,7 +83,9 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    `mode=apply` (no identifiers in the inputs — your username already lives
    in the repo) →
    approve the device-flow URL + code at netcup's own Keycloak, from any browser. The
-   ephemeral token dies with the runner. *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
+   ephemeral token dies with the runner; the run revokes the device-grant
+   refresh token at teardown, and a teardown that cannot prove the credential
+   dead fails the run (no silent green). *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
 4. **A1 provisions** — the run opens its own /32 window, installs `tang`,
    creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net`),
    prints its **thumbprint** (to run artifact today — ntfy push + committed
