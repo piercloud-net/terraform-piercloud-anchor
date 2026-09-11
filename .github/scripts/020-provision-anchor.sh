@@ -262,7 +262,14 @@ scp_token_refresh() {
       printf 'NETCUP_SCP_REFRESH_TOKEN=%s\n' "$rt" >>"$GITHUB_ENV"
     fi
   fi
-  log "scp token refreshed (access token TTL is ~5 min; long runs cross it)"
+  # stderr DELIBERATELY: this function runs inside api_call, and several of
+  # api_call's callers are captured as data (`pid="$(own_policy_id)"`,
+  # `list="$(list_tmp_policies)"`, `mac="$(resolve_mac)"`, ...). A stdout line
+  # from here is prepended to that capture and breaks the jq parse (live
+  # 2026-09-11: rc 5 on `pid="$(own_policy_id)"`, empty pid, window policy
+  # leaked). The ::add-mask:: lines above are on stderr for the same reason;
+  # the runner scans both streams for workflow commands.
+  log "scp token refreshed (access token TTL is ~5 min; long runs cross it)" >&2
   return 0
 }
 

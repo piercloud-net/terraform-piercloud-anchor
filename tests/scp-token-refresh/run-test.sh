@@ -81,7 +81,10 @@ chmod +x "$WORK/bin/curl"
 # ---- extract the functions under test (sourcing the CLI would dispatch) ----
 extract() { awk "/^$1\\(\\) \\{/,/^\\}/" "$SCRIPT"; }
 {
-  echo 'log() { :; }'
+  # Real log shape (stdout): with a stubbed log() the captured-stdout regression
+  # below cannot see the bug at all — that is exactly why the refresh banner
+  # slipped through review. Keep this faithful to the script.
+  echo 'log() { printf "A1: %s\n" "$*"; }'
   extract scp_token_refresh
   extract _api_curl
   extract api_call
@@ -133,6 +136,48 @@ run_case refresh-bad "RT1"
 is "case3 status"        "401"         "$HTTP_STATUS"
 is "case3 api calls"     "1"           "$CALLS"
 is "case3 refresh calls" "1"           "$REFRESHED"
+
+# ---- case 4: a refresh must not corrupt a captured stdout ------------------
+# The live failure (review SECURITY, reproduced): pid="$(own_policy_id)" — a
+# captured call site — got the refresh success line on stdout PREPENDED to the
+# JSON, so jq died with "parse error: Invalid numeric literal", cmd_close read
+# rc 5 with an empty pid, and the A1 window policy leaked. The capture below is
+# the faithful shape: api_call's body goes to the outvar and the wrapper prints
+# the outvar INSIDE the command substitution (a bare `$(api_call ...)` would
+# lose HTTP_STATUS — see api_call's subshell warning).
+run_capture() { # $1 label, $2 mode -> CAP_RC/CAPTURED/CAP_STDOUT/CAP_STDERR/CAP_REFRESHED
+  local rc=0
+  STUB_MODE="$2" \
+  STUB_CALLS="$WORK/calls.cap.$1" STUB_SEEN="$WORK/seen.cap.$1" \
+  STUB_REFRESHED="$WORK/refreshed.cap.$1" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="RT1" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://token.example/token" \
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    json_call() { local o=""; api_call GET "/api/v1/test" "" o; printf "%s" "$o"; }
+    captured="$(json_call)"
+    printf "CAPTURED=%s\n" "$captured"
+  ' _ "$WORK/functions.sh" > "$WORK/cap.out.$1" 2> "$WORK/cap.err.$1" || rc=$?
+  CAP_RC="$rc"
+  CAPTURED="$(sed -n 's/^CAPTURED=//p' "$WORK/cap.out.$1")"
+  # Anything else the wrapper wrote to stdout (the bug: the refresh banner).
+  CAP_STDOUT="$(grep -v '^CAPTURED=' "$WORK/cap.out.$1" || true)"
+  CAP_STDERR="$(cat "$WORK/cap.err.$1")"
+  CAP_REFRESHED=0
+  if [ -f "$WORK/refreshed.cap.$1" ]; then CAP_REFRESHED="$(wc -l < "$WORK/refreshed.cap.$1" | tr -d ' ')"; fi
+}
+
+run_capture c4 401-then-200
+is "case4 rc"                    "0"           "$CAP_RC"
+is "case4 captured body"         '{"ok":true}' "$CAPTURED"
+is "case4 captured parses (jq)"  "1"           "$(printf '%s' "$CAPTURED" | jq -e '.ok == true' >/dev/null 2>&1 && echo 1 || echo 0)"
+is "case4 no stray stdout"       ""            "$CAP_STDOUT"
+is "case4 refresh banner stderr" "1"           "$(grep -c 'scp token refreshed' "$WORK/cap.err.c4" || true)"
+is "case4 refresh calls"         "1"           "$CAP_REFRESHED"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
