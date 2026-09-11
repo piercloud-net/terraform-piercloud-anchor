@@ -101,8 +101,9 @@ the public repo — codification target: the private operator control plane).
   ever needed on this zone, ACM returns; gate/timing is tracked in issue
   #107.
 - **Leg 2 — edge → origin.** Full (Strict) needs a valid origin cert on the
-  box. Do NOT rely on Caddy auto-TLS (HTTP-01) for proxied two-label hosts:
-  Always-Use-HTTPS redirects the challenge to https, and the https follow-up
+  box. Do NOT rely on Caddy auto-TLS (HTTP-01) for any proxied host (the flat
+  dashboard included): Always-Use-HTTPS redirects the challenge to https, and
+  the https follow-up
   needs the origin cert ACME is still trying to obtain — a catch-22 (live
   2026-09-10, issue #88). Plant the pair (below); a run that cannot handshake
   `:443` logs the WARNING variant of the dashboard check, not a failure.
