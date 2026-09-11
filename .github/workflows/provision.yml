@@ -940,11 +940,34 @@ jobs:
           NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
         run: |
           set -euo pipefail
+          summary() { # $1 = one-line outcome (bounded, token-free by construction)
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Device-grant revocation\n- %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          bounded_detail() { # $1 = curl stderr file -> <=300 chars, one trimmed line
+            head -c 300 "$1" 2>/dev/null | tr '\n\r' '  ' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+          }
           # Refresh-token handoff is a 0600 runner-local FILE (see the poll
           # step): load it into this step's process env only — the ~30-day
           # credential never sits in the job environment.
-          if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ] && [ -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
+          if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ]; then
+            # F1 residual (review security): the path is exported ONLY when
+            # the poll step received a refresh token, so an unreadable or
+            # empty file is NOT "no token was issued" — the credential may be
+            # live. Claiming a clean no-op here would be a false green: fail
+            # the run RED.
+            if [ ! -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
+              echo "::error::NETCUP_SCP_REFRESH_TOKEN_FILE is set but the handoff file is missing or unreadable — the run's refresh token may still be live and cannot be revoked here. Revoke the tenant's offline session in netcup's Keycloak (SCP) admin/account UI, then investigate. No fallback exists (C-A)."
+              summary "FAILED: refresh-token handoff file set but unreadable — token NOT revoked (may stay live up to Keycloak's ~30-day idle expiry)"
+              exit 1
+            fi
             NETCUP_SCP_REFRESH_TOKEN="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
+            if [ -z "$NETCUP_SCP_REFRESH_TOKEN" ]; then
+              echo "::error::the refresh-token handoff file is empty — a token was issued to this run but cannot be revoked here. Revoke the tenant's offline session in netcup's Keycloak (SCP) admin/account UI, then investigate. No fallback exists (C-A)."
+              summary "FAILED: refresh-token handoff file empty — token NOT revoked (may stay live up to Keycloak's ~30-day idle expiry)"
+              exit 1
+            fi
           fi
           # Errexit stays ON (explicit): a teardown that cannot prove the
           # refresh credential is dead is a security failure and MUST turn the
@@ -961,14 +984,6 @@ jobs:
           # RFC 7009 lets a public client revoke with client_id only — no
           # secret, no Authorization header — so revocation still works now
           # that the access token is already dead.
-          summary() { # $1 = one-line outcome (bounded, token-free by construction)
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '### Device-grant revocation\n- %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          }
-          bounded_detail() { # $1 = curl stderr file -> <=300 chars, one trimmed line
-            head -c 300 "$1" 2>/dev/null | tr '\n\r' '  ' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
-          }
           if [ -z "${NETCUP_SCP_REFRESH_TOKEN:-}" ]; then
             echo "No refresh token was issued to this run — nothing to revoke (clean no-op)."
             summary "no refresh token was issued to this run — nothing to revoke"
@@ -1072,6 +1087,12 @@ jobs:
           fi
           if [ "$CANARY_VERIFIED" -ne 1 ]; then
             exit 1
+          fi
+          # Best-effort cleanup (review security, hygiene): the canary just
+          # proved the credential dead, so drop the 0600 handoff file now.
+          # Never fatal — the run's verdict is already decided above.
+          if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ]; then
+            rm -f "$NETCUP_SCP_REFRESH_TOKEN_FILE" || true
           fi
           exit 0
 

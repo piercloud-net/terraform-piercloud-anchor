@@ -204,7 +204,7 @@ is "case4 rc"                    "0"           "$CAP_RC"
 is "case4 captured body"         '{"ok":true}' "$CAPTURED"
 is "case4 captured parses (jq)"  "1"           "$(printf '%s' "$CAPTURED" | jq -e '.ok == true' >/dev/null 2>&1 && echo 1 || echo 0)"
 is "case4 no stray stdout"       ""            "$CAP_STDOUT"
-is "case4 refresh banner stderr" "1"           "$(grep -c 'scp token refreshed' "$WORK/cap.err.c4" || true)"
+is "case4 refresh banner stderr" "1"           "$(printf '%s' "$CAP_STDERR" | grep -c 'scp token refreshed' || true)"
 is "case4 refresh calls"         "1"           "$CAP_REFRESHED"
 
 # ---- case 5: adoption of the persisted refresh-token FILE is UNCONDITIONAL --
