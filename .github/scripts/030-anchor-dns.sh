@@ -19,10 +19,6 @@
 # overwrites both A records to the exact anchor IPv4 (anchor: TTL 300
 # DNS-only; dashboard: orange-cloud/proxied), then re-reads each record
 # and fails unless name + address (+ proxied flag) match exactly.
-# Afterwards, best-effort and read-only, it reads the LEGACY two-label
-# dashboard record: if present it prints a ::notice:: telling the operator
-# to verify the flat host and then delete the old record (never delete
-# certs). Notice only — never an error, never a delete.
 #
 # SCOPE (D8): the operator zone mints names only for operator-provisioned
 # netcup anchors. A BYO twin anchor keeps its tenant-owned URL via the
@@ -125,19 +121,3 @@ upsert_record() { # $1 = left-hand name, $2 = proxied (true/false), $3 = ttl, $4
 
 upsert_record "$record" false 300 "operator anchor; DNS-only (proxied off)"
 upsert_record "$status" true 1 "dashboard; orange-cloud (proxied)"
-
-# D4 legacy notice (#106): read-only, best-effort. The pre-rename two-label
-# dashboard record `status.<san>` may still exist while the operator
-# migrates; surface it on every run so it cannot linger unseen. Never
-# delete here and never fail the run: `|| true` on the GET (a curl error
-# in the command substitution would abort under set -e) and a defensive
-# `2>/dev/null || true` on the parse. Print only the record name — never
-# the token, never a whole API response. No scheme in the message string:
-# this file is scanned by the SCP endpoint allowlist (a literal URL here
-# would be an unlisted endpoint).
-legacy="status.${san}.${CF_ZONE}"
-legacy_json="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$legacy" 2>/dev/null || true)"
-legacy_name="$(printf '%s' "$legacy_json" | jq -r '.result[0].name // empty' 2>/dev/null || true)"
-if [ -n "$legacy_name" ]; then
-  echo "::notice::legacy dashboard record ${legacy_name} still exists — verify the flat host ${status}.${CF_ZONE} then delete the old record; never delete certs (ACM sunset: #107)."
-fi
