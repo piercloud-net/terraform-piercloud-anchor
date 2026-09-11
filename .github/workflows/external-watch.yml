@@ -1,0 +1,183 @@
+# .github/workflows/external-watch.yml — always-on external watch (issue #94).
+#
+# Third vantage point for the "everything at the anchor looks silent" case:
+# Gatus runs ON the anchor and the main-box canary runs on the main box, so
+# neither can report its own host being down. This scheduled workflow probes
+# the PUBLIC dashboard from GitHub's network — if both boxes are gone, the
+# runner still runs and still files the incident.
+#
+# Credential-free probe: public GETs only (no tokens, no secrets). The one
+# optional secret is the NTFY push; it degrades to a logged no-op until
+# NTFY_TOPIC exists (same pattern as provision.yml).
+#
+# Deliberately NOT in .github/scripts/: that path is scanned by CI's SCP
+# endpoint allowlist (scope: provision.yml + .github/scripts/*.sh), which
+# would reject the status.* URL and the /api/v1 path as unlisted. New
+# workflow files are out of that scope by construction.
+
+name: external-watch
+
+on:
+  schedule:
+    # Backstop cadence, not an SLO probe: GitHub may delay scheduled runs
+    # under load (worst around the top of the hour).
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      probe_url:
+        description: "Override the probed base URL (default: the live dashboard). For proving the failure/recovery path."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+# One watcher at a time: overlapping runs could open/comment/close the
+# incident issue out of order.
+concurrency:
+  group: external-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: probe the dashboard from GitHub's network
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+
+      - name: "Probe: HTTP 200 + Gatus data + edge cert >= 14d"
+        id: probe
+        continue-on-error: true
+        env:
+          PROBE_URL: ${{ inputs.probe_url }}
+          MIN_CERT_DAYS: "14"
+          ATTEMPTS: "3"
+          RETRY_SLEEP: "10"
+        run: |
+          # The probe is inline (not a .github/scripts/ file) on purpose —
+          # see the header comment. Env knobs exist so the exact code can be
+          # extracted and run locally against good/bad URLs.
+          set -uo pipefail
+          URL="${PROBE_URL:-https://status.pier.piercloud.net/}"
+          base="${URL%/}"
+          host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+          fail=""
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            fail=""
+            work="$(mktemp -d)"
+            code="$(curl -sS -o "$work/body" -w '%{http_code}' --max-time 20 "$base/" 2>"$work/err" || true)"
+            if [ "$code" != "200" ]; then
+              fail="HTTP ${code:-<no-response>}"
+              [ -s "$work/err" ] && fail="$fail ($(head -n1 "$work/err"))"
+            elif ! grep -qi 'gatus' "$work/body"; then
+              fail="HTTP 200 but the body is not the Gatus dashboard (marker missing)"
+            fi
+            if [ -z "$fail" ]; then
+              api_code="$(curl -sS -o "$work/api" -w '%{http_code}' --max-time 20 "$base/api/v1/endpoints/statuses" 2>"$work/err" || true)"
+              if [ "$api_code" != "200" ]; then
+                fail="statuses API HTTP ${api_code:-<no-response>}"
+              elif ! jq -e 'type == "array" and length >= 1' "$work/api" >/dev/null 2>&1; then
+                fail="statuses API returned no endpoints"
+              fi
+            fi
+            if [ -z "$fail" ]; then
+              # `timeout` is GNU coreutils (absent on stock macOS) — fall back
+              # to gtimeout, then to no timeout. The array expansion is
+              # bash-3.2-safe (empty array + set -u would die otherwise).
+              # -checkend does the date math portably, and the two branches
+              # keep a broken probe distinct from a genuinely stale cert.
+              TO=()
+              command -v timeout  >/dev/null 2>&1 && TO=(timeout 15)
+              [ "${#TO[@]}" -eq 0 ] && command -v gtimeout >/dev/null 2>&1 && TO=(gtimeout 15)
+              openssl_out="$(echo | ${TO[@]+"${TO[@]}"} openssl s_client -connect "${host}:443" -servername "$host" 2>/dev/null || true)"
+              if ! printf '%s' "$openssl_out" | grep -q 'BEGIN CERTIFICATE'; then
+                fail="could not read the edge certificate from ${host}:443 (handshake failed or probe tooling broken)"
+              elif ! printf '%s' "$openssl_out" | openssl x509 -checkend $(( MIN_CERT_DAYS * 86400 )) -noout >/dev/null 2>&1; then
+                fail="edge certificate expires within ${MIN_CERT_DAYS}d (${host}:443)"
+              fi
+            fi
+            rm -rf "$work"
+            [ -z "$fail" ] && break
+            echo "attempt ${attempt}/${ATTEMPTS} failed: ${fail}"
+            [ "$attempt" -lt "$ATTEMPTS" ] && sleep "$RETRY_SLEEP"
+          done
+          if [ -z "$fail" ]; then
+            echo "external-watch: OK — ${base} served Gatus data and the edge certificate is valid >= ${MIN_CERT_DAYS}d"
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; fi
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "### external-watch: OK — \`${base}\` (cert >= ${MIN_CERT_DAYS}d)" >> "$GITHUB_STEP_SUMMARY"; fi
+          else
+            echo "external-watch: FAIL — ${fail}"
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              echo "detail=${fail}" >> "$GITHUB_OUTPUT"
+            fi
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "### external-watch: FAIL — ${fail}" >> "$GITHUB_STEP_SUMMARY"; fi
+            exit 1
+          fi
+
+      - name: ntfy push (no-op until NTFY_TOPIC is set)
+        if: steps.probe.outcome == 'failure'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "NTFY_TOPIC unset — no push; the incident issue is the alert path."
+            exit 0
+          fi
+          NTFY_AUTH=()
+          [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+          curl -sS --fail "${NTFY_AUTH[@]}" \
+            -H "Title: anchor dashboard unreachable (external watch)" \
+            -H "Priority: high" -H "Tags: rotating_light" \
+            -d "${DETAIL:-probe failed} — ${RUN_URL}" \
+            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null
+          echo "ntfy push sent."
+
+      - name: Incident state (issue = open while failing; auto-close on recovery)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OK: ${{ steps.probe.outputs.ok }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label=external-watch
+          gh label create "$label" --color B60205 \
+            --description "Automated external-watch incident (GitHub-side cron; open = probe failing)" 2>/dev/null || true
+          existing="$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [ "$OK" = "true" ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "Recovered at $(date -u +%FT%TZ) — probe green again. Run: ${RUN_URL}"
+              gh issue close "$existing"
+              echo "closed external-watch incident #${existing}"
+            else
+              echo "probe OK; no open incident issue"
+            fi
+            exit 0
+          fi
+          body="$(printf 'External watch probe failed.\n\n- detail: %s\n- run: %s\n\nMachine-managed by `.github/workflows/external-watch.yml` — open = failing, auto-closed on recovery.\n' "${DETAIL:-unknown}" "${RUN_URL}")"
+          if [ -n "$existing" ]; then
+            last="$(gh issue view "$existing" --json comments --jq '(.comments | last | .createdAt) // empty')"
+            if [ -z "$last" ] || [ "$(date -u -d "$last" +%s)" -le "$(date -u -d '6 hours ago' +%s)" ]; then
+              gh issue comment "$existing" --body "Still failing (previous comment > 6h old): ${DETAIL:-unknown} — ${RUN_URL}"
+            else
+              echo "incident #${existing} already records this failure (<6h); no comment"
+            fi
+          else
+            if ! gh issue create --title "[external-watch] dashboard probe failing: ${DETAIL:-unknown}" \
+                 --label "$label" --body "$body"; then
+              echo "::warning::could not attach the label — creating the incident without it"
+              gh issue create --title "[external-watch] dashboard probe failing: ${DETAIL:-unknown}" --body "$body"
+            fi
+          fi
+
+      - name: Fail the run on probe failure (GitHub notifies watchers)
+        if: steps.probe.outcome == 'failure'
+        run: exit 1

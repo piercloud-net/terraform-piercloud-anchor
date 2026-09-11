@@ -56,6 +56,8 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
   scripts as the deliberate exception: they open the A1 window and call
   the netcup API, but hold no credentials to user boxes outside the
   per-run device-flow (S1 — the token dies with the runner).
+  `external-watch.yml` is the second credential-free CI workflow: public
+  GETs of the dashboard only (no token, no user-box access).
 - CI greps (endpoint-allowlist, key-material, secret-print) run from
   `main`, so a PR cannot weaken its own checks; a line carrying
   `ci-allowlist: <reason>` (10+ chars) is the only escape hatch.

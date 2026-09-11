@@ -164,12 +164,31 @@ Planned — enforcement (including the canary-fail proof gate) lands with live M
 canary-fail proof. Tears down the firewall policy + attachment only — the
 server and the tang keys are untouched. Until it lands, delete nothing yourself — open a repo issue.
 
-## 8. Explore later: push alerts + extra monitors (optional, after the bind)
+## 9. Explore later: push alerts + extra monitors (optional, after the bind)
 
 The anchor already watches your homepage and tang itself, and prints statuses into the run log. When you want taps on the shoulder instead:
 
 - install the [ntfy app](https://ntfy.sh), subscribe to any random topic name (yours), then set repo secrets `NTFY_TOPIC` (that name) + `NTFY_TOKEN` only if your ntfy server needs auth (empty for ntfy.sh hosted) — re-dispatch `mode=apply` to take effect.
 - extra targets: `GATUS_ENDPOINTS` repo secret, comma-separated `name=url` (`blog=https://blog.example.com`, HTTP(S) only) + re-dispatch.
+
+## 10. External watch: always-on, GitHub-side (automatic)
+
+`external-watch.yml` runs every 15 minutes on GitHub's network and probes the
+public dashboard: `HTTP 200`, the statuses API actually returning data, and an
+edge certificate valid for at least 14 more days. It is the third vantage
+point — Gatus runs *on* the anchor and the main-box canary on your main box, so
+if both go quiet, GitHub is the only watcher left standing (and the only one
+whose alert path does not die with either box).
+
+- A failure files an issue labelled **`external-watch`** (open = failing, with
+the probe detail and a run link) and fails the run, so GitHub also notifies
+repo watchers. Recovery auto-comments and closes the issue.
+- Push alerts need no extra setup: once `NTFY_TOPIC`/`NTFY_TOKEN` exist (§9),
+the watch pushes there too.
+- Manual run / test: Actions → `external-watch` → Run workflow (`probe_url`
+overrides the target, which is how the failure/recovery path is proven).
+- Free on public repos; cadence is the workflow `cron`, cert window is
+`MIN_CERT_DAYS` in the probe step.
 
 ## What this repo never does
 
