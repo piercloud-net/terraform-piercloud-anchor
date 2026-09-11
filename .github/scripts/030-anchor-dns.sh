@@ -11,12 +11,14 @@
 # WHAT IT DOES: derives the flat anchor name from TENANT_USER (D5:
 # `anchor-<sanitized>-01.piercloud.net`; NN=01 — a second operator anchor
 # for one alias (-02+) is a future multi-anchor case, not handled here),
-# plus the dashboard name `status.<sanitized>.piercloud.net` (per-tenant
-# singleton, no NN), resolves the zone id at runtime (one fewer stored
-# secret), creates or overwrites both A records to the exact anchor IPv4
-# (anchor: TTL 300 DNS-only; dashboard: orange-cloud/proxied), then
-# re-reads each record and fails unless name + address (+ proxied flag)
-# match exactly.
+# plus the flat dashboard name `status-<sanitized>.piercloud.net`
+# (per-tenant singleton, no NN; ONE label deep, so Cloudflare's free
+# Universal SSL covers the edge leg — the old two-label `status.<sanitized>`
+# form needed Advanced Certificate Manager/Total TLS, see issue #106),
+# resolves the zone id at runtime (one fewer stored secret), creates or
+# overwrites both A records to the exact anchor IPv4 (anchor: TTL 300
+# DNS-only; dashboard: orange-cloud/proxied), then re-reads each record
+# and fails unless name + address (+ proxied flag) match exactly.
 #
 # SCOPE (D8): the operator zone mints names only for operator-provisioned
 # netcup anchors. A BYO twin anchor keeps its tenant-owned URL via the
@@ -72,7 +74,7 @@ if [ -z "$san" ]; then
   exit 1
 fi
 record="anchor-${san}-01" # NN=01; -02+ is a future multi-anchor case.
-status="status.${san}"    # dashboard singleton: one per tenant, no NN.
+status="status-${san}"    # dashboard singleton: flat, one label — free Universal SSL covers it.
 
 auth=(-sS -H "Authorization: Bearer $CLOUDFLARE_DNS_TOKEN" -H "Content-Type: application/json")
 

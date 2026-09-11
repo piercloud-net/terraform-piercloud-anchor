@@ -12,7 +12,7 @@
 #
 # Deliberately NOT in .github/scripts/: that path is scanned by CI's SCP
 # endpoint allowlist (scope: provision.yml + .github/scripts/*.sh), which
-# would reject the status.* URL and the /api/v1 path as unlisted. New
+# would reject the status-* URL and the /api/v1 path as unlisted. New
 # workflow files are out of that scope by construction.
 
 name: external-watch
@@ -61,7 +61,7 @@ jobs:
           # see the header comment. Env knobs exist so the exact code can be
           # extracted and run locally against good/bad URLs.
           set -uo pipefail
-          URL="${PROBE_URL:-https://status.pier.piercloud.net/}"
+          URL="${PROBE_URL:-https://status-pier.piercloud.net/}"
           base="${URL%/}"
           host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
           fail=""

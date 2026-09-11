@@ -54,7 +54,7 @@ caddy_status_names() { # STATUS_HOST/STATUS_MATCH from TENANT_USER
 # probe wait for a re-dispatch with TENANT_USER.
 SAN="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
 if [ -n "$SAN" ]; then
-  STATUS_HOST="status.${SAN}.piercloud.net"
+  STATUS_HOST="status-${SAN}.piercloud.net"
 else
   STATUS_HOST=""
   warn "TENANT_USER unset — dashboard TLS block and TLS-expiry probe skipped (re-dispatch with TENANT_USER to converge them)"
@@ -62,7 +62,7 @@ fi
 # Exact Host value for the :80 dashboard matcher (review: a wildcard span was
 # never verified — render the exact name; hand runs get a never-matching
 # sentinel so the :80 block still validates).
-STATUS_MATCH="${STATUS_HOST:-status.invalid}"
+STATUS_MATCH="${STATUS_HOST:-status-invalid.invalid}"
 }
 
 render_caddyfile() { # print the Caddyfile to stdout
@@ -961,4 +961,4 @@ if [ -n "${STATUS_HOST:-}" ]; then
   fi
 fi
 
-log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status.<alias>.piercloud.net} (TLS on the box)."
+log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box)."

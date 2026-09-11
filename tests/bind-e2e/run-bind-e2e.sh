@@ -22,7 +22,7 @@ PROVISION_SH="${REPO_ROOT}/scripts/010-provision.sh"
 CADDY_PORT="${CADDY_PORT:-18080}"
 MOCK_PORT="${MOCK_PORT:-18081}"
 STUB_PORT="${STUB_PORT:-18082}"
-AOP_SNI="status.prodprobe.piercloud.net"
+AOP_SNI="status-prodprobe.piercloud.net"
 TENANT_USER="${TENANT_USER:-citest}"
 CADDY_VERSION="2.11.4"
 CADDY_TGZ="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
@@ -106,7 +106,7 @@ export DASH_TLS_STANZA="	# harness: no :443 block (CADDY_SKIP_HTTPS); tang never
 export STATUS_HOST="" STATUS_MATCH=""
 caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.ci"
-[ "${STATUS_HOST}" = "status.citest.piercloud.net" ] || die "sanitize drift: STATUS_HOST=${STATUS_HOST}"
+[ "${STATUS_HOST}" = "status-citest.piercloud.net" ] || die "sanitize drift: STATUS_HOST=${STATUS_HOST}"
 grep -q "reverse_proxy 127.0.0.1:${MOCK_PORT}" "${WORK}/Caddyfile.ci" || die "render does not point /adv|/rec at the mock"
 grep -q "reverse_proxy 127.0.0.1:${STUB_PORT}" "${WORK}/Caddyfile.ci" || die "render does not point the status host at the stub"
 grep -q "host ${STATUS_HOST}" "${WORK}/Caddyfile.ci" || die "render lacks the exact-Host status matcher"
@@ -254,7 +254,7 @@ adv_ok "${WORK}/not-an-adv.json" && die "provision /adv assertion accepts a raw 
 log "PASS: provision /adv assertion accepts flattened + general advertisements and rejects raw JWK sets"
 # Regression guard: the prodshape render above runs in a subshell precisely
 # so this still names the CI tenant (a clobbered name aborts here, by design).
-[ "${STATUS_HOST}" = "status.citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
+[ "${STATUS_HOST}" = "status-citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
 STUB_GOT="$(curl -sf -H "Host: ${STATUS_HOST}" "http://127.0.0.1:${CADDY_PORT}/api/v1/endpoints/statuses")" || die "status-host request failed"
 [ "${STUB_GOT}" = "gatus-stub-ok" ] || die "status-host routing broken (got: ${STUB_GOT})"
 log "PASS: exact-Host dashboard routing reaches the stub"
