@@ -45,6 +45,7 @@ All notable changes to this project will be documented in this file.
 - Converge tang key material to one bindable set (closes #87)
 - Probe the Caddy :443 origin with SNI (closes #92)
 - *(aop)* Verify the client cert + Caddy 2.11.4 + AOP-aware :443 proof (closes #97)
+- *(aop)* Probe hardening + CI compiles the client_auth stanza (closes #99)
 
 ### 📚 Documentation
 
