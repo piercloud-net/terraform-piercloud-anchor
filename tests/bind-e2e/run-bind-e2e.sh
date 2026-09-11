@@ -120,6 +120,32 @@ HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
 
+# AOP shape: compile the REAL stanza builder (extracted from its first
+# column-0 guard line up to the column-0 closing `fi`; later indented guards
+# belong to the probe section) with a CA bundle + origin pair present, so a
+# directive rename (require_and_verify / trust_pool file) fails HERE and not
+# only on the next live dispatch (review lens LENS1-7).
+aop_b=$(grep -n -m1 '^if \[ "${ORIGIN_TLS}" = "1" \]; then$' "${PROVISION_SH}" | cut -d: -f1)
+[ -n "${aop_b}" ] || die "AOP stanza builder not found in ${PROVISION_SH}"
+aop_e=$(awk -v s="${aop_b}" 'NR>s && /^fi$/{print NR; exit}' "${PROVISION_SH}")
+[ -n "${aop_e}" ] || die "AOP stanza builder end (column-0 fi) not found"
+sed -n "${aop_b},${aop_e}p" "${PROVISION_SH}" > "${WORK}/aop-stanza.src"
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/aop-ca.key" -out "${WORK}/aop-ca.pem" \
+  -days 1 -nodes -subj "/CN=harness-aop-ca" >/dev/null 2>&1 || die "openssl could not mint the harness AOP CA"
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin.key" -out "${WORK}/origin.crt" \
+  -days 1 -nodes -subj "/CN=harness-origin" >/dev/null 2>&1 || die "openssl could not mint the harness origin pair"
+( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
+  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export ORIGIN_TLS="1" AOP_TLS="yes"
+  export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
+  # shellcheck disable=SC1090
+  source "${WORK}/aop-stanza.src"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.aop" )
+grep -q "client_auth" "${WORK}/Caddyfile.aop" || die "AOP render lacks the client_auth block"
+HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.aop" --adapter caddyfile
+log "AOP render validates (real client_auth stanza compiled)"
+
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"
 export TENANT_USER=citest TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"

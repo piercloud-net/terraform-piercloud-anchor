@@ -137,7 +137,8 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "	handle {"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (queued: issue #56)."
+    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (the"
+    printf '%s\n' "		# rate_limit directive itself is queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
     printf '%s\n' "}"
@@ -900,20 +901,41 @@ if [ -n "${STATUS_HOST:-}" ]; then
   # asserted; a wrong trust bundle black-holes every edge pull, so this is
   # fail-closed.
   if [ -n "${AOP_TLS}" ]; then
-    if curl -skf --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
-      die "Caddy :443 answered a cert-less probe while AOP is deployed — client_auth is not enforcing; refusing to finish blind"
-    fi
-    log "Caddy :443 rejects cert-less origin pulls while AOP is deployed (OK; expected)"
+    # curl exit codes decisively separate "the origin rejected the cert-less
+    # handshake" (35/56 = TLS layer, the point of AOP) from "nothing answered"
+    # (7 refused / 28 timeout) or a DNS problem (6): only a TLS-layer rejection
+    # proves client_auth is enforcing — a dead :443 must not pass this probe.
+    neg_rc=0
+    curl -sk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>/dev/null || neg_rc=$?
+    case "${neg_rc}" in
+      0)
+        die "Caddy :443 answered a cert-less probe while AOP is deployed — client_auth is not enforcing; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply" ;;
+      35|56)
+        log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}; OK under require_and_verify)" ;;
+      7|28)
+        die "Caddy :443 did not answer the cert-less probe (curl exit ${neg_rc}: refused/timeout) — cannot prove client_auth is enforcing; refusing to finish blind" ;;
+      *)
+        die "Caddy :443 cert-less probe failed with curl exit ${neg_rc} (not a TLS-layer rejection) — cannot prove client_auth is enforcing; refusing to finish blind" ;;
+    esac
     edge_ok=0
-    for _ in 1 2 3; do
-      if curl -sSf --max-time 20 "https://${STATUS_HOST}/" -o /dev/null; then edge_ok=1; break; fi
-      sleep 5
+    edge_rc=0
+    for attempt in 1 2 3; do
+      edge_rc=0
+      curl -sSf --max-time 20 "https://${STATUS_HOST}/" -o /dev/null || edge_rc=$?
+      if [ "${edge_rc}" -eq 0 ]; then edge_ok=1; break; fi
+      if [ "${attempt}" -lt 3 ]; then
+        log "edge pull attempt ${attempt}/3 failed (curl exit ${edge_rc}); retrying in 5s"
+        sleep 5
+      fi
     done
     if [ "$edge_ok" -ne 1 ]; then
-      die "edge pull through Cloudflare failed while AOP is deployed — the origin trust bundle does not match Cloudflare's client cert; unset CF_AOP_CA_PEM and re-dispatch to roll back"
+      if [ "${edge_rc}" -eq 6 ]; then
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The proxied edge record is upserted by the DNS stage AFTER this job, so on a first-time/DR dispatch this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once DNS converges re-enable AOP (docs/dr.md)"
+      fi
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch)"
     fi
     log "edge pull through Cloudflare serves with AOP enforced (OK)"
-  elif curl -skf --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
+  elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
   elif [ ! -s "${CADDY_ORIGIN_CRT}" ]; then
     # No operator origin pair: auto-TLS cannot issue for a name whose public
