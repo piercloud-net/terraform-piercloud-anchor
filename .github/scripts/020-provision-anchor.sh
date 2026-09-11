@@ -1241,44 +1241,64 @@ cmd_sweep_post() {
   # NOT attached is a leftover by definition — retire it (close_policy is
   # detach-then-delete; the detach no-ops when it is already unattached). The
   # attached policy is never touched.
-  local steady attached mac
+  local steady attached mac canon_jq
   mac="$(resolve_mac)"
-  # Attached-list parse (review security N1, live-proven; N4 id hardening):
-  # dispatch on the ENTRY type and hard-fail on anything ambiguous. The
-  # previous `(.id // .)` fallback made an id-less/null/empty-id entry
-  # resolve to the WHOLE OBJECT; the live steady-state policy then looked
-  # unattached and close_policy deleted it (cleartext/dashboard outage
-  # until re-apply). Tolerated: an array of {"id":number}/{"id":string}/
-  # bare number/bare string entries whose id is a canonical non-negative
-  # integer — string ids must match ^[0-9]+$; numbers must be integral
-  # with an integer tostring (so {"id":42.0} cannot stringify to "42.0"
-  # and hide the live id 42). All canonical ids are stringified (the
-  # comparison below is against stringified steady ids). Ambiguous =
-  # missing key, non-array userPolicies, null/boolean/object entries, id
-  # null/empty/non-scalar/non-canonical → jq errors: no STEADY-STATE
-  # policy is detached or deleted (die). The tmp-policy pass above has
-  # already run by then and is unaffected.
-  attached="$(iface_fw_get "$mac" | jq -ce '
-    def id_string:
+  # One canonical-id rule, applied to BOTH sides of the attachment
+  # comparison (F1 attached entries, F2 steady pid). String: canonical
+  # decimal, so "" / "0042" / "42\n" / "+42" fail. Number: canonical
+  # decimal literal after tostring(), so 42.0 / 1e2 / -3 fail (jq >= 1.7
+  # keeps the literal; 1.6 collapses 42.0 to 42 and cannot distinguish —
+  # the test harness gates that one case). The literal 0 is allowed
+  # uniformly on both sides (netcup policy ids are >= 1 in practice, so 0
+  # is unreachable but deliberately not special-cased).
+  canon_jq='
+    def canon_id($what):
       if type == "string" then
-        (if test("^[0-9]+$") then . else error("userPolicies entry with a non-canonical string id") end)
+        (if test("^(0|[1-9][0-9]*)\\z") then . else error("\($what): non-canonical string id") end)
       elif type == "number" then
-        (if ((. | floor) == .) and ((. | tostring) | test("^[0-9]+$")) then tostring
-         else error("userPolicies entry with a non-canonical numeric id") end)
-      else error("userPolicies entry with a non-scalar id") end;
+        (if (. >= 0) and ((. | floor) == .) and ((. | tostring) | test("^(0|[1-9][0-9]*)\\z")) then tostring
+         else error("\($what): non-canonical numeric id") end)
+      else error("\($what): id is not a non-negative integer") end;
+  '
+  # Attached-list parse (review security N1, live-proven; N4 + F1/F2 id
+  # hardening): dispatch on the ENTRY type and hard-fail on anything
+  # ambiguous. The previous `(.id // .)` fallback made an id-less/null/
+  # empty-id entry resolve to the WHOLE OBJECT; the live steady-state
+  # policy then looked unattached and close_policy deleted it (cleartext/
+  # dashboard outage until re-apply). Tolerated: an array of {"id":number}/
+  # {"id":string}/bare number/bare string entries whose id is a canonical
+  # non-negative integer — strings must match ^(0|[1-9][0-9]*)\z. `\z`,
+  # never `$`: Oniguruma's `$` also matches immediately BEFORE a trailing
+  # newline, so "42\n" slipped through the old ^[0-9]+$ guard, missed the
+  # live-id match and the sweep deleted the attached policy 42 (F1,
+  # live-proven). Numbers must be integral, non-negative and stringify to
+  # the same canonical shape — 42.0 and 1e2 are rejected, not rounded or
+  # exponent-formatted into a different id. All canonical ids are
+  # stringified (the comparison below is against stringified steady ids).
+  # Ambiguous = missing key, non-array userPolicies, null/boolean/object
+  # entries, id null/empty/non-scalar/non-canonical → jq errors: no
+  # STEADY-STATE policy is detached or deleted (die). The tmp-policy pass
+  # above has already run by then and is unaffected.
+  attached="$(iface_fw_get "$mac" | jq -ce "$canon_jq"'
     if (.userPolicies | type) == "array" then
       [.userPolicies[] |
         if type == "object" then
-          (.id | if . == null then error("userPolicies entry without a usable id") else id_string end)
-        elif type == "string" or type == "number" then id_string
+          (.id | if . == null then error("userPolicies entry without a usable id") else canon_id("userPolicies entry") end)
+        elif type == "string" or type == "number" then canon_id("userPolicies entry")
         else error("userPolicies entry of an ambiguous type") end]
     else error("userPolicies missing or not an array") end')" \
     || die "could not parse the attached-policy list for $SERVER_ID/$mac — refusing the steady-state orphan sweep on unproven attachment state"
   steady="$(list_steady_policies)"
+  # F2: the STEADY-state id passes the exact same canonicalization BEFORE
+  # it is compared or handed to close_policy. Raw "0042" used to miss the
+  # attached "42" match; close_policy then rewrote userPolicies to [] (PUT
+  # removed the live attachment) and deleted /firewall-policies/0042.
+  # A malformed steady id fails closed with no mutation.
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r '.name')"
-    pid="$(printf '%s' "$entry" | jq -r '.id')"
+    pid="$(printf '%s' "$entry" | jq -er "$canon_jq"'.id | canon_id("steady-state policy")')" \
+      || die "steady-state policy '$name' carries a non-canonical id — refusing the steady-state orphan sweep on unproven attachment state"
     if printf '%s' "$attached" | jq -e --arg id "$pid" 'index($id) != null' >/dev/null 2>&1; then
       log "post-sweep: steady-state policy '$name' (id ${pid}) is attached — kept"
       continue

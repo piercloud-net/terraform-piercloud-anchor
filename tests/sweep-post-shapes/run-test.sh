@@ -22,6 +22,19 @@
 # {"id":"   "}, {"id":"42.0"}, {"id":"0x2a"}, {"id":"+42"} must all
 # hard-fail instead of stringifying through to a non-matching id.
 #
+# F1/F2 id hardening (security delta review, 2026-09-11): the N4 string
+# guard was ^[0-9]+$ — but in jq/Oniguruma `$` also matches immediately
+# BEFORE a trailing newline, so {"id":"42\n"} passed, missed the live-id
+# index() and the sweep deleted the attached policy 42; {"id":"0042"}
+# (leading zero) reached the delete the same way. The guard now anchors
+# with \z and requires canonical digits. Independently, the STEADY-state
+# pid (from the steady list) was never validated: steady {"id":"0042"} +
+# attached numeric 42 made close_policy PUT merged=[] (live attachment
+# removed) + DELETE /firewall-policies/0042. Both sides now use one
+# canonical rule (strings ^(0|[1-9][0-9]*)\z; numbers integral,
+# non-negative, canonical after tostring, so 42.0/1e2/-3 fail; the
+# literal 0 is allowed uniformly).
+#
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
@@ -174,6 +187,57 @@ ambiguous_case c8o '{"userPolicies":[{"id":"   "}]}'                            
 ambiguous_case c8p '{"userPolicies":[{"id":"42.0"}]}'                                        # stringified float
 ambiguous_case c8q '{"userPolicies":[{"id":"0x2a"}]}'                                        # hex string
 ambiguous_case c8r '{"userPolicies":[{"id":"+42"}]}'                                         # signed string
+
+# ---- F1 (security delta): $ matches before a trailing LF; \z does not ----
+# {"id":"42\n"} and {"id":"0042"} are the two proven holes: both passed
+# the old ^[0-9]+$ guard, failed index() against the live id "42", and the
+# steady policy read as unattached -> close_policy deleted it. Both must
+# now hard-fail with the live policy untouched (the N4 cases above kept
+# their meaning; these two are the teeth of the F1 fix).
+ambiguous_case c8s '{"userPolicies":[{"id":"42\n"}]}'                                        # trailing LF (F1 proof)
+ambiguous_case c8t '{"userPolicies":[{"id":"0042"}]}'                                        # leading zero (F1 proof)
+ambiguous_case c8u '{"userPolicies":[{"id":"42\r"}]}'                                        # trailing CR
+ambiguous_case c8v '{"userPolicies":[{"id":"\n42"}]}'                                        # leading LF
+# 1e2 keeps its literal only on jq >= 1.7 (like c8m): 1.6 collapses it to
+# 100, where accepting it as the live id is the only possible behaviour.
+if [ "$(jq -rn '1e2 | tostring')" = "1E+2" ]; then
+  ambiguous_case c8w '{"userPolicies":[{"id":1e2}]}'                                          # exponent form
+else
+  printf 'SKIP c8w ({"id":1e2}: jq < 1.7 collapses the literal to 100)\n'
+fi
+
+# ---- canonical 0 stays accepted on both sides (uniform rule) -------------
+# netcup policy ids are >= 1 in practice; allowing the literal 0 uniformly
+# keeps one rule for both sides. Attached bare 0 and "0" must read as
+# attached to steady id 0 and mutate nothing.
+rc="$(RC_OF c8x "[]" '{"userPolicies":[0]}' '[{"id":0,"name":"piercloud-anchor-anchor-pier-01-933556","description":""}]')"
+is "c8x rc" "0" "$rc"
+is "c8x actions (id 0 kept)" "" "$(ACTIONS c8x)"
+rc="$(RC_OF c8y "[]" '{"userPolicies":["0"]}' '[{"id":0,"name":"piercloud-anchor-anchor-pier-01-933556","description":""}]')"
+is "c8y rc" "0" "$rc"
+is "c8y actions (string 0 kept)" "" "$(ACTIONS c8y)"
+
+# ---- F2 (security delta): the STEADY-state pid is canonicalized too ------
+# steady {"id":"0042"} + attached numeric 42 used to miss the index()
+# match; close_policy then PUT merged=[] (live attachment removed) and
+# DELETEd /firewall-policies/0042. Raw "42\n" was newline-stripped by the
+# shell into "42" (accepted by luck) and an empty id ran close_policy("").
+# All three must fail closed with the live policy untouched, and a
+# canonical string steady id must still match the numeric attachment.
+steady_case() { # $1 label, $2 STUB_STEADY (attached stays numeric 42)
+  local rc
+  rc="$(RC_OF "$1" "[]" '{"userPolicies":[{"id":42}]}' "$2")"
+  is "$1 rc != 0 (fail-closed)" "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
+  is "$1 actions (live untouched)" "" "$(ACTIONS "$1")"
+  is "$1 refusal logged" "1" "$(grep -c 'refusing the steady-state orphan sweep' "$WORK/out.$1" || true)"
+}
+steady_case c9a '[{"id":"0042","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]'  # leading zero (F2 proof)
+steady_case c9b '[{"id":"42\n","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]' # trailing LF (F2 proof)
+steady_case c9c '[{"id":"","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]'     # empty id (F2 proof)
+# positive control: a canonical STRING steady id still matches live id 42
+rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]')"
+is "c9d rc" "0" "$rc"
+is "c9d actions (live kept)" "" "$(ACTIONS c9d)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
