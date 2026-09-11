@@ -635,18 +635,25 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          # NOTE: the refresh token is deliberately NOT in the tofu steps'
-          # env (review security MEDIUM) — the community provider only gets
-          # the short-lived access token. A provider-side 401 fails loud
-          # rather than the provider silently refreshing without persisting
-          # the rotation.
-          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
+          # NOTE (review security, corrected): the refresh token VALUE is not
+          # in any tofu step's env — the community provider only gets the
+          # short-lived access token. But the runner-local 0600 handoff FILE
+          # PATH rides the job env (dynamic $GITHUB_ENV), and the file is
+          # readable by same-user processes on this runner, so `tofu init`
+          # must not be able to silently swap the provider build: the
+          # committed .terraform.lock.hcl + `-lockfile=readonly` below pin
+          # and verify the exact provider binaries (N3). A provider-side 401
+          # fails loud rather than refreshing without persisting the
+          # rotation.
           TF_IN_AUTOMATION: "true"
         run: |
           set -euo pipefail
           # No backend block: local state file on the ephemeral runner.
           # Nothing persists past this run by construction.
-          tofu init -input=false
+          # -lockfile=readonly (security N3): the provider lock is committed,
+          # so a version/hash mismatch fails loudly here instead of silently
+          # re-resolving the community provider mid-run.
+          tofu init -input=false -lockfile=readonly
 
       - name: Stateless import (re-adopt, import-apply-discard)
         if: inputs.mode == 'apply'
@@ -722,7 +729,6 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
@@ -745,7 +751,6 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
