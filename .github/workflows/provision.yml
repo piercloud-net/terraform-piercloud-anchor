@@ -569,6 +569,12 @@ jobs:
           ANCHOR_HOSTNAME: ${{ env.ANCHOR_HOSTNAME }}
         run: |
           set -euo pipefail
+          # Injection guards (defense in depth; parse-time validation lands in
+          # the resolve step): these values are interpolated into generated HCL
+          # and API paths, so a malformed/crafted API response must never reach
+          # them. Fail closed, never fall back.
+          case "$SERVER_ID" in '' | *[!0-9]*) echo "::error::SERVER_ID is not all-digits — refusing to write an import file (injection guard)."; exit 1 ;; esac
+          case "$SCP_USER_ID" in '' | *[!0-9]*) echo "::error::SCP_USER_ID is not all-digits — refusing to write an import file (injection guard)."; exit 1 ;; esac
           # Stateless re-adopt: the ephemeral runner holds no state, so every
           # apply re-imports what it must converge instead of duplicating it.
           # Generated at runtime, never committed; removed post-apply below.
@@ -601,6 +607,7 @@ jobs:
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces" \
             | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
           [ -n "$MAC" ] || { echo "No interface MAC resolved — refusing to guess the firewall policy" >&2; exit 1; }
+          printf '%s' "$MAC" | grep -qE '^[0-9a-fA-F:]{17}$' || { echo "::error::resolved interface MAC is not a 17-char hex/colon value — refusing to interpolate it (injection guard)."; exit 1; }
           POLICY_ID="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces/${MAC}/firewall" \
             | jq -r --arg n "$POLICY_NAME" '[.userPolicies[]? | select(.name == $n) | .id | tostring] | if length == 0 then "" elif length == 1 then .[0] else "AMBIGUOUS" end')"
@@ -610,6 +617,7 @@ jobs:
               echo "More than one attached policy named $POLICY_NAME — refusing to guess; clean up in SCP and re-dispatch." >&2
               exit 1 ;;
             *)
+              case "$POLICY_ID" in '' | *[!0-9]*) echo "::error::resolved firewall policy id is not all-digits — refusing to write the import block (injection guard)."; exit 1 ;; esac
               cat >> workflow-import.tf <<EOF
           import {
             to = netcup_scp_user_firewall_policy.tang[0]
@@ -892,10 +900,17 @@ jobs:
               echo "::warning::refresh-token revocation returned HTTP ${CODE:-none}${DETAIL:+ (curl: $DETAIL)} — the run's credential stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A)." ;;
           esac
           # Canary: prove the session actually died. A revoked refresh token
-          # must be REFUSED; Keycloak answers a refused grant with HTTP 200
-          # and an error BODY (invalid_token / invalid_grant), so the body's
-          # error field decides, not the status. The token and the response
-          # body are never printed — only the error code below.
+          # must be REFUSED. The live realm answers a refused refresh grant
+          # with HTTP 400 + {"error":"invalid_grant","error_description":
+          # "Invalid refresh token"} (reviewer-probed live 2026-09-11) — the
+          # 200-with-an-error-BODY shape applies to the REVOKE endpoint, not
+          # the token endpoint. ONLY invalid_grant / invalid_token prove the
+          # token died; invalid_client / unauthorized_client merely say the
+          # CLIENT was disabled/renamed — reporting "revocation verified" on
+          # those would be a false security claim, so any other error (or an
+          # unparseable/missing endpoint) stays UNVERIFIED with a warning.
+          # The token and the response body are never printed — only the
+          # accepted error code below.
           if [ -n "$TOKEN_ENDPOINT" ]; then
             CERFILE="$(mktemp)"
             CANARY="$(curl -sS --max-time 30 -X POST "$TOKEN_ENDPOINT" \
@@ -905,13 +920,25 @@ jobs:
             CANARY_DETAIL="$(bounded_detail "$CERFILE")"
             rm -f "$CERFILE"
             CANARY_ERR="$(printf '%s' "$CANARY" | jq -r '.error // empty' 2>/dev/null)" || CANARY_ERR=""
-            if [ -n "$CANARY_ERR" ]; then
-              echo "::notice::revocation verified — the refresh token is dead (${CANARY_ERR})."
-              summary "${REVOKE_STATE}; canary rejected the token (${CANARY_ERR})"
-            else
-              echo "::warning::revocation canary was NOT rejected by the token endpoint${CANARY_DETAIL:+ (curl: $CANARY_DETAIL)} — the refresh token may still be live (up to Keycloak's ~30-day offline-session idle expiry). Investigate the Keycloak sessions; no fallback exists (C-A). The token and response body are never printed."
-              summary "${REVOKE_STATE}; CANARY NOT REJECTED — the credential may still be live (investigate the Keycloak sessions)"
-            fi
+            case "$(printf '%s' "$CANARY_ERR" | tr '[:upper:]' '[:lower:]')" in
+              invalid_grant | invalid_token)
+                echo "::notice::revocation verified — the refresh token is dead (${CANARY_ERR})."
+                if [ "$REVOKE_STATE" = "revoked (HTTP 200)" ]; then
+                  summary "${REVOKE_STATE}; canary rejected the token (${CANARY_ERR})"
+                else
+                  # Contradiction guard: the revoke POST reported a failure but
+                  # the canary proves the credential is dead anyway (e.g. it
+                  # was already invalidated) — report the verified outcome
+                  # once, never "FAILED; verified".
+                  summary "revocation verified by canary (${CANARY_ERR}); the revoke POST had reported ${REVOKE_STATE}"
+                fi ;;
+              "")
+                echo "::warning::revocation canary was NOT rejected by the token endpoint${CANARY_DETAIL:+ (curl: $CANARY_DETAIL)} — the refresh token may still be live (up to Keycloak's ~30-day offline-session idle expiry). Investigate the Keycloak sessions; no fallback exists (C-A). The token and response body are never printed."
+                summary "${REVOKE_STATE}; CANARY NOT REJECTED — the credential may still be live (investigate the Keycloak sessions)" ;;
+              *)
+                echo "::warning::revocation canary returned '${CANARY_ERR}', which does not prove the token died (only invalid_grant/invalid_token do; invalid_client/unauthorized_client only mean the client itself was disabled or renamed). Revocation is UNVERIFIED — the refresh token may still be live. Investigate the Keycloak sessions; no fallback exists (C-A). The token and response body are never printed."
+                summary "${REVOKE_STATE}; canary UNVERIFIED (error '${CANARY_ERR}' does not prove death) — the credential may still be live (investigate the Keycloak sessions)" ;;
+            esac
           else
             echo "::warning::token_endpoint missing from the OIDC discovery document — revocation is unverified (cannot canary)."
             summary "${REVOKE_STATE}; canary NOT RUN (token_endpoint missing) — revocation unverified"

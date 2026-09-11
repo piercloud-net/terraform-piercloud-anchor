@@ -161,6 +161,13 @@ case "$CMD" in
   *) die "usage: $0 [--rotate] {sweep-pre|open|provision|close|sweep-post|bootstrap-password|lock-password}" ;;
 esac
 
+# Injection guards: every value interpolated into an API path, jq argv or
+# generated HCL/shell must match its strict shape first — a malformed or
+# crafted API response is not a source of shell syntax. Fail closed, never
+# fall back.
+all_digits() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
+valid_mac() { printf '%s' "$1" | grep -qE '^[0-9a-fA-F:]{17}$'; }
+
 NETCUP_API_BASE="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
 SERVER_ID="${SERVER_ID:-}"
 SCP_USER_ID="${SCP_USER_ID:-}"
@@ -171,7 +178,9 @@ case "$CMD" in
   lock-password) ;;
   *)
     [ -n "$SERVER_ID" ] || die "SERVER_ID is required"
+    all_digits "$SERVER_ID" || die "SERVER_ID is not all-digits — refusing to interpolate it into API paths (injection guard)"
     [ -n "$SCP_USER_ID" ] || die "SCP_USER_ID is required"
+    all_digits "$SCP_USER_ID" || die "SCP_USER_ID is not all-digits — refusing to interpolate it into API paths (injection guard)"
     [ -n "$RUN_ID" ] || die "RUN_ID is required (idempotency key)"
     ;;
 esac
@@ -402,6 +411,7 @@ fetch_egress_ip() { # dual-endpoint pin, exact match or fail (single host only, 
 resolve_mac() {
   local resp mac
   if [ -n "${INTERFACE_MAC:-}" ]; then
+    valid_mac "$INTERFACE_MAC" || die "INTERFACE_MAC override is not a 17-char hex/colon MAC — refusing to interpolate it into API paths (injection guard)"
     printf '%s' "$INTERFACE_MAC"
     return 0
   fi
@@ -414,6 +424,7 @@ resolve_mac() {
   # policy looks unattached and sweep-post deletes it.
   mac="$(printf '%s' "$resp" | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
   [ -n "$mac" ] || die "could not resolve NIC MAC for server $SERVER_ID (set INTERFACE_MAC)"
+  valid_mac "$mac" || die "resolved NIC MAC is not a 17-char hex/colon value — refusing to interpolate it into API paths (injection guard)"
   printf '%s' "$mac"
 }
 
@@ -443,6 +454,7 @@ iface_fw_put() { # $1 = mac, $2 = user-policy id JSON array -> PUT merged save b
 
 attach_policy() { # $1 = policy id (idempotent merge under the global mutex)
   local id="$1" mac current_ids merged
+  all_digits "$id" || die "attach_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   mac="$(resolve_mac)"
   current_ids="$(iface_fw_get "$mac" | jq -c '[.userPolicies // [] | .[] | (.id // .)]')"
   if printf '%s' "$current_ids" | jq -e --argjson i "$id" 'index($i) != null' >/dev/null; then
@@ -456,6 +468,7 @@ attach_policy() { # $1 = policy id (idempotent merge under the global mutex)
 
 detach_policy() { # $1 = policy id (absent = success no-op)
   local id="$1" mac current_ids merged
+  all_digits "$id" || die "detach_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   mac="$(resolve_mac)"
   current_ids="$(iface_fw_get "$mac" | jq -c '[.userPolicies // [] | .[] | (.id // .)]')"
   if ! printf '%s' "$current_ids" | jq -e --argjson i "$id" 'index($i) != null' >/dev/null; then
@@ -469,6 +482,7 @@ detach_policy() { # $1 = policy id (absent = success no-op)
 
 delete_policy() { # $1 = policy id (404 = already gone, success)
   local id="$1" resp
+  all_digits "$id" || die "delete_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   api_call DELETE "$(policies_path)/${id}" "" resp
   if ! api_ok "$HTTP_STATUS" "gone-ok"; then
     die "delete policy $id failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -490,8 +504,16 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 # ---------------------------------------------------------------------------
 # sweep-pre: enumerate -> classify (own / non-own / orphan) -> fail closed on
 # orphan BEFORE any mutation -> retire EVERY non-own tmp (aged >2h or
-# leaked-fresh: the workflow-wide mutex means no foreign run can be live) ->
-# drop this run's own leftovers (open recreates the window).
+# leaked-fresh) -> drop this run's own leftovers (open recreates the window).
+#
+# SINGLE-WRITER ASSUMPTION (why retiring a FRESH non-own tmp is safe here):
+# provision.yml pins concurrency.group=piercloud-netcup-policy, a STATIC
+# literal that serializes every run of THIS workflow for EVERY tenant, so at
+# pre-sweep no other run of this repo can hold a tmp. It does NOT serialize
+# another repo sharing the same netcup account — two writers on one account
+# are out of contract. The tradeoff is deliberate: an attached leaked tmp
+# keeps admitting a stale runner /32 to :22 for as long as it lives (GitHub
+# recycles runner IPs), so the fresh leak is retired now rather than at 2h.
 # ---------------------------------------------------------------------------
 cmd_sweep_pre() {
   require_token
@@ -503,8 +525,9 @@ cmd_sweep_pre() {
   # Pass 1 — classify ONLY, mutate nothing yet: OWN leftovers (a retry is
   # normal; duplicates are possible through async races), NON-OWN (aged >2h
   # = dead run, or fresh = leaked by a dead run: provision.yml's workflow-wide
-  # concurrency.group serializes every run, so a non-own tmp can never belong
-  # to a live run), ORPHAN (no valid created_at — ambiguous, operator must
+  # concurrency.group serializes every run OF THIS REPO, so a non-own tmp can
+  # never belong to a live run here; another repo on the same account is out
+  # of contract), ORPHAN (no valid created_at — ambiguous, operator must
   # look). The fail-closed verdict is decided before any retirement (review
   # MINOR-1: never sweep half the list and then bail).
   while IFS= read -r entry; do
