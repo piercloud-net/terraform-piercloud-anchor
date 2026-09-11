@@ -534,9 +534,12 @@ jobs:
         run: |
           set -euo pipefail
           # TTL tag piercloud-tmp-<server_id>-<run_id>, description
-          # created_at=<RFC3339-UTC> purpose=A1-ssh. >1 tmp on this server,
-          # or any tmp >2h / orphan at pre-step, fails BEFORE creating
-          # (exit 3, operator notified by the failure step below).
+          # created_at=<RFC3339-UTC> purpose=A1-ssh. Classify first, then
+          # retire EVERY non-own tmp (aged or leaked-fresh — the workflow
+          # mutex means no foreign run can be live); only an orphan (no
+          # parseable created_at) or a failed retire stays fail-closed,
+          # BEFORE creating (exit 3, operator notified by the failure step
+          # below).
           .github/scripts/020-provision-anchor.sh sweep-pre
 
       - name: Set up OpenTofu (>= 1.11 for ephemeral values)
@@ -588,9 +591,15 @@ jobs:
           # matching policy is attached. Fail closed on ambiguity.
           SCP="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
           POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}-${SERVER_ID}"
+          # Lexicographically smallest MAC — character-for-character the same
+          # jq rule as resolve_mac() in .github/scripts/020-provision-anchor.sh
+          # and main.tf local.interface_mac (`try(sort([...mac])[0], null)`,
+          # "sorted for determinism"). On a >1-NIC server any other pick
+          # resolves the wrong interface: the attached steady-state policy is
+          # looked for (and later swept) against the wrong NIC.
           MAC="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces" \
-            | jq -r 'if type == "array" then .[0] elif has("data") then .data[0] elif has("items") then .items[0] elif has("interfaces") then .interfaces[0] else . end | .mac // empty')"
+            | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
           [ -n "$MAC" ] || { echo "No interface MAC resolved — refusing to guess the firewall policy" >&2; exit 1; }
           POLICY_ID="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces/${MAC}/firewall" \
@@ -812,7 +821,7 @@ jobs:
             echo "NTFY_TOPIC unset — failure stays in the run summary."
             exit 0
           fi
-          MSG="piercloud A1/provision FAILED for $TENANT_USER — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
+          MSG="piercloud A1/provision FAILED for $TENANT_USER — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, an orphan tmp policy (no parseable created_at) exists on the server or one could not be retired: clean up by hand, then re-dispatch. Nothing was created by the failed step."
           NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
           curl -sS --fail "${NTFY_AUTH[@]}" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
 

@@ -10,10 +10,11 @@
 # (020: next free after 010) is unique across `scripts/` + `.github/scripts/`.
 #
 # WHAT IT DOES (A1 hardened lifecycle, SPEC §"A1 self-open /32 window"):
-#   sweep-pre  enumerate tmp policies -> retire aged (>2h, run long dead) ->
-#              surplus fail-closed (>1 FRESH foreign tmp on this server, or
-#              any orphan tmp, exits 3 BEFORE creating anything) -> drop this
-#              run's own leftover.
+#   sweep-pre  enumerate tmp policies -> classify (own / non-own / orphan) ->
+#              fail-closed on orphan (no parseable created_at) BEFORE any
+#              mutation -> retire EVERY non-own tmp (aged >2h or leaked
+#              fresh: the workflow-wide mutex means no foreign run can be
+#              live) -> drop this run's own leftovers.
 #   open       dual-endpoint egress-IP fetch (exact match or fail) -> create
 #              TTL-tagged tmp policy (idempotent on run_id: retry reuses the
 #              existing policy, never duplicates) -> attach to the server NIC.
@@ -120,7 +121,8 @@
 #   INTERFACE_MAC            override NIC MAC (default: resolved via API).
 #
 # EXIT CODES: 0 ok · 1 error / cleanup incomplete (fail-closed, fail loudly) ·
-#   3 surplus fail-closed at pre-step (operator must look before re-dispatch).
+#   3 fail-closed at pre-step (orphan tmp or a failed retire — operator must
+#   look before re-dispatch).
 #
 # M0-GATED (no live netcup credentials exist; live run + verify-twice-live
 # are pending — recorded honestly in the PR body, never claimed here):
@@ -131,7 +133,7 @@
 #
 set -euo pipefail
 
-TMP_TTL_SECONDS=7200 # 2h: tmp older than this is swept, and fails pre-step.
+TMP_TTL_SECONDS=7200 # 2h: tmp older than this is 'aged' (its run is long dead) on every sweep.
 IP_ENDPOINT_A="https://api.ipify.org"
 IP_ENDPOINT_B="https://ipv4.icanhazip.com"
 ROTATE=0
@@ -394,13 +396,12 @@ resolve_mac() {
   fi
   api_call GET "/api/v1/servers/${SERVER_ID}/interfaces" "" resp
   api_ok "$HTTP_STATUS" || die "list server interfaces failed (HTTP $HTTP_STATUS)"
-  mac="$(printf '%s' "$resp" | jq -r \
-    'if type == "array" then .[0]
-     elif has("data") then .data[0]
-     elif has("items") then .items[0]
-     elif has("interfaces") then .interfaces[0]
-     else . end
-     | .mac // empty')"
+  # Lexicographically smallest MAC — the exact same jq rule as the
+  # import-discovery step in provision.yml and main.tf's local.interface_mac
+  # (`try(sort([...mac])[0], null)`, "sorted for determinism"). On a >1-NIC
+  # server any other pick reads the WRONG interface: the live steady-state
+  # policy looks unattached and sweep-post deletes it.
+  mac="$(printf '%s' "$resp" | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
   [ -n "$mac" ] || die "could not resolve NIC MAC for server $SERVER_ID (set INTERFACE_MAC)"
   printf '%s' "$mac"
 }
@@ -476,56 +477,70 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 }
 
 # ---------------------------------------------------------------------------
-# sweep-pre: enumerate -> retire AGED tmps (>2h, same rule as post-sweep) ->
-# surplus fail-closed on FRESH foreign tmps -> drop own leftover.
+# sweep-pre: enumerate -> classify (own / non-own / orphan) -> fail closed on
+# orphan BEFORE any mutation -> retire EVERY non-own tmp (aged >2h or
+# leaked-fresh: the workflow-wide mutex means no foreign run can be live) ->
+# drop this run's own leftovers (open recreates the window).
 # ---------------------------------------------------------------------------
 cmd_sweep_pre() {
   require_token
-  local list count entry name desc age pid own="" fresh=0 aged=0
+  local list count entry name desc age pid
+  local classify="" owns="" aged=0 leaked=0
   list="$(list_tmp_policies)"
   count="$(printf '%s' "$list" | jq 'length')"
   log "pre-sweep: $count tmp polic(ies) on server $SERVER_ID"
-  # Classify FIRST, then judge: OWN leftover (retry of this run), AGED (>2h —
-  # its run is long dead; same retirement rule post-sweep uses), ORPHAN (no
-  # valid created_at — ambiguous, stays fail-closed) or FRESH FOREIGN.
-  # Regression fixed here (live 2026-09-11): the old order checked count>1
-  # before anything else, so two tmps leaked by the ~5 min access-token TTL
-  # blocked every later run at this step until they aged out. Aged tmps are
-  # now retired in place instead of blocking, and this run's own leftover no
-  # longer counts towards surplus (a retry is normal, not an anomaly).
+  # Pass 1 — classify ONLY, mutate nothing yet: OWN leftovers (a retry is
+  # normal; duplicates are possible through async races), NON-OWN (aged >2h
+  # = dead run, or fresh = leaked by a dead run: provision.yml's workflow-wide
+  # concurrency.group serializes every run, so a non-own tmp can never belong
+  # to a live run), ORPHAN (no valid created_at — ambiguous, operator must
+  # look). The fail-closed verdict is decided before any retirement (review
+  # MINOR-1: never sweep half the list and then bail).
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r '.name')"
     desc="$(printf '%s' "$entry" | jq -r '.description')"
     pid="$(printf '%s' "$entry" | jq -r '.id')"
     if [ "$name" = "$OWN_NAME" ]; then
-      own="$pid" # retry of this run — dropped below; open recreates the window, never surplus
+      # dropped below; open recreates the window from the pinned /32
+      owns="${owns}${pid}
+"
       continue
     fi
     age="$(policy_age "$desc")"
     if [ "$age" = "orphan" ]; then
       surplus_fail "orphan tmp policy '$name' (no valid created_at) at pre-step — refusing to create. Notify the operator."
     fi
-    if [ "$age" -gt "$TMP_TTL_SECONDS" ]; then
-      log "pre-sweep: retiring aged tmp policy '$name' (age ${age}s — its run is long gone)"
-      close_policy "$pid" || surplus_fail "could not retire aged tmp policy '$name' — operator must clean up by hand."
-      aged=$((aged + 1))
-      continue
-    fi
-    fresh=$((fresh + 1))
-    # A single fresh foreign tmp is left alone (the mutex rules out a racing
-    # run); more than one means something leaked — refuse, get eyes on it.
+    classify="${classify}${pid}|${name}|${age}
+"
   done < <(printf '%s' "$list" | jq -c '.[]')
-  if [ "$fresh" -gt 1 ]; then
-    surplus_fail "$fresh fresh tmp policies on server $SERVER_ID (>1) — refusing to create. Notify the operator; clean up by hand, then re-dispatch."
+  # Pass 2 — retire every non-own tmp (close_policy = detach-then-delete),
+  # then this run's own leftovers. A failed retire stays fail-closed.
+  local rest rp rn ra
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    rp="${entry%%|*}"; rest="${entry#*|}"
+    rn="${rest%%|*}"; ra="${rest#*|}"
+    if [ "$ra" -gt "$TMP_TTL_SECONDS" ]; then
+      log "pre-sweep: retiring aged tmp policy '$rn' (age ${ra}s — its run is long gone)"
+      aged=$((aged + 1))
+    else
+      # GitHub recycles runner IPs: a leaked tmp keeps admitting a stale
+      # runner /32 to :22 for as long as it lives. The mutex means its run
+      # is dead — retire it now instead of waiting for the 2h age.
+      log "pre-sweep: retiring leaked tmp policy '$rn' (age ${ra}s — its run is dead under the workflow mutex)"
+      leaked=$((leaked + 1))
+    fi
+    close_policy "$rp" || surplus_fail "could not retire tmp policy '$rn' — operator must clean up by hand."
+  done <<<"$classify"
+  if [ "$aged" -gt 0 ] || [ "$leaked" -gt 0 ]; then
+    log "pre-sweep: retired $aged aged + $leaked leaked tmp polic(ies)"
   fi
-  if [ "$aged" -gt 0 ]; then
-    log "pre-sweep: retired $aged aged tmp polic(ies)"
-  fi
-  if [ -n "$own" ]; then
-    log "pre-sweep: dropping own leftover policy $own (hard-killed attempt of this run)"
-    close_policy "$own"
-  fi
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    log "pre-sweep: dropping own leftover policy $entry (hard-killed attempt of this run)"
+    close_policy "$entry"
+  done <<<"$owns"
   log "pre-sweep clean"
 }
 
