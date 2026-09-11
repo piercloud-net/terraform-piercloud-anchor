@@ -176,10 +176,11 @@ done
 
 # --- AOP handshake split, served for real (not just validated): a cert-less
 # client must be rejected at the TLS layer, a client leaf signed by the
-# trust-pool CA must be accepted end-to-end. The dashboard vhost is
-# production-addressed (`https://<sni>` = :443/:80) and this harness runs as
-# root, so it binds the real port. This is the CI-visible half of the provision
-# run's AOP probe (review lens LENS1R2-5).
+# trust-pool CA must be accepted. The vhost is minimal ON PURPOSE — built from
+# the REAL stanza builder (extracted above), `respond` instead of the full
+# render: the full render is validated twice already, and serving it here would
+# drag in the tang site + admin endpoint + :80 redirects, none of which this
+# assertion is about. CI runs as root, so :443 binds. (review lens LENS1R2-5)
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${WORK}/aop-leaf.key" >/dev/null 2>&1 || die "openssl could not mint the harness client key"
 chmod 600 "${WORK}/aop-leaf.key"
 openssl req -new -key "${WORK}/aop-leaf.key" -subj "/CN=aop-client" \
@@ -188,21 +189,16 @@ printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedK
 openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${WORK}/aop-ca.key" \
   -CAcreateserial -CAserial "${WORK}/aop-ca.srl" -days 1 -sha256 -extfile "${WORK}/aop-leaf.ext" \
   -out "${WORK}/aop-leaf.crt" >/dev/null 2>&1 || die "openssl could not sign the harness client leaf"
-( export CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
-  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
-  export ORIGIN_TLS="1" AOP_TLS="yes"
+( export ORIGIN_TLS="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # shellcheck disable=SC1090
   source "${WORK}/aop-stanza.src"
-  caddy_status_names
-  render_caddyfile > "${WORK}/Caddyfile.aopsrv" )
-# The CI runners already listen on :80: serve the vhost with the automatic
-# HTTP->HTTPS redirect listener disabled (it would bind :80 and die). The render
-# emits its own global options block, so the directive is merged into that one
-# (a second global block would be rejected). Client auth is unaffected.
-awk '!done && $0=="{" { print; print "\tauto_https disable_redirects"; done=1; next } { print }' \
-  "${WORK}/Caddyfile.aopsrv" > "${WORK}/Caddyfile.aopsrv.tmp"
-mv "${WORK}/Caddyfile.aopsrv.tmp" "${WORK}/Caddyfile.aopsrv"
+  {
+    printf '{\n\tadmin off\n\tauto_https disable_redirects\n}\n\n'
+    printf 'https://%s {\n' "${AOP_SNI}"
+    printf '%s\n' "${DASH_TLS_STANZA}"
+    printf '\trespond "gatus-stub-ok" 200\n}\n'
+  } > "${WORK}/Caddyfile.aopsrv" )
 HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.aopsrv" --adapter caddyfile >"${WORK}/caddy-aop.log" 2>&1 &
 AOP_CADDY_PID=$!
 ok=0
