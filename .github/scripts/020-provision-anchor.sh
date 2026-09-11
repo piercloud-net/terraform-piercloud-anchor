@@ -214,16 +214,18 @@ scp_token_refresh() {
     local f_at f_rt
     f_at="$(grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
     f_rt="$(grep -a '^NETCUP_SCP_REFRESH_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
-    # Adoption REPLACES a possibly-consumed in-process token; it never
-    # resurrects one. A non-empty handoff value can only originate from a
-    # refresh by a process that already held a token, so an empty in-process
-    # value means this process was deliberately handed none (e.g. a stubbed
-    # test run) — taking the file's value there would fabricate a credential.
-    if [ -n "${NETCUP_SCP_ACCESS_TOKEN:-}" ] && [ -n "$f_at" ]; then
+    # Adoption is UNCONDITIONAL: a non-empty handoff value can only have
+    # been appended by a refresh in THIS step — every step gets a fresh empty
+    # $GITHUB_ENV from the runner (reviewer-verified against the runner
+    # sources), and only scp_token_refresh appends these names. Adopt the
+    # last (newest) value, replacing a possibly-consumed in-process copy; no
+    # other guard is needed (an earlier "never resurrect" guard described a
+    # harness artifact, not production).
+    if [ -n "$f_at" ]; then
       NETCUP_SCP_ACCESS_TOKEN="$f_at"
       export NETCUP_SCP_ACCESS_TOKEN
     fi
-    if [ -n "${NETCUP_SCP_REFRESH_TOKEN:-}" ] && [ -n "$f_rt" ]; then
+    if [ -n "$f_rt" ]; then
       NETCUP_SCP_REFRESH_TOKEN="$f_rt"
       export NETCUP_SCP_REFRESH_TOKEN
     fi
@@ -257,9 +259,11 @@ scp_token_refresh() {
   # trust model is unchanged. Append (never rewrite): the newest value is
   # the last line.
   if [ -n "${GITHUB_ENV:-}" ]; then
-    printf 'NETCUP_SCP_ACCESS_TOKEN=%s\n' "$at" >>"$GITHUB_ENV"
+    printf 'NETCUP_SCP_ACCESS_TOKEN=%s\n' "$at" >>"$GITHUB_ENV" \
+      || warn "could not persist the refreshed access token to \$GITHUB_ENV — a later step may miss the fresh token and 401"
     if [ -n "$rt" ]; then
-      printf 'NETCUP_SCP_REFRESH_TOKEN=%s\n' "$rt" >>"$GITHUB_ENV"
+      printf 'NETCUP_SCP_REFRESH_TOKEN=%s\n' "$rt" >>"$GITHUB_ENV" \
+        || warn "could not persist the rotated refresh token to \$GITHUB_ENV — a parent shell's later 401 may present the consumed token"
     fi
   fi
   # stderr DELIBERATELY: this function runs inside api_call, and several of

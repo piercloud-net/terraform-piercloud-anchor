@@ -50,6 +50,7 @@ done
 
 if [ "$url" = "https://token.example/token" ]; then
   echo refresh >> "$STUB_REFRESHED"
+  if [ -n "${STUB_REFRESH_BODY:-}" ]; then printf '%s' "${body#&}" > "$STUB_REFRESH_BODY"; fi
   case "$STUB_MODE" in
     refresh-bad) printf 'this is not json' ;;
     *)           printf '{"access_token":"AT2","refresh_token":"RT2"}' ;;
@@ -93,14 +94,21 @@ for fn in scp_token_refresh _api_curl api_call; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
-run_case() { # $1 mode, $2 refresh token ("" = unset) -> sets HTTP_STATUS/OUT/CALLS/REFRESHED/SEEN
-  STUB_MODE="$1" \
+run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB_ENV body]
+  # Per-case handoff file: in CI the REAL $GITHUB_ENV is set, and a shared
+  # file let case 1's FAKE tokens leak into case 2 (which then adopted them)
+  # — a harness artifact that previously forced a production "never
+  # resurrect" guard. One file per case: hermetic, no cross-case adoption.
+  : > "$WORK/genv.$1"
+  if [ -n "${4:-}" ]; then printf '%s\n' "$4" > "$WORK/genv.$1"; fi
+  STUB_MODE="$2" \
+  GITHUB_ENV="$WORK/genv.$1" \
   STUB_CALLS="$WORK/calls.$1" STUB_SEEN="$WORK/seen.$1" \
-  STUB_REFRESHED="$WORK/refreshed.$1" \
+  STUB_REFRESHED="$WORK/refreshed.$1" STUB_REFRESH_BODY="$WORK/refreshbody.$1" \
   PATH="$WORK/bin:$PATH" \
   NETCUP_API_BASE="https://scp.example" \
   NETCUP_SCP_ACCESS_TOKEN="AT1" \
-  NETCUP_SCP_REFRESH_TOKEN="$2" \
+  NETCUP_SCP_REFRESH_TOKEN="$3" \
   NETCUP_SCP_TOKEN_ENDPOINT="https://token.example/token" \
   bash -c '
     set -euo pipefail
@@ -115,24 +123,27 @@ run_case() { # $1 mode, $2 refresh token ("" = unset) -> sets HTTP_STATUS/OUT/CA
   if [ -f "$WORK/calls.$1" ]; then CALLS="$(cat "$WORK/calls.$1")"; fi
   if [ -f "$WORK/refreshed.$1" ]; then REFRESHED="$(wc -l < "$WORK/refreshed.$1" | tr -d ' ')"; fi
   if [ -f "$WORK/seen.$1" ]; then SEEN="$(paste -sd, "$WORK/seen.$1")"; fi
+  REFRESH_BODY=""
+  if [ -f "$WORK/refreshbody.$1" ]; then REFRESH_BODY="$(cat "$WORK/refreshbody.$1")"; fi
 }
 
 # ---- case 1: 401 → refresh → retry once → 200 (and the NEW token is used) ---
-run_case 401-then-200 "RT1"
+run_case c1 401-then-200 "RT1"
 is "case1 status"        "200"         "$HTTP_STATUS"
 is "case1 body"          '{"ok":true}' "$OUT"
 is "case1 api calls"     "2"           "$CALLS"
 is "case1 refresh calls" "1"           "$REFRESHED"
 is "case1 tokens seen"   "AT1,AT2"     "$SEEN"
+is "case1 refresh body"  "grant_type=refresh_token&client_id=scp&refresh_token=RT1" "$REFRESH_BODY"
 
 # ---- case 2: no refresh token → 401 stays 401, single request --------------
-run_case always-401 ""
+run_case c2 always-401 ""
 is "case2 status"        "401"         "$HTTP_STATUS"
 is "case2 api calls"     "1"           "$CALLS"
 is "case2 refresh calls" "0"           "$REFRESHED"
 
 # ---- case 3: refresh refused (non-JSON) → 401 stays 401, no replay ---------
-run_case refresh-bad "RT1"
+run_case c3 refresh-bad "RT1"
 is "case3 status"        "401"         "$HTTP_STATUS"
 is "case3 api calls"     "1"           "$CALLS"
 is "case3 refresh calls" "1"           "$REFRESHED"
@@ -147,7 +158,9 @@ is "case3 refresh calls" "1"           "$REFRESHED"
 # lose HTTP_STATUS — see api_call's subshell warning).
 run_capture() { # $1 label, $2 mode -> CAP_RC/CAPTURED/CAP_STDOUT/CAP_STDERR/CAP_REFRESHED
   local rc=0
+  : > "$WORK/genv.$1"
   STUB_MODE="$2" \
+  GITHUB_ENV="$WORK/genv.$1" \
   STUB_CALLS="$WORK/calls.cap.$1" STUB_SEEN="$WORK/seen.cap.$1" \
   STUB_REFRESHED="$WORK/refreshed.cap.$1" \
   PATH="$WORK/bin:$PATH" \
@@ -178,6 +191,15 @@ is "case4 captured parses (jq)"  "1"           "$(printf '%s' "$CAPTURED" | jq -
 is "case4 no stray stdout"       ""            "$CAP_STDOUT"
 is "case4 refresh banner stderr" "1"           "$(grep -c 'scp token refreshed' "$WORK/cap.err.c4" || true)"
 is "case4 refresh calls"         "1"           "$CAP_REFRESHED"
+
+# ---- case 5: adoption of the persisted handoff is UNCONDITIONAL ------------
+# A subshell refreshed and persisted RT3; the parent's in-process copy is
+# empty/consumed. With the old guarded adoption the parent bailed out (0
+# refreshes, 401); unconditional adoption must use the persisted RT3.
+run_case c5 401-then-200 "" $'NETCUP_SCP_ACCESS_TOKEN=AT3\nNETCUP_SCP_REFRESH_TOKEN=RT3'
+is "case5 status"          "200" "$HTTP_STATUS"
+is "case5 refresh calls"   "1"   "$REFRESHED"
+is "case5 adopted RT used" "1"   "$(case "$REFRESH_BODY" in *refresh_token=RT3*) echo 1;; *) echo 0;; esac)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
