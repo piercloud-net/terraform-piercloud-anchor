@@ -254,6 +254,8 @@ require_token() {
 # handoff file. Same semantics as the workflow's guard_line: reject
 # newline/CR, then any non-printable character. Fail closed BEFORE masking or
 # persisting either value.
+# Caveat (reviewer INFO): bash strips NUL and trailing newlines before this
+# guard sees a value — do not over-trust it for those two shapes.
 guard_token_value() { # $1 label, $2 value
   case "$2" in
     *[$'\n\r']*) die "SCP token response $1 contains a newline/CR — refusing the handoff write (injection guard)" ;;
@@ -1241,25 +1243,34 @@ cmd_sweep_post() {
   # attached policy is never touched.
   local steady attached mac
   mac="$(resolve_mac)"
-  # Attached-list parse (review security N1, live-proven): dispatch on the
-  # ENTRY type and hard-fail on anything ambiguous. The previous `(.id // .)`
-  # fallback made an id-less/null/empty-id entry resolve to the WHOLE OBJECT;
-  # the live steady-state policy then looked unattached and close_policy
-  # deleted it (cleartext/dashboard outage until re-apply). Tolerated: an
-  # array of {"id":number}/{"id":string}/bare number/bare string entries,
-  # all stringified (the comparison below is against stringified steady
-  # ids). Ambiguous = missing key, non-array userPolicies, null/boolean/
-  # object entries, id null/empty/non-scalar → jq errors and NOTHING is
-  # detached or deleted (die).
+  # Attached-list parse (review security N1, live-proven; N4 id hardening):
+  # dispatch on the ENTRY type and hard-fail on anything ambiguous. The
+  # previous `(.id // .)` fallback made an id-less/null/empty-id entry
+  # resolve to the WHOLE OBJECT; the live steady-state policy then looked
+  # unattached and close_policy deleted it (cleartext/dashboard outage
+  # until re-apply). Tolerated: an array of {"id":number}/{"id":string}/
+  # bare number/bare string entries whose id is a canonical non-negative
+  # integer — string ids must match ^[0-9]+$; numbers must be integral
+  # with an integer tostring (so {"id":42.0} cannot stringify to "42.0"
+  # and hide the live id 42). All canonical ids are stringified (the
+  # comparison below is against stringified steady ids). Ambiguous =
+  # missing key, non-array userPolicies, null/boolean/object entries, id
+  # null/empty/non-scalar/non-canonical → jq errors: no STEADY-STATE
+  # policy is detached or deleted (die). The tmp-policy pass above has
+  # already run by then and is unaffected.
   attached="$(iface_fw_get "$mac" | jq -ce '
+    def id_string:
+      if type == "string" then
+        (if test("^[0-9]+$") then . else error("userPolicies entry with a non-canonical string id") end)
+      elif type == "number" then
+        (if ((. | floor) == .) and ((. | tostring) | test("^[0-9]+$")) then tostring
+         else error("userPolicies entry with a non-canonical numeric id") end)
+      else error("userPolicies entry with a non-scalar id") end;
     if (.userPolicies | type) == "array" then
       [.userPolicies[] |
         if type == "object" then
-          (.id | if . == null or . == "" then error("userPolicies entry without a usable id")
-                 elif type == "string" or type == "number" then tostring
-                 else error("userPolicies entry with a non-scalar id") end)
-        elif type == "string" or type == "number" then
-          (if . == "" then error("userPolicies entry with an empty id") else tostring end)
+          (.id | if . == null then error("userPolicies entry without a usable id") else id_string end)
+        elif type == "string" or type == "number" then id_string
         else error("userPolicies entry of an ambiguous type") end]
     else error("userPolicies missing or not an array") end')" \
     || die "could not parse the attached-policy list for $SERVER_ID/$mac — refusing the steady-state orphan sweep on unproven attachment state"

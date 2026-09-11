@@ -14,6 +14,14 @@
 # null/boolean/object entries, id null/empty/non-scalar) hard-fails with NO
 # detach and NO delete.
 #
+# N4 id hardening (same day): tolerated ids must be canonical non-negative
+# integers — string ids must match ^[0-9]+$, and numbers must be integral
+# with an integer tostring. In particular {"id":42.0} must hard-fail on
+# jq >= 1.7 (decNumber preserves the literal; tostring gives "42.0", which
+# would read as unattached against live id 42) and {"id":"42 "},
+# {"id":"   "}, {"id":"42.0"}, {"id":"0x2a"}, {"id":"+42"} must all
+# hard-fail instead of stringifying through to a non-matching id.
+#
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
@@ -150,6 +158,22 @@ ambiguous_case c8i '{"userPolicies":[""]}'                                      
 ambiguous_case c8j '{"userPolicies":[true]}'                                                   # boolean entry
 ambiguous_case c8k '{"userPolicies":[{"id":true}]}'                                            # boolean id
 ambiguous_case c8l '{"userPolicies":[{"id":[42]}]}'                                            # array id
+
+# ---- N4: non-canonical ids hard-fail like the ambiguous shapes -----------
+# (other tolerated shapes: 42, "42", 42, "42" bare — covered by cases 1-4.)
+# {"id":42.0} needs jq >= 1.7 (decNumber): 1.6 stores doubles and collapses
+# the literal to 42, where accepting it as the live id is the only possible
+# behaviour — gate the single case instead of failing on old jq.
+if [ "$(jq -rn '42.0 | tostring')" = "42.0" ]; then
+  ambiguous_case c8m '{"userPolicies":[{"id":42.0}]}'                                          # 42.0 -> "42.0"
+else
+  printf 'SKIP c8m ({"id":42.0}: jq < 1.7 collapses the literal to 42)\n'
+fi
+ambiguous_case c8n '{"userPolicies":[{"id":"42 "}]}'                                         # trailing space
+ambiguous_case c8o '{"userPolicies":[{"id":"   "}]}'                                         # whitespace only
+ambiguous_case c8p '{"userPolicies":[{"id":"42.0"}]}'                                        # stringified float
+ambiguous_case c8q '{"userPolicies":[{"id":"0x2a"}]}'                                        # hex string
+ambiguous_case c8r '{"userPolicies":[{"id":"+42"}]}'                                         # signed string
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
