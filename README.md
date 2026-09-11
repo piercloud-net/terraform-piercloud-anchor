@@ -210,11 +210,13 @@ end-to-end encryption available on top for apps that want it.**
 - **At rest — ciphertext.** Your disks are LUKS-encrypted with keys the host
   never holds: seizure, a disk copy, or root on the host yields ciphertext only.
 - **In transit — disclosed edge.** A service can be served directly (TLS
-  terminates in your own instance) or behind the piercloud edge on Cloudflare
-  when you want its DDoS protection. When proxied, Cloudflare terminates visitor
-  TLS and can see request content in memory — no default log retention, but US
-  legal process applies under Cloudflare's DPA. Applications can add client-side
-  end-to-end encryption on top; that stays ciphertext even through the edge.
+  terminates in your own instance — no third party in the data path) or behind
+  the piercloud edge on Cloudflare when you want its DDoS protection. When
+  proxied, Cloudflare terminates visitor TLS and can see request content in
+  memory — no default log retention, but US legal process applies under
+  Cloudflare's DPA. Client-side end-to-end encryption in the app is the only way
+  a proxied site's content stays unreadable to the edge (transport TLS is
+  terminated by Cloudflare, not by your VM).
 - **At runtime — the disclosed floor.** Today the host can read running
   instance memory (accepted and disclosed). Phase 2 closes it with confidential
   computing (AMD SEV-SNP): per-VM memory encryption plus remote attestation that
