@@ -41,14 +41,20 @@ while [ $# -gt 0 ]; do
     -X) shift 2 ;;
     -H) headers+=("$2"); shift 2 ;;
     -d) body="$2"; shift 2 ;;
-    --data-urlencode) body="$body&$2"; shift 2 ;;
+    --data-urlencode)
+      # curl's name@file form (tokens ride there so they never hit argv).
+      v="$2"
+      case "$v" in
+        *@/*) name="${v%%@*}"; f="${v#*@}"; v="${name}=$(cat "$f" 2>/dev/null || true)" ;;
+      esac
+      body="$body&$v"; shift 2 ;;
     --max-time) shift 2 ;;
     -sS) shift ;;
     *) url="$1"; shift ;;
   esac
 done
 
-if [ "$url" = "https://token.example/token" ]; then
+if [ "$url" = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" ]; then
   echo refresh >> "$STUB_REFRESHED"
   if [ -n "${STUB_REFRESH_BODY:-}" ]; then printf '%s' "${body#&}" > "$STUB_REFRESH_BODY"; fi
   case "$STUB_MODE" in
@@ -86,6 +92,7 @@ extract() { awk "/^$1\\(\\) \\{/,/^\\}/" "$SCRIPT"; }
   # below cannot see the bug at all — that is exactly why the refresh banner
   # slipped through review. Keep this faithful to the script.
   echo 'log() { printf "A1: %s\n" "$*"; }'
+  echo 'die() { printf "A1 FAIL: %s\n" "$*" >&2; exit 1; }'
   extract scp_token_refresh
   extract _api_curl
   extract api_call
@@ -109,7 +116,7 @@ run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB
   NETCUP_API_BASE="https://scp.example" \
   NETCUP_SCP_ACCESS_TOKEN="AT1" \
   NETCUP_SCP_REFRESH_TOKEN="$3" \
-  NETCUP_SCP_TOKEN_ENDPOINT="https://token.example/token" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" \
   bash -c '
     set -euo pipefail
     source "$1"
@@ -167,7 +174,7 @@ run_capture() { # $1 label, $2 mode -> CAP_RC/CAPTURED/CAP_STDOUT/CAP_STDERR/CAP
   NETCUP_API_BASE="https://scp.example" \
   NETCUP_SCP_ACCESS_TOKEN="AT1" \
   NETCUP_SCP_REFRESH_TOKEN="RT1" \
-  NETCUP_SCP_TOKEN_ENDPOINT="https://token.example/token" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" \
   bash -c '
     set -euo pipefail
     source "$1"
@@ -200,6 +207,28 @@ run_case c5 401-then-200 "" $'NETCUP_SCP_ACCESS_TOKEN=AT3\nNETCUP_SCP_REFRESH_TO
 is "case5 status"          "200" "$HTTP_STATUS"
 is "case5 refresh calls"   "1"   "$REFRESHED"
 is "case5 adopted RT used" "1"   "$(case "$REFRESH_BODY" in *refresh_token=RT3*) echo 1;; *) echo 0;; esac)"
+
+# ---- case 6: a token endpoint outside the SCP realm is refused ---------------
+# A tampered/hijacked discovery document must never receive the refresh token:
+# the endpoint pin dies loudly instead of POSTing to the attacker.
+run_pin_case() {
+  local rc=0
+  : > "$WORK/genv.c6"
+  STUB_MODE=401-then-200 \
+  GITHUB_ENV="$WORK/genv.c6" \
+  STUB_CALLS="$WORK/calls.c6" STUB_SEEN="$WORK/seen.c6" STUB_REFRESHED="$WORK/refreshed.c6" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="RT1" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://attacker.example/token" \
+  bash -c 'source "$1"; api_call GET "/api/v1/test" "" out; printf "OUT=%s\n" "$out"' _ "$WORK/functions.sh" >"$WORK/pin.out" 2>"$WORK/pin.err" || rc=$?
+  PIN_RC="$rc"
+}
+run_pin_case
+is "case6 pin refused (rc != 0)" "1" "$([ "$PIN_RC" -ne 0 ] && echo 1 || echo 0)"
+is "case6 no refresh sent"       "0" "$([ -f "$WORK/refreshed.c6" ] && wc -l < "$WORK/refreshed.c6" | tr -d ' ' || echo 0)"
+is "case6 loud error"            "1" "$(grep -c 'refusing to send the refresh token' "$WORK/pin.err" || true)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

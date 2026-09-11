@@ -206,6 +206,17 @@ jobs:
           DEVICE_ENDPOINT="$(echo "$DISCO" | jq -r '.device_authorization_endpoint')"
           TOKEN_ENDPOINT="$(echo "$DISCO" | jq -r '.token_endpoint')"
           test "$DEVICE_ENDPOINT" != "null" || { echo "::error::discovery doc lacks device_authorization_endpoint — STOP, escalate."; exit 1; }
+          # Endpoint pin (review security MEDIUM): only the live SCP Keycloak
+          # realm may receive auth traffic — a tampered discovery document
+          # must not receive the device code (or, later, the tokens).
+          require_scp_endpoint() { # $1 label, $2 URL
+            case "$2" in
+              https://www.servercontrolpanel.de/realms/scp/*) ;;
+              *) echo "::error::$1 is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+            esac
+          }
+          require_scp_endpoint "device_authorization_endpoint" "$DEVICE_ENDPOINT"
+          require_scp_endpoint "token_endpoint" "$TOKEN_ENDPOINT"
           RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" --data-urlencode "client_id=scp" --data-urlencode "scope=offline_access openid")"
           # C-f: grant disabled (or any refusal) → STOP + escalate.
           # No downgrade path exists by design (C-A) — this job exits here.
@@ -315,6 +326,13 @@ jobs:
             case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
             if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
           }
+          # Endpoint pin (review security MEDIUM): the device-code POST may
+          # only ever go to the live SCP Keycloak realm (the value arrives via
+          # the request job's output; re-checked here at the point of use).
+          case "$TOKEN_ENDPOINT" in
+            https://www.servercontrolpanel.de/realms/scp/*) ;;
+            *) echo "::error::token_endpoint is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+          esac
           # No re-mask (see request job): masked values can't cross via outputs;
           # the code arrives unmasked by design and is never printed anywhere.
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
@@ -930,14 +948,31 @@ jobs:
             summary "FAILED: revocation_endpoint missing from discovery — token NOT revoked (usable until Keycloak's idle expiry, ~30 days)"
             exit 0
           fi
+          # Endpoint pin (review security MEDIUM): only the live SCP Keycloak
+          # realm may receive the token; a tampered discovery document must not.
+          require_scp_endpoint() { # $1 label, $2 URL
+            case "$2" in
+              https://www.servercontrolpanel.de/realms/scp/*) ;;
+              *) echo "::error::$1 is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+            esac
+          }
+          require_scp_endpoint "revocation_endpoint" "$REVOKE_ENDPOINT"
+          if [ -n "$TOKEN_ENDPOINT" ]; then require_scp_endpoint "token_endpoint" "$TOKEN_ENDPOINT"; fi
           # POST the refresh token (public client: client_id + token only);
           # the response body is discarded, the HTTP status and a BOUNDED
           # curl-stderr detail are kept for the warning and the step summary.
+          # Token off argv (review security MEDIUM): write it to a 0600 temp
+          # file (mktemp's default mode) and use curl's @file form so the
+          # value never shows up in /proc/<pid>/cmdline; the EXIT trap
+          # removes both temp files on every path.
           ERRFILE="$(mktemp)"
+          TOKEN_FILE="$(mktemp)"
+          printf '%s' "$NETCUP_SCP_REFRESH_TOKEN" > "$TOKEN_FILE"
+          trap 'rm -f "$ERRFILE" "$TOKEN_FILE"' EXIT
           CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$REVOKE_ENDPOINT" \
             --data-urlencode "client_id=scp" \
             --data-urlencode "token_type_hint=refresh_token" \
-            --data-urlencode "token=$NETCUP_SCP_REFRESH_TOKEN" 2>"$ERRFILE")" || CODE=""
+            --data-urlencode "token@$TOKEN_FILE" 2>"$ERRFILE")" || CODE=""
           DETAIL="$(bounded_detail "$ERRFILE")"
           rm -f "$ERRFILE"
           case "$CODE" in
@@ -965,7 +1000,7 @@ jobs:
             CANARY="$(curl -sS --max-time 30 -X POST "$TOKEN_ENDPOINT" \
               --data-urlencode "grant_type=refresh_token" \
               --data-urlencode "client_id=scp" \
-              --data-urlencode "refresh_token=$NETCUP_SCP_REFRESH_TOKEN" 2>"$CERFILE")" || CANARY=""
+              --data-urlencode "refresh_token@$TOKEN_FILE" 2>"$CERFILE")" || CANARY=""
             CANARY_DETAIL="$(bounded_detail "$CERFILE")"
             rm -f "$CERFILE"
             CANARY_ERR="$(printf '%s' "$CANARY" | jq -r '.error // empty' 2>/dev/null)" || CANARY_ERR=""

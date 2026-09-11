@@ -241,11 +241,27 @@ scp_token_refresh() {
   fi
   [ -n "${NETCUP_SCP_REFRESH_TOKEN:-}" ] || return 1
   [ -n "${NETCUP_SCP_TOKEN_ENDPOINT:-}" ] || return 1
-  local resp at rt
-  resp="$(curl -sS --max-time 30 -X POST "$NETCUP_SCP_TOKEN_ENDPOINT" \
+  # Endpoint pin (review security MEDIUM): the refresh token may only ever go
+  # to the live SCP Keycloak realm. A tampered/hijacked discovery document
+  # would otherwise receive the credential — refuse loudly instead.
+  case "$NETCUP_SCP_TOKEN_ENDPOINT" in
+    https://www.servercontrolpanel.de/realms/scp/*) ;;
+    *) die "NETCUP_SCP_TOKEN_ENDPOINT is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to send the refresh token (endpoint pin)" ;;
+  esac
+  local resp at rt tf
+  # Token off argv (review security MEDIUM): --data-urlencode with the literal
+  # value is world-readable via /proc/<pid>/cmdline; write it to a 0600 temp
+  # file (mktemp's default mode) and use curl's @file form instead.
+  tf="$(mktemp)"
+  printf '%s' "$NETCUP_SCP_REFRESH_TOKEN" >"$tf"
+  if ! resp="$(curl -sS --max-time 30 -X POST "$NETCUP_SCP_TOKEN_ENDPOINT" \
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "client_id=scp" \
-    --data-urlencode "refresh_token=$NETCUP_SCP_REFRESH_TOKEN")" || return 1
+    --data-urlencode "refresh_token@$tf")"; then
+    rm -f "$tf"
+    return 1
+  fi
+  rm -f "$tf"
   at="$(printf '%s' "$resp" | jq -r '.access_token // empty' 2>/dev/null)" || return 1
   [ -n "$at" ] || return 1
   rt="$(printf '%s' "$resp" | jq -r '.refresh_token // empty' 2>/dev/null)" || rt=""
