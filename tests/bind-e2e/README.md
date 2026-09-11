@@ -30,5 +30,9 @@ provision or recover against EC/X25519 at all, and P-521 is what
 current-jose `tangd-keygen` emits, so it is the production shape for
 current deployments.
 
-Run: `sudo bash tests/bind-e2e/run-bind-e2e.sh` (root for loop +
-cryptsetup; ~3 min, no secrets, no cloud).
+Run: `sudo bash tests/bind-e2e/run-bind-e2e.sh` on Linux with apt + root loop/
+`dm-crypt` (CI: `ubuntu-latest`, ~3 min, no secrets, no cloud). It is not
+runnable on a dev Mac (apt deps, linux/amd64 caddy, loop devices) — for a local
+slice, extract the render span and run `caddy validate` as the AOP render case
+does; the served client-auth handshake is covered by CI and by the provision
+run's live AOP probes.

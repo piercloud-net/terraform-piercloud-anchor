@@ -906,16 +906,28 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # (7 refused / 28 timeout) or a DNS problem (6): only a TLS-layer rejection
     # proves client_auth is enforcing — a dead :443 must not pass this probe.
     neg_rc=0
-    curl -sk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>/dev/null || neg_rc=$?
+    neg_err=""
+    neg_err="$(curl -sk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>&1)" || neg_rc=$?
     case "${neg_rc}" in
       0)
         die "Caddy :443 answered a cert-less probe while AOP is deployed — client_auth is not enforcing; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply" ;;
-      35|56)
-        log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}; OK under require_and_verify)" ;;
+      35|55|56)
+        # 35 = TLS connect error (handshake stage); 55/56 = send/recv failure —
+        # these are how curl surfaces a client-auth rejection (measured on curl
+        # 7.88/8.5/8.11/8.14/8.19/8.20 across TLS 1.2/1.3; 55 is real on the
+        # newer OpenSSL 3.5 builds). The OpenSSL 'alert' line is extra evidence
+        # when present, but a rejection must not fail on its absence.
+        neg_hint="$(printf '%s' "${neg_err}" | tr '\n' ' ' | cut -c1-160)"
+        if printf '%s' "${neg_err}" | grep -qi 'alert'; then
+          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}, alert confirmed; OK under require_and_verify)"
+        else
+          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}; OK under require_and_verify)"
+          warn "no OpenSSL 'alert' text in curl stderr (${neg_hint:-no stderr}) — confirm the rejection manually if this box was expected to serve cert-less"
+        fi ;;
       7|28)
-        die "Caddy :443 did not answer the cert-less probe (curl exit ${neg_rc}: refused/timeout) — cannot prove client_auth is enforcing; refusing to finish blind" ;;
+        die "Caddy :443 did not answer the cert-less probe (curl exit ${neg_rc}: refused/timeout) — cannot prove client_auth is enforcing; check 'docker logs caddy' and that :443 is listening BEFORE touching AOP secrets; refusing to finish blind" ;;
       *)
-        die "Caddy :443 cert-less probe failed with curl exit ${neg_rc} (not a TLS-layer rejection) — cannot prove client_auth is enforcing; refusing to finish blind" ;;
+        die "Caddy :443 cert-less probe failed with curl exit ${neg_rc} (not a TLS-layer rejection) — cannot prove client_auth is enforcing; stderr: $(printf '%s' "${neg_err}" | tr '\n' ' ' | cut -c1-160); refusing to finish blind" ;;
     esac
     edge_ok=0
     edge_rc=0
@@ -932,7 +944,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
       if [ "${edge_rc}" -eq 6 ]; then
         die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The proxied edge record is upserted by the DNS stage AFTER this job, so on a first-time/DR dispatch this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once DNS converges re-enable AOP (docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch)"
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the proxied record may still point at the old box (edge 521/522) — the DNS stage converges only AFTER this job, see docs/dr.md"
     fi
     log "edge pull through Cloudflare serves with AOP enforced (OK)"
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then

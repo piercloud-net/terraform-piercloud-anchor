@@ -22,6 +22,7 @@ PROVISION_SH="${REPO_ROOT}/scripts/010-provision.sh"
 CADDY_PORT="${CADDY_PORT:-18080}"
 MOCK_PORT="${MOCK_PORT:-18081}"
 STUB_PORT="${STUB_PORT:-18082}"
+AOP_SNI="status.prodprobe.piercloud.net"
 TENANT_USER="${TENANT_USER:-citest}"
 CADDY_VERSION="2.11.4"
 CADDY_TGZ="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
@@ -39,6 +40,7 @@ cleanup() {
   [ -n "${RT_PID:-}" ] && kill "${RT_PID}" 2>/dev/null || true
   cryptsetup close real-tang 2>/dev/null || true
   [ -n "${CADDY_PID:-}" ] && kill "${CADDY_PID}" 2>/dev/null || true
+  [ -n "${AOP_CADDY_PID:-}" ] && kill "${AOP_CADDY_PID}" 2>/dev/null || true
   [ -n "${MOCK_PID:-}" ] && kill "${MOCK_PID}" 2>/dev/null || true
   [ -n "${STUB_PID:-}" ] && kill "${STUB_PID}" 2>/dev/null || true
   cryptsetup close e2e-slot 2>/dev/null || true
@@ -171,6 +173,47 @@ for i in $(seq 1 30); do
   sleep 1
 done
 [ "${ok}" = "1" ] || { tail -30 "${WORK}/caddy.log"; die "caddy did not serve /adv"; }
+
+# --- AOP handshake split, served for real (not just validated): a cert-less
+# client must be rejected at the TLS layer, a client leaf signed by the
+# trust-pool CA must be accepted end-to-end. The dashboard vhost is
+# production-addressed (`https://<sni>` = :443/:80) and this harness runs as
+# root, so it binds the real port. This is the CI-visible half of the provision
+# run's AOP probe (review lens LENS1R2-5).
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${WORK}/aop-leaf.key" >/dev/null 2>&1 || die "openssl could not mint the harness client key"
+chmod 600 "${WORK}/aop-leaf.key"
+openssl req -new -key "${WORK}/aop-leaf.key" -subj "/CN=aop-client" \
+  -out "${WORK}/aop-leaf.csr" >/dev/null 2>&1 || die "openssl could not build the harness client CSR"
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "${WORK}/aop-leaf.ext"
+openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${WORK}/aop-ca.key" \
+  -CAcreateserial -CAserial "${WORK}/aop-ca.srl" -days 1 -sha256 -extfile "${WORK}/aop-leaf.ext" \
+  -out "${WORK}/aop-leaf.crt" >/dev/null 2>&1 || die "openssl could not sign the harness client leaf"
+( export CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
+  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export ORIGIN_TLS="1" AOP_TLS="yes"
+  export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
+  # shellcheck disable=SC1090
+  source "${WORK}/aop-stanza.src"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.aopsrv" )
+HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.aopsrv" --adapter caddyfile >"${WORK}/caddy-aop.log" 2>&1 &
+AOP_CADDY_PID=$!
+ok=0
+for i in $(seq 1 30); do
+  # cert-less must NOT connect, so "ready" is :443 accepting TCP.
+  if (: >"/dev/tcp/127.0.0.1/443") 2>/dev/null; then ok=1; break; fi
+  sleep 1
+done
+[ "${ok}" = "1" ] || { tail -30 "${WORK}/caddy-aop.log"; die "AOP caddy did not open :443"; }
+aop_neg_rc=0
+curl -sk --max-time 10 --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" -o /dev/null 2>"${WORK}/aop-neg.err" || aop_neg_rc=$?
+[ "${aop_neg_rc}" -ne 0 ] || die "AOP vhost answered a cert-less request — client_auth is not enforcing"
+log "PASS: cert-less request rejected (curl exit ${aop_neg_rc}; $(head -1 "${WORK}/aop-neg.err" | cut -c1-90))"
+curl -skf --max-time 10 --cert "${WORK}/aop-leaf.crt" --key "${WORK}/aop-leaf.key" \
+  --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" -o "${WORK}/aop-pos.body" \
+  || die "leaf-signed client was rejected by the AOP vhost"
+grep -q "gatus-stub-ok" "${WORK}/aop-pos.body" || die "leaf-signed client did not reach the stub backend (got: $(head -c 120 "${WORK}/aop-pos.body"))"
+log "PASS: leaf-signed client accepted end-to-end through the AOP vhost"
 
 # ---------------------------------------------------------------- 5. proxy
 log "Proxy assertions (content-identical + signature-verified)"
