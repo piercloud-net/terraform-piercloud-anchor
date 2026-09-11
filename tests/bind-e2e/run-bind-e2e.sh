@@ -22,6 +22,7 @@ PROVISION_SH="${REPO_ROOT}/scripts/010-provision.sh"
 CADDY_PORT="${CADDY_PORT:-18080}"
 MOCK_PORT="${MOCK_PORT:-18081}"
 STUB_PORT="${STUB_PORT:-18082}"
+AOP_SNI="status.prodprobe.piercloud.net"
 TENANT_USER="${TENANT_USER:-citest}"
 CADDY_VERSION="2.11.4"
 CADDY_TGZ="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
@@ -39,6 +40,7 @@ cleanup() {
   [ -n "${RT_PID:-}" ] && kill "${RT_PID}" 2>/dev/null || true
   cryptsetup close real-tang 2>/dev/null || true
   [ -n "${CADDY_PID:-}" ] && kill "${CADDY_PID}" 2>/dev/null || true
+  [ -n "${AOP_CADDY_PID:-}" ] && kill "${AOP_CADDY_PID}" 2>/dev/null || true
   [ -n "${MOCK_PID:-}" ] && kill "${MOCK_PID}" 2>/dev/null || true
   [ -n "${STUB_PID:-}" ] && kill "${STUB_PID}" 2>/dev/null || true
   cryptsetup close e2e-slot 2>/dev/null || true
@@ -120,6 +122,32 @@ HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
 
+# AOP shape: compile the REAL stanza builder (extracted from its first
+# column-0 guard line up to the column-0 closing `fi`; later indented guards
+# belong to the probe section) with a CA bundle + origin pair present, so a
+# directive rename (require_and_verify / trust_pool file) fails HERE and not
+# only on the next live dispatch (review lens LENS1-7).
+aop_b=$(grep -n -m1 '^if \[ "${ORIGIN_TLS}" = "1" \]; then$' "${PROVISION_SH}" | cut -d: -f1)
+[ -n "${aop_b}" ] || die "AOP stanza builder not found in ${PROVISION_SH}"
+aop_e=$(awk -v s="${aop_b}" 'NR>s && /^fi$/{print NR; exit}' "${PROVISION_SH}")
+[ -n "${aop_e}" ] || die "AOP stanza builder end (column-0 fi) not found"
+sed -n "${aop_b},${aop_e}p" "${PROVISION_SH}" > "${WORK}/aop-stanza.src"
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/aop-ca.key" -out "${WORK}/aop-ca.pem" \
+  -days 1 -nodes -subj "/CN=harness-aop-ca" >/dev/null 2>&1 || die "openssl could not mint the harness AOP CA"
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin.key" -out "${WORK}/origin.crt" \
+  -days 1 -nodes -subj "/CN=harness-origin" >/dev/null 2>&1 || die "openssl could not mint the harness origin pair"
+( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
+  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export ORIGIN_TLS="1" AOP_TLS="yes"
+  export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
+  # shellcheck disable=SC1090
+  source "${WORK}/aop-stanza.src"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.aop" )
+grep -q "client_auth" "${WORK}/Caddyfile.aop" || die "AOP render lacks the client_auth block"
+HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.aop" --adapter caddyfile
+log "AOP render validates (real client_auth stanza compiled)"
+
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"
 export TENANT_USER=citest TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
@@ -145,6 +173,50 @@ for i in $(seq 1 30); do
   sleep 1
 done
 [ "${ok}" = "1" ] || { tail -30 "${WORK}/caddy.log"; die "caddy did not serve /adv"; }
+
+# --- AOP handshake split, served for real (not just validated): a cert-less
+# client must be rejected at the TLS layer, a client leaf signed by the
+# trust-pool CA must be accepted. The vhost is minimal ON PURPOSE — built from
+# the REAL stanza builder (extracted above), `respond` instead of the full
+# render: the full render is validated twice already, and serving it here would
+# drag in the tang site + admin endpoint + :80 redirects, none of which this
+# assertion is about. CI runs as root, so :443 binds. (review lens LENS1R2-5)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${WORK}/aop-leaf.key" >/dev/null 2>&1 || die "openssl could not mint the harness client key"
+chmod 600 "${WORK}/aop-leaf.key"
+openssl req -new -key "${WORK}/aop-leaf.key" -subj "/CN=aop-client" \
+  -out "${WORK}/aop-leaf.csr" >/dev/null 2>&1 || die "openssl could not build the harness client CSR"
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "${WORK}/aop-leaf.ext"
+openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${WORK}/aop-ca.key" \
+  -CAcreateserial -CAserial "${WORK}/aop-ca.srl" -days 1 -sha256 -extfile "${WORK}/aop-leaf.ext" \
+  -out "${WORK}/aop-leaf.crt" >/dev/null 2>&1 || die "openssl could not sign the harness client leaf"
+( export ORIGIN_TLS="1" AOP_TLS="yes"
+  export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
+  # shellcheck disable=SC1090
+  source "${WORK}/aop-stanza.src"
+  {
+    printf '{\n\tadmin off\n\tauto_https disable_redirects\n}\n\n'
+    printf 'https://%s {\n' "${AOP_SNI}"
+    printf '%s\n' "${DASH_TLS_STANZA}"
+    printf '\trespond "gatus-stub-ok" 200\n}\n'
+  } > "${WORK}/Caddyfile.aopsrv" )
+HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.aopsrv" --adapter caddyfile >"${WORK}/caddy-aop.log" 2>&1 &
+AOP_CADDY_PID=$!
+ok=0
+for i in $(seq 1 30); do
+  # cert-less must NOT connect, so "ready" is :443 accepting TCP.
+  if (: >"/dev/tcp/127.0.0.1/443") 2>/dev/null; then ok=1; break; fi
+  sleep 1
+done
+[ "${ok}" = "1" ] || { tail -30 "${WORK}/caddy-aop.log"; die "AOP caddy did not open :443"; }
+aop_neg_rc=0
+curl -sk --max-time 10 --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" -o /dev/null 2>"${WORK}/aop-neg.err" || aop_neg_rc=$?
+[ "${aop_neg_rc}" -ne 0 ] || die "AOP vhost answered a cert-less request — client_auth is not enforcing"
+log "PASS: cert-less request rejected (curl exit ${aop_neg_rc}; $(head -1 "${WORK}/aop-neg.err" | cut -c1-90))"
+curl -skf --max-time 10 --cert "${WORK}/aop-leaf.crt" --key "${WORK}/aop-leaf.key" \
+  --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" -o "${WORK}/aop-pos.body" \
+  || die "leaf-signed client was rejected by the AOP vhost"
+grep -q "gatus-stub-ok" "${WORK}/aop-pos.body" || die "leaf-signed client did not reach the stub backend (got: $(head -c 120 "${WORK}/aop-pos.body"))"
+log "PASS: leaf-signed client accepted end-to-end through the AOP vhost"
 
 # ---------------------------------------------------------------- 5. proxy
 log "Proxy assertions (content-identical + signature-verified)"
