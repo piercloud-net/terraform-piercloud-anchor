@@ -85,7 +85,10 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    approve the device-flow URL + code at netcup's own Keycloak, from any browser. The
    ephemeral token dies with the runner; the run revokes the device-grant
    refresh token at teardown, and a teardown that cannot prove the credential
-   dead fails the run (no silent green). *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
+   dead fails the run (no silent green). If the runner is killed or the run is
+   cancelled before teardown, that refresh token can stay live for up to ~30
+   days — revoke your offline session for the anchor's tenant in netcup's
+   Keycloak (SCP) admin/account UI, then re-dispatch. *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
 4. **A1 provisions** — the run opens its own /32 window, installs `tang`,
    creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net`),
    prints its **thumbprint** (to run artifact today — ntfy push + committed

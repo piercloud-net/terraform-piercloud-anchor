@@ -92,6 +92,11 @@ token, provisions, and the token dies with the runner — the run revokes the de
 (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG` (masking note: both the access token and the refresh token stay masked; the short-lived code is unmasked-by-design, see above). The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
 STOP + open an issue in your repo so the operator sees it (C-A — no fallback exists, none is permitted).
 
+If the runner is killed or the run is cancelled before teardown, the run's
+refresh token can stay live for up to ~30 days — revoke your offline session
+for this anchor's tenant in netcup's Keycloak (SCP) admin/account UI, then
+re-dispatch `mode=apply`.
+
 ## 4. A1 provisions, thumbprint lands via run artifact (H1 chain)
 
 The run opens the hardened A1 self-open /32 SSH window, sets its own one-time root password when none was pasted (applied on the running box via the guest agent — no reboot, no tap needed; concurrent runs serialize on a lock-wait), and provisions the
