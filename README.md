@@ -206,6 +206,14 @@ Jurisdiction, honestly: FR box / DE anchor / IT operator — EIO or direct
 e-Evidence orders are delay plus two-compulsion cost, NOT prevention;
 rotation is forward security only.
 
+### Data: at rest, in transit, at runtime
+
+**Encrypted to your instance, unreadable at rest by the host, runtime confidentiality arriving via attested confidential computing — and an application-level encryption layer available on top for apps that want it.**
+
+- **At rest — ciphertext.** Your disks are LUKS-encrypted with keys the host never holds: seizure, a disk copy, or root on the host yields ciphertext only.
+- **In transit — disclosed edge.** A service can be served directly (TLS terminates in your own instance — no third party in the data path) or behind the piercloud edge on Cloudflare when you want its DDoS protection. When proxied, Cloudflare terminates visitor TLS and can see request content in memory — no default log retention, but US legal process applies under Cloudflare's DPA. An application-level encryption layer between client and origin — the origin can decrypt it, unless the app is fully end-to-end encrypted — is the only way a proxied site's content stays unreadable to the edge (transport TLS is terminated by Cloudflare, not by your VM).
+- **At runtime — the disclosed floor.** Today the host can read running instance memory (accepted and disclosed). Phase 2 closes it with confidential computing (AMD SEV-SNP): per-VM memory encryption plus remote attestation that your own verifier checks before keys are released (side-channel limits are documented, not hidden).
+
 Visibility (C-E): identifiers in repo secrets always; public default once
 secrets land; the approval card is LOUD about what commit you approve
 (and shows SHA + diff vs default branch today; refuse-on-change pin pending the backend recorder); the repo is authoritative, any UI advisory.
