@@ -45,7 +45,7 @@ for fn in policy_age close_policy cmd_sweep_pre; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
-# GNU-compatible `date -d <ISO>` shim: the script runs on Ubuntu runners
+# GNU-compatible `date -d <RFC 3339 timestamp>` shim: the script runs on Ubuntu runners
 # (GNU date) while a dev laptop may be BSD/macOS — the shim keeps the REAL
 # policy_age exercised on both. Everything else delegates to the real date.
 mkdir -p "$WORK/bin"
@@ -60,7 +60,7 @@ exec /bin/date "$@"
 SHIM
 chmod +x "$WORK/bin/date"
 
-stamp() { # $1 = seconds ago -> ISO8601 Z (same shape the workflow writes)
+stamp() { # $1 = seconds ago -> RFC 3339 UTC timestamp (same shape the workflow writes)
   python3 -c "import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"
 }
 entry() { # $1 id, $2 name, $3 age-seconds ("orphan" = unstamped description)

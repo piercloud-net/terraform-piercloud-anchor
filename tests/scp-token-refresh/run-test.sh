@@ -61,7 +61,12 @@ fi
 n="$(cat "$STUB_CALLS" 2>/dev/null || echo 0)"
 n=$((n + 1)); echo "$n" > "$STUB_CALLS"
 for h in "${headers[@]}"; do
-  case "$h" in Authorization:*) echo "${h#Authorization: Bearer }" >> "$STUB_SEEN" ;; esac
+  case "$h" in
+    Authorization:*)
+      token="${h#Authorization: Bearer }"
+      printf '%s\n' "$token" >> "$STUB_SEEN"
+      ;;
+  esac
 done
 if [ "$STUB_MODE" = "401-then-200" ] && [ "$n" -ge 2 ]; then
   if [ -n "$out" ]; then printf '{"ok":true}' > "$out"; fi
