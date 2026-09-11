@@ -320,6 +320,22 @@ jobs:
                 # Same-job steps below consume it; it never crosses jobs,
                 # never lands in state (C-d: TF 1.11 ephemerals carry it).
                 echo "NETCUP_SCP_ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
+                # ~5-min access-token TTL vs multi-minute runs (live
+                # 2026-09-11: the async apply outlived the token, every tail
+                # step 401'd and the A1 window policy leaked). offline_access
+                # was already requested at approval — hand the refresh token
+                # to the script's REST helper (scp_token_refresh), which
+                # re-mints ONCE on a 401 and replays the request. Same-runner
+                # handoff, dies with the runner (C-d trust model unchanged).
+                REFRESH_TOKEN="$(echo "$POLL" | jq -r '.refresh_token // empty')"
+                if [ -n "$REFRESH_TOKEN" ]; then
+                  echo "::add-mask::$REFRESH_TOKEN"
+                  echo "NETCUP_SCP_REFRESH_TOKEN=$REFRESH_TOKEN" >> "$GITHUB_ENV"
+                  echo "NETCUP_SCP_TOKEN_ENDPOINT=$TOKEN_ENDPOINT" >> "$GITHUB_ENV"
+                  echo "::notice::refresh token captured — long runs survive the ~5 min access-token TTL."
+                else
+                  echo "::warning::no refresh_token in the token response — runs longer than ~5 min will 401 at the tail (fail-loud, no fallback)."
+                fi
                 # C-d: refresh stays in-memory only (same-runner handoff
                 # above); TF 1.11 ephemerals carry it — it never lands in state.
                 echo "Approved. Token held in runner memory only."
@@ -358,6 +374,8 @@ jobs:
         id: resolve
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
           SCP_USER_ID_IN: ${{ secrets.SCP_USER_ID }}
           CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
@@ -506,6 +524,8 @@ jobs:
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -527,6 +547,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
         run: |
           set -euo pipefail
@@ -590,6 +612,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
@@ -612,6 +636,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
           TF_VAR_server_id: ${{ env.SERVER_ID }}
@@ -633,6 +659,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -647,6 +675,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -678,6 +708,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -741,6 +773,8 @@ jobs:
         if: always() && steps.device.outputs.authorized == 'true' && inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -752,6 +786,8 @@ jobs:
         if: always()
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}

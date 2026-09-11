@@ -51,6 +51,18 @@
 # ENV (all identifiers arrive via environment — never argv, never logs):
 #   NETCUP_SCP_ACCESS_TOKEN  per-run device-flow token (required except
 #                            sweep-post, which no-ops cleanly without it).
+#                            The SCP access token lives ~5 min (live
+#                            2026-09-11: tail steps 401'd after the async
+#                            apply) — see NETCUP_SCP_REFRESH_TOKEN below.
+#   NETCUP_SCP_REFRESH_TOKEN optional offline_access token from the SAME
+#                            device approval; on any 401 the REST helper
+#                            re-mints the access token from it and retries
+#                            once (same-runner handoff only, dies with the
+#                            runner — same trust model as the access token).
+#                            Absent/empty = pre-refresh behaviour (fail loud).
+#   NETCUP_SCP_TOKEN_ENDPOINT Keycloak token endpoint for that refresh grant
+#                            (resolved from the OIDC discovery doc by the
+#                            device-request job; public, not a secret).
 #   NETCUP_API_BASE          SCP REST base (default verified against the
 #                            provider source: defaultBaseURL in
 #                            rixlhq/terraform-provider-netcup
@@ -165,6 +177,50 @@ require_token() {
 # header, responses are error-truncated before printing so a surprising echo
 # can never leak request state into logs).
 # ---------------------------------------------------------------------------
+# Re-mint the access token from the device grant's own refresh token
+# (offline_access was already requested at approval). No new standing secret,
+# no new fallback: the refresh token is minted by the same human approval and
+# dies with the runner (C-d). Returns non-zero when unavailable/refused, so
+# callers keep the pre-existing fail-loud 401 path.
+scp_token_refresh() {
+  [ -n "${NETCUP_SCP_REFRESH_TOKEN:-}" ] || return 1
+  [ -n "${NETCUP_SCP_TOKEN_ENDPOINT:-}" ] || return 1
+  local resp at rt
+  resp="$(curl -sS --max-time 30 -X POST "$NETCUP_SCP_TOKEN_ENDPOINT" \
+    --data-urlencode "grant_type=refresh_token" \
+    --data-urlencode "client_id=scp" \
+    --data-urlencode "refresh_token=$NETCUP_SCP_REFRESH_TOKEN")" || return 1
+  at="$(printf '%s' "$resp" | jq -r '.access_token // empty' 2>/dev/null)" || return 1
+  [ -n "$at" ] || return 1
+  rt="$(printf '%s' "$resp" | jq -r '.refresh_token // empty' 2>/dev/null)" || rt=""
+  echo "::add-mask::$at" # mask FIRST, before any use
+  NETCUP_SCP_ACCESS_TOKEN="$at"
+  export NETCUP_SCP_ACCESS_TOKEN
+  if [ -n "$rt" ]; then
+    echo "::add-mask::$rt"
+    NETCUP_SCP_REFRESH_TOKEN="$rt"
+    export NETCUP_SCP_REFRESH_TOKEN
+  fi
+  log "scp token refreshed (access token TTL is ~5 min; long runs cross it)"
+  return 0
+}
+
+_api_curl() { # method path body ctype resp_file -> sets HTTP_STATUS
+  local method="$1" path="$2" body="$3" ctype="$4" resp_file="$5"
+  if [ -n "$body" ]; then
+    HTTP_STATUS="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
+      -X "$method" "${NETCUP_API_BASE}${path}" \
+      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
+      -H "Content-Type: $ctype" -H 'Accept: application/json' \
+      -d "$body")"
+  else
+    HTTP_STATUS="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
+      -X "$method" "${NETCUP_API_BASE}${path}" \
+      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
+      -H 'Accept: application/json')"
+  fi
+}
+
 api_call() { # method path [body] [outvar] [content-type] -> sets HTTP_STATUS; body to stdout or $outvar
   # Subshell warning: callers MUST NOT use resp="$(api_call ...)" — command
   # substitution forks, and HTTP_STATUS set inside would die with it (live
@@ -175,17 +231,15 @@ api_call() { # method path [body] [outvar] [content-type] -> sets HTTP_STATUS; b
   local method="$1" path="$2" body="${3:-}" outvar="${4:-}" ctype="${5:-application/json}"
   local resp_file status content
   resp_file="$(mktemp)"
-  if [ -n "$body" ]; then
-    status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
-      -X "$method" "${NETCUP_API_BASE}${path}" \
-      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
-      -H "Content-Type: $ctype" -H 'Accept: application/json' \
-      -d "$body")"
-  else
-    status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
-      -X "$method" "${NETCUP_API_BASE}${path}" \
-      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
-      -H 'Accept: application/json')"
+  _api_curl "$method" "$path" "$body" "$ctype" "$resp_file"
+  status="$HTTP_STATUS"
+  if [ "$status" = "401" ] && scp_token_refresh; then
+    # A 401 is rejected BEFORE processing (no side effect), so replaying the
+    # same request once with the re-minted token is safe for every verb used
+    # here (GET/POST/PUT/PATCH/DELETE). One retry only — a second 401 is a
+    # real authz problem and must stay loud.
+    _api_curl "$method" "$path" "$body" "$ctype" "$resp_file"
+    status="$HTTP_STATUS"
   fi
   HTTP_STATUS="$status"
   content="$(cat "$resp_file")" # same trailing-newline strip as $(...) capture — callers already live with it
