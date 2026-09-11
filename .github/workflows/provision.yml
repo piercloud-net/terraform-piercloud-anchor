@@ -352,10 +352,12 @@ jobs:
                 guard_line "access_token" "$ACCESS_TOKEN"
                 echo "::add-mask::$ACCESS_TOKEN"
                 echo "authorized=true" >> "$GITHUB_OUTPUT"
-                # M2 same-job handoff: the token persists ONLY in this
-                # runner's local GITHUB_ENV handoff FILE (dies with the
-                # runner). Same-job steps below consume it; it never crosses
-                # jobs, never lands in state (C-d: TF 1.11 ephemerals carry it).
+                # M2 same-job handoff: the ACCESS token persists ONLY in this
+                # runner's local GITHUB_ENV handoff (dies with the runner);
+                # the REFRESH token gets its own 0600 file below — it must
+                # not sit in the job env. Same-job steps below consume both;
+                # neither crosses jobs, neither lands in state (C-d: TF 1.11
+                # ephemerals carry the access token).
                 echo "NETCUP_SCP_ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
                 # ~5-min access-token TTL vs multi-minute runs (live
                 # 2026-09-11: the async apply outlived the token, every tail
@@ -370,16 +372,28 @@ jobs:
                   # Discovery-derived: guard again at the write (defense in depth).
                   guard_line "token_endpoint" "$TOKEN_ENDPOINT"
                   echo "::add-mask::$REFRESH_TOKEN"
-                  echo "NETCUP_SCP_REFRESH_TOKEN=$REFRESH_TOKEN" >> "$GITHUB_ENV"
+                  # Refresh-token handoff: a 0600 runner-local FILE, NOT
+                  # $GITHUB_ENV. Only the PATH is exported, so the ~30-day
+                  # credential never enters the job environment where every
+                  # later step — including the community tofu provider pulled
+                  # by `tofu init` — could read it (review security MEDIUM).
+                  # scp_token_refresh reads and rewrites this file for the
+                  # current value and every rotation.
+                  REFRESH_TOKEN_FILE="$RUNNER_TEMP/scp-refresh-${GITHUB_RUN_ID}.token"
+                  if ! (umask 077; printf '%s' "$REFRESH_TOKEN" > "$REFRESH_TOKEN_FILE"); then
+                    echo "::error::could not write the refresh-token handoff file $REFRESH_TOKEN_FILE — aborting (no handoff is safer than an env leak)."
+                    exit 1
+                  fi
+                  echo "NETCUP_SCP_REFRESH_TOKEN_FILE=$REFRESH_TOKEN_FILE" >> "$GITHUB_ENV"
                   echo "NETCUP_SCP_TOKEN_ENDPOINT=$TOKEN_ENDPOINT" >> "$GITHUB_ENV"
-                  echo "::notice::refresh token captured — long runs survive the ~5 min access-token TTL."
+                  echo "::notice::refresh token captured to the runner-local file handoff — long runs survive the ~5 min access-token TTL."
                 else
                   echo "::warning::no refresh_token in the token response — runs longer than ~5 min will 401 at the tail (fail-loud, no fallback)."
                 fi
-                # C-d: the refresh token stays in the runner-local GITHUB_ENV
-                # handoff FILE (the script re-reads it across subshells and
-                # re-appends each rotation); TF 1.11 ephemerals carry it — it
-                # never lands in state.
+                # C-d: the refresh token stays in its 0600 runner-local FILE
+                # (the script re-reads it across subshells and rewrites it on
+                # every rotation); TF 1.11 ephemerals carry the access token —
+                # the refresh credential never enters the job env nor state.
                 echo "Approved. Token held on this runner only (local handoff file)."
                 echo "::notice::netcup approval received for $TENANT_USER — token in the runner-local handoff, provisioning continues."
                 echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -416,7 +430,7 @@ jobs:
         id: resolve
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
           SCP_USER_ID_IN: ${{ secrets.SCP_USER_ID }}
@@ -593,7 +607,7 @@ jobs:
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
@@ -619,7 +633,11 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          # NOTE: the refresh token is deliberately NOT in the tofu steps'
+          # env (review security MEDIUM) — the community provider only gets
+          # the short-lived access token. A provider-side 401 fails loud
+          # rather than the provider silently refreshing without persisting
+          # the rotation.
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
         run: |
@@ -698,7 +716,6 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
@@ -722,7 +739,6 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
@@ -745,7 +761,7 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
@@ -761,7 +777,7 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
@@ -794,7 +810,7 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
@@ -859,7 +875,7 @@ jobs:
         if: always() && steps.device.outputs.authorized == 'true' && inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
@@ -872,7 +888,7 @@ jobs:
         if: always()
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
@@ -903,7 +919,7 @@ jobs:
       - name: Revoke device-grant refresh token (always, every run)
         if: always()
         env:
-          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           # Public, constant Keycloak discovery doc (same realm for every
           # tenant) — same pattern as the device-request job. The revocation
           # endpoint is read from it at runtime, so no endpoint literal is
@@ -911,6 +927,12 @@ jobs:
           NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
         run: |
           set -uo pipefail
+          # Refresh-token handoff is a 0600 runner-local FILE (see the poll
+          # step): load it into this step's process env only — the ~30-day
+          # credential never sits in the job environment.
+          if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ] && [ -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
+            NETCUP_SCP_REFRESH_TOKEN="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
+          fi
           # M1: the runner's default shell is `bash -e` (this step defines no
           # shell: override), so errexit IS in force unless disabled — the old
           # "no set -e" claim was wrong. Teardown never owns the run verdict:

@@ -57,8 +57,8 @@
 #                            2026-09-11: tail steps 401'd after the async
 #                            apply) — see NETCUP_SCP_REFRESH_TOKEN below.
 #                            Every refresh re-appends the new value to the
-#                            runner-local $GITHUB_ENV handoff FILE (not just
-#                            shell memory: call sites refresh inside command
+#                            runner-local $GITHUB_ENV handoff (not just shell
+#                            memory: call sites refresh inside command
 #                            substitutions, whose variable updates die with
 #                            the subshell). The file lives on this runner
 #                            only and dies with it — same trust model as the
@@ -66,14 +66,21 @@
 #   NETCUP_SCP_REFRESH_TOKEN optional offline_access token from the SAME
 #                            device approval; on any 401 the REST helper
 #                            re-mints the access token from it and retries
-#                            once. This is the same runner-local $GITHUB_ENV
-#                            handoff FILE: scp_token_refresh re-reads the
-#                            newest value on entry (a subshell may already
-#                            have refreshed — the realm may rotate refresh
-#                            tokens on use) and re-appends after every
-#                            successful refresh, so a parent's retry uses
-#                            the rotated token, never the consumed one.
+#                            once. In CI the poll step hands it over as a
+#                            0600 runner-local FILE and exports only the
+#                            PATH (NETCUP_SCP_REFRESH_TOKEN_FILE), so the
+#                            ~30-day credential never enters the job env
+#                            where every later step — including the
+#                            community tofu provider — could read it.
+#                            scp_token_refresh re-reads the file on entry
+#                            (a subshell may already have rotated it) and
+#                            rewrites it after every successful rotation,
+#                            so a parent's retry uses the rotated token,
+#                            never the consumed one. The direct env var
+#                            stays supported for local harnesses (the file
+#                            wins when both are set).
 #                            Absent/empty = pre-refresh behaviour (fail loud).
+#   NETCUP_SCP_REFRESH_TOKEN_FILE  path to that 0600 file (the CI handoff).
 #   NETCUP_SCP_TOKEN_ENDPOINT Keycloak token endpoint for that refresh grant
 #                            (resolved from the OIDC discovery doc by the
 #                            device-request job; public, not a secret).
@@ -209,34 +216,40 @@ require_token() {
 #
 # Subshell/rotation safety: callers routinely refresh inside command
 # substitutions (e.g. `pid="$(own_policy_id)"`), whose in-process variable
-# updates die with the subshell. Every successful refresh therefore ALSO
-# appends both tokens to $GITHUB_ENV — the runner-local handoff FILE — and
-# the function re-reads the newest values on entry, so a parent's later 401
+# updates die with the subshell. The REFRESH token is handed over as a 0600
+# runner-local FILE ($NETCUP_SCP_REFRESH_TOKEN_FILE) — never via the job env,
+# which every later step (including the community tofu provider) can read —
+# and the function re-reads that file on entry, so a parent's later 401
 # retries with the ROTATED refresh token instead of the consumed one. The
-# file lives on this runner only and dies with it (C-d trust model unchanged).
+# ACCESS token is still appended to $GITHUB_ENV (the provider genuinely
+# consumes it) and re-adopted on entry; both live on this runner only and die
+# with it (C-d trust model unchanged).
 scp_token_refresh() {
   # Re-read the newest handoff values FIRST: a subshell may have refreshed
-  # already and the realm may have rotated the refresh token on use, so the
-  # parent's copy can be the consumed one. Append-only writes make the LAST
-  # line in the file the newest value.
+  # already and the realm may rotate the refresh token on use, so the
+  # parent's copy can be the consumed one. Every writer overwrites the whole
+  # refresh-token file, so its content is the newest value; the access-token
+  # appends are append-only, so the LAST line in $GITHUB_ENV is the newest.
+  local f_at f_rt
+  if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ] && [ -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
+    f_rt="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
+    if [ -n "$f_rt" ]; then
+      NETCUP_SCP_REFRESH_TOKEN="$f_rt"
+      export NETCUP_SCP_REFRESH_TOKEN
+    fi
+  fi
   if [ -n "${GITHUB_ENV:-}" ] && [ -f "$GITHUB_ENV" ]; then
-    local f_at f_rt
     f_at="$(grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
-    f_rt="$(grep -a '^NETCUP_SCP_REFRESH_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
     # Adoption is UNCONDITIONAL: a non-empty handoff value can only have
     # been appended by a refresh in THIS step — every step gets a fresh empty
     # $GITHUB_ENV from the runner (reviewer-verified against the runner
-    # sources), and only scp_token_refresh appends these names. Adopt the
+    # sources), and only scp_token_refresh appends this name. Adopt the
     # last (newest) value, replacing a possibly-consumed in-process copy; no
     # other guard is needed (an earlier "never resurrect" guard described a
     # harness artifact, not production).
     if [ -n "$f_at" ]; then
       NETCUP_SCP_ACCESS_TOKEN="$f_at"
       export NETCUP_SCP_ACCESS_TOKEN
-    fi
-    if [ -n "$f_rt" ]; then
-      NETCUP_SCP_REFRESH_TOKEN="$f_rt"
-      export NETCUP_SCP_REFRESH_TOKEN
     fi
   fi
   [ -n "${NETCUP_SCP_REFRESH_TOKEN:-}" ] || return 1
@@ -277,19 +290,22 @@ scp_token_refresh() {
     echo "::add-mask::$rt" >&2
     NETCUP_SCP_REFRESH_TOKEN="$rt"
     export NETCUP_SCP_REFRESH_TOKEN
+    # Persist the rotation for parent shells: rewrite the 0600 handoff file
+    # (the in-process assignment dies with a subshell). A failed rewrite is a
+    # warning, not fatal: the in-process value is already fresh.
+    if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ]; then
+      (umask 077; printf '%s' "$rt" >"$NETCUP_SCP_REFRESH_TOKEN_FILE") \
+        || warn "could not persist the rotated refresh token to $NETCUP_SCP_REFRESH_TOKEN_FILE — a parent shell's later 401 may present the consumed token"
+    fi
   fi
   # Persist the same-runner handoff: the in-process assignments above die
-  # with a subshell, so a parent's later 401 must see the rotated values.
-  # $GITHUB_ENV is a runner-local FILE that dies with the runner — the
-  # trust model is unchanged. Append (never rewrite): the newest value is
-  # the last line.
+  # with a subshell, so a parent's later 401 must see the fresh ACCESS token.
+  # $GITHUB_ENV is a runner-local FILE that dies with the runner — the trust
+  # model is unchanged. Append (never rewrite): the newest value is the last
+  # line. The refresh token goes to its 0600 file above, never here.
   if [ -n "${GITHUB_ENV:-}" ]; then
     printf 'NETCUP_SCP_ACCESS_TOKEN=%s\n' "$at" >>"$GITHUB_ENV" \
       || warn "could not persist the refreshed access token to \$GITHUB_ENV — a later step may miss the fresh token and 401"
-    if [ -n "$rt" ]; then
-      printf 'NETCUP_SCP_REFRESH_TOKEN=%s\n' "$rt" >>"$GITHUB_ENV" \
-        || warn "could not persist the rotated refresh token to \$GITHUB_ENV — a parent shell's later 401 may present the consumed token"
-    fi
   fi
   # stderr DELIBERATELY: this function runs inside api_call, and several of
   # api_call's callers are captured as data (`pid="$(own_policy_id)"`,

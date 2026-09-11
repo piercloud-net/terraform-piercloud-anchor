@@ -101,15 +101,17 @@ for fn in scp_token_refresh _api_curl api_call; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
-run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB_ENV body]
-  # Per-case handoff file: in CI the REAL $GITHUB_ENV is set, and a shared
+run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB_ENV body], [$5 seed refresh-token file]
+  # Per-case handoff files: in CI the REAL $GITHUB_ENV is set, and a shared
   # file let case 1's FAKE tokens leak into case 2 (which then adopted them)
   # — a harness artifact that previously forced a production "never
   # resurrect" guard. One file per case: hermetic, no cross-case adoption.
-  : > "$WORK/genv.$1"
+  : > "$WORK/genv.$1"; : > "$WORK/rtok.$1"
   if [ -n "${4:-}" ]; then printf '%s\n' "$4" > "$WORK/genv.$1"; fi
+  if [ -n "${5:-}" ]; then printf '%s' "$5" > "$WORK/rtok.$1"; fi
   STUB_MODE="$2" \
   GITHUB_ENV="$WORK/genv.$1" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
   STUB_CALLS="$WORK/calls.$1" STUB_SEEN="$WORK/seen.$1" \
   STUB_REFRESHED="$WORK/refreshed.$1" STUB_REFRESH_BODY="$WORK/refreshbody.$1" \
   PATH="$WORK/bin:$PATH" \
@@ -142,6 +144,8 @@ is "case1 api calls"     "2"           "$CALLS"
 is "case1 refresh calls" "1"           "$REFRESHED"
 is "case1 tokens seen"   "AT1,AT2"     "$SEEN"
 is "case1 refresh body"  "grant_type=refresh_token&client_id=scp&refresh_token=RT1" "$REFRESH_BODY"
+is "case1 rotated RT persisted to file" "RT2" "$(cat "$WORK/rtok.c1")"
+is "case1 RT NOT in GITHUB_ENV"          "0"   "$(grep -c '^NETCUP_SCP_REFRESH_TOKEN=' "$WORK/genv.c1" || true)"
 
 # ---- case 2: no refresh token → 401 stays 401, single request --------------
 run_case c2 always-401 ""
@@ -165,9 +169,10 @@ is "case3 refresh calls" "1"           "$REFRESHED"
 # lose HTTP_STATUS — see api_call's subshell warning).
 run_capture() { # $1 label, $2 mode -> CAP_RC/CAPTURED/CAP_STDOUT/CAP_STDERR/CAP_REFRESHED
   local rc=0
-  : > "$WORK/genv.$1"
+  : > "$WORK/genv.$1"; : > "$WORK/rtok.$1"
   STUB_MODE="$2" \
   GITHUB_ENV="$WORK/genv.$1" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
   STUB_CALLS="$WORK/calls.cap.$1" STUB_SEEN="$WORK/seen.cap.$1" \
   STUB_REFRESHED="$WORK/refreshed.cap.$1" \
   PATH="$WORK/bin:$PATH" \
@@ -199,23 +204,26 @@ is "case4 no stray stdout"       ""            "$CAP_STDOUT"
 is "case4 refresh banner stderr" "1"           "$(grep -c 'scp token refreshed' "$WORK/cap.err.c4" || true)"
 is "case4 refresh calls"         "1"           "$CAP_REFRESHED"
 
-# ---- case 5: adoption of the persisted handoff is UNCONDITIONAL ------------
-# A subshell refreshed and persisted RT3; the parent's in-process copy is
-# empty/consumed. With the old guarded adoption the parent bailed out (0
-# refreshes, 401); unconditional adoption must use the persisted RT3.
-run_case c5 401-then-200 "" $'NETCUP_SCP_ACCESS_TOKEN=AT3\nNETCUP_SCP_REFRESH_TOKEN=RT3'
+# ---- case 5: adoption of the persisted refresh-token FILE is UNCONDITIONAL --
+# A subshell refreshed and rewrote the handoff FILE with RT3; the parent's
+# in-process copy is empty/consumed. The parent must adopt the file's RT3
+# (with the old guarded adoption it bailed out: 0 refreshes, 401), rotate it
+# to RT2, and write RT2 back for the next parent/step.
+run_case c5 401-then-200 "" 'NETCUP_SCP_ACCESS_TOKEN=AT3' 'RT3'
 is "case5 status"          "200" "$HTTP_STATUS"
 is "case5 refresh calls"   "1"   "$REFRESHED"
 is "case5 adopted RT used" "1"   "$(case "$REFRESH_BODY" in *refresh_token=RT3*) echo 1;; *) echo 0;; esac)"
+is "case5 file rotated to RT2" "RT2" "$(cat "$WORK/rtok.c5")"
 
 # ---- case 6: a token endpoint outside the SCP realm is refused ---------------
 # A tampered/hijacked discovery document must never receive the refresh token:
 # the endpoint pin dies loudly instead of POSTing to the attacker.
 run_pin_case() {
   local rc=0
-  : > "$WORK/genv.c6"
+  : > "$WORK/genv.c6"; : > "$WORK/rtok.c6"
   STUB_MODE=401-then-200 \
   GITHUB_ENV="$WORK/genv.c6" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.c6" \
   STUB_CALLS="$WORK/calls.c6" STUB_SEEN="$WORK/seen.c6" STUB_REFRESHED="$WORK/refreshed.c6" \
   PATH="$WORK/bin:$PATH" \
   NETCUP_API_BASE="https://scp.example" \
