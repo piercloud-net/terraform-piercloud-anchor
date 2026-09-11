@@ -612,6 +612,8 @@ jobs:
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
+          # Destructive sweeps only in apply mode; other modes report-only.
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           # TTL tag piercloud-tmp-<server_id>-<run_id>, description
@@ -893,6 +895,8 @@ jobs:
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
+          # Destructive sweeps only in apply mode; other modes report-only.
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           # Sweeps this run's policy at any age + every tmp >2h + orphans.

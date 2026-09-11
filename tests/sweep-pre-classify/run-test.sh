@@ -48,11 +48,13 @@ detach_policy() {
 }
 delete_policy() { printf 'delete %s\n' "$1" >> "$STUB_ACTIONS"; }
 PRELUDE
+  extract sweep_destructive
+  extract sweep_note
   extract policy_age
   extract close_policy
   extract cmd_sweep_pre
 } > "$WORK/functions.sh"
-for fn in policy_age close_policy cmd_sweep_pre; do
+for fn in sweep_destructive sweep_note policy_age close_policy cmd_sweep_pre; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
@@ -82,10 +84,11 @@ entry() { # $1 id, $2 name, $3 age-seconds ("orphan" = unstamped description)
   fi
 }
 
-RC_OF() { local l="$1"; STUB_LIST="$2" STUB_FAIL_DETACH_PID="${STUB_FAIL_DETACH_PID:-}" PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" SERVER_ID=933556 OWN_NAME="piercloud-tmp-933556-999" TMP_TTL_SECONDS=7200 \
+RC_OF() { local l="$1" mode="${3-apply}"; STUB_LIST="$2" STUB_FAIL_DETACH_PID="${STUB_FAIL_DETACH_PID:-}" PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE="$mode" SERVER_ID=933556 OWN_NAME="piercloud-tmp-933556-999" TMP_TTL_SECONDS=7200 \
   bash -c 'set -euo pipefail; source "$1"; cmd_sweep_pre' _ "$WORK/functions.sh" > "$WORK/out.$l" 2>&1 && echo 0 || echo $?; }
 ACTIONS() { [ -f "$WORK/actions.$1" ] && paste -sd' ' "$WORK/actions.$1" || echo ""; }
 OUT() { cat "$WORK/out.$1" 2>/dev/null || echo ""; }
+SUMMARY() { [ -f "$WORK/summary.$1" ] && cat "$WORK/summary.$1" || echo ""; }
 
 # ---- case 1: nothing to sweep ----------------------------------------------
 rc=$(RC_OF c1 "[]"); is "c1 rc" "0" "$rc"
@@ -160,6 +163,30 @@ rc=$(RC_OF c12 "[$(entry 99 piercloud-tmp-933556-999 30),$(entry 98 piercloud-tm
 is "c12 rc" "0" "$rc"
 is "c12 actions" "detach 99 delete 99 detach 98 delete 98" "$(ACTIONS c12)"
 is "c12 drop count" "$(grep -c 'dropping own leftover' "$WORK/out.c12" || true)" "2"
+
+# ---- case 13: mode=check is REPORT-ONLY: nothing is detached/deleted, the
+# ----          would-be retirements land in the log + step summary ----------
+rc=$(RC_OF c13 "[$(entry 11 piercloud-tmp-933556-1 60),$(entry 99 piercloud-tmp-933556-999 30)]" check)
+is "c13 rc" "0" "$rc"
+is "c13 actions (none)" "" "$(ACTIONS c13)"
+is "c13 no destructive line" "$(grep -c 'retiring leaked tmp policy' "$WORK/out.c13" || true)" "0"
+is "c13 report-only leaked" "$(grep -c 'REPORT-ONLY (mode=check): leaked tmp policy' "$WORK/out.c13" || true)" "1"
+is "c13 report-only own" "$(grep -c 'REPORT-ONLY (mode=check): own leftover policy' "$WORK/out.c13" || true)" "1"
+is "c13 summary line" "3" "$(grep -c 'A1 sweep: pre-sweep: REPORT-ONLY' "$WORK/summary.c13" || true)"
+is "c13 clean report" "$(grep -c 'pre-sweep clean in REPORT-ONLY mode' "$WORK/out.c13" || true)" "1"
+
+# ---- case 14: mode=check still fails closed on an orphan (anomaly stays
+# ----          visible) but mutates nothing ---------------------------------
+rc=$(RC_OF c14 "[$(entry 11 piercloud-tmp-933556-1 orphan)]" check)
+is "c14 rc" "3" "$rc"
+is "c14 orphan msg" "$(grep -c 'orphan tmp policy' "$WORK/out.c14" || true)" "1"
+is "c14 actions (none)" "" "$(ACTIONS c14)"
+
+# ---- case 15: MODE unset (local invocation) is report-only too (fail-safe) --
+rc=$(RC_OF c15 "[$(entry 11 piercloud-tmp-933556-1 60)]" "")
+is "c15 rc" "0" "$rc"
+is "c15 actions (none)" "" "$(ACTIONS c15)"
+is "c15 report-only" "1" "$(grep -c 'REPORT-ONLY (mode=unset): leaked tmp policy' "$WORK/out.c15" || true)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

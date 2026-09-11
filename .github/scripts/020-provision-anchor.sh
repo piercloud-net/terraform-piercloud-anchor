@@ -175,10 +175,26 @@ esac
 all_digits() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
 valid_mac() { printf '%s' "$1" | grep -qE '^[0-9a-fA-F:]{17}$'; }
 
+# Sweep mode gate (review security MEDIUM): only apply may detach/delete
+# policies. check/update-ip/destroy — and an invocation with MODE unset
+# (local use) — are report-only: they classify and fail closed on anomalies,
+# but never mutate. provision.yml passes MODE: ${{ inputs.mode }} to both
+# sweep steps.
+sweep_destructive() {
+  [ "$MODE" = "apply" ]
+}
+sweep_note() { # $1 = message -> log + step summary (report-only evidence)
+  log "$1"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf 'A1 sweep: %s\n' "$1" >>"$GITHUB_STEP_SUMMARY"
+  fi
+}
+
 NETCUP_API_BASE="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
 SERVER_ID="${SERVER_ID:-}"
 SCP_USER_ID="${SCP_USER_ID:-}"
 RUN_ID="${RUN_ID:-}"
+MODE="${MODE:-}"
 # lock-password is the SSH-only finally-path (no API use): it must run even
 # when resolve never produced ids, so it is exempt from the id guards.
 case "$CMD" in
@@ -538,11 +554,12 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 # orphan BEFORE any mutation -> retire EVERY non-own tmp (aged >2h or
 # leaked-fresh) -> drop this run's own leftovers (open recreates the window).
 #
-# SINGLE-WRITER ASSUMPTION (why retiring a FRESH non-own tmp is safe here):
-# provision.yml pins concurrency.group=piercloud-netcup-policy, a STATIC
-# literal that serializes every run of THIS workflow for EVERY tenant, so at
-# pre-sweep no other run of this repo can hold a tmp. It does NOT serialize
-# another repo sharing the same netcup account — two writers on one account
+# SINGLE-WRITER-PER-ACCOUNT ASSUMPTION (why retiring a FRESH non-own tmp is
+# safe here): provision.yml pins concurrency.group=piercloud-netcup-policy, a
+# STATIC literal that serializes every run of THIS workflow for EVERY tenant,
+# so at pre-sweep no other run of this repo can hold a tmp. It does NOT
+# serialize another repo sharing the same netcup account — one account must
+# have exactly ONE writer (this repo's workflow); two writers on one account
 # are out of contract. The tradeoff is deliberate: an attached leaked tmp
 # keeps admitting a stale runner /32 to :22 for as long as it lives (GitHub
 # recycles runner IPs), so the fresh leak is retired now rather than at 2h.
@@ -581,33 +598,57 @@ cmd_sweep_pre() {
 "
   done < <(printf '%s' "$list" | jq -c '.[]')
   # Pass 2 — retire every non-own tmp (close_policy = detach-then-delete),
-  # then this run's own leftovers. A failed retire stays fail-closed.
+  # then this run's own leftovers. A failed retire stays fail-closed. All of
+  # this mutates ONLY in apply mode: report-only modes enumerate and log the
+  # would-be retirements (plus a step-summary line) instead.
   local rest rp rn ra
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     rp="${entry%%|*}"; rest="${entry#*|}"
     rn="${rest%%|*}"; ra="${rest#*|}"
     if [ "$ra" -gt "$TMP_TTL_SECONDS" ]; then
-      log "pre-sweep: retiring aged tmp policy '$rn' (age ${ra}s — its run is long gone)"
       aged=$((aged + 1))
+      if sweep_destructive; then
+        log "pre-sweep: retiring aged tmp policy '$rn' (age ${ra}s — its run is long gone)"
+      else
+        sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): aged tmp policy '$rn' (age ${ra}s) would be retired by an apply run"
+      fi
     else
+      leaked=$((leaked + 1))
       # GitHub recycles runner IPs: a leaked tmp keeps admitting a stale
       # runner /32 to :22 for as long as it lives. The mutex means its run
       # is dead — retire it now instead of waiting for the 2h age.
-      log "pre-sweep: retiring leaked tmp policy '$rn' (age ${ra}s — its run is dead under the workflow mutex)"
-      leaked=$((leaked + 1))
+      if sweep_destructive; then
+        log "pre-sweep: retiring leaked tmp policy '$rn' (age ${ra}s — its run is dead under the workflow mutex)"
+      else
+        sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): leaked tmp policy '$rn' (age ${ra}s) would be retired by an apply run"
+      fi
     fi
-    close_policy "$rp" || surplus_fail "could not retire tmp policy '$rn' — operator must clean up by hand."
+    if sweep_destructive; then
+      close_policy "$rp" || surplus_fail "could not retire tmp policy '$rn' — operator must clean up by hand."
+    fi
   done <<<"$classify"
   if [ "$aged" -gt 0 ] || [ "$leaked" -gt 0 ]; then
-    log "pre-sweep: retired $aged aged + $leaked leaked tmp polic(ies)"
+    if sweep_destructive; then
+      log "pre-sweep: retired $aged aged + $leaked leaked tmp polic(ies)"
+    else
+      sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): $aged aged + $leaked leaked tmp polic(ies) need attention — run mode=apply to retire them"
+    fi
   fi
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
-    log "pre-sweep: dropping own leftover policy $entry (hard-killed attempt of this run)"
-    close_policy "$entry"
+    if sweep_destructive; then
+      log "pre-sweep: dropping own leftover policy $entry (hard-killed attempt of this run)"
+      close_policy "$entry"
+    else
+      sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): own leftover policy $entry would be dropped by an apply run"
+    fi
   done <<<"$owns"
-  log "pre-sweep clean"
+  if sweep_destructive; then
+    log "pre-sweep clean"
+  else
+    sweep_note "pre-sweep clean in REPORT-ONLY mode (mode=${MODE:-unset}); no policy was retired"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1122,6 +1163,8 @@ cmd_close() {
 # sweep-post: delete own-run any-age + tmp >2h + orphans. Fails loudly if any
 # delete fails (an orphan window must never pass silently). No token (auth
 # never completed) = clean no-op so `always()` keeps the original verdict.
+# Destructive ONLY in apply mode (sweep_destructive): the other modes report
+# what would be swept + append it to the step summary, and delete nothing.
 # ---------------------------------------------------------------------------
 cmd_sweep_post() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
@@ -1137,15 +1180,19 @@ cmd_sweep_post() {
     pid="$(printf '%s' "$entry" | jq -r '.id')"
     age="$(policy_age "$desc")"
     if [ "$name" = "$OWN_NAME" ] || [ "$age" = "orphan" ] || [ "$age" -gt "$TMP_TTL_SECONDS" ]; then
-      if [ "$age" = "orphan" ]; then
-        warn "post-sweep: orphan tmp policy '$name' — sweeping"
+      if sweep_destructive; then
+        if [ "$age" = "orphan" ]; then
+          warn "post-sweep: orphan tmp policy '$name' — sweeping"
+        else
+          log "post-sweep: sweeping '$name' (age ${age}s)"
+        fi
+        if close_policy "$pid"; then
+          swept=$((swept + 1))
+        else
+          failures=$((failures + 1))
+        fi
       else
-        log "post-sweep: sweeping '$name' (age ${age}s)"
-      fi
-      if close_policy "$pid"; then
-        swept=$((swept + 1))
-      else
-        failures=$((failures + 1))
+        sweep_note "post-sweep: REPORT-ONLY (mode=${MODE:-unset}): tmp policy '$name' (age ${age}s) would be swept by an apply run"
       fi
     fi
   done < <(printf '%s' "$list" | jq -c '.[]')
@@ -1158,7 +1205,15 @@ cmd_sweep_post() {
   # attached policy is never touched.
   local steady attached mac
   mac="$(resolve_mac)"
-  attached="$(iface_fw_get "$mac" | jq -c '[.userPolicies[]? | (.id | tostring)]')"
+  # Attached-list parse (review security MEDIUM/LOW): every other reader uses
+  # (.id // .), while `(.id | tostring)` here turned a string-shaped/missing
+  # id into ["null"], so
+  # EVERY steady policy looked unattached and the attached (live) one got
+  # deleted. Require a real userPolicies array and stringify BOTH sides of the
+  # comparison: an unparseable/missing attached list is ambiguous, and
+  # ambiguity must NEVER delete (hard failure instead).
+  attached="$(iface_fw_get "$mac" | jq -ce 'if (.userPolicies | type) == "array" then [.userPolicies[] | if (.id // .) == null then error("userPolicies entry without an id") else ((.id // .) | tostring) end] else error("userPolicies missing or not an array") end')" \
+    || die "could not parse the attached-policy list for $SERVER_ID/$mac — refusing the steady-state orphan sweep on unproven attachment state"
   steady="$(list_steady_policies)"
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
@@ -1168,11 +1223,15 @@ cmd_sweep_post() {
       log "post-sweep: steady-state policy '$name' (id ${pid}) is attached — kept"
       continue
     fi
-    warn "post-sweep: steady-state ORPHAN '$name' (id ${pid}) — retiring (not attached)"
-    if close_policy "$pid"; then
-      swept=$((swept + 1))
+    if sweep_destructive; then
+      warn "post-sweep: steady-state ORPHAN '$name' (id ${pid}) — retiring (not attached)"
+      if close_policy "$pid"; then
+        swept=$((swept + 1))
+      else
+        failures=$((failures + 1))
+      fi
     else
-      failures=$((failures + 1))
+      sweep_note "post-sweep: REPORT-ONLY (mode=${MODE:-unset}): steady-state ORPHAN '$name' (id ${pid}) is not attached — would be retired by an apply run"
     fi
   done < <(printf '%s' "$steady" | jq -c '.[]')
   log "post-sweep done: swept=$swept failures=$failures"
