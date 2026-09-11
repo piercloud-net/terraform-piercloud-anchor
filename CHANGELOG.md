@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 - Approval card in its own job so it renders live (closes #24)
 - Passwordless bootstrap + zero-IP discovery (closes #50)
 - Caddy dashboard TLS + custom-domain pattern (closes #49)
+- *(dashboard)* Dashboard host status-<tenant> — one flat label, Universal SSL (closes #106)
 
 ### 🐛 Bug Fixes
 
@@ -55,6 +56,8 @@ All notable changes to this project will be documented in this file.
 - Working tap targets + ntfy out of bootstrap (closes #30, closes #31)
 - Passwordless-first framing in usage.md (closes #50)
 - Two-leg edge/origin TLS ceremony + wildcard Origin CA pair (closes #90)
+- Review protocol — independent review, security first (closes #108)
+- Data trust disclosure — at rest, in transit, at runtime (closes #103)
 
 ### ⚙️ Miscellaneous Tasks
 
