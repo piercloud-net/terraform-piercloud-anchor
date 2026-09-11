@@ -538,13 +538,12 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           SERVER_ID: ${{ env.SERVER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
+          ANCHOR_HOSTNAME: ${{ env.ANCHOR_HOSTNAME }}
         run: |
           set -euo pipefail
           # Stateless re-adopt: the ephemeral runner holds no state, so every
-          # apply re-imports the adopted server before planning — otherwise a
-          # stateless re-run would duplicate the firewall policy instead of
-          # converging. Server only: the policy id is account-side and not
-          # known pre-apply (first live apply confirms the create path).
+          # apply re-imports what it must converge instead of duplicating it.
           # Generated at runtime, never committed; removed post-apply below.
           cat > .workflow-import.tf <<EOF
           import {
@@ -553,6 +552,35 @@ jobs:
           }
           EOF
           echo "Wrote .workflow-import.tf for server $SERVER_ID."
+
+          # Firewall policy re-adopt (cap fix, issue #101): the policy id IS
+          # known pre-apply — read the ATTACHED policy off the interface; its
+          # name is deterministic (module local.policy_name). Import → Read →
+          # in-place PUT (provider has no ForceNew): create path only when no
+          # matching policy is attached. Fail closed on ambiguity.
+          SCP="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
+          POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}-${SERVER_ID}"
+          MAC="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
+            "$SCP/api/v1/servers/${SERVER_ID}/interfaces" \
+            | jq -r 'if type == "array" then .[0] elif has("data") then .data[0] elif has("items") then .items[0] elif has("interfaces") then .interfaces[0] else . end | .mac // empty')"
+          [ -n "$MAC" ] || { echo "No interface MAC resolved — refusing to guess the firewall policy" >&2; exit 1; }
+          POLICY_ID="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
+            "$SCP/api/v1/servers/${SERVER_ID}/interfaces/${MAC}/firewall" \
+            | jq -r --arg n "$POLICY_NAME" '[.userPolicies[]? | select(.name == $n) | .id | tostring] | if length == 0 then "" elif length == 1 then .[0] else "AMBIGUOUS" end')"
+          case "$POLICY_ID" in
+            "") echo "No attached steady-state policy named $POLICY_NAME — create path (first apply)." ;;
+            AMBIGUOUS)
+              echo "More than one attached policy named $POLICY_NAME — refusing to guess; clean up in SCP and re-dispatch." >&2
+              exit 1 ;;
+            *)
+              cat >> .workflow-import.tf <<EOF
+          import {
+            to = netcup_scp_user_firewall_policy.tang[0]
+            id = "${SCP_USER_ID}/${POLICY_ID}"
+          }
+          EOF
+              echo "Firewall policy ${POLICY_ID} will be re-adopted (create only if absent)." ;;
+          esac
 
       - name: tofu plan (ephemeral token, never state)
         if: inputs.mode == 'apply'

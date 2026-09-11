@@ -42,7 +42,9 @@
 #   close      detach-then-delete the run's own tmp policy, always in that
 #              order; missing policy is a success no-op (idempotent).
 #   sweep-post delete this run's policy at any age + every tmp older than 2h
-#              (+ orphans: no valid created_at). Tolerates a missing token
+#              (+ orphans: no valid created_at) + UNATTACHED steady-state
+#              orphans (issue #101 — the create-per-run leak). Tolerates a
+#              missing token
 #              (auth never completed -> nothing created -> clean no-op) so the
 #              workflow `always()` post step never masks the real failure.
 #
@@ -149,6 +151,8 @@ esac
 
 TMP_PREFIX="piercloud-tmp-${SERVER_ID}-"
 OWN_NAME="piercloud-tmp-${SERVER_ID}-${RUN_ID}"
+# Steady-state (module-managed) policy family: piercloud-anchor-<hostname>-<server_id>.
+STEADY_PREFIX="piercloud-anchor-"
 
 require_token() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
@@ -202,6 +206,23 @@ api_ok() { # $1 = status; 2xx (+404-as-gone when $2=gone-ok)
 }
 
 policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
+
+list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
+  local resp
+  api_call GET "$(policies_path)" "" resp
+  api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
+  printf '%s' "$resp" | jq -c \
+    'if type == "array" then .
+     elif has("firewallPolicies") then .firewallPolicies
+     elif has("data") then .data
+     elif has("items") then .items
+     elif has("policies") then .policies
+     elif has("firewallPolicy") then [.firewallPolicy]
+     else [] end
+     | map(select(((.name // "") | startswith($p)) and ((.name // "") | endswith($s)))
+           | {id: .id, name: .name, description: (.description // "")})' \
+    --arg p "$STEADY_PREFIX" --arg s "-${SERVER_ID}"
+}
 
 list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only)
   local resp
@@ -918,6 +939,32 @@ cmd_sweep_post() {
       fi
     fi
   done < <(printf '%s' "$list" | jq -c '.[]')
+  # Steady-state orphans (pre-import backlog, issue #101): stateless applies
+  # before the conditional import created a fresh
+  # piercloud-anchor-<hostname>-<server_id> policy each run and orphaned the
+  # previous one (cap incidents 2026-09-10). Any policy in that family that is
+  # NOT attached is a leftover by definition — retire it (close_policy is
+  # detach-then-delete; the detach no-ops when it is already unattached). The
+  # attached policy is never touched.
+  local steady attached mac
+  mac="$(resolve_mac)"
+  attached="$(iface_fw_get "$mac" | jq -c '[.userPolicies[]? | (.id | tostring)]')"
+  steady="$(list_steady_policies)"
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="$(printf '%s' "$entry" | jq -r '.name')"
+    pid="$(printf '%s' "$entry" | jq -r '.id')"
+    if printf '%s' "$attached" | jq -e --arg id "$pid" 'index($id) != null' >/dev/null 2>&1; then
+      log "post-sweep: steady-state policy '$name' (id ${pid}) is attached — kept"
+      continue
+    fi
+    warn "post-sweep: steady-state ORPHAN '$name' (id ${pid}) — retiring (not attached)"
+    if close_policy "$pid"; then
+      swept=$((swept + 1))
+    else
+      failures=$((failures + 1))
+    fi
+  done < <(printf '%s' "$steady" | jq -c '.[]')
   log "post-sweep done: swept=$swept failures=$failures"
   if [ "$failures" -ne 0 ]; then
     die "post-sweep left $failures tmp polic(ies) behind — operator must clean up by hand"
