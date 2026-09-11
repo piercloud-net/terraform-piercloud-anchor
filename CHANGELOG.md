@@ -44,6 +44,7 @@ All notable changes to this project will be documented in this file.
 - Read the DNS proxied flag without jq's false-as-empty trap (closes #85)
 - Converge tang key material to one bindable set (closes #87)
 - Probe the Caddy :443 origin with SNI (closes #92)
+- *(aop)* Verify the client cert + Caddy 2.11.4 + AOP-aware :443 proof (closes #97)
 
 ### 📚 Documentation
 
@@ -58,6 +59,7 @@ All notable changes to this project will be documented in this file.
 - Relicense MIT -> Apache-2.0 ([#6](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/6))
 - Allowlist tasks/users SCP endpoints (closes #50)
 - Mock-tang bind-proof e2e through real Caddy render (closes #57)
+- External-watch — GitHub-side cron probes the public dashboard (closes #94)
 
 
 ## [Unreleased]
