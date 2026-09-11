@@ -196,6 +196,13 @@ openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${
   source "${WORK}/aop-stanza.src"
   caddy_status_names
   render_caddyfile > "${WORK}/Caddyfile.aopsrv" )
+# The CI runners already listen on :80: serve the vhost with the automatic
+# HTTP->HTTPS redirect listener disabled (it would bind :80 and die). The render
+# emits its own global options block, so the directive is merged into that one
+# (a second global block would be rejected). Client auth is unaffected.
+awk '!done && $0=="{" { print; print "\tauto_https disable_redirects"; done=1; next } { print }' \
+  "${WORK}/Caddyfile.aopsrv" > "${WORK}/Caddyfile.aopsrv.tmp"
+mv "${WORK}/Caddyfile.aopsrv.tmp" "${WORK}/Caddyfile.aopsrv"
 HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.aopsrv" --adapter caddyfile >"${WORK}/caddy-aop.log" 2>&1 &
 AOP_CADDY_PID=$!
 ok=0
