@@ -545,13 +545,17 @@ jobs:
           # Stateless re-adopt: the ephemeral runner holds no state, so every
           # apply re-imports what it must converge instead of duplicating it.
           # Generated at runtime, never committed; removed post-apply below.
-          cat > .workflow-import.tf <<EOF
+          # NOT a dotfile: Terraform/OpenTofu silently IGNORE files whose names
+          # start with `.` — the previous `.workflow-import.tf` was never loaded,
+          # so no import ever happened and every apply created a new firewall
+          # policy (proven locally: dotfile → "1 to add", renamed → "1 to import").
+          cat > workflow-import.tf <<EOF
           import {
             to = netcup_scp_server.anchor[0]
             id = "$SERVER_ID"
           }
           EOF
-          echo "Wrote .workflow-import.tf for server $SERVER_ID."
+          echo "Wrote workflow-import.tf for server $SERVER_ID."
 
           # Firewall policy re-adopt (cap fix, issue #101): the policy id IS
           # known pre-apply — read the ATTACHED policy off the interface; its
@@ -573,7 +577,7 @@ jobs:
               echo "More than one attached policy named $POLICY_NAME — refusing to guess; clean up in SCP and re-dispatch." >&2
               exit 1 ;;
             *)
-              cat >> .workflow-import.tf <<EOF
+              cat >> workflow-import.tf <<EOF
           import {
             to = netcup_scp_user_firewall_policy.tang[0]
             id = "${SCP_USER_ID}/${POLICY_ID}"
@@ -622,7 +626,7 @@ jobs:
           # DETACH the runner's /32 window, so the ssh handoff timed out.
           tofu apply -input=false -auto-approve tfplan
           # Import-apply-discard: the generated import served its one run.
-          rm -f .workflow-import.tf
+          rm -f workflow-import.tf
 
       - name: A1 open (TTL-tagged single-/32 window, after steady state)
         id: a1-open

@@ -7,8 +7,10 @@
 crash.log
 crash.*.log
 
-# Workflow-generated stateless import (import-apply-discard) — runtime only
+# Workflow-generated stateless import (import-apply-discard) — runtime only.
+# No leading dot: HCL loaders ignore dotfiles (that bug made the import a no-op).
 .workflow-import.tf
+workflow-import.tf
 
 # Local overrides / scratch
 .local/
