@@ -93,9 +93,8 @@ token, provisions, and the token dies with the runner — the run revokes the de
 STOP + open an issue in your repo so the operator sees it (C-A — no fallback exists, none is permitted).
 
 If the runner is killed or the run is cancelled before teardown, the run's
-refresh token can stay live for up to ~30 days — revoke your offline session
-for this anchor's tenant in netcup's Keycloak (SCP) admin/account UI, then
-re-dispatch `mode=apply`.
+refresh token can stay live for up to ~30 days — recovery: [dr.md, "Runner
+killed or run cancelled before teardown" row](dr.md#dr-table).
 
 ## 4. A1 provisions, thumbprint lands via run artifact (H1 chain)
 

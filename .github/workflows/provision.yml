@@ -644,7 +644,11 @@ jobs:
           # committed .terraform.lock.hcl + `-lockfile=readonly` below pin
           # and verify the exact provider binaries (N3). A provider-side 401
           # fails loud rather than refreshing without persisting the
-          # rotation.
+          # rotation. Scope: the lock pins the exact build + hashes and fails
+          # closed on a mismatch; it is NOT a defense against a malicious
+          # upstream release, and the 0600 handoff file stays readable by
+          # same-UID processes on this runner (both accepted, disclosed
+          # limits).
           TF_IN_AUTOMATION: "true"
         run: |
           set -euo pipefail
