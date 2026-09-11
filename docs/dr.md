@@ -78,8 +78,8 @@ Caddy (`caddy:2.11.4-alpine`, pinned + Renovate-watched) owns `:80`;
 (`127.0.0.1:8080`, Caddy proxies the status host to it). The Caddyfile is
 dispatch-managed (same render pattern as the Gatus config): `handle /adv* +
 /rec*` → `127.0.0.1:8081` plain, NO redirect; `/.well-known/acme-challenge/*`
-→ HTTP-01; the exact status hostname (`host status.<tenant>.piercloud.net`,
-rendered from TENANT_USER — `status.invalid` sentinel on hand runs) →
+→ HTTP-01; the exact status hostname (`host status-<tenant>.piercloud.net`,
+rendered from TENANT_USER — `status-invalid.invalid` sentinel on hand runs) →
 `127.0.0.1:8080`; explicit per-tenant site
 blocks, NEVER `on_demand` TLS; catch-all aborts. Tang paths are never served
 on the `:443` dashboard vhost (they abort there). Caddy runs with host
@@ -92,16 +92,14 @@ to `:8081/adv` before any proxy proof runs.
 Operator edge ceremony (operator-plane, verified by eye after each change;
 the DNS-edit token the anchor run holds cannot set these, so it stays outside
 the public repo — codification target: the private operator control plane).
-**Two TLS legs must both be up — they fail independently, and the dashboard
-host is two labels deep:**
+**Two TLS legs must both be up — they fail independently:**
 
-- **Leg 1 — visitor → edge.** `status.<tenant>.piercloud.net` is two labels
-  deep, so Cloudflare's free Universal SSL (apex + one label) does NOT cover
-  it. Enable **Advanced Certificate Manager** ($10/mo per zone) and
-  **Total TLS**, or order an advanced certificate carrying the wildcard SANs
-  (`*.pier.piercloud.net`, later `*.user.piercloud.net`; up to 50 SANs per
-  cert). Without this the edge aborts the handshake
-  (`SSLV3_ALERT_HANDSHAKE_FAILURE`).
+- **Leg 1 — visitor → edge.** The dashboard host
+  `status-<tenant>.piercloud.net` is ONE flat label, so Cloudflare's free
+  Universal SSL (apex + one label) covers it — the dashboard needs no
+  **Advanced Certificate Manager** / **Total TLS**. If a two-label hostname is
+  ever needed on this zone, ACM returns; gate/timing is tracked in issue
+  #107.
 - **Leg 2 — edge → origin.** Full (Strict) needs a valid origin cert on the
   box. Do NOT rely on Caddy auto-TLS (HTTP-01) for proxied two-label hosts:
   Always-Use-HTTPS redirects the challenge to https, and the https follow-up

@@ -113,7 +113,7 @@ logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the
 repo retention setting. **Save the thumbprint in your PM NOW** (and finish
 the [day-1 checklist](dr.md#day-1-off-device-checklist)).
 
-The run also creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://status.<you>.piercloud.net` (TLS terminated on the box by Caddy; nothing to enter).
+The run also creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://status-<you>.piercloud.net` (TLS terminated on the box by Caddy; nothing to enter).
 
 ## 5. Bind your main box (clevis) — at its keyboard, not your phone
 
