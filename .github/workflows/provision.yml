@@ -191,6 +191,14 @@ jobs:
         id: request
         run: |
           set -euo pipefail
+          # Handoff-write guard (review security): API-derived values are
+          # written to $GITHUB_OUTPUT line-by-line, so a crafted value with an
+          # embedded newline would forge additional outputs. Reject newline/CR
+          # and any non-printable characters before every such write.
+          guard_line() { # $1 label, $2 API-derived value
+            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
+            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
+          }
           # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
           # (prior literals were probed, never recorded). Endpoints are
           # recovered from the Keycloak OIDC discovery document FIRST.
@@ -248,6 +256,9 @@ jobs:
           # Handoff to the poll job (device_code only: short-lived,
           # user-mediated, already log-printed. The ACCESS token is minted
           # and consumed inside the poll job — it never crosses jobs (C-d).
+          guard_line "device_code" "$DEVICE_CODE"
+          guard_line "token_endpoint" "$TOKEN_ENDPOINT"
+          guard_line "interval" "$INTERVAL"
           echo "device_code=$DEVICE_CODE" >> "$GITHUB_OUTPUT"
           echo "token_endpoint=$TOKEN_ENDPOINT" >> "$GITHUB_OUTPUT"
           echo "interval=$INTERVAL" >> "$GITHUB_OUTPUT"
@@ -297,6 +308,13 @@ jobs:
           INTERVAL: ${{ needs.device-request.outputs.interval }}
         run: |
           set -euo pipefail
+          # Handoff-write guard (review security): the token response is
+          # API-derived; a crafted value with an embedded newline would forge
+          # additional $GITHUB_ENV lines (e.g. redirect NETCUP_API_BASE).
+          guard_line() { # $1 label, $2 API-derived value
+            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
+            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
+          }
           # No re-mask (see request job): masked values can't cross via outputs;
           # the code arrives unmasked by design and is never printed anywhere.
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
@@ -313,6 +331,7 @@ jobs:
             case "$STATUS" in
               ok)
                 ACCESS_TOKEN="$(echo "$POLL" | jq -r '.access_token')"
+                guard_line "access_token" "$ACCESS_TOKEN"
                 echo "::add-mask::$ACCESS_TOKEN"
                 echo "authorized=true" >> "$GITHUB_OUTPUT"
                 # M2 same-job handoff: the token persists ONLY in this
@@ -329,6 +348,9 @@ jobs:
                 # handoff, dies with the runner (C-d trust model unchanged).
                 REFRESH_TOKEN="$(echo "$POLL" | jq -r '.refresh_token // empty')"
                 if [ -n "$REFRESH_TOKEN" ]; then
+                  guard_line "refresh_token" "$REFRESH_TOKEN"
+                  # Discovery-derived: guard again at the write (defense in depth).
+                  guard_line "token_endpoint" "$TOKEN_ENDPOINT"
                   echo "::add-mask::$REFRESH_TOKEN"
                   echo "NETCUP_SCP_REFRESH_TOKEN=$REFRESH_TOKEN" >> "$GITHUB_ENV"
                   echo "NETCUP_SCP_TOKEN_ENDPOINT=$TOKEN_ENDPOINT" >> "$GITHUB_ENV"
@@ -384,6 +406,14 @@ jobs:
           TENANT_USER: ${{ vars.TENANT_USER }}
         run: |
           set -euo pipefail
+          # Handoff-write guard (review security): every API-derived value
+          # below reaches $GITHUB_ENV/$GITHUB_OUTPUT; reject newline/CR and
+          # non-printable characters so a crafted response cannot forge extra
+          # env lines (e.g. redirecting NETCUP_API_BASE with the token).
+          guard_line() { # $1 label, $2 API-derived value
+            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
+            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
+          }
           # The numeric server id is the stable key (policy names, tmp tags,
           # module adopt) but it appears in no email — so the run resolves it
           # itself. Runs before every consumer below; ids are identifiers,
@@ -398,6 +428,10 @@ jobs:
           SAN="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
           [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."; exit 1; }
           HOSTNAME="anchor-${SAN}-01"
+          # Vendor variables are trusted less than they look: a newline in the
+          # repo variable survives the sanitize sed (line-oriented) and would
+          # forge an extra $GITHUB_ENV line. Reject before the write.
+          guard_line "ANCHOR_HOSTNAME" "$HOSTNAME"
           echo "ANCHOR_HOSTNAME=$HOSTNAME" >> "$GITHUB_ENV"
           echo "Derived hostname $HOSTNAME."
           # SCP user id: NEVER the customer number (live 403 proved they
@@ -413,6 +447,11 @@ jobs:
             [ -n "$SCP_EFF" ] || { echo "::error::userinfo returned no numeric id — token scope may lack openid, or the grant changed. Escalate, no fallback."; exit 1; }
             echo "Resolved SCP user id=$SCP_EFF from token userinfo."
           fi
+          # Parse-time validation (review security): the userinfo id is
+          # interpolated into API paths, TF vars and policy-import HCL — it
+          # must be all-digits before it goes anywhere. Fail closed.
+          case "$SCP_EFF" in '' | *[!0-9]*) echo "::error::resolved SCP user id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
+          guard_line "SCP_USER_ID_EFF" "$SCP_EFF"
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
           # Approver guard (issue #50): the device approval the tenant
           # already tapped is the ONLY authorization moment — prove it came
@@ -491,6 +530,11 @@ jobs:
               exit 1
             fi
           fi
+          # Parse-time validation (review security): the discovered server id
+          # is interpolated into API paths and the generated import HCL — it
+          # must be all-digits before it goes anywhere. Fail closed.
+          case "$RESOLVED_ID" in '' | *[!0-9]*) echo "::error::resolved server id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
+          guard_line "SERVER_ID" "$RESOLVED_ID"
           echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
           # SSH/DNS target: the pasted IP wins when set (legacy,
           # byte-for-byte); else the server detail's first IPv4 (IPv6-only
@@ -505,6 +549,11 @@ jobs:
             [ -n "$HOST4" ] || { echo "::error::server $RESOLVED_ID reports no IPv4 address (IPv6-only is unsupported — runners have no IPv6). Attach an IPv4, or set ANCHOR_IPV4 and re-dispatch."; exit 1; }
             echo "Discovery: anchor IPv4 from server detail, no pasted IP needed."
           fi
+          # Parse-time validation (review security): the SSH/DNS target must
+          # be a bare IPv4 (both the pasted-secret and the API-derived path) —
+          # it is interpolated into runner shell and $GITHUB_OUTPUT. Fail closed.
+          case "$HOST4" in '' | *[!0-9.]*) echo "::error::anchor host is not a bare IPv4 — refusing to use it (injection guard)."; exit 1 ;; esac
+          guard_line "ANCHOR_HOST" "$HOST4"
           echo "ANCHOR_HOST=$HOST4" >> "$GITHUB_ENV"
           echo "anchor_ipv4=$HOST4" >> "$GITHUB_OUTPUT"
           echo "Resolved server_id=$RESOLVED_ID (ssh/dns target set)."
