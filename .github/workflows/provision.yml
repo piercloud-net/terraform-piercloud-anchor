@@ -694,6 +694,10 @@ jobs:
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces" \
             | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
           [ -n "$MAC" ] || { echo "No interface MAC resolved — refusing to guess the firewall policy" >&2; exit 1; }
+          # Newline-safe (review security N2): grep is line-oriented, so a
+          # value with an embedded newline matched its first line; reject
+          # newline/CR explicitly before the whole-value shape check.
+          case "$MAC" in '' | *[$'\n\r']*) echo "::error::resolved interface MAC contains a newline/CR — refusing to interpolate it (injection guard)."; exit 1 ;; esac
           printf '%s' "$MAC" | grep -qE '^[0-9a-fA-F:]{17}$' || { echo "::error::resolved interface MAC is not a 17-char hex/colon value — refusing to interpolate it (injection guard)."; exit 1; }
           POLICY_ID="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces/${MAC}/firewall" \

@@ -173,7 +173,14 @@ esac
 # crafted API response is not a source of shell syntax. Fail closed, never
 # fall back.
 all_digits() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
-valid_mac() { printf '%s' "$1" | grep -qE '^[0-9a-fA-F:]{17}$'; }
+valid_mac() {
+  # Whole-value anchor, newline-safe (review security N2): grep is
+  # line-oriented, so 'aa:bb:cc:dd:ee:ff\nanything' matched its FIRST line
+  # and passed. Reject newline/CR explicitly, then anchor the whole
+  # (necessarily single-line) value.
+  case "$1" in '' | *[$'\n\r']*) return 1 ;; esac
+  printf '%s' "$1" | grep -qE '^[0-9a-fA-F:]{17}$'
+}
 
 # Sweep mode gate (review security MEDIUM): only apply may detach/delete
 # policies. check/update-ip/destroy — and an invocation with MODE unset
