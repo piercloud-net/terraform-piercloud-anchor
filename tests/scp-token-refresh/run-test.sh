@@ -59,6 +59,8 @@ if [ "$url" = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-conn
   if [ -n "${STUB_REFRESH_BODY:-}" ]; then printf '%s' "${body#&}" > "$STUB_REFRESH_BODY"; fi
   case "$STUB_MODE" in
     refresh-bad) printf 'this is not json' ;;
+    refresh-inject-at) printf '%s' '{"access_token":"AT2\nNETCUP_API_BASE=http://attacker","refresh_token":"RT2"}' ;;
+    refresh-inject-rt) printf '%s' '{"access_token":"AT2","refresh_token":"RT2\nNETCUP_API_BASE=http://attacker"}' ;;
     *)           printf '{"access_token":"AT2","refresh_token":"RT2"}' ;;
   esac
   exit 0
@@ -94,10 +96,11 @@ extract() { awk "/^$1\\(\\) \\{/,/^\\}/" "$SCRIPT"; }
   echo 'log() { printf "A1: %s\n" "$*"; }'
   echo 'die() { printf "A1 FAIL: %s\n" "$*" >&2; exit 1; }'
   extract scp_token_refresh
+  extract guard_token_value
   extract _api_curl
   extract api_call
 } > "$WORK/functions.sh"
-for fn in scp_token_refresh _api_curl api_call; do
+for fn in scp_token_refresh guard_token_value _api_curl api_call; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
@@ -237,6 +240,53 @@ run_pin_case
 is "case6 pin refused (rc != 0)" "1" "$([ "$PIN_RC" -ne 0 ] && echo 1 || echo 0)"
 is "case6 no refresh sent"       "0" "$([ -f "$WORK/refreshed.c6" ] && wc -l < "$WORK/refreshed.c6" | tr -d ' ' || echo 0)"
 is "case6 loud error"            "1" "$(grep -c 'refusing to send the refresh token' "$WORK/pin.err" || true)"
+
+# ---- cases 7+8: injected token values are refused BEFORE any handoff write ---
+# Review SECURITY N0 (live-proven): the workflow's poll step guards the FIRST
+# token response, but this refresh path (~every 401 after 5 min) did not. A
+# crafted response whose access_token or refresh_token carries an embedded
+# newline (jq -r emits the real byte) forged a second $GITHUB_ENV line — every
+# later step inherited it, so ${NETCUP_API_BASE:-…} sent the Bearer token to
+# the attacker while the run stayed green. Fail closed BEFORE masking, the env
+# append and the 0600 file write: the env file keeps exactly its seeded single
+# line and the refresh-token file keeps its old value.
+run_inject() { # $1 label, $2 mode -> INJ_RC / inj.out.$1 / inj.err.$1 / per-case files
+  local rc=0
+  printf 'NETCUP_SCP_ACCESS_TOKEN=AT1\n' > "$WORK/genv.$1"
+  printf 'RT0' > "$WORK/rtok.$1"
+  STUB_MODE="$2" \
+  GITHUB_ENV="$WORK/genv.$1" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
+  STUB_CALLS="$WORK/calls.$1" STUB_SEEN="$WORK/seen.$1" \
+  STUB_REFRESHED="$WORK/refreshed.$1" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="RT1" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" \
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    out=""
+    api_call GET "/api/v1/test" "" out
+    printf "HTTP_STATUS=%s\nOUT=%s\n" "$HTTP_STATUS" "$out"
+  ' _ "$WORK/functions.sh" > "$WORK/inj.out.$1" 2> "$WORK/inj.err.$1" || rc=$?
+  INJ_RC="$rc"
+}
+
+run_inject c7 refresh-inject-at
+is "case7 injection rc (fail-closed)"            "1"  "$INJ_RC"
+is "case7 env file keeps exactly 1 line"         "1"  "$(wc -l < "$WORK/genv.c7" | tr -d ' ')"
+is "case7 no forged NETCUP_API_BASE in env"      "0"  "$(grep -c '^NETCUP_API_BASE=' "$WORK/genv.c7" || true)"
+is "case7 RT file NOT rewritten"                 "RT0" "$(cat "$WORK/rtok.c7")"
+is "case7 loud guard error"                      "1"  "$(grep -c 'injection guard' "$WORK/inj.err.c7" || true)"
+
+run_inject c8 refresh-inject-rt
+is "case8 injection rc (fail-closed)"            "1"  "$INJ_RC"
+is "case8 env file keeps exactly 1 line"         "1"  "$(wc -l < "$WORK/genv.c8" | tr -d ' ')"
+is "case8 no forged NETCUP_API_BASE in env"      "0"  "$(grep -c '^NETCUP_API_BASE=' "$WORK/genv.c8" || true)"
+is "case8 RT file NOT rewritten"                 "RT0" "$(cat "$WORK/rtok.c8")"
+is "case8 loud guard error"                      "1"  "$(grep -c 'injection guard' "$WORK/inj.err.c8" || true)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -240,6 +240,21 @@ require_token() {
 # ACCESS token is still appended to $GITHUB_ENV (the provider genuinely
 # consumes it) and re-adopted on entry; both live on this runner only and die
 # with it (C-d trust model unchanged).
+# Token-response guard (review security N0): a crafted/compromised token
+# response must never forge extra $GITHUB_ENV lines (e.g. a second line
+# NETCUP_API_BASE=http://attacker, inherited by every later step) nor smuggle
+# control bytes into the 0600 refresh-token handoff file. Same semantics as
+# the workflow's guard_line: reject newline/CR, then any non-printable
+# character. Fail closed BEFORE masking or persisting either value.
+guard_token_value() { # $1 label, $2 value
+  case "$2" in
+    *[$'\n\r']*) die "SCP token response $1 contains a newline/CR — refusing the handoff write (injection guard)" ;;
+  esac
+  if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then
+    die "SCP token response $1 contains non-printable characters — refusing the handoff write (injection guard)"
+  fi
+}
+
 scp_token_refresh() {
   # Re-read the newest handoff values FIRST: a subshell may have refreshed
   # already and the realm may rotate the refresh token on use, so the
@@ -294,6 +309,18 @@ scp_token_refresh() {
   at="$(printf '%s' "$resp" | jq -r '.access_token // empty' 2>/dev/null)" || return 1
   [ -n "$at" ] || return 1
   rt="$(printf '%s' "$resp" | jq -r '.refresh_token // empty' 2>/dev/null)" || rt=""
+  # Guard BOTH values before anything else writes them anywhere (review
+  # security N0, live-proven): the poll step guards the FIRST token response,
+  # but this refresh path (every 401 after ~5 min) did not — an injected
+  # newline in .access_token forged a second $GITHUB_ENV line (e.g.
+  # NETCUP_API_BASE=http://attacker), which every later step then inherited,
+  # sending the Bearer token to the attacker while the run stayed green. If
+  # either value fails the guard, NOTHING is written — no mask, no env
+  # append, no refresh-token file.
+  guard_token_value "access_token" "$at"
+  if [ -n "$rt" ]; then
+    guard_token_value "refresh_token" "$rt"
+  fi
   # Mask FIRST, before any use — on stderr deliberately: stdout here is
   # routinely captured as data (command substitution / pipeline), where a
   # mask line would corrupt the capture AND never reach the runner. The
