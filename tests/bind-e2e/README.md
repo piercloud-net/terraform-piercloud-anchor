@@ -3,7 +3,7 @@
 The real `clevis luks bind` + reboot test needs the tenant's main-box
 keyboard, so the Caddy-in-front-of-tang path was never bind-proven. This
 harness proves it in CI on every PR: mock tang on loopback, **real**
-`caddy:2.11.2` in front running the repo's **real** rendered Caddyfile
+`caddy:2.11.4` in front running the repo's **real** rendered Caddyfile
 (extracted from `scripts/010-provision.sh` at runtime — never a copy),
 then real `clevis luks bind` / `list` / `encrypt`+`decrypt` / `unlock -n`
 against loopback LUKS volumes, all through the proxy.

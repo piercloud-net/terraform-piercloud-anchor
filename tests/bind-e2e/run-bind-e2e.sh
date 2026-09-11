@@ -23,11 +23,11 @@ CADDY_PORT="${CADDY_PORT:-18080}"
 MOCK_PORT="${MOCK_PORT:-18081}"
 STUB_PORT="${STUB_PORT:-18082}"
 TENANT_USER="${TENANT_USER:-citest}"
-CADDY_VERSION="2.11.2"
+CADDY_VERSION="2.11.4"
 CADDY_TGZ="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
 CADDY_URL="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/${CADDY_TGZ}"
 # Pinned SHA-512 of the upstream release asset (caddy ships SHA512 checksums).
-CADDY_SHA512="2513b289054386b76642a9e8bfc10d217df2b5361e4cdd0c72672b0eeab57ae737d57466eb70f1a44233cbcc697ecf21de88137ca45ef4b64f150a32b58f5f14"
+CADDY_SHA512="8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9"
 
 WORK="$(mktemp -d /tmp/bind-e2e.XXXXXX)"
 START="$(date +%s)"

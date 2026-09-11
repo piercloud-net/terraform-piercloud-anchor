@@ -72,7 +72,7 @@ no unbind+bind ceremony.
 
 ## Caddy dashboard: edge checklist + cutover reversibility
 
-Caddy (`caddy:2.11.2-alpine`, pinned + Renovate-watched) owns `:80`;
+Caddy (`caddy:2.11.4-alpine`, pinned + Renovate-watched) owns `:80`;
 `tangd.socket` listens on `127.0.0.1:8081`; Gatus stays loopback-only
 (`127.0.0.1:8080`, Caddy proxies the status host to it). The Caddyfile is
 dispatch-managed (same render pattern as the Gatus config): `handle /adv* +
@@ -111,7 +111,7 @@ host is two labels deep:**
 - SSL/TLS mode **Full (Strict)** (edge → origin encrypted, origin cert verified).
 - Cache Rule **Bypass** for `/.well-known/acme-challenge/*` (HTTP-01 must reach the box, never a cached edge hit).
 - No WAF custom rule / Bot Fight Mode block on that path (challenge fetches look like bots).
-- Zone-level **Authenticated Origin Pulls** with our own cert: upload the CA in the zone dashboard, then set the `CF_AOP_CA_PEM` repo secret (public bundle) + re-dispatch — Caddy enforces the edge client cert at the handshake. Until then, edge auth is firewall-allowlist + Host binding (documented degradation, dashboard-only).
+- Zone-level **Authenticated Origin Pulls** with our own cert: mint a CA + leaf offline, upload the **leaf cert + key** to Cloudflare (zone-level AOP; global AOP's shared cert is publicly downloadable and adds ~no security), enable the setting, THEN set the `CF_AOP_CA_PEM` repo secret (**the CA bundle**) + re-dispatch — Caddy verifies the edge client cert at the handshake (`require_and_verify` + trust pool, 2.11.4), and the run itself asserts both halves (cert-less origin pull rejected; edge pull serves 200). Order matters: CF side first, origin second — the reverse black-holes every edge pull. Rollback: unset `CF_AOP_CA_PEM` + re-dispatch (and/or disable the CF setting). Until then, edge auth is firewall-allowlist + Host binding (documented degradation, dashboard-only).
 - Origin CA pair: issue in the Cloudflare dashboard, plant as the `CF_ORIGIN_CERT_PEM` / `CF_ORIGIN_KEY_PEM` repo secrets (operator-plane, set at template time — the tenant pastes nothing), re-dispatch to deploy. Origin CA supports **leftmost wildcards** (one level) and up to 200 SANs, so ONE wildcard pair — e.g. `*.pier.piercloud.net` (plus `*.piercloud.net` / the apex if wanted) — serves every present and future tenant host on this anchor; no per-hostname pairs. Caddy renders it unchanged (`tls <cert> <key>`); validity can be up to 15 years (Cloudflare sends no expiry notifications — calendar it anyway). Deployed key material, NOT a standing API token: the box presents its origin cert but cannot rewrite the zone.
 
 Cutover reversibility (if Caddy ever wedges and the `:80` proxy with it —

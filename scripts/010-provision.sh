@@ -29,7 +29,7 @@ GATUS_IMAGE="twinproduction/gatus:v5.36.0"
 GATUS_PORT="8080"
 GATUS_CONFIG="/etc/gatus/config.yaml"
 # renovate: depName=caddy datasource=docker
-CADDY_IMAGE="caddy:2.11.2-alpine"
+CADDY_IMAGE="caddy:2.11.4-alpine"
 CADDY_CONFIG="/etc/caddy/Caddyfile"
 CADDY_ORIGIN_CRT="/etc/caddy/origin.crt"
 CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
@@ -102,8 +102,8 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	}"
   printf '%s\n' "	handle /rec* {"
   printf '%s\n' "		# No in-Caddy rate limit by decision: the pinned official build"
-  printf '%s\n' "		# (caddy:2.11.2-alpine) ships no rate_limit directive — verified via"
-  printf '%s\n' "		# list-modules on the v2.11.2 binary; it lives in a third-party xcaddy"
+  printf '%s\n' "		# (caddy:2.11.4-alpine) ships no rate_limit directive — verified via"
+  printf '%s\n' "		# list-modules on the v2.11.4 binary; it lives in a third-party xcaddy"
   printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
   printf '%s\n' "		# Flood protection"
   printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
@@ -650,7 +650,7 @@ if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
-  log "AOP client-auth bundle deployed — zone-level origin pulls are handshake-enforced"
+  log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
 else
   warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + Host binding until the operator finishes the AOP ceremony (docs/dr.md) + re-dispatches"
 fi
@@ -659,8 +659,8 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
   if [ -n "${AOP_TLS}" ]; then
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY} {
 		client_auth {
-			mode require
-			trusted_ca_cert_file ${CADDY_AOP_CA}
+			mode require_and_verify
+			trust_pool file ${CADDY_AOP_CA}
 		}
 	}"
   else
@@ -893,7 +893,27 @@ if [ -n "${STATUS_HOST:-}" ]; then
   # and Caddy selects the origin cert by SNI, so a Host header alone fails a
   # healthy box once the operator origin pair is deployed (live 2026-09-10,
   # issue #92). --resolve keeps the TCP connect on loopback.
-  if curl -skf --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
+  #
+  # AOP (issue #97): when the client-auth bundle is deployed the origin must
+  # REJECT a cert-less probe (that is the point), while the edge pull — which
+  # carries Cloudflare's client cert — must still serve. Both halves are
+  # asserted; a wrong trust bundle black-holes every edge pull, so this is
+  # fail-closed.
+  if [ -n "${AOP_TLS}" ]; then
+    if curl -skf --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
+      die "Caddy :443 answered a cert-less probe while AOP is deployed — client_auth is not enforcing; refusing to finish blind"
+    fi
+    log "Caddy :443 rejects cert-less origin pulls while AOP is deployed (OK; expected)"
+    edge_ok=0
+    for _ in 1 2 3; do
+      if curl -sSf --max-time 20 "https://${STATUS_HOST}/" -o /dev/null; then edge_ok=1; break; fi
+      sleep 5
+    done
+    if [ "$edge_ok" -ne 1 ]; then
+      die "edge pull through Cloudflare failed while AOP is deployed — the origin trust bundle does not match Cloudflare's client cert; unset CF_AOP_CA_PEM and re-dispatch to roll back"
+    fi
+    log "edge pull through Cloudflare serves with AOP enforced (OK)"
+  elif curl -skf --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
   elif [ ! -s "${CADDY_ORIGIN_CRT}" ]; then
     # No operator origin pair: auto-TLS cannot issue for a name whose public
