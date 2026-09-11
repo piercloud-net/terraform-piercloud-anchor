@@ -78,6 +78,23 @@ invariants live in [invariants.md](invariants.md); the scripts rules live in
 - Reviewers: any conditional/fallback/legacy content in the bootstrap
   flow is a NEEDS-WORK finding, same weight as a code defect.
 
+## Review protocol (independent review, security first)
+
+- Every change gets an independent review before merge; the reviewer is
+  never the author.
+- **Security is the first lens**, ahead of correctness and style:
+  credential custody (S1 / C-A — standing secrets, token lifetime, where
+  secrets travel), exposure windows (firewall / temporary access),
+  injection of external data into shell, HCL, `$GITHUB_ENV` /
+  `$GITHUB_OUTPUT`, and fail-open behaviour — a green run that leaves a
+  security property broken is a defect, not a warning.
+- Findings must be **reproduced** before reporting: a failing command, a
+  payload, or a reverted-fix test. Evidence, not assertion.
+- Fixes to findings get a **verify pass by the reviewer that raised them**
+  before live proof / merge.
+- Review verdicts are recorded in the PR (body or comment) so the trail is
+  auditable.
+
 ## Public-safety rules for content
 
 - Nothing sensitive in committed files: no credentials, no hostnames/IPs of
