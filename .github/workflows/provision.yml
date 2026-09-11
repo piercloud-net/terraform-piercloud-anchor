@@ -316,9 +316,9 @@ jobs:
                 echo "::add-mask::$ACCESS_TOKEN"
                 echo "authorized=true" >> "$GITHUB_OUTPUT"
                 # M2 same-job handoff: the token persists ONLY in this
-                # runner's environment (GITHUB_ENV dies with the runner).
-                # Same-job steps below consume it; it never crosses jobs,
-                # never lands in state (C-d: TF 1.11 ephemerals carry it).
+                # runner's local GITHUB_ENV handoff FILE (dies with the
+                # runner). Same-job steps below consume it; it never crosses
+                # jobs, never lands in state (C-d: TF 1.11 ephemerals carry it).
                 echo "NETCUP_SCP_ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
                 # ~5-min access-token TTL vs multi-minute runs (live
                 # 2026-09-11: the async apply outlived the token, every tail
@@ -336,10 +336,12 @@ jobs:
                 else
                   echo "::warning::no refresh_token in the token response — runs longer than ~5 min will 401 at the tail (fail-loud, no fallback)."
                 fi
-                # C-d: refresh stays in-memory only (same-runner handoff
-                # above); TF 1.11 ephemerals carry it — it never lands in state.
-                echo "Approved. Token held in runner memory only."
-                echo "::notice::netcup approval received for $TENANT_USER — token in runner memory, provisioning continues."
+                # C-d: the refresh token stays in the runner-local GITHUB_ENV
+                # handoff FILE (the script re-reads it across subshells and
+                # re-appends each rotation); TF 1.11 ephemerals carry it — it
+                # never lands in state.
+                echo "Approved. Token held on this runner only (local handoff file)."
+                echo "::notice::netcup approval received for $TENANT_USER — token in the runner-local handoff, provisioning continues."
                 echo "" >> "$GITHUB_STEP_SUMMARY"
                 echo "✅ Approved — the code above is dead. Provisioning continues." >> "$GITHUB_STEP_SUMMARY"
                 exit 0
