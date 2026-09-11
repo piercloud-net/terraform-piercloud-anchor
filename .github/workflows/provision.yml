@@ -814,6 +814,51 @@ jobs:
           NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
           curl -sS --fail "${NTFY_AUTH[@]}" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
 
+      - name: Revoke device-grant refresh token (always, every run)
+        if: always()
+        env:
+          NETCUP_SCP_REFRESH_TOKEN: ${{ env.NETCUP_SCP_REFRESH_TOKEN }}
+          # Public, constant Keycloak discovery doc (same realm for every
+          # tenant) — same pattern as the device-request job. The revocation
+          # endpoint is read from it at runtime, so no endpoint literal is
+          # hardcoded here.
+          NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
+        run: |
+          set -uo pipefail
+          # Teardown: without this, the device grant's offline_access refresh
+          # token outlives the runner by up to ~30 days (Keycloak offline
+          # session idle expiry) even though the ACCESS token dies in ~5 min.
+          # RFC 7009 lets a public client revoke with client_id only — no
+          # secret, no Authorization header — so revocation still works now
+          # that the access token is already dead.
+          # Deliberately no `set -e`: this step never owns the run verdict;
+          # every failure path degrades to a loud warning and exit 0.
+          if [ -z "${NETCUP_SCP_REFRESH_TOKEN:-}" ]; then
+            echo "No refresh token was issued to this run — nothing to revoke (clean no-op)."
+            exit 0
+          fi
+          # Endpoint from the OIDC discovery document; the token itself is
+          # never printed (masked at birth in the poll step, passed only as
+          # the POST body below).
+          DISCO="$(curl -sS --max-time 30 "$NETCUP_OIDC_DISCOVERY_URL" 2>/dev/null)" || DISCO=""
+          REVOKE_ENDPOINT="$(printf '%s' "$DISCO" | jq -r '.revocation_endpoint // empty' 2>/dev/null)" || REVOKE_ENDPOINT=""
+          if [ -z "$REVOKE_ENDPOINT" ]; then
+            echo "::warning::could not resolve revocation_endpoint from the OIDC discovery document — the run's refresh token was NOT revoked and stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A)."
+            exit 0
+          fi
+          # POST the refresh token (public client: client_id + token only);
+          # discard the response body, keep only the HTTP status.
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$REVOKE_ENDPOINT" \
+            --data-urlencode "client_id=scp" \
+            --data-urlencode "token_type_hint=refresh_token" \
+            --data-urlencode "token=$NETCUP_SCP_REFRESH_TOKEN" 2>/dev/null)" || CODE=""
+          case "$CODE" in
+            200)
+              echo "::notice::device-grant refresh token revoked — the run-issued credential dies with the runner in effect." ;;
+            *)
+              echo "::warning::refresh-token revocation returned HTTP ${CODE:-none} — the run's credential stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A)." ;;
+          esac
+
   anchor-dns:
     name: "Anchor DNS upsert + verify (Cloudflare, fail-closed)"
     runs-on: ubuntu-latest

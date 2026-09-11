@@ -88,7 +88,7 @@ If your repo has you as a reviewer (power path), GitHub pauses the run first: ap
 
 The run prints a netcup device-flow URL + `XXXX-XXXX` user code (plus a push via ntfy, once you set that up later — see §8). You approve at netcup's own Keycloak (your
 session, your 2FA, ~600s window) — the approval is one tap, phone browsers included. The runner polls, receives an ephemeral
-token, provisions, and the token dies with the runner. Only the URL + code
+token, provisions, and the token dies with the runner — the run revokes the device-grant refresh token at teardown, so the credential dies in effect, not only by custody. Only the URL + code
 (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG` (masking note: the access token stays masked; the short-lived code is unmasked-by-design, see above). The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
 STOP + open an issue in your repo so the operator sees it (C-A — no fallback exists, none is permitted).
 
