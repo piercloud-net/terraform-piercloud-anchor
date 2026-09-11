@@ -10,9 +10,10 @@
 # (020: next free after 010) is unique across `scripts/` + `.github/scripts/`.
 #
 # WHAT IT DOES (A1 hardened lifecycle, SPEC §"A1 self-open /32 window"):
-#   sweep-pre  enumerate tmp policies -> surplus fail-closed (>1 tmp on this
-#              server, or any tmp older than 2h / orphan at pre-step, exits 3
-#              BEFORE creating anything) -> drop this run's own leftover.
+#   sweep-pre  enumerate tmp policies -> retire aged (>2h, run long dead) ->
+#              surplus fail-closed (>1 FRESH foreign tmp on this server, or
+#              any orphan tmp, exits 3 BEFORE creating anything) -> drop this
+#              run's own leftover.
 #   open       dual-endpoint egress-IP fetch (exact match or fail) -> create
 #              TTL-tagged tmp policy (idempotent on run_id: retry reuses the
 #              existing policy, never duplicates) -> attach to the server NIC.
@@ -417,36 +418,52 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 }
 
 # ---------------------------------------------------------------------------
-# sweep-pre: enumerate -> surplus fail-closed -> drop own leftover.
+# sweep-pre: enumerate -> retire AGED tmps (>2h, same rule as post-sweep) ->
+# surplus fail-closed on FRESH foreign tmps -> drop own leftover.
 # ---------------------------------------------------------------------------
 cmd_sweep_pre() {
   require_token
-  local list count entry name desc age
+  local list count entry name desc age pid own="" fresh=0 aged=0
   list="$(list_tmp_policies)"
   count="$(printf '%s' "$list" | jq 'length')"
   log "pre-sweep: $count tmp polic(ies) on server $SERVER_ID"
-  if [ "$count" -gt 1 ]; then
-    surplus_fail "$count tmp policies on server $SERVER_ID (>1) — refusing to create. Notify the operator; clean up by hand, then re-dispatch."
-  fi
+  # Classify FIRST, then judge: OWN leftover (retry of this run), AGED (>2h —
+  # its run is long dead; same retirement rule post-sweep uses), ORPHAN (no
+  # valid created_at — ambiguous, stays fail-closed) or FRESH FOREIGN.
+  # Regression fixed here (live 2026-09-11): the old order checked count>1
+  # before anything else, so two tmps leaked by the ~5 min access-token TTL
+  # blocked every later run at this step until they aged out. Aged tmps are
+  # now retired in place instead of blocking, and this run's own leftover no
+  # longer counts towards surplus (a retry is normal, not an anomaly).
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r '.name')"
     desc="$(printf '%s' "$entry" | jq -r '.description')"
+    pid="$(printf '%s' "$entry" | jq -r '.id')"
     if [ "$name" = "$OWN_NAME" ]; then
-      continue # own leftover handled below (retry of this run reuses it)
+      own="$pid" # retry of this run — reused by open below, never surplus
+      continue
     fi
     age="$(policy_age "$desc")"
     if [ "$age" = "orphan" ]; then
       surplus_fail "orphan tmp policy '$name' (no valid created_at) at pre-step — refusing to create. Notify the operator."
     fi
     if [ "$age" -gt "$TMP_TTL_SECONDS" ]; then
-      surplus_fail "tmp policy '$name' is ${age}s old (>2h) at pre-step — refusing to create. Notify the operator."
+      log "pre-sweep: retiring aged tmp policy '$name' (age ${age}s — its run is long gone)"
+      close_policy "$pid" || surplus_fail "could not retire aged tmp policy '$name' — operator must clean up by hand."
+      aged=$((aged + 1))
+      continue
     fi
-    # A fresh single tmp that is not ours: leave it alone (only >1 or
-    # stale/orphan fail-closed per SPEC; the mutex rules out a racing run).
+    fresh=$((fresh + 1))
+    # A single fresh foreign tmp is left alone (the mutex rules out a racing
+    # run); more than one means something leaked — refuse, get eyes on it.
   done < <(printf '%s' "$list" | jq -c '.[]')
-  local own
-  own="$(printf '%s' "$list" | jq -r --arg n "$OWN_NAME" 'map(select(.name == $n)) | .[0].id // empty')"
+  if [ "$fresh" -gt 1 ]; then
+    surplus_fail "$fresh fresh tmp policies on server $SERVER_ID (>1) — refusing to create. Notify the operator; clean up by hand, then re-dispatch."
+  fi
+  if [ "$aged" -gt 0 ]; then
+    log "pre-sweep: retired $aged aged tmp polic(ies)"
+  fi
   if [ -n "$own" ]; then
     log "pre-sweep: dropping own leftover policy $own (hard-killed attempt of this run)"
     close_policy "$own"
