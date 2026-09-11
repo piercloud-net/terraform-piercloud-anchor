@@ -836,39 +836,87 @@ jobs:
           NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
         run: |
           set -uo pipefail
+          # M1: the runner's default shell is `bash -e` (this step defines no
+          # shell: override), so errexit IS in force unless disabled — the old
+          # "no set -e" claim was wrong. Teardown never owns the run verdict:
+          # turn errexit OFF explicitly, keep the per-command || guards and
+          # the final exit 0, so an unexpected unguarded failure degrades to a
+          # warning/step-summary note instead of a red step.
+          set +e
           # Teardown: without this, the device grant's offline_access refresh
           # token outlives the runner by up to ~30 days (Keycloak offline
           # session idle expiry) even though the ACCESS token dies in ~5 min.
           # RFC 7009 lets a public client revoke with client_id only — no
           # secret, no Authorization header — so revocation still works now
           # that the access token is already dead.
-          # Deliberately no `set -e`: this step never owns the run verdict;
-          # every failure path degrades to a loud warning and exit 0.
+          summary() { # $1 = one-line outcome (bounded, token-free by construction)
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Device-grant revocation\n- %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          bounded_detail() { # $1 = curl stderr file -> <=300 chars, one trimmed line
+            head -c 300 "$1" 2>/dev/null | tr '\n\r' '  ' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+          }
           if [ -z "${NETCUP_SCP_REFRESH_TOKEN:-}" ]; then
             echo "No refresh token was issued to this run — nothing to revoke (clean no-op)."
+            summary "no refresh token was issued to this run — nothing to revoke"
             exit 0
           fi
-          # Endpoint from the OIDC discovery document; the token itself is
+          # Endpoints from the OIDC discovery document; the token itself is
           # never printed (masked at birth in the poll step, passed only as
-          # the POST body below).
+          # the POST bodies below).
           DISCO="$(curl -sS --max-time 30 "$NETCUP_OIDC_DISCOVERY_URL" 2>/dev/null)" || DISCO=""
           REVOKE_ENDPOINT="$(printf '%s' "$DISCO" | jq -r '.revocation_endpoint // empty' 2>/dev/null)" || REVOKE_ENDPOINT=""
+          TOKEN_ENDPOINT="$(printf '%s' "$DISCO" | jq -r '.token_endpoint // empty' 2>/dev/null)" || TOKEN_ENDPOINT=""
           if [ -z "$REVOKE_ENDPOINT" ]; then
             echo "::warning::could not resolve revocation_endpoint from the OIDC discovery document — the run's refresh token was NOT revoked and stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A)."
+            summary "FAILED: revocation_endpoint missing from discovery — token NOT revoked (usable until Keycloak's idle expiry, ~30 days)"
             exit 0
           fi
           # POST the refresh token (public client: client_id + token only);
-          # discard the response body, keep only the HTTP status.
+          # the response body is discarded, the HTTP status and a BOUNDED
+          # curl-stderr detail are kept for the warning and the step summary.
+          ERRFILE="$(mktemp)"
           CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$REVOKE_ENDPOINT" \
             --data-urlencode "client_id=scp" \
             --data-urlencode "token_type_hint=refresh_token" \
-            --data-urlencode "token=$NETCUP_SCP_REFRESH_TOKEN" 2>/dev/null)" || CODE=""
+            --data-urlencode "token=$NETCUP_SCP_REFRESH_TOKEN" 2>"$ERRFILE")" || CODE=""
+          DETAIL="$(bounded_detail "$ERRFILE")"
+          rm -f "$ERRFILE"
           case "$CODE" in
             200)
+              REVOKE_STATE="revoked (HTTP 200)"
               echo "::notice::device-grant refresh token revoked — the run-issued credential dies with the runner in effect." ;;
             *)
-              echo "::warning::refresh-token revocation returned HTTP ${CODE:-none} — the run's credential stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A)." ;;
+              REVOKE_STATE="FAILED (HTTP ${CODE:-none}${DETAIL:+, curl: $DETAIL})"
+              echo "::warning::refresh-token revocation returned HTTP ${CODE:-none}${DETAIL:+ (curl: $DETAIL)} — the run's credential stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A)." ;;
           esac
+          # Canary: prove the session actually died. A revoked refresh token
+          # must be REFUSED; Keycloak answers a refused grant with HTTP 200
+          # and an error BODY (invalid_token / invalid_grant), so the body's
+          # error field decides, not the status. The token and the response
+          # body are never printed — only the error code below.
+          if [ -n "$TOKEN_ENDPOINT" ]; then
+            CERFILE="$(mktemp)"
+            CANARY="$(curl -sS --max-time 30 -X POST "$TOKEN_ENDPOINT" \
+              --data-urlencode "grant_type=refresh_token" \
+              --data-urlencode "client_id=scp" \
+              --data-urlencode "refresh_token=$NETCUP_SCP_REFRESH_TOKEN" 2>"$CERFILE")" || CANARY=""
+            CANARY_DETAIL="$(bounded_detail "$CERFILE")"
+            rm -f "$CERFILE"
+            CANARY_ERR="$(printf '%s' "$CANARY" | jq -r '.error // empty' 2>/dev/null)" || CANARY_ERR=""
+            if [ -n "$CANARY_ERR" ]; then
+              echo "::notice::revocation verified — the refresh token is dead (${CANARY_ERR})."
+              summary "${REVOKE_STATE}; canary rejected the token (${CANARY_ERR})"
+            else
+              echo "::warning::revocation canary was NOT rejected by the token endpoint${CANARY_DETAIL:+ (curl: $CANARY_DETAIL)} — the refresh token may still be live (up to Keycloak's ~30-day offline-session idle expiry). Investigate the Keycloak sessions; no fallback exists (C-A). The token and response body are never printed."
+              summary "${REVOKE_STATE}; CANARY NOT REJECTED — the credential may still be live (investigate the Keycloak sessions)"
+            fi
+          else
+            echo "::warning::token_endpoint missing from the OIDC discovery document — revocation is unverified (cannot canary)."
+            summary "${REVOKE_STATE}; canary NOT RUN (token_endpoint missing) — revocation unverified"
+          fi
+          exit 0
 
   anchor-dns:
     name: "Anchor DNS upsert + verify (Cloudflare, fail-closed)"
