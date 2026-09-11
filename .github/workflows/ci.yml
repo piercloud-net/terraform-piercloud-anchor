@@ -519,6 +519,100 @@ jobs:
           [ "$fail" -eq 0 ]
           echo "no sovereignty-downgrade print patterns (OK)"
 
+  unit-tests-scripts:
+    name: unit-tests (scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+        with:
+          persist-credentials: false
+      - name: Gate on changed paths (CI scripts or harnesses)
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin main --depth=1 >/dev/null 2>&1 || true
+            # Two-dot endpoint diff (same rationale as bind-e2e's gate):
+            # never needs a merge-base, so shallow PR checkouts cannot
+            # break it. --no-renames keeps BOTH sides of a move visible:
+            # rename detection lists only the destination, so a script
+            # moved out of .github/scripts/ would otherwise skip this gate.
+            # An empty/undeterminable file list RUNS (a wasted run costs
+            # seconds; a wrongly-skipped run would let a
+            # 020-provision-anchor.sh regression land unseen).
+            changed="$(git diff --name-only --no-renames origin/main HEAD 2>/dev/null || true)"
+            printf '%s\n' "$changed"
+            if [ -z "$changed" ]; then
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "::warning::unit-tests could not list changed files — running unconditionally"
+            # Herestring, never `printf ... | grep -q`: under pipefail a
+            # large list makes grep's early exit SIGPIPE the writer
+            # (pipeline rc 141), which silently turns this match into
+            # run=no on exactly the big PRs that need the harnesses.
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes)/)' <<<"$changed"; then
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=no" >> "$GITHUB_OUTPUT"
+              echo "::notice::unit-tests skipped (no CI script or harness paths changed)"
+            fi
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run the committed script harnesses (cheap first)
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # Committed harnesses, run as-is (no flags, no edits): cred-free,
+          # offline (stubbed curl / API boundary). Cheap-first ordering puts
+          # the fastest failure (scp-token-refresh, ~0.4s) up front.
+          bash tests/scp-token-refresh/run-test.sh
+          bash tests/sweep-pre-classify/run-test.sh
+          bash tests/sweep-post-shapes/run-test.sh
+      - name: bash -n + shellcheck -S warning over the CI-called scripts
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # The harnesses exercise 020-provision-anchor.sh behaviour; this
+          # step guards the whole CI-called script surface. shellcheck
+          # -S warning FAILS the job by design: the tree passes clean at
+          # that level today (verified against shellcheck 0.9.0 — the
+          # ubuntu-latest version), so a finding is a regression, not
+          # advisory chatter (info/style severities stay out of scope).
+          # This uses whatever shellcheck the runner ships — the version
+          # is printed below and deliberately not pinned here (a pinned
+          # copy would add a download and rot silently as the runner
+          # moves on). Bump policy: this gate fires on ANY
+          # .github/workflows/ change, so a runner-side bump that adds a
+          # warning-level diagnostic can fail unrelated workflow PRs.
+          # When that happens, treat the bump as the change — fix the
+          # scripts or raise the level in a reviewed commit; never
+          # quietly pin an old copy. globstar: the surface includes
+          # nested dirs under .github/scripts/.
+          shopt -s globstar nullglob
+          scripts=(.github/scripts/**/*.sh)
+          shellcheck --version
+          for f in "${scripts[@]}"; do
+            bash -n "$f"
+          done
+          if [ "${#scripts[@]}" -gt 0 ]; then
+            shellcheck -S warning "${scripts[@]}"
+          fi
+          echo "scripts parse and pass shellcheck -S warning (OK)"
+      - name: provision.yml still parses as YAML
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # Ruby's psych (stdlib) ships on ubuntu-latest, so this needs no
+          # action or install step. load_file with aliases enabled accepts
+          # anchors/aliases (GitHub Actions does too) and catches syntax
+          # errors plus undefined alias targets — shapes GitHub's loader
+          # would refuse. It does NOT reject duplicate mapping keys (psych
+          # keeps the last one) and does NOT validate the Actions schema,
+          # so a duplicated key or unknown field can still pass this step.
+          ruby -ryaml -e 'YAML.load_file(ARGV[0], aliases: true)' .github/workflows/provision.yml
+          echo "provision.yml parses (OK)"
+
   bind-e2e:
     name: bind-proof e2e (Caddy fronting mock tang)
     runs-on: ubuntu-latest
@@ -533,15 +627,22 @@ jobs:
             git fetch origin main --depth=1 >/dev/null 2>&1 || true
             # Two-dot endpoint diff (never needs a merge-base, so shallow
             # PR checkouts cannot break it): everything HEAD brings vs the
-            # main tip. If the file list cannot be determined at all, RUN
+            # main tip. --no-renames keeps BOTH sides of a move visible:
+            # rename detection lists only the destination, so a harness
+            # moved out of the filtered prefixes would otherwise be missed.
+            # If the file list cannot be determined at all, RUN
             # (a wasted run costs minutes; a wrongly-skipped run costs the
             # whole point of this job).
-            changed="$(git diff --name-only origin/main HEAD 2>/dev/null || true)"
+            changed="$(git diff --name-only --no-renames origin/main HEAD 2>/dev/null || true)"
             printf '%s\n' "$changed"
             if [ -z "$changed" ]; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
               echo "::warning::bind-e2e could not list changed files — running unconditionally"
-            elif printf '%s' "$changed" | grep -qE '^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$'; then
+            # Herestring, never `printf ... | grep -q`: under pipefail a
+            # large list makes grep's early exit SIGPIPE the writer
+            # (pipeline rc 141), which silently turns this match into
+            # run=no on exactly the big PRs that need the bind proof.
+            elif grep -qE '^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"

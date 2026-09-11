@@ -10,9 +10,11 @@
 # (020: next free after 010) is unique across `scripts/` + `.github/scripts/`.
 #
 # WHAT IT DOES (A1 hardened lifecycle, SPEC §"A1 self-open /32 window"):
-#   sweep-pre  enumerate tmp policies -> surplus fail-closed (>1 tmp on this
-#              server, or any tmp older than 2h / orphan at pre-step, exits 3
-#              BEFORE creating anything) -> drop this run's own leftover.
+#   sweep-pre  enumerate tmp policies -> classify (own / non-own / orphan) ->
+#              fail-closed on orphan (no parseable created_at) BEFORE any
+#              mutation -> retire EVERY non-own tmp (aged >2h or leaked
+#              fresh: the workflow-wide mutex means no foreign run can be
+#              live) -> drop this run's own leftovers.
 #   open       dual-endpoint egress-IP fetch (exact match or fail) -> create
 #              TTL-tagged tmp policy (idempotent on run_id: retry reuses the
 #              existing policy, never duplicates) -> attach to the server NIC.
@@ -42,13 +44,46 @@
 #   close      detach-then-delete the run's own tmp policy, always in that
 #              order; missing policy is a success no-op (idempotent).
 #   sweep-post delete this run's policy at any age + every tmp older than 2h
-#              (+ orphans: no valid created_at). Tolerates a missing token
+#              (+ orphans: no valid created_at) + UNATTACHED steady-state
+#              orphans (issue #101 — the create-per-run leak). Tolerates a
+#              missing token
 #              (auth never completed -> nothing created -> clean no-op) so the
 #              workflow `always()` post step never masks the real failure.
 #
 # ENV (all identifiers arrive via environment — never argv, never logs):
 #   NETCUP_SCP_ACCESS_TOKEN  per-run device-flow token (required except
 #                            sweep-post, which no-ops cleanly without it).
+#                            The SCP access token lives ~5 min (live
+#                            2026-09-11: tail steps 401'd after the async
+#                            apply) — see NETCUP_SCP_REFRESH_TOKEN below.
+#                            Every refresh re-appends the new value to the
+#                            runner-local $GITHUB_ENV handoff (not just shell
+#                            memory: call sites refresh inside command
+#                            substitutions, whose variable updates die with
+#                            the subshell). The file lives on this runner
+#                            only and dies with it — same trust model as the
+#                            token itself.
+#   NETCUP_SCP_REFRESH_TOKEN optional offline_access token from the SAME
+#                            device approval; on any 401 the REST helper
+#                            re-mints the access token from it and retries
+#                            once. In CI the poll step hands it over as a
+#                            0600 runner-local FILE and exports only the
+#                            PATH (NETCUP_SCP_REFRESH_TOKEN_FILE), so the
+#                            ~30-day credential never enters the job env
+#                            where every later step — including the
+#                            community tofu provider — could read it.
+#                            scp_token_refresh re-reads the file on entry
+#                            (a subshell may already have rotated it) and
+#                            rewrites it after every successful rotation,
+#                            so a parent's retry uses the rotated token,
+#                            never the consumed one. The direct env var
+#                            stays supported for local harnesses (the file
+#                            wins when both are set).
+#                            Absent/empty = pre-refresh behaviour (fail loud).
+#   NETCUP_SCP_REFRESH_TOKEN_FILE  path to that 0600 file (the CI handoff).
+#   NETCUP_SCP_TOKEN_ENDPOINT Keycloak token endpoint for that refresh grant
+#                            (resolved from the OIDC discovery doc by the
+#                            device-request job; public, not a secret).
 #   NETCUP_API_BASE          SCP REST base (default verified against the
 #                            provider source: defaultBaseURL in
 #                            rixlhq/terraform-provider-netcup
@@ -93,7 +128,8 @@
 #   INTERFACE_MAC            override NIC MAC (default: resolved via API).
 #
 # EXIT CODES: 0 ok · 1 error / cleanup incomplete (fail-closed, fail loudly) ·
-#   3 surplus fail-closed at pre-step (operator must look before re-dispatch).
+#   3 fail-closed at pre-step (orphan tmp or a failed retire — operator must
+#   look before re-dispatch).
 #
 # M0-GATED (no live netcup credentials exist; live run + verify-twice-live
 # are pending — recorded honestly in the PR body, never claimed here):
@@ -104,7 +140,7 @@
 #
 set -euo pipefail
 
-TMP_TTL_SECONDS=7200 # 2h: tmp older than this is swept, and fails pre-step.
+TMP_TTL_SECONDS=7200 # 2h: tmp older than this is 'aged' (its run is long dead) on every sweep.
 IP_ENDPOINT_A="https://api.ipify.org"
 IP_ENDPOINT_B="https://ipv4.icanhazip.com"
 ROTATE=0
@@ -132,23 +168,57 @@ case "$CMD" in
   *) die "usage: $0 [--rotate] {sweep-pre|open|provision|close|sweep-post|bootstrap-password|lock-password}" ;;
 esac
 
+# Injection guards: every value interpolated into an API path, jq argv or
+# generated HCL/shell must match its strict shape first — a malformed or
+# crafted API response is not a source of shell syntax. Fail closed, never
+# fall back.
+all_digits() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
+valid_mac() {
+  # Whole-value anchor, newline-safe (review security N2): grep is
+  # line-oriented, so 'aa:bb:cc:dd:ee:ff\nanything' matched its FIRST line
+  # and passed. Reject newline/CR explicitly, then anchor the whole
+  # (necessarily single-line) value.
+  case "$1" in '' | *[$'\n\r']*) return 1 ;; esac
+  printf '%s' "$1" | grep -qE '^[0-9a-fA-F:]{17}$'
+}
+
+# Sweep mode gate (review security MEDIUM): only apply may detach/delete
+# policies. check/update-ip/destroy — and an invocation with MODE unset
+# (local use) — are report-only: they classify and fail closed on anomalies,
+# but never mutate. provision.yml passes MODE: ${{ inputs.mode }} to both
+# sweep steps.
+sweep_destructive() {
+  [ "$MODE" = "apply" ]
+}
+sweep_note() { # $1 = message -> log + step summary (report-only evidence)
+  log "$1"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf 'A1 sweep: %s\n' "$1" >>"$GITHUB_STEP_SUMMARY"
+  fi
+}
+
 NETCUP_API_BASE="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
 SERVER_ID="${SERVER_ID:-}"
 SCP_USER_ID="${SCP_USER_ID:-}"
 RUN_ID="${RUN_ID:-}"
+MODE="${MODE:-}"
 # lock-password is the SSH-only finally-path (no API use): it must run even
 # when resolve never produced ids, so it is exempt from the id guards.
 case "$CMD" in
   lock-password) ;;
   *)
     [ -n "$SERVER_ID" ] || die "SERVER_ID is required"
+    all_digits "$SERVER_ID" || die "SERVER_ID is not all-digits — refusing to interpolate it into API paths (injection guard)"
     [ -n "$SCP_USER_ID" ] || die "SCP_USER_ID is required"
+    all_digits "$SCP_USER_ID" || die "SCP_USER_ID is not all-digits — refusing to interpolate it into API paths (injection guard)"
     [ -n "$RUN_ID" ] || die "RUN_ID is required (idempotency key)"
     ;;
 esac
 
 TMP_PREFIX="piercloud-tmp-${SERVER_ID}-"
 OWN_NAME="piercloud-tmp-${SERVER_ID}-${RUN_ID}"
+# Steady-state (module-managed) policy family: piercloud-anchor-<hostname>-<server_id>.
+STEADY_PREFIX="piercloud-anchor-"
 
 require_token() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
@@ -161,6 +231,163 @@ require_token() {
 # header, responses are error-truncated before printing so a surprising echo
 # can never leak request state into logs).
 # ---------------------------------------------------------------------------
+# Re-mint the access token from the device grant's own refresh token
+# (offline_access was already requested at approval). No new standing secret,
+# no new fallback: the refresh token is minted by the same human approval and
+# dies with the runner (C-d). Returns non-zero when unavailable/refused, so
+# callers keep the pre-existing fail-loud 401 path.
+#
+# Subshell/rotation safety: callers routinely refresh inside command
+# substitutions (e.g. `pid="$(own_policy_id)"`), whose in-process variable
+# updates die with the subshell. The REFRESH token is handed over as a 0600
+# runner-local FILE ($NETCUP_SCP_REFRESH_TOKEN_FILE) — never via the job env,
+# which every later step (including the community tofu provider) can read —
+# and the function re-reads that file on entry, so a parent's later 401
+# retries with the ROTATED refresh token instead of the consumed one. The
+# ACCESS token is still appended to $GITHUB_ENV (the provider genuinely
+# consumes it) and re-adopted on entry; both live on this runner only and die
+# with it (C-d trust model unchanged).
+# Token-response guard (review security N0): a crafted/compromised token
+# response must never forge extra $GITHUB_ENV lines (e.g. a second line
+# redirecting NETCUP_API_BASE to an attacker-controlled base, inherited by
+# every later step) nor smuggle control bytes into the 0600 refresh-token
+# handoff file. Same semantics as the workflow's guard_line: reject
+# newline/CR, then any non-printable character. Fail closed BEFORE masking or
+# persisting either value.
+# Caveat (reviewer INFO): bash strips NUL and trailing newlines before this
+# guard sees a value — do not over-trust it for those two shapes.
+guard_token_value() { # $1 label, $2 value
+  case "$2" in
+    *[$'\n\r']*) die "SCP token response $1 contains a newline/CR — refusing the handoff write (injection guard)" ;;
+  esac
+  if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then
+    die "SCP token response $1 contains non-printable characters — refusing the handoff write (injection guard)"
+  fi
+}
+
+scp_token_refresh() {
+  # Re-read the newest handoff values FIRST: a subshell may have refreshed
+  # already and the realm may rotate the refresh token on use, so the
+  # parent's copy can be the consumed one. Every writer overwrites the whole
+  # refresh-token file, so its content is the newest value; the access-token
+  # appends are append-only, so the LAST line in $GITHUB_ENV is the newest.
+  local f_at f_rt
+  if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ] && [ -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
+    f_rt="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
+    if [ -n "$f_rt" ]; then
+      NETCUP_SCP_REFRESH_TOKEN="$f_rt"
+      export NETCUP_SCP_REFRESH_TOKEN
+    fi
+  fi
+  if [ -n "${GITHUB_ENV:-}" ] && [ -f "$GITHUB_ENV" ]; then
+    f_at="$(grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
+    # Adoption is UNCONDITIONAL: a non-empty handoff value can only have
+    # been appended by a refresh in THIS step — every step gets a fresh empty
+    # $GITHUB_ENV from the runner (reviewer-verified against the runner
+    # sources), and only scp_token_refresh appends this name. Adopt the
+    # last (newest) value, replacing a possibly-consumed in-process copy; no
+    # other guard is needed (an earlier "never resurrect" guard described a
+    # harness artifact, not production).
+    if [ -n "$f_at" ]; then
+      NETCUP_SCP_ACCESS_TOKEN="$f_at"
+      export NETCUP_SCP_ACCESS_TOKEN
+    fi
+  fi
+  [ -n "${NETCUP_SCP_REFRESH_TOKEN:-}" ] || return 1
+  [ -n "${NETCUP_SCP_TOKEN_ENDPOINT:-}" ] || return 1
+  # Endpoint pin (review security MEDIUM): the refresh token may only ever go
+  # to the live SCP Keycloak realm. A tampered/hijacked discovery document
+  # would otherwise receive the credential — refuse loudly instead.
+  case "$NETCUP_SCP_TOKEN_ENDPOINT" in
+    https://www.servercontrolpanel.de/realms/scp/*) ;;
+    *) die "NETCUP_SCP_TOKEN_ENDPOINT is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to send the refresh token (endpoint pin)" ;;
+  esac
+  local resp at rt tf
+  # Token off argv (review security MEDIUM): --data-urlencode with the literal
+  # value is world-readable via /proc/<pid>/cmdline; write it to a 0600 temp
+  # file (mktemp's default mode) and use curl's @file form instead.
+  tf="$(mktemp)"
+  printf '%s' "$NETCUP_SCP_REFRESH_TOKEN" >"$tf"
+  if ! resp="$(curl -sS --max-time 30 -X POST "$NETCUP_SCP_TOKEN_ENDPOINT" \
+    --data-urlencode "grant_type=refresh_token" \
+    --data-urlencode "client_id=scp" \
+    --data-urlencode "refresh_token@$tf")"; then
+    rm -f "$tf"
+    return 1
+  fi
+  rm -f "$tf"
+  at="$(printf '%s' "$resp" | jq -r '.access_token // empty' 2>/dev/null)" || return 1
+  [ -n "$at" ] || return 1
+  rt="$(printf '%s' "$resp" | jq -r '.refresh_token // empty' 2>/dev/null)" || rt=""
+  # Guard BOTH values before anything else writes them anywhere (review
+  # security N0, live-proven): the poll step guards the FIRST token response,
+  # but this refresh path (every 401 after ~5 min) did not — an injected
+  # newline in .access_token forged a second $GITHUB_ENV line (e.g.
+  # NETCUP_API_BASE to an attacker-controlled base), which every later step
+  # then inherited, sending the Bearer token to the attacker while the run
+  # stayed green. If
+  # either value fails the guard, NOTHING is written — no mask, no env
+  # append, no refresh-token file.
+  guard_token_value "access_token" "$at"
+  if [ -n "$rt" ]; then
+    guard_token_value "refresh_token" "$rt"
+  fi
+  # Mask FIRST, before any use — on stderr deliberately: stdout here is
+  # routinely captured as data (command substitution / pipeline), where a
+  # mask line would corrupt the capture AND never reach the runner. The
+  # runner scans BOTH streams for workflow commands (ScriptHandler wires
+  # stdout and stderr through the same ActionCommandManager).
+  echo "::add-mask::$at" >&2
+  NETCUP_SCP_ACCESS_TOKEN="$at"
+  export NETCUP_SCP_ACCESS_TOKEN
+  if [ -n "$rt" ]; then
+    echo "::add-mask::$rt" >&2
+    NETCUP_SCP_REFRESH_TOKEN="$rt"
+    export NETCUP_SCP_REFRESH_TOKEN
+    # Persist the rotation for parent shells: rewrite the 0600 handoff file
+    # (the in-process assignment dies with a subshell). A failed rewrite is a
+    # warning, not fatal: the in-process value is already fresh.
+    if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ]; then
+      (umask 077; printf '%s' "$rt" >"$NETCUP_SCP_REFRESH_TOKEN_FILE") \
+        || warn "could not persist the rotated refresh token to $NETCUP_SCP_REFRESH_TOKEN_FILE — a parent shell's later 401 may present the consumed token"
+    fi
+  fi
+  # Persist the same-runner handoff: the in-process assignments above die
+  # with a subshell, so a parent's later 401 must see the fresh ACCESS token.
+  # $GITHUB_ENV is a runner-local FILE that dies with the runner — the trust
+  # model is unchanged. Append (never rewrite): the newest value is the last
+  # line. The refresh token goes to its 0600 file above, never here.
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    printf 'NETCUP_SCP_ACCESS_TOKEN=%s\n' "$at" >>"$GITHUB_ENV" \
+      || warn "could not persist the refreshed access token to \$GITHUB_ENV — a later step may miss the fresh token and 401"
+  fi
+  # stderr DELIBERATELY: this function runs inside api_call, and several of
+  # api_call's callers are captured as data (`pid="$(own_policy_id)"`,
+  # `list="$(list_tmp_policies)"`, `mac="$(resolve_mac)"`, ...). A stdout line
+  # from here is prepended to that capture and breaks the jq parse (live
+  # 2026-09-11: rc 5 on `pid="$(own_policy_id)"`, empty pid, window policy
+  # leaked). The ::add-mask:: lines above are on stderr for the same reason;
+  # the runner scans both streams for workflow commands.
+  log "scp token refreshed (access token TTL is ~5 min; long runs cross it)" >&2
+  return 0
+}
+
+_api_curl() { # method path body ctype resp_file -> sets HTTP_STATUS
+  local method="$1" path="$2" body="$3" ctype="$4" resp_file="$5"
+  if [ -n "$body" ]; then
+    HTTP_STATUS="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
+      -X "$method" "${NETCUP_API_BASE}${path}" \
+      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
+      -H "Content-Type: $ctype" -H 'Accept: application/json' \
+      -d "$body")"
+  else
+    HTTP_STATUS="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
+      -X "$method" "${NETCUP_API_BASE}${path}" \
+      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
+      -H 'Accept: application/json')"
+  fi
+}
+
 api_call() { # method path [body] [outvar] [content-type] -> sets HTTP_STATUS; body to stdout or $outvar
   # Subshell warning: callers MUST NOT use resp="$(api_call ...)" — command
   # substitution forks, and HTTP_STATUS set inside would die with it (live
@@ -171,17 +398,15 @@ api_call() { # method path [body] [outvar] [content-type] -> sets HTTP_STATUS; b
   local method="$1" path="$2" body="${3:-}" outvar="${4:-}" ctype="${5:-application/json}"
   local resp_file status content
   resp_file="$(mktemp)"
-  if [ -n "$body" ]; then
-    status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
-      -X "$method" "${NETCUP_API_BASE}${path}" \
-      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
-      -H "Content-Type: $ctype" -H 'Accept: application/json' \
-      -d "$body")"
-  else
-    status="$(curl -sS --max-time 30 -o "$resp_file" -w '%{http_code}' \
-      -X "$method" "${NETCUP_API_BASE}${path}" \
-      -H "Authorization: Bearer ${NETCUP_SCP_ACCESS_TOKEN}" \
-      -H 'Accept: application/json')"
+  _api_curl "$method" "$path" "$body" "$ctype" "$resp_file"
+  status="$HTTP_STATUS"
+  if [ "$status" = "401" ] && scp_token_refresh; then
+    # A 401 is rejected BEFORE processing (no side effect), so replaying the
+    # same request once with the re-minted token is safe for every verb used
+    # here (GET/POST/PUT/PATCH/DELETE). One retry only — a second 401 is a
+    # real authz problem and must stay loud.
+    _api_curl "$method" "$path" "$body" "$ctype" "$resp_file"
+    status="$HTTP_STATUS"
   fi
   HTTP_STATUS="$status"
   content="$(cat "$resp_file")" # same trailing-newline strip as $(...) capture — callers already live with it
@@ -202,6 +427,23 @@ api_ok() { # $1 = status; 2xx (+404-as-gone when $2=gone-ok)
 }
 
 policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
+
+list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
+  local resp
+  api_call GET "$(policies_path)" "" resp
+  api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
+  printf '%s' "$resp" | jq -c \
+    'if type == "array" then .
+     elif has("firewallPolicies") then .firewallPolicies
+     elif has("data") then .data
+     elif has("items") then .items
+     elif has("policies") then .policies
+     elif has("firewallPolicy") then [.firewallPolicy]
+     else [] end
+     | map(select(((.name // "") | startswith($p)) and ((.name // "") | endswith($s)))
+           | {id: .id, name: .name, description: (.description // "")})' \
+    --arg p "$STEADY_PREFIX" --arg s "-${SERVER_ID}"
+}
 
 list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only)
   local resp
@@ -255,19 +497,20 @@ fetch_egress_ip() { # dual-endpoint pin, exact match or fail (single host only, 
 resolve_mac() {
   local resp mac
   if [ -n "${INTERFACE_MAC:-}" ]; then
+    valid_mac "$INTERFACE_MAC" || die "INTERFACE_MAC override is not a 17-char hex/colon MAC — refusing to interpolate it into API paths (injection guard)"
     printf '%s' "$INTERFACE_MAC"
     return 0
   fi
   api_call GET "/api/v1/servers/${SERVER_ID}/interfaces" "" resp
   api_ok "$HTTP_STATUS" || die "list server interfaces failed (HTTP $HTTP_STATUS)"
-  mac="$(printf '%s' "$resp" | jq -r \
-    'if type == "array" then .[0]
-     elif has("data") then .data[0]
-     elif has("items") then .items[0]
-     elif has("interfaces") then .interfaces[0]
-     else . end
-     | .mac // empty')"
+  # Lexicographically smallest MAC — the exact same jq rule as the
+  # import-discovery step in provision.yml and main.tf's local.interface_mac
+  # (`try(sort([...mac])[0], null)`, "sorted for determinism"). On a >1-NIC
+  # server any other pick reads the WRONG interface: the live steady-state
+  # policy looks unattached and sweep-post deletes it.
+  mac="$(printf '%s' "$resp" | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
   [ -n "$mac" ] || die "could not resolve NIC MAC for server $SERVER_ID (set INTERFACE_MAC)"
+  valid_mac "$mac" || die "resolved NIC MAC is not a 17-char hex/colon value — refusing to interpolate it into API paths (injection guard)"
   printf '%s' "$mac"
 }
 
@@ -297,6 +540,7 @@ iface_fw_put() { # $1 = mac, $2 = user-policy id JSON array -> PUT merged save b
 
 attach_policy() { # $1 = policy id (idempotent merge under the global mutex)
   local id="$1" mac current_ids merged
+  all_digits "$id" || die "attach_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   mac="$(resolve_mac)"
   current_ids="$(iface_fw_get "$mac" | jq -c '[.userPolicies // [] | .[] | (.id // .)]')"
   if printf '%s' "$current_ids" | jq -e --argjson i "$id" 'index($i) != null' >/dev/null; then
@@ -310,6 +554,7 @@ attach_policy() { # $1 = policy id (idempotent merge under the global mutex)
 
 detach_policy() { # $1 = policy id (absent = success no-op)
   local id="$1" mac current_ids merged
+  all_digits "$id" || die "detach_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   mac="$(resolve_mac)"
   current_ids="$(iface_fw_get "$mac" | jq -c '[.userPolicies // [] | .[] | (.id // .)]')"
   if ! printf '%s' "$current_ids" | jq -e --argjson i "$id" 'index($i) != null' >/dev/null; then
@@ -323,6 +568,7 @@ detach_policy() { # $1 = policy id (absent = success no-op)
 
 delete_policy() { # $1 = policy id (404 = already gone, success)
   local id="$1" resp
+  all_digits "$id" || die "delete_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   api_call DELETE "$(policies_path)/${id}" "" resp
   if ! api_ok "$HTTP_STATUS" "gone-ok"; then
     die "delete policy $id failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -342,41 +588,105 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 }
 
 # ---------------------------------------------------------------------------
-# sweep-pre: enumerate -> surplus fail-closed -> drop own leftover.
+# sweep-pre: enumerate -> classify (own / non-own / orphan) -> fail closed on
+# orphan BEFORE any mutation -> retire EVERY non-own tmp (aged >2h or
+# leaked-fresh) -> drop this run's own leftovers (open recreates the window).
+#
+# SINGLE-WRITER-PER-ACCOUNT ASSUMPTION (why retiring a FRESH non-own tmp is
+# safe here): provision.yml pins concurrency.group=piercloud-netcup-policy, a
+# STATIC literal that serializes every run of THIS workflow for EVERY tenant,
+# so at pre-sweep no other run of this repo can hold a tmp. It does NOT
+# serialize another repo sharing the same netcup account — one account must
+# have exactly ONE writer (this repo's workflow); two writers on one account
+# are out of contract. The tradeoff is deliberate: an attached leaked tmp
+# keeps admitting a stale runner /32 to :22 for as long as it lives (GitHub
+# recycles runner IPs), so the fresh leak is retired now rather than at 2h.
 # ---------------------------------------------------------------------------
 cmd_sweep_pre() {
   require_token
-  local list count entry name desc age
+  local list count entry name desc age pid
+  local classify="" owns="" aged=0 leaked=0
   list="$(list_tmp_policies)"
   count="$(printf '%s' "$list" | jq 'length')"
   log "pre-sweep: $count tmp polic(ies) on server $SERVER_ID"
-  if [ "$count" -gt 1 ]; then
-    surplus_fail "$count tmp policies on server $SERVER_ID (>1) — refusing to create. Notify the operator; clean up by hand, then re-dispatch."
-  fi
+  # Pass 1 — classify ONLY, mutate nothing yet: OWN leftovers (a retry is
+  # normal; duplicates are possible through async races), NON-OWN (aged >2h
+  # = dead run, or fresh = leaked by a dead run: provision.yml's workflow-wide
+  # concurrency.group serializes every run OF THIS REPO, so a non-own tmp can
+  # never belong to a live run here; another repo on the same account is out
+  # of contract), ORPHAN (no valid created_at — ambiguous, operator must
+  # look). The fail-closed verdict is decided before any retirement (review
+  # MINOR-1: never sweep half the list and then bail).
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r '.name')"
     desc="$(printf '%s' "$entry" | jq -r '.description')"
+    pid="$(printf '%s' "$entry" | jq -r '.id')"
     if [ "$name" = "$OWN_NAME" ]; then
-      continue # own leftover handled below (retry of this run reuses it)
+      # dropped below; open recreates the window from the pinned /32
+      owns="${owns}${pid}
+"
+      continue
     fi
     age="$(policy_age "$desc")"
     if [ "$age" = "orphan" ]; then
       surplus_fail "orphan tmp policy '$name' (no valid created_at) at pre-step — refusing to create. Notify the operator."
     fi
-    if [ "$age" -gt "$TMP_TTL_SECONDS" ]; then
-      surplus_fail "tmp policy '$name' is ${age}s old (>2h) at pre-step — refusing to create. Notify the operator."
-    fi
-    # A fresh single tmp that is not ours: leave it alone (only >1 or
-    # stale/orphan fail-closed per SPEC; the mutex rules out a racing run).
+    classify="${classify}${pid}|${name}|${age}
+"
   done < <(printf '%s' "$list" | jq -c '.[]')
-  local own
-  own="$(printf '%s' "$list" | jq -r --arg n "$OWN_NAME" 'map(select(.name == $n)) | .[0].id // empty')"
-  if [ -n "$own" ]; then
-    log "pre-sweep: dropping own leftover policy $own (hard-killed attempt of this run)"
-    close_policy "$own"
+  # Pass 2 — retire every non-own tmp (close_policy = detach-then-delete),
+  # then this run's own leftovers. A failed retire stays fail-closed. All of
+  # this mutates ONLY in apply mode: report-only modes enumerate and log the
+  # would-be retirements (plus a step-summary line) instead.
+  local rest rp rn ra
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    rp="${entry%%|*}"; rest="${entry#*|}"
+    rn="${rest%%|*}"; ra="${rest#*|}"
+    if [ "$ra" -gt "$TMP_TTL_SECONDS" ]; then
+      aged=$((aged + 1))
+      if sweep_destructive; then
+        log "pre-sweep: retiring aged tmp policy '$rn' (age ${ra}s — its run is long gone)"
+      else
+        sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): aged tmp policy '$rn' (age ${ra}s) would be retired by an apply run"
+      fi
+    else
+      leaked=$((leaked + 1))
+      # GitHub recycles runner IPs: a leaked tmp keeps admitting a stale
+      # runner /32 to :22 for as long as it lives. The mutex means its run
+      # is dead — retire it now instead of waiting for the 2h age.
+      if sweep_destructive; then
+        log "pre-sweep: retiring leaked tmp policy '$rn' (age ${ra}s — its run is dead under the workflow mutex)"
+      else
+        sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): leaked tmp policy '$rn' (age ${ra}s) would be retired by an apply run"
+      fi
+    fi
+    if sweep_destructive; then
+      close_policy "$rp" || surplus_fail "could not retire tmp policy '$rn' — operator must clean up by hand."
+    fi
+  done <<<"$classify"
+  if [ "$aged" -gt 0 ] || [ "$leaked" -gt 0 ]; then
+    if sweep_destructive; then
+      log "pre-sweep: retired $aged aged + $leaked leaked tmp polic(ies)"
+    else
+      sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): $aged aged + $leaked leaked tmp polic(ies) need attention — run mode=apply to retire them"
+    fi
   fi
-  log "pre-sweep clean"
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    if sweep_destructive; then
+      log "pre-sweep: dropping own leftover policy $entry (hard-killed attempt of this run)"
+      close_policy "$entry"
+    else
+      sweep_note "pre-sweep: REPORT-ONLY (mode=${MODE:-unset}): own leftover policy $entry would be dropped by an apply run"
+    fi
+  done <<<"$owns"
+  if sweep_destructive; then
+    log "pre-sweep clean"
+  else
+    sweep_note "pre-sweep clean in REPORT-ONLY mode (mode=${MODE:-unset}); no policy was retired"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1201,8 @@ cmd_close() {
 # sweep-post: delete own-run any-age + tmp >2h + orphans. Fails loudly if any
 # delete fails (an orphan window must never pass silently). No token (auth
 # never completed) = clean no-op so `always()` keeps the original verdict.
+# Destructive ONLY in apply mode (sweep_destructive): the other modes report
+# what would be swept + append it to the step summary, and delete nothing.
 # ---------------------------------------------------------------------------
 cmd_sweep_post() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
@@ -906,18 +1218,102 @@ cmd_sweep_post() {
     pid="$(printf '%s' "$entry" | jq -r '.id')"
     age="$(policy_age "$desc")"
     if [ "$name" = "$OWN_NAME" ] || [ "$age" = "orphan" ] || [ "$age" -gt "$TMP_TTL_SECONDS" ]; then
-      if [ "$age" = "orphan" ]; then
-        warn "post-sweep: orphan tmp policy '$name' — sweeping"
+      if sweep_destructive; then
+        if [ "$age" = "orphan" ]; then
+          warn "post-sweep: orphan tmp policy '$name' — sweeping"
+        else
+          log "post-sweep: sweeping '$name' (age ${age}s)"
+        fi
+        if close_policy "$pid"; then
+          swept=$((swept + 1))
+        else
+          failures=$((failures + 1))
+        fi
       else
-        log "post-sweep: sweeping '$name' (age ${age}s)"
+        sweep_note "post-sweep: REPORT-ONLY (mode=${MODE:-unset}): tmp policy '$name' (age ${age}s) would be swept by an apply run"
       fi
+    fi
+  done < <(printf '%s' "$list" | jq -c '.[]')
+  # Steady-state orphans (pre-import backlog, issue #101): stateless applies
+  # before the conditional import created a fresh
+  # piercloud-anchor-<hostname>-<server_id> policy each run and orphaned the
+  # previous one (cap incidents 2026-09-10). Any policy in that family that is
+  # NOT attached is a leftover by definition — retire it (close_policy is
+  # detach-then-delete; the detach no-ops when it is already unattached). The
+  # attached policy is never touched.
+  local steady attached mac canon_jq
+  mac="$(resolve_mac)"
+  # One canonical-id rule, applied to BOTH sides of the attachment
+  # comparison (F1 attached entries, F2 steady pid). String: canonical
+  # decimal, so "" / "0042" / "42\n" / "+42" fail. Number: canonical
+  # decimal literal after tostring(), so 42.0 / 1e2 / -3 fail (jq >= 1.7
+  # keeps the literal; 1.6 collapses 42.0 to 42 and cannot distinguish —
+  # the test harness gates that one case). The literal 0 is allowed
+  # uniformly on both sides (netcup policy ids are >= 1 in practice, so 0
+  # is unreachable but deliberately not special-cased).
+  canon_jq='
+    def canon_id($what):
+      if type == "string" then
+        (if test("^(0|[1-9][0-9]*)\\z") then . else error("\($what): non-canonical string id") end)
+      elif type == "number" then
+        (if (. >= 0) and ((. | floor) == .) and ((. | tostring) | test("^(0|[1-9][0-9]*)\\z")) then tostring
+         else error("\($what): non-canonical numeric id") end)
+      else error("\($what): id is not a non-negative integer") end;
+  '
+  # Attached-list parse (review security N1, live-proven; N4 + F1/F2 id
+  # hardening): dispatch on the ENTRY type and hard-fail on anything
+  # ambiguous. The previous `(.id // .)` fallback made an id-less/null/
+  # empty-id entry resolve to the WHOLE OBJECT; the live steady-state
+  # policy then looked unattached and close_policy deleted it (cleartext/
+  # dashboard outage until re-apply). Tolerated: an array of {"id":number}/
+  # {"id":string}/bare number/bare string entries whose id is a canonical
+  # non-negative integer — strings must match ^(0|[1-9][0-9]*)\z. `\z`,
+  # never `$`: Oniguruma's `$` also matches immediately BEFORE a trailing
+  # newline, so "42\n" slipped through the old ^[0-9]+$ guard, missed the
+  # live-id match and the sweep deleted the attached policy 42 (F1,
+  # live-proven). Numbers must be integral, non-negative and stringify to
+  # the same canonical shape — 42.0 and 1e2 are rejected, not rounded or
+  # exponent-formatted into a different id. All canonical ids are
+  # stringified (the comparison below is against stringified steady ids).
+  # Ambiguous = missing key, non-array userPolicies, null/boolean/object
+  # entries, id null/empty/non-scalar/non-canonical → jq errors: no
+  # STEADY-STATE policy is detached or deleted (die). The tmp-policy pass
+  # above has already run by then and is unaffected.
+  attached="$(iface_fw_get "$mac" | jq -ce "$canon_jq"'
+    if (.userPolicies | type) == "array" then
+      [.userPolicies[] |
+        if type == "object" then
+          (.id | if . == null then error("userPolicies entry without a usable id") else canon_id("userPolicies entry") end)
+        elif type == "string" or type == "number" then canon_id("userPolicies entry")
+        else error("userPolicies entry of an ambiguous type") end]
+    else error("userPolicies missing or not an array") end')" \
+    || die "could not parse the attached-policy list for $SERVER_ID/$mac — refusing the steady-state orphan sweep on unproven attachment state"
+  steady="$(list_steady_policies)"
+  # F2: the STEADY-state id passes the exact same canonicalization BEFORE
+  # it is compared or handed to close_policy. Raw "0042" used to miss the
+  # attached "42" match; close_policy then rewrote userPolicies to [] (PUT
+  # removed the live attachment) and deleted /firewall-policies/0042.
+  # A malformed steady id fails closed with no mutation.
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="$(printf '%s' "$entry" | jq -r '.name')"
+    pid="$(printf '%s' "$entry" | jq -er "$canon_jq"'.id | canon_id("steady-state policy")')" \
+      || die "steady-state policy '$name' carries a non-canonical id — refusing the steady-state orphan sweep on unproven attachment state"
+    if printf '%s' "$attached" | jq -e --arg id "$pid" 'index($id) != null' >/dev/null 2>&1; then
+      log "post-sweep: steady-state policy '$name' (id ${pid}) is attached — kept"
+      continue
+    fi
+    if sweep_destructive; then
+      warn "post-sweep: steady-state ORPHAN '$name' (id ${pid}) — retiring (not attached)"
       if close_policy "$pid"; then
         swept=$((swept + 1))
       else
         failures=$((failures + 1))
       fi
+    else
+      sweep_note "post-sweep: REPORT-ONLY (mode=${MODE:-unset}): steady-state ORPHAN '$name' (id ${pid}) is not attached — would be retired by an apply run"
     fi
-  done < <(printf '%s' "$list" | jq -c '.[]')
+  done < <(printf '%s' "$steady" | jq -c '.[]')
   log "post-sweep done: swept=$swept failures=$failures"
   if [ "$failures" -ne 0 ]; then
     die "post-sweep left $failures tmp polic(ies) behind — operator must clean up by hand"

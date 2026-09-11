@@ -82,15 +82,19 @@ is advisory display only.
 Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Dispatch takes the mode (plus action flags) — no identifiers: your username already lives in the repo's `TENANT_USER` variable, and everything sensitive
 resolves from repo secrets inside the run.
 
-Only the URL + code (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG`. The short-lived code is deliberately NOT `::add-mask::`-masked (masks silently break the job-handoff outputs); instead it is never printed beyond the card, never stored, dead in 600s, and useless without your own netcup session. The access token stays masked and never crosses jobs.
+Only the URL + code (+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG`. The short-lived code is deliberately NOT `::add-mask::`-masked (masks silently break the job-handoff outputs); instead it is never printed beyond the card, never stored, dead in 600s, and useless without your own netcup session. The access and refresh tokens stay masked and never cross jobs.
 
 If your repo has you as a reviewer (power path), GitHub pauses the run first: approve the pending deployment (check the commit matches the banner card), THEN approve the netcup code below. Two taps, in that order — the first approves WHAT runs, the second lets it touch your account. Without a reviewer identity the run proceeds straight to the code, and the LOUD banner is your check.
 
 The run prints a netcup device-flow URL + `XXXX-XXXX` user code (plus a push via ntfy, once you set that up later — see §8). You approve at netcup's own Keycloak (your
 session, your 2FA, ~600s window) — the approval is one tap, phone browsers included. The runner polls, receives an ephemeral
-token, provisions, and the token dies with the runner. Only the URL + code
-(+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG` (masking note: the access token stays masked; the short-lived code is unmasked-by-design, see above). The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
+token, provisions, and the token dies with the runner — the run revokes the device-grant refresh token at teardown; a teardown that cannot prove the credential dead fails the run RED (no silent green). Only the URL + code
+(+ alias) are ever printed — `curl -sS`, no `-v`, no `TF_LOG` (masking note: both the access token and the refresh token stay masked; the short-lived code is unmasked-by-design, see above). The card carries, verbatim: "we will never email or message you a code to re-confirm." If the device grant is ever disabled:
 STOP + open an issue in your repo so the operator sees it (C-A — no fallback exists, none is permitted).
+
+If the runner is killed or the run is cancelled before teardown, the run's
+refresh token can stay live for up to ~30 days — recovery: [dr.md, "Runner
+killed or run cancelled before teardown" row](dr.md#dr-table).
 
 ## 4. A1 provisions, thumbprint lands via run artifact (H1 chain)
 

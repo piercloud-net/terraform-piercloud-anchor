@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# Unit test for the SCP access-token refresh path in
+# .github/scripts/020-provision-anchor.sh (scp_token_refresh + api_call).
+#
+# Context (live 2026-09-11): the netcup/SCP access token lives ~5 minutes
+# while a real run takes longer (async apply), so every tail step 401'd and
+# leaked the A1 window policy. The fix re-mints the access token from the
+# device grant's own offline_access refresh token on the first 401 and
+# replays the request once. This harness proves the three behaviours with a
+# stubbed `curl` — no network, no credentials:
+#   1. 401 → refresh → retry once → 2xx, and the retry carries the NEW token
+#   2. no refresh token → 401 stays 401, exactly one request (fail loud)
+#   3. refresh refused / unusable → 401 stays 401, exactly one request
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT="$ROOT/.github/scripts/020-provision-anchor.sh"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+pass=0
+fail=0
+ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+is()  { # $1 label, $2 expected, $3 actual
+  if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
+}
+
+# ---- stubbed curl -----------------------------------------------------------
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+# Minimal curl stand-in: understands -sS --max-time N -X M -o FILE -w '%{http_code}'
+# -H 'Header: v' -d body --data-urlencode k v and one URL. Driven by $STUB_MODE.
+set -euo pipefail
+out=""; url=""; body=""; declare -a headers=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;                                   # only '%{http_code}' is used
+    -X) shift 2 ;;
+    -H) headers+=("$2"); shift 2 ;;
+    -d) body="$2"; shift 2 ;;
+    --data-urlencode)
+      # curl's name@file form (tokens ride there so they never hit argv).
+      v="$2"
+      case "$v" in
+        *@/*) name="${v%%@*}"; f="${v#*@}"; v="${name}=$(cat "$f" 2>/dev/null || true)" ;;
+      esac
+      body="$body&$v"; shift 2 ;;
+    --max-time) shift 2 ;;
+    -sS) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+if [ "$url" = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" ]; then
+  echo refresh >> "$STUB_REFRESHED"
+  if [ -n "${STUB_REFRESH_BODY:-}" ]; then printf '%s' "${body#&}" > "$STUB_REFRESH_BODY"; fi
+  case "$STUB_MODE" in
+    refresh-bad) printf 'this is not json' ;;
+    refresh-inject-at) printf '%s' '{"access_token":"AT2\nNETCUP_API_BASE=http://attacker","refresh_token":"RT2"}' ;;
+    refresh-inject-rt) printf '%s' '{"access_token":"AT2","refresh_token":"RT2\nNETCUP_API_BASE=http://attacker"}' ;;
+    *)           printf '{"access_token":"AT2","refresh_token":"RT2"}' ;;
+  esac
+  exit 0
+fi
+
+# API call: record the bearer token actually sent, then answer by mode.
+n="$(cat "$STUB_CALLS" 2>/dev/null || echo 0)"
+n=$((n + 1)); echo "$n" > "$STUB_CALLS"
+for h in "${headers[@]}"; do
+  case "$h" in
+    Authorization:*)
+      token="${h#Authorization: Bearer }"
+      printf '%s\n' "$token" >> "$STUB_SEEN"
+      ;;
+  esac
+done
+if [ "$STUB_MODE" = "401-then-200" ] && [ "$n" -ge 2 ]; then
+  if [ -n "$out" ]; then printf '{"ok":true}' > "$out"; fi
+  printf 200
+  exit 0
+fi
+if [ -n "$out" ]; then printf '{"message":"Invalid token."}' > "$out"; fi
+printf 401
+STUB
+chmod +x "$WORK/bin/curl"
+
+# ---- extract the functions under test (sourcing the CLI would dispatch) ----
+extract() { awk "/^$1\\(\\) \\{/,/^\\}/" "$SCRIPT"; }
+{
+  # Real log shape (stdout): with a stubbed log() the captured-stdout regression
+  # below cannot see the bug at all — that is exactly why the refresh banner
+  # slipped through review. Keep this faithful to the script.
+  echo 'log() { printf "A1: %s\n" "$*"; }'
+  echo 'die() { printf "A1 FAIL: %s\n" "$*" >&2; exit 1; }'
+  extract scp_token_refresh
+  extract guard_token_value
+  extract _api_curl
+  extract api_call
+} > "$WORK/functions.sh"
+for fn in scp_token_refresh guard_token_value _api_curl api_call; do
+  grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
+done
+
+run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB_ENV body], [$5 seed refresh-token file]
+  # Per-case handoff files: in CI the REAL $GITHUB_ENV is set, and a shared
+  # file let case 1's FAKE tokens leak into case 2 (which then adopted them)
+  # — a harness artifact that previously forced a production "never
+  # resurrect" guard. One file per case: hermetic, no cross-case adoption.
+  : > "$WORK/genv.$1"; : > "$WORK/rtok.$1"
+  if [ -n "${4:-}" ]; then printf '%s\n' "$4" > "$WORK/genv.$1"; fi
+  if [ -n "${5:-}" ]; then printf '%s' "$5" > "$WORK/rtok.$1"; fi
+  STUB_MODE="$2" \
+  GITHUB_ENV="$WORK/genv.$1" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
+  STUB_CALLS="$WORK/calls.$1" STUB_SEEN="$WORK/seen.$1" \
+  STUB_REFRESHED="$WORK/refreshed.$1" STUB_REFRESH_BODY="$WORK/refreshbody.$1" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="$3" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" \
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    out=""
+    api_call GET "/api/v1/test" "" out
+    printf "HTTP_STATUS=%s\nOUT=%s\n" "$HTTP_STATUS" "$out"
+  ' _ "$WORK/functions.sh" > "$WORK/result.$1" 2>&1 || true
+  HTTP_STATUS="$(sed -n 's/^HTTP_STATUS=//p' "$WORK/result.$1")"
+  OUT="$(sed -n 's/^OUT=//p' "$WORK/result.$1")"
+  CALLS=0; REFRESHED=0; SEEN=""
+  if [ -f "$WORK/calls.$1" ]; then CALLS="$(cat "$WORK/calls.$1")"; fi
+  if [ -f "$WORK/refreshed.$1" ]; then REFRESHED="$(wc -l < "$WORK/refreshed.$1" | tr -d ' ')"; fi
+  if [ -f "$WORK/seen.$1" ]; then SEEN="$(paste -sd, "$WORK/seen.$1")"; fi
+  REFRESH_BODY=""
+  if [ -f "$WORK/refreshbody.$1" ]; then REFRESH_BODY="$(cat "$WORK/refreshbody.$1")"; fi
+}
+
+# ---- case 1: 401 → refresh → retry once → 200 (and the NEW token is used) ---
+run_case c1 401-then-200 "RT1"
+is "case1 status"        "200"         "$HTTP_STATUS"
+is "case1 body"          '{"ok":true}' "$OUT"
+is "case1 api calls"     "2"           "$CALLS"
+is "case1 refresh calls" "1"           "$REFRESHED"
+is "case1 tokens seen"   "AT1,AT2"     "$SEEN"
+is "case1 refresh body"  "grant_type=refresh_token&client_id=scp&refresh_token=RT1" "$REFRESH_BODY"
+is "case1 rotated RT persisted to file" "RT2" "$(cat "$WORK/rtok.c1")"
+is "case1 RT NOT in GITHUB_ENV"          "0"   "$(grep -c '^NETCUP_SCP_REFRESH_TOKEN=' "$WORK/genv.c1" || true)"
+
+# ---- case 2: no refresh token → 401 stays 401, single request --------------
+run_case c2 always-401 ""
+is "case2 status"        "401"         "$HTTP_STATUS"
+is "case2 api calls"     "1"           "$CALLS"
+is "case2 refresh calls" "0"           "$REFRESHED"
+
+# ---- case 3: refresh refused (non-JSON) → 401 stays 401, no replay ---------
+run_case c3 refresh-bad "RT1"
+is "case3 status"        "401"         "$HTTP_STATUS"
+is "case3 api calls"     "1"           "$CALLS"
+is "case3 refresh calls" "1"           "$REFRESHED"
+
+# ---- case 4: a refresh must not corrupt a captured stdout ------------------
+# The live failure (review SECURITY, reproduced): pid="$(own_policy_id)" — a
+# captured call site — got the refresh success line on stdout PREPENDED to the
+# JSON, so jq died with "parse error: Invalid numeric literal", cmd_close read
+# rc 5 with an empty pid, and the A1 window policy leaked. The capture below is
+# the faithful shape: api_call's body goes to the outvar and the wrapper prints
+# the outvar INSIDE the command substitution (a bare `$(api_call ...)` would
+# lose HTTP_STATUS — see api_call's subshell warning).
+run_capture() { # $1 label, $2 mode -> CAP_RC/CAPTURED/CAP_STDOUT/CAP_STDERR/CAP_REFRESHED
+  local rc=0
+  : > "$WORK/genv.$1"; : > "$WORK/rtok.$1"
+  STUB_MODE="$2" \
+  GITHUB_ENV="$WORK/genv.$1" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
+  STUB_CALLS="$WORK/calls.cap.$1" STUB_SEEN="$WORK/seen.cap.$1" \
+  STUB_REFRESHED="$WORK/refreshed.cap.$1" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="RT1" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" \
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    json_call() { local o=""; api_call GET "/api/v1/test" "" o; printf "%s" "$o"; }
+    captured="$(json_call)"
+    printf "CAPTURED=%s\n" "$captured"
+  ' _ "$WORK/functions.sh" > "$WORK/cap.out.$1" 2> "$WORK/cap.err.$1" || rc=$?
+  CAP_RC="$rc"
+  CAPTURED="$(sed -n 's/^CAPTURED=//p' "$WORK/cap.out.$1")"
+  # Anything else the wrapper wrote to stdout (the bug: the refresh banner).
+  CAP_STDOUT="$(grep -v '^CAPTURED=' "$WORK/cap.out.$1" || true)"
+  CAP_STDERR="$(cat "$WORK/cap.err.$1")"
+  CAP_REFRESHED=0
+  if [ -f "$WORK/refreshed.cap.$1" ]; then CAP_REFRESHED="$(wc -l < "$WORK/refreshed.cap.$1" | tr -d ' ')"; fi
+}
+
+run_capture c4 401-then-200
+is "case4 rc"                    "0"           "$CAP_RC"
+is "case4 captured body"         '{"ok":true}' "$CAPTURED"
+is "case4 captured parses (jq)"  "1"           "$(printf '%s' "$CAPTURED" | jq -e '.ok == true' >/dev/null 2>&1 && echo 1 || echo 0)"
+is "case4 no stray stdout"       ""            "$CAP_STDOUT"
+is "case4 refresh banner stderr" "1"           "$(printf '%s' "$CAP_STDERR" | grep -c 'scp token refreshed' || true)"
+is "case4 refresh calls"         "1"           "$CAP_REFRESHED"
+
+# ---- case 5: adoption of the persisted refresh-token FILE is UNCONDITIONAL --
+# A subshell refreshed and rewrote the handoff FILE with RT3; the parent's
+# in-process copy is empty/consumed. The parent must adopt the file's RT3
+# (with the old guarded adoption it bailed out: 0 refreshes, 401), rotate it
+# to RT2, and write RT2 back for the next parent/step.
+run_case c5 401-then-200 "" 'NETCUP_SCP_ACCESS_TOKEN=AT3' 'RT3'
+is "case5 status"          "200" "$HTTP_STATUS"
+is "case5 refresh calls"   "1"   "$REFRESHED"
+is "case5 adopted RT used" "1"   "$(case "$REFRESH_BODY" in *refresh_token=RT3*) echo 1;; *) echo 0;; esac)"
+is "case5 file rotated to RT2" "RT2" "$(cat "$WORK/rtok.c5")"
+
+# ---- case 6: a token endpoint outside the SCP realm is refused ---------------
+# A tampered/hijacked discovery document must never receive the refresh token:
+# the endpoint pin dies loudly instead of POSTing to the attacker.
+run_pin_case() {
+  local rc=0
+  : > "$WORK/genv.c6"; : > "$WORK/rtok.c6"
+  STUB_MODE=401-then-200 \
+  GITHUB_ENV="$WORK/genv.c6" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.c6" \
+  STUB_CALLS="$WORK/calls.c6" STUB_SEEN="$WORK/seen.c6" STUB_REFRESHED="$WORK/refreshed.c6" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="RT1" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://attacker.example/token" \
+  bash -c 'source "$1"; api_call GET "/api/v1/test" "" out; printf "OUT=%s\n" "$out"' _ "$WORK/functions.sh" >"$WORK/pin.out" 2>"$WORK/pin.err" || rc=$?
+  PIN_RC="$rc"
+}
+run_pin_case
+is "case6 pin refused (rc != 0)" "1" "$([ "$PIN_RC" -ne 0 ] && echo 1 || echo 0)"
+is "case6 no refresh sent"       "0" "$([ -f "$WORK/refreshed.c6" ] && wc -l < "$WORK/refreshed.c6" | tr -d ' ' || echo 0)"
+is "case6 loud error"            "1" "$(grep -c 'refusing to send the refresh token' "$WORK/pin.err" || true)"
+
+# ---- cases 7+8: injected token values are refused BEFORE any handoff write ---
+# Review SECURITY N0 (live-proven): the workflow's poll step guards the FIRST
+# token response, but this refresh path (~every 401 after 5 min) did not. A
+# crafted response whose access_token or refresh_token carries an embedded
+# newline (jq -r emits the real byte) forged a second $GITHUB_ENV line — every
+# later step inherited it, so ${NETCUP_API_BASE:-…} sent the Bearer token to
+# the attacker while the run stayed green. Fail closed BEFORE masking, the env
+# append and the 0600 file write: the env file keeps exactly its seeded single
+# line and the refresh-token file keeps its old value.
+run_inject() { # $1 label, $2 mode -> INJ_RC / inj.out.$1 / inj.err.$1 / per-case files
+  local rc=0
+  printf 'NETCUP_SCP_ACCESS_TOKEN=AT1\n' > "$WORK/genv.$1"
+  printf 'RT0' > "$WORK/rtok.$1"
+  STUB_MODE="$2" \
+  GITHUB_ENV="$WORK/genv.$1" \
+  NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
+  STUB_CALLS="$WORK/calls.$1" STUB_SEEN="$WORK/seen.$1" \
+  STUB_REFRESHED="$WORK/refreshed.$1" \
+  PATH="$WORK/bin:$PATH" \
+  NETCUP_API_BASE="https://scp.example" \
+  NETCUP_SCP_ACCESS_TOKEN="AT1" \
+  NETCUP_SCP_REFRESH_TOKEN="RT1" \
+  NETCUP_SCP_TOKEN_ENDPOINT="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token" \
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    out=""
+    api_call GET "/api/v1/test" "" out
+    printf "HTTP_STATUS=%s\nOUT=%s\n" "$HTTP_STATUS" "$out"
+  ' _ "$WORK/functions.sh" > "$WORK/inj.out.$1" 2> "$WORK/inj.err.$1" || rc=$?
+  INJ_RC="$rc"
+}
+
+run_inject c7 refresh-inject-at
+is "case7 injection rc (fail-closed)"            "1"  "$INJ_RC"
+is "case7 env file keeps exactly 1 line"         "1"  "$(wc -l < "$WORK/genv.c7" | tr -d ' ')"
+is "case7 no forged NETCUP_API_BASE in env"      "0"  "$(grep -c '^NETCUP_API_BASE=' "$WORK/genv.c7" || true)"
+is "case7 RT file NOT rewritten"                 "RT0" "$(cat "$WORK/rtok.c7")"
+is "case7 loud guard error"                      "1"  "$(grep -c 'injection guard' "$WORK/inj.err.c7" || true)"
+
+run_inject c8 refresh-inject-rt
+is "case8 injection rc (fail-closed)"            "1"  "$INJ_RC"
+is "case8 env file keeps exactly 1 line"         "1"  "$(wc -l < "$WORK/genv.c8" | tr -d ' ')"
+is "case8 no forged NETCUP_API_BASE in env"      "0"  "$(grep -c '^NETCUP_API_BASE=' "$WORK/genv.c8" || true)"
+is "case8 RT file NOT rewritten"                 "RT0" "$(cat "$WORK/rtok.c8")"
+is "case8 loud guard error"                      "1"  "$(grep -c 'injection guard' "$WORK/inj.err.c8" || true)"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

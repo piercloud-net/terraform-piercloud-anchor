@@ -191,6 +191,14 @@ jobs:
         id: request
         run: |
           set -euo pipefail
+          # Handoff-write guard (review security): API-derived values are
+          # written to $GITHUB_OUTPUT line-by-line, so a crafted value with an
+          # embedded newline would forge additional outputs. Reject newline/CR
+          # and any non-printable characters before every such write.
+          guard_line() { # $1 label, $2 API-derived value
+            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
+            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
+          }
           # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
           # (prior literals were probed, never recorded). Endpoints are
           # recovered from the Keycloak OIDC discovery document FIRST.
@@ -198,6 +206,17 @@ jobs:
           DEVICE_ENDPOINT="$(echo "$DISCO" | jq -r '.device_authorization_endpoint')"
           TOKEN_ENDPOINT="$(echo "$DISCO" | jq -r '.token_endpoint')"
           test "$DEVICE_ENDPOINT" != "null" || { echo "::error::discovery doc lacks device_authorization_endpoint — STOP, escalate."; exit 1; }
+          # Endpoint pin (review security MEDIUM): only the live SCP Keycloak
+          # realm may receive auth traffic — a tampered discovery document
+          # must not receive the device code (or, later, the tokens).
+          require_scp_endpoint() { # $1 label, $2 URL
+            case "$2" in
+              https://www.servercontrolpanel.de/realms/scp/*) ;;
+              *) echo "::error::$1 is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+            esac
+          }
+          require_scp_endpoint "device_authorization_endpoint" "$DEVICE_ENDPOINT"
+          require_scp_endpoint "token_endpoint" "$TOKEN_ENDPOINT"
           RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" --data-urlencode "client_id=scp" --data-urlencode "scope=offline_access openid")"
           # C-f: grant disabled (or any refusal) → STOP + escalate.
           # No downgrade path exists by design (C-A) — this job exits here.
@@ -248,6 +267,9 @@ jobs:
           # Handoff to the poll job (device_code only: short-lived,
           # user-mediated, already log-printed. The ACCESS token is minted
           # and consumed inside the poll job — it never crosses jobs (C-d).
+          guard_line "device_code" "$DEVICE_CODE"
+          guard_line "token_endpoint" "$TOKEN_ENDPOINT"
+          guard_line "interval" "$INTERVAL"
           echo "device_code=$DEVICE_CODE" >> "$GITHUB_OUTPUT"
           echo "token_endpoint=$TOKEN_ENDPOINT" >> "$GITHUB_OUTPUT"
           echo "interval=$INTERVAL" >> "$GITHUB_OUTPUT"
@@ -297,6 +319,20 @@ jobs:
           INTERVAL: ${{ needs.device-request.outputs.interval }}
         run: |
           set -euo pipefail
+          # Handoff-write guard (review security): the token response is
+          # API-derived; a crafted value with an embedded newline would forge
+          # additional $GITHUB_ENV lines (e.g. redirect NETCUP_API_BASE).
+          guard_line() { # $1 label, $2 API-derived value
+            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
+            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
+          }
+          # Endpoint pin (review security MEDIUM): the device-code POST may
+          # only ever go to the live SCP Keycloak realm (the value arrives via
+          # the request job's output; re-checked here at the point of use).
+          case "$TOKEN_ENDPOINT" in
+            https://www.servercontrolpanel.de/realms/scp/*) ;;
+            *) echo "::error::token_endpoint is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+          esac
           # No re-mask (see request job): masked values can't cross via outputs;
           # the code arrives unmasked by design and is never printed anywhere.
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
@@ -313,17 +349,53 @@ jobs:
             case "$STATUS" in
               ok)
                 ACCESS_TOKEN="$(echo "$POLL" | jq -r '.access_token')"
+                guard_line "access_token" "$ACCESS_TOKEN"
                 echo "::add-mask::$ACCESS_TOKEN"
                 echo "authorized=true" >> "$GITHUB_OUTPUT"
-                # M2 same-job handoff: the token persists ONLY in this
-                # runner's environment (GITHUB_ENV dies with the runner).
-                # Same-job steps below consume it; it never crosses jobs,
-                # never lands in state (C-d: TF 1.11 ephemerals carry it).
+                # M2 same-job handoff: the ACCESS token persists ONLY in this
+                # runner's local GITHUB_ENV handoff (dies with the runner);
+                # the REFRESH token gets its own 0600 file below — it must
+                # not sit in the job env. Same-job steps below consume both;
+                # neither crosses jobs, neither lands in state (C-d: TF 1.11
+                # ephemerals carry the access token).
                 echo "NETCUP_SCP_ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_ENV"
-                # C-d: refresh stays in-memory only (same-runner handoff
-                # above); TF 1.11 ephemerals carry it — it never lands in state.
-                echo "Approved. Token held in runner memory only."
-                echo "::notice::netcup approval received for $TENANT_USER — token in runner memory, provisioning continues."
+                # ~5-min access-token TTL vs multi-minute runs (live
+                # 2026-09-11: the async apply outlived the token, every tail
+                # step 401'd and the A1 window policy leaked). offline_access
+                # was already requested at approval — hand the refresh token
+                # to the script's REST helper (scp_token_refresh), which
+                # re-mints ONCE on a 401 and replays the request. Same-runner
+                # handoff, dies with the runner (C-d trust model unchanged).
+                REFRESH_TOKEN="$(echo "$POLL" | jq -r '.refresh_token // empty')"
+                if [ -n "$REFRESH_TOKEN" ]; then
+                  guard_line "refresh_token" "$REFRESH_TOKEN"
+                  # Discovery-derived: guard again at the write (defense in depth).
+                  guard_line "token_endpoint" "$TOKEN_ENDPOINT"
+                  echo "::add-mask::$REFRESH_TOKEN"
+                  # Refresh-token handoff: a 0600 runner-local FILE, NOT
+                  # $GITHUB_ENV. Only the PATH is exported, so the ~30-day
+                  # credential never enters the job environment where every
+                  # later step — including the community tofu provider pulled
+                  # by `tofu init` — could read it (review security MEDIUM).
+                  # scp_token_refresh reads and rewrites this file for the
+                  # current value and every rotation.
+                  REFRESH_TOKEN_FILE="$RUNNER_TEMP/scp-refresh-${GITHUB_RUN_ID}.token"
+                  if ! (umask 077; printf '%s' "$REFRESH_TOKEN" > "$REFRESH_TOKEN_FILE"); then
+                    echo "::error::could not write the refresh-token handoff file $REFRESH_TOKEN_FILE — aborting (no handoff is safer than an env leak)."
+                    exit 1
+                  fi
+                  echo "NETCUP_SCP_REFRESH_TOKEN_FILE=$REFRESH_TOKEN_FILE" >> "$GITHUB_ENV"
+                  echo "NETCUP_SCP_TOKEN_ENDPOINT=$TOKEN_ENDPOINT" >> "$GITHUB_ENV"
+                  echo "::notice::refresh token captured to the runner-local file handoff — long runs survive the ~5 min access-token TTL."
+                else
+                  echo "::warning::no refresh_token in the token response — runs longer than ~5 min will 401 at the tail (fail-loud, no fallback)."
+                fi
+                # C-d: the refresh token stays in its 0600 runner-local FILE
+                # (the script re-reads it across subshells and rewrites it on
+                # every rotation); TF 1.11 ephemerals carry the access token —
+                # the refresh credential never enters the job env nor state.
+                echo "Approved. Token held on this runner only (local handoff file)."
+                echo "::notice::netcup approval received for $TENANT_USER — token in the runner-local handoff, provisioning continues."
                 echo "" >> "$GITHUB_STEP_SUMMARY"
                 echo "✅ Approved — the code above is dead. Provisioning continues." >> "$GITHUB_STEP_SUMMARY"
                 exit 0
@@ -358,12 +430,22 @@ jobs:
         id: resolve
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
           SCP_USER_ID_IN: ${{ secrets.SCP_USER_ID }}
           CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
           TENANT_USER: ${{ vars.TENANT_USER }}
         run: |
           set -euo pipefail
+          # Handoff-write guard (review security): every API-derived value
+          # below reaches $GITHUB_ENV/$GITHUB_OUTPUT; reject newline/CR and
+          # non-printable characters so a crafted response cannot forge extra
+          # env lines (e.g. redirecting NETCUP_API_BASE with the token).
+          guard_line() { # $1 label, $2 API-derived value
+            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
+            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
+          }
           # The numeric server id is the stable key (policy names, tmp tags,
           # module adopt) but it appears in no email — so the run resolves it
           # itself. Runs before every consumer below; ids are identifiers,
@@ -378,6 +460,10 @@ jobs:
           SAN="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
           [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."; exit 1; }
           HOSTNAME="anchor-${SAN}-01"
+          # Vendor variables are trusted less than they look: a newline in the
+          # repo variable survives the sanitize sed (line-oriented) and would
+          # forge an extra $GITHUB_ENV line. Reject before the write.
+          guard_line "ANCHOR_HOSTNAME" "$HOSTNAME"
           echo "ANCHOR_HOSTNAME=$HOSTNAME" >> "$GITHUB_ENV"
           echo "Derived hostname $HOSTNAME."
           # SCP user id: NEVER the customer number (live 403 proved they
@@ -393,6 +479,11 @@ jobs:
             [ -n "$SCP_EFF" ] || { echo "::error::userinfo returned no numeric id — token scope may lack openid, or the grant changed. Escalate, no fallback."; exit 1; }
             echo "Resolved SCP user id=$SCP_EFF from token userinfo."
           fi
+          # Parse-time validation (review security): the userinfo id is
+          # interpolated into API paths, TF vars and policy-import HCL — it
+          # must be all-digits before it goes anywhere. Fail closed.
+          case "$SCP_EFF" in '' | *[!0-9]*) echo "::error::resolved SCP user id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
+          guard_line "SCP_USER_ID_EFF" "$SCP_EFF"
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
           # Approver guard (issue #50): the device approval the tenant
           # already tapped is the ONLY authorization moment — prove it came
@@ -471,6 +562,11 @@ jobs:
               exit 1
             fi
           fi
+          # Parse-time validation (review security): the discovered server id
+          # is interpolated into API paths and the generated import HCL — it
+          # must be all-digits before it goes anywhere. Fail closed.
+          case "$RESOLVED_ID" in '' | *[!0-9]*) echo "::error::resolved server id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
+          guard_line "SERVER_ID" "$RESOLVED_ID"
           echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
           # SSH/DNS target: the pasted IP wins when set (legacy,
           # byte-for-byte); else the server detail's first IPv4 (IPv6-only
@@ -485,6 +581,11 @@ jobs:
             [ -n "$HOST4" ] || { echo "::error::server $RESOLVED_ID reports no IPv4 address (IPv6-only is unsupported — runners have no IPv6). Attach an IPv4, or set ANCHOR_IPV4 and re-dispatch."; exit 1; }
             echo "Discovery: anchor IPv4 from server detail, no pasted IP needed."
           fi
+          # Parse-time validation (review security): the SSH/DNS target must
+          # be a bare IPv4 (both the pasted-secret and the API-derived path) —
+          # it is interpolated into runner shell and $GITHUB_OUTPUT. Fail closed.
+          case "$HOST4" in '' | *[!0-9.]*) echo "::error::anchor host is not a bare IPv4 — refusing to use it (injection guard)."; exit 1 ;; esac
+          guard_line "ANCHOR_HOST" "$HOST4"
           echo "ANCHOR_HOST=$HOST4" >> "$GITHUB_ENV"
           echo "anchor_ipv4=$HOST4" >> "$GITHUB_OUTPUT"
           echo "Resolved server_id=$RESOLVED_ID (ssh/dns target set)."
@@ -506,15 +607,22 @@ jobs:
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
+          # Destructive sweeps only in apply mode; other modes report-only.
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           # TTL tag piercloud-tmp-<server_id>-<run_id>, description
-          # created_at=<RFC3339-UTC> purpose=A1-ssh. >1 tmp on this server,
-          # or any tmp >2h / orphan at pre-step, fails BEFORE creating
-          # (exit 3, operator notified by the failure step below).
+          # created_at=<RFC3339-UTC> purpose=A1-ssh. Classify first, then
+          # retire EVERY non-own tmp (aged or leaked-fresh — the workflow
+          # mutex means no foreign run can be live); only an orphan (no
+          # parseable created_at) or a failed retire stays fail-closed,
+          # BEFORE creating (exit 3, operator notified by the failure step
+          # below).
           .github/scripts/020-provision-anchor.sh sweep-pre
 
       - name: Set up OpenTofu (>= 1.11 for ephemeral values)
@@ -527,32 +635,99 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          # NOTE (review security, corrected): the refresh token VALUE is not
+          # in any tofu step's env — the community provider only gets the
+          # short-lived access token. But the runner-local 0600 handoff FILE
+          # PATH rides the job env (dynamic $GITHUB_ENV), and the file is
+          # readable by same-user processes on this runner, so `tofu init`
+          # must not be able to silently swap the provider build: the
+          # committed .terraform.lock.hcl + `-lockfile=readonly` below pin
+          # and verify the exact provider binaries (N3). A provider-side 401
+          # fails loud rather than refreshing without persisting the
+          # rotation. Scope: the lock pins the exact build + hashes and fails
+          # closed on a mismatch; it is NOT a defense against a malicious
+          # upstream release, and the 0600 handoff file stays readable by
+          # same-UID processes on this runner (both accepted, disclosed
+          # limits).
           TF_IN_AUTOMATION: "true"
         run: |
           set -euo pipefail
           # No backend block: local state file on the ephemeral runner.
           # Nothing persists past this run by construction.
-          tofu init -input=false
+          # -lockfile=readonly (security N3): the provider lock is committed,
+          # so a version/hash mismatch fails loudly here instead of silently
+          # re-resolving the community provider mid-run.
+          tofu init -input=false -lockfile=readonly
 
       - name: Stateless import (re-adopt, import-apply-discard)
         if: inputs.mode == 'apply'
         env:
           SERVER_ID: ${{ env.SERVER_ID }}
+          SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
+          ANCHOR_HOSTNAME: ${{ env.ANCHOR_HOSTNAME }}
         run: |
           set -euo pipefail
+          # Injection guards (defense in depth; parse-time validation lands in
+          # the resolve step): these values are interpolated into generated HCL
+          # and API paths, so a malformed/crafted API response must never reach
+          # them. Fail closed, never fall back.
+          case "$SERVER_ID" in '' | *[!0-9]*) echo "::error::SERVER_ID is not all-digits — refusing to write an import file (injection guard)."; exit 1 ;; esac
+          case "$SCP_USER_ID" in '' | *[!0-9]*) echo "::error::SCP_USER_ID is not all-digits — refusing to write an import file (injection guard)."; exit 1 ;; esac
           # Stateless re-adopt: the ephemeral runner holds no state, so every
-          # apply re-imports the adopted server before planning — otherwise a
-          # stateless re-run would duplicate the firewall policy instead of
-          # converging. Server only: the policy id is account-side and not
-          # known pre-apply (first live apply confirms the create path).
+          # apply re-imports what it must converge instead of duplicating it.
           # Generated at runtime, never committed; removed post-apply below.
-          cat > .workflow-import.tf <<EOF
+          # NOT a dotfile: Terraform/OpenTofu silently IGNORE files whose names
+          # start with `.` — the previous `.workflow-import.tf` was never loaded,
+          # so no import ever happened and every apply created a new firewall
+          # policy (proven locally: dotfile → "1 to add", renamed → "1 to import").
+          cat > workflow-import.tf <<EOF
           import {
             to = netcup_scp_server.anchor[0]
             id = "$SERVER_ID"
           }
           EOF
-          echo "Wrote .workflow-import.tf for server $SERVER_ID."
+          echo "Wrote workflow-import.tf for server $SERVER_ID."
+
+          # Firewall policy re-adopt (cap fix, issue #101): the policy id IS
+          # known pre-apply — read the ATTACHED policy off the interface; its
+          # name is deterministic (module local.policy_name). Import → Read →
+          # in-place PUT (provider has no ForceNew): create path only when no
+          # matching policy is attached. Fail closed on ambiguity.
+          SCP="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
+          POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}-${SERVER_ID}"
+          # Lexicographically smallest MAC — character-for-character the same
+          # jq rule as resolve_mac() in .github/scripts/020-provision-anchor.sh
+          # and main.tf local.interface_mac (`try(sort([...mac])[0], null)`,
+          # "sorted for determinism"). On a >1-NIC server any other pick
+          # resolves the wrong interface: the attached steady-state policy is
+          # looked for (and later swept) against the wrong NIC.
+          MAC="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
+            "$SCP/api/v1/servers/${SERVER_ID}/interfaces" \
+            | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
+          [ -n "$MAC" ] || { echo "No interface MAC resolved — refusing to guess the firewall policy" >&2; exit 1; }
+          # Newline-safe (review security N2): grep is line-oriented, so a
+          # value with an embedded newline matched its first line; reject
+          # newline/CR explicitly before the whole-value shape check.
+          case "$MAC" in '' | *[$'\n\r']*) echo "::error::resolved interface MAC contains a newline/CR — refusing to interpolate it (injection guard)."; exit 1 ;; esac
+          printf '%s' "$MAC" | grep -qE '^[0-9a-fA-F:]{17}$' || { echo "::error::resolved interface MAC is not a 17-char hex/colon value — refusing to interpolate it (injection guard)."; exit 1; }
+          POLICY_ID="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
+            "$SCP/api/v1/servers/${SERVER_ID}/interfaces/${MAC}/firewall" \
+            | jq -r --arg n "$POLICY_NAME" '[.userPolicies[]? | select(.name == $n) | .id | tostring] | if length == 0 then "" elif length == 1 then .[0] else "AMBIGUOUS" end')"
+          case "$POLICY_ID" in
+            "") echo "No attached steady-state policy named $POLICY_NAME — create path (first apply)." ;;
+            AMBIGUOUS)
+              echo "More than one attached policy named $POLICY_NAME — refusing to guess; clean up in SCP and re-dispatch." >&2
+              exit 1 ;;
+            *)
+              case "$POLICY_ID" in '' | *[!0-9]*) echo "::error::resolved firewall policy id is not all-digits — refusing to write the import block (injection guard)."; exit 1 ;; esac
+              cat >> workflow-import.tf <<EOF
+          import {
+            to = netcup_scp_user_firewall_policy.tang[0]
+            id = "${SCP_USER_ID}/${POLICY_ID}"
+          }
+          EOF
+              echo "Firewall policy ${POLICY_ID} will be re-adopted (create only if absent)." ;;
+          esac
 
       - name: tofu plan (ephemeral token, never state)
         if: inputs.mode == 'apply'
@@ -594,13 +769,15 @@ jobs:
           # DETACH the runner's /32 window, so the ssh handoff timed out.
           tofu apply -input=false -auto-approve tfplan
           # Import-apply-discard: the generated import served its one run.
-          rm -f .workflow-import.tf
+          rm -f workflow-import.tf
 
       - name: A1 open (TTL-tagged single-/32 window, after steady state)
         id: a1-open
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -615,6 +792,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -646,6 +825,8 @@ jobs:
         if: inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -709,6 +890,8 @@ jobs:
         if: always() && steps.device.outputs.authorized == 'true' && inputs.mode == 'apply'
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
@@ -720,9 +903,13 @@ jobs:
         if: always()
         env:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
           SERVER_ID: ${{ env.SERVER_ID }}
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
+          # Destructive sweeps only in apply mode; other modes report-only.
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           # Sweeps this run's policy at any age + every tmp >2h + orphans.
@@ -742,9 +929,176 @@ jobs:
             echo "NTFY_TOPIC unset — failure stays in the run summary."
             exit 0
           fi
-          MSG="piercloud A1/provision FAILED for $TENANT_USER — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, >1 tmp policies or a >2h tmp exist on the server: clean up by hand, then re-dispatch. Nothing was created by the failed step."
+          MSG="piercloud A1/provision FAILED for $TENANT_USER — run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. If the log shows SURPLUS_FAIL_CLOSED, an orphan tmp policy (no parseable created_at) exists on the server or one could not be retired: clean up by hand, then re-dispatch. Nothing was created by the failed step."
           NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
           curl -sS --fail "${NTFY_AUTH[@]}" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+
+      - name: Revoke device-grant refresh token (always, every run)
+        if: always()
+        env:
+          NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
+          # Public, constant Keycloak discovery doc (same realm for every
+          # tenant) — same pattern as the device-request job. The revocation
+          # endpoint is read from it at runtime, so no endpoint literal is
+          # hardcoded here.
+          NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
+        run: |
+          set -euo pipefail
+          summary() { # $1 = one-line outcome (bounded, token-free by construction)
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Device-grant revocation\n- %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          bounded_detail() { # $1 = curl stderr file -> <=300 chars, one trimmed line
+            head -c 300 "$1" 2>/dev/null | tr '\n\r' '  ' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+          }
+          # Refresh-token handoff is a 0600 runner-local FILE (see the poll
+          # step): load it into this step's process env only — the ~30-day
+          # credential never sits in the job environment.
+          if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ]; then
+            # F1 residual (review security): the path is exported ONLY when
+            # the poll step received a refresh token, so an unreadable or
+            # empty file is NOT "no token was issued" — the credential may be
+            # live. Claiming a clean no-op here would be a false green: fail
+            # the run RED.
+            if [ ! -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
+              echo "::error::NETCUP_SCP_REFRESH_TOKEN_FILE is set but the handoff file is missing or unreadable — the run's refresh token may still be live and cannot be revoked here. Revoke the tenant's offline session in netcup's Keycloak (SCP) admin/account UI, then investigate. No fallback exists (C-A)."
+              summary "FAILED: refresh-token handoff file set but unreadable — token NOT revoked (may stay live up to Keycloak's ~30-day idle expiry)"
+              exit 1
+            fi
+            NETCUP_SCP_REFRESH_TOKEN="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
+            if [ -z "$NETCUP_SCP_REFRESH_TOKEN" ]; then
+              echo "::error::the refresh-token handoff file is empty — a token was issued to this run but cannot be revoked here. Revoke the tenant's offline session in netcup's Keycloak (SCP) admin/account UI, then investigate. No fallback exists (C-A)."
+              summary "FAILED: refresh-token handoff file empty — token NOT revoked (may stay live up to Keycloak's ~30-day idle expiry)"
+              exit 1
+            fi
+          fi
+          # Errexit stays ON (explicit): a teardown that cannot prove the
+          # refresh credential is dead is a security failure and MUST turn the
+          # run RED (review security HIGH — this reverses the earlier
+          # "teardown never owns the verdict" guidance: an always() step never
+          # runs when the runner dies, so a silent green teardown would let a
+          # ~30-day token outlive the run while the docs claim it died). The
+          # per-command || guards below cover the deliberately tolerated
+          # cases; every unproven-revocation branch exits non-zero. A clean
+          # no-op (no token was ever issued) stays exit 0.
+          # Teardown: without this, the device grant's offline_access refresh
+          # token outlives the runner by up to ~30 days (Keycloak offline
+          # session idle expiry) even though the ACCESS token dies in ~5 min.
+          # RFC 7009 lets a public client revoke with client_id only — no
+          # secret, no Authorization header — so revocation still works now
+          # that the access token is already dead.
+          if [ -z "${NETCUP_SCP_REFRESH_TOKEN:-}" ]; then
+            echo "No refresh token was issued to this run — nothing to revoke (clean no-op)."
+            summary "no refresh token was issued to this run — nothing to revoke"
+            exit 0
+          fi
+          # Endpoints from the OIDC discovery document; the token itself is
+          # never printed (masked at birth in the poll step, passed only as
+          # the POST bodies below).
+          DISCO="$(curl -sS --max-time 30 "$NETCUP_OIDC_DISCOVERY_URL" 2>/dev/null)" || DISCO=""
+          REVOKE_ENDPOINT="$(printf '%s' "$DISCO" | jq -r '.revocation_endpoint // empty' 2>/dev/null)" || REVOKE_ENDPOINT=""
+          TOKEN_ENDPOINT="$(printf '%s' "$DISCO" | jq -r '.token_endpoint // empty' 2>/dev/null)" || TOKEN_ENDPOINT=""
+          if [ -z "$REVOKE_ENDPOINT" ]; then
+            echo "::error::could not resolve revocation_endpoint from the OIDC discovery document — the run's refresh token was NOT revoked and stays usable until Keycloak's offline-session idle expiry (~30 days). No fallback exists (C-A). Failing the run RED: an unproven teardown must not pass."
+            summary "FAILED: revocation_endpoint missing from discovery — token NOT revoked (usable until Keycloak's idle expiry, ~30 days)"
+            exit 1
+          fi
+          # Endpoint pin (review security MEDIUM): only the live SCP Keycloak
+          # realm may receive the token; a tampered discovery document must not.
+          require_scp_endpoint() { # $1 label, $2 URL
+            case "$2" in
+              https://www.servercontrolpanel.de/realms/scp/*) ;;
+              *) echo "::error::$1 is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+            esac
+          }
+          require_scp_endpoint "revocation_endpoint" "$REVOKE_ENDPOINT"
+          if [ -n "$TOKEN_ENDPOINT" ]; then require_scp_endpoint "token_endpoint" "$TOKEN_ENDPOINT"; fi
+          # POST the refresh token (public client: client_id + token only);
+          # the response body is discarded, the HTTP status and a BOUNDED
+          # curl-stderr detail are kept for the warning and the step summary.
+          # Token off argv (review security MEDIUM): write it to a 0600 temp
+          # file (mktemp's default mode) and use curl's @file form so the
+          # value never shows up in /proc/<pid>/cmdline; the EXIT trap
+          # removes both temp files on every path.
+          ERRFILE="$(mktemp)"
+          TOKEN_FILE="$(mktemp)"
+          printf '%s' "$NETCUP_SCP_REFRESH_TOKEN" > "$TOKEN_FILE"
+          trap 'rm -f "$ERRFILE" "$TOKEN_FILE"' EXIT
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$REVOKE_ENDPOINT" \
+            --data-urlencode "client_id=scp" \
+            --data-urlencode "token_type_hint=refresh_token" \
+            --data-urlencode "token@$TOKEN_FILE" 2>"$ERRFILE")" || CODE=""
+          DETAIL="$(bounded_detail "$ERRFILE")"
+          rm -f "$ERRFILE"
+          REVOKE_OK=0
+          case "$CODE" in
+            200)
+              REVOKE_OK=1
+              REVOKE_STATE="revoked (HTTP 200)"
+              echo "::notice::device-grant refresh token revoked — the run-issued credential dies with the runner in effect." ;;
+            *)
+              REVOKE_STATE="FAILED (HTTP ${CODE:-none}${DETAIL:+, curl: $DETAIL})"
+              echo "::warning::refresh-token revocation returned HTTP ${CODE:-none}${DETAIL:+ (curl: $DETAIL)} — the canary below decides whether the credential can still be proven dead; a failed canary turns the run RED. No fallback exists (C-A)." ;;
+          esac
+          # Canary: prove the session actually died. A revoked refresh token
+          # must be REFUSED. The live realm answers a refused refresh grant
+          # with HTTP 400 + {"error":"invalid_grant","error_description":
+          # "Invalid refresh token"} (reviewer-probed live 2026-09-11) — the
+          # 200-with-an-error-BODY shape applies to the REVOKE endpoint, not
+          # the token endpoint. ONLY invalid_grant / invalid_token prove the
+          # token died; invalid_client / unauthorized_client merely say the
+          # CLIENT was disabled/renamed — reporting "revocation verified" on
+          # those would be a false security claim, so any other error (or an
+          # unparseable/missing endpoint) stays UNVERIFIED with a warning.
+          # The token and the response body are never printed — only the
+          # accepted error code below. An unverified outcome is a RED run
+          # (review security HIGH): the run must not stay green while the
+          # docs claim the credential is dead.
+          CANARY_VERIFIED=0
+          if [ -n "$TOKEN_ENDPOINT" ]; then
+            CERFILE="$(mktemp)"
+            CANARY="$(curl -sS --max-time 30 -X POST "$TOKEN_ENDPOINT" \
+              --data-urlencode "grant_type=refresh_token" \
+              --data-urlencode "client_id=scp" \
+              --data-urlencode "refresh_token@$TOKEN_FILE" 2>"$CERFILE")" || CANARY=""
+            CANARY_DETAIL="$(bounded_detail "$CERFILE")"
+            rm -f "$CERFILE"
+            CANARY_ERR="$(printf '%s' "$CANARY" | jq -r '.error // empty' 2>/dev/null)" || CANARY_ERR=""
+            case "$(printf '%s' "$CANARY_ERR" | tr '[:upper:]' '[:lower:]')" in
+              invalid_grant | invalid_token)
+                CANARY_VERIFIED=1
+                echo "::notice::revocation verified — the refresh token is dead (${CANARY_ERR})."
+                if [ "$REVOKE_OK" -eq 1 ]; then
+                  summary "${REVOKE_STATE}; canary rejected the token (${CANARY_ERR})"
+                else
+                  # Contradiction guard: the revoke POST reported a failure but
+                  # the canary proves the credential is dead anyway (e.g. it
+                  # was already invalidated) — report the verified outcome
+                  # once, never "FAILED; verified".
+                  summary "revocation verified by canary (${CANARY_ERR}); the revoke POST had reported ${REVOKE_STATE}"
+                fi ;;
+              "")
+                echo "::error::revocation canary was NOT rejected by the token endpoint${CANARY_DETAIL:+ (curl: $CANARY_DETAIL)} — the refresh token may still be live (up to Keycloak's ~30-day offline-session idle expiry). The run stays RED; investigate the Keycloak sessions. No fallback exists (C-A). The token and response body are never printed."
+                summary "${REVOKE_STATE}; CANARY NOT REJECTED — the credential may still be live (investigate the Keycloak sessions); run RED" ;;
+              *)
+                echo "::error::revocation canary returned '${CANARY_ERR}', which does not prove the token died (only invalid_grant/invalid_token do; invalid_client/unauthorized_client only mean the client itself was disabled or renamed). Revocation is UNVERIFIED — the refresh token may still be live. The run stays RED; investigate the Keycloak sessions. No fallback exists (C-A). The token and response body are never printed."
+                summary "${REVOKE_STATE}; canary UNVERIFIED (error '${CANARY_ERR}' does not prove death) — the credential may still be live (investigate the Keycloak sessions); run RED" ;;
+            esac
+          else
+            echo "::error::token_endpoint missing from the OIDC discovery document — revocation is unverified (cannot canary). The run stays RED; investigate the Keycloak sessions."
+            summary "${REVOKE_STATE}; canary NOT RUN (token_endpoint missing) — revocation unverified; run RED"
+          fi
+          if [ "$CANARY_VERIFIED" -ne 1 ]; then
+            exit 1
+          fi
+          # Best-effort cleanup (review security, hygiene): the canary just
+          # proved the credential dead, so drop the 0600 handoff file now.
+          # Never fatal — the run's verdict is already decided above.
+          if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ]; then
+            rm -f "$NETCUP_SCP_REFRESH_TOKEN_FILE" || true
+          fi
+          exit 0
 
   anchor-dns:
     name: "Anchor DNS upsert + verify (Cloudflare, fail-closed)"

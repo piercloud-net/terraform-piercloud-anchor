@@ -1,14 +1,21 @@
 # OpenTofu
 .terraform/
+# Provider lock: the module ROOT's lock is committed deliberately (security
+# N3) — it pins the community rixlhq/netcup provider for `tofu init
+# -lockfile=readonly` in provision.yml and every CI init. Nested example locks
+# stay ignored (they may resolve freely).
 .terraform.lock.hcl
+!/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan
 crash.log
 crash.*.log
 
-# Workflow-generated stateless import (import-apply-discard) — runtime only
+# Workflow-generated stateless import (import-apply-discard) — runtime only.
+# No leading dot: HCL loaders ignore dotfiles (that bug made the import a no-op).
 .workflow-import.tf
+workflow-import.tf
 
 # Local overrides / scratch
 .local/

@@ -24,10 +24,13 @@ data "netcup_scp_server_interfaces" "anchor" {
 # module.tang_anchor.netcup_scp_server.anchor[0]. The device-flow workflow
 # runs this tree AS its root; its mode=apply generates the equivalent
 # one-shot import file at runtime (import-apply-discard) when live testing
-# lands — never a committed block here. Firewall-policy re-adopt is
-# intentionally never imported (its account-side id is not known
-# pre-apply); the first live stateless apply confirms the provider's
-# create-path behavior for the steady-state policy.
+# lands — never a committed block here. The firewall policy is re-adopted
+# too: the workflow discovers the ATTACHED steady-state policy by its exact
+# deterministic name via the interface-firewall endpoint pre-apply and
+# imports netcup_scp_user_firewall_policy.tang[0] with the provider's
+# `<user_id>/<policy_id>` id — create path only when none is attached
+# (issue #101: updates are in-place PUTs, no ForceNew, so runs converge on
+# one policy instead of leaking one per apply).
 
 # Adopt (do not create) the existing server and patch its mutable attributes.
 # Servers cannot be created or deleted through the SCP API — the user orders
