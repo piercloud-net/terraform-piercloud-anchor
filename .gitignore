@@ -29,3 +29,12 @@ override.tf.json
 *.pem
 *.key
 .env
+
+# Verification browser (tools/verification-browser): any browser profile is a
+# credential store — never commit it. Separate lines (gitignore does not expand
+# braces); the CfT download and logs are ignored too, in case BROWSER_HOME
+# points inside the clone (the default lives outside it).
+*-profile/
+tools/verification-browser/cft/
+tools/verification-browser/*.log
+__pycache__/

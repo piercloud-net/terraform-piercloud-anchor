@@ -42,6 +42,7 @@ This file holds the engineering conventions of this repo. The two hard invariant
 - Fixes to findings — and any commit pushed after a verdict — get a **verify pass by a reviewer instance seeded with the finding** (for agent reviewers, a fresh instance; a commit that answers no finding is checked against the verdict it invalidates) before live proof / merge; a verdict applies only to the commit it reviewed.
 - Review verdicts are recorded in the PR so the trail is auditable.
 - Precedent: verdicts are recorded as PR comments naming the reviewed commit SHA.
+- The runnable checklist lives in [verification.md](verification.md) (CI gates, live proof per change type, device-flow approval).
 
 ## Public-safety rules for content
 
