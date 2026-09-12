@@ -97,7 +97,11 @@ preflight_session() {
     *login-actions/authenticate*|*protocol/openid-connect/auth*)
       not_confirmed "the automation profile's netcup SCP session is gone (pre-flight landed on the sign-in page: $(printf '%s' "$ui_url" | redact))" ;;
     https://www.servercontrolpanel.de/scp-ui*)
-      echo "pre-flight OK: netcup SCP session present in the automation profile" ;;
+      if [ "$stable" -ge "$settle_polls" ]; then
+        echo "pre-flight OK: netcup SCP session present in the automation profile"
+      else
+        not_confirmed "pre-flight could not observe a stable page within the poll bound (last URL: $(printf '%s' "$ui_url" | redact)) — refusing to report a session; re-run, or sign in if the sign-in form appears"
+      fi ;;
     *)
       not_confirmed "pre-flight landed on an unexpected page: $(printf '%s' "$ui_url" | redact)" ;;
   esac
