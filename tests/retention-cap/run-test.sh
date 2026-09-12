@@ -48,6 +48,9 @@ check "at-cap passes" 0 "$TMP/at-cap"
 expect_out "at-cap summary counts the key" "retention-days literals checked: 1"
 
 # 2. Literal above the public cap fails loudly with file:line.
+# The temp path here is also the regression guard for output sanitizing on
+# short strings (an out-of-range negative-offset substring went empty on the
+# CI bash build — see the sanitize() comment in the script).
 mkdir -p "$TMP/over-cap"
 printf '          retention-days: 400\n' > "$TMP/over-cap/provision.yml"
 check "over-cap fails" 1 "$TMP/over-cap"

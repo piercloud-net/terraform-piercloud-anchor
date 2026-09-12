@@ -27,12 +27,13 @@ if [ ! -d "$DIR" ]; then
 fi
 
 # Sanitize an untrusted (file-derived) token for terminal output.
-# Truncate to the LAST $2 chars: long absolute fixture paths (macOS mktemp)
-# must still carry the basename+line, matching the file:line contract.
+# Keep the LAST $2 chars so long absolute fixture paths still carry the
+# basename+line (file:line contract). `tail -c` clamps cleanly on short
+# inputs; a negative-offset bash substring (${v: -n}) returns EMPTY on some
+# bash builds when n exceeds the length (CI-caught 2026-09-12) — do not
+# reintroduce it.
 sanitize() { # $1 value, $2 max chars (default 32)
-  local v="${1//[^A-Za-z0-9_.\/-]/}"
-  local n="${2:-32}"
-  printf '%s' "${v: -$n}"
+  printf '%s' "$1" | tr -cd 'A-Za-z0-9_./-' | tail -c "${2:-32}"
 }
 
 COUNT=0
