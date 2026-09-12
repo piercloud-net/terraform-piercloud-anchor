@@ -26,7 +26,7 @@ This file holds the engineering conventions of this repo. The two hard invariant
 
 - `scripts/` files never connect anywhere: they run ON the box, started by a human. API-touching CI workflows (`.github/workflows/provision.yml` + CI-called `.github/scripts/`) coexist with those human-run on-box scripts as the deliberate exception: they open the A1 window and call the netcup API, but hold no credentials to user boxes outside the per-run device-flow (S1 — the token dies with the runner). `external-watch.yml` is the second credential-free CI workflow: public GETs of the dashboard only (no token, no user-box access).
 - CI greps (endpoint-allowlist, key-material, secret-print) run from `main`, so a PR cannot weaken its own checks; a line carrying `ci-allowlist: <reason>` (10+ chars) is the only escape hatch.
-- Retention semantics: `retention-days` covers run ARTIFACTS only (the thumbprint chain relies on `retention-days: 400`); repo log retention is a separate repo setting (90d default) — never rely on logs alone.
+- Retention semantics: `retention-days` covers run ARTIFACTS only, and GitHub caps artifact retention on public repos at 90 days — `retention-days: 90` is a convenience copy, never the durable record. The durable thumbprint legs (H1) are the committed break-glass file (reviewable App PR, pending) and the platform registry (the future backend per-tenant record, pending); repo log retention is a separate repo setting, also capped at 90 days on public repos — never rely on logs or artifacts alone. `mode=check` asserts every workflow's `retention-days` stays within the cap.
 
 ## Bootstrap-flow minimalism (reviewers enforce, NEEDS-WORK if violated)
 

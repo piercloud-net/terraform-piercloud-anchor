@@ -39,3 +39,4 @@ either place (020 is taken by the A1 entrypoint below).
 |---|---|---|
 | `.github/scripts/020-provision-anchor.sh` | the Actions runner | A1 hardened /32 window lifecycle (`sweep-pre`/`open`/`provision`/`close`/`sweep-post`) + plain-ssh provisioning handoff; `--rotate` passthrough, `passwd -l root` last |
 | `.github/scripts/030-anchor-dns.sh` | the Actions runner | Cloudflare A-record upsert + verify-after-write for `anchor-01-<tenant>.piercloud.net`; fail-closed without the org token |
+| `.github/scripts/040-retention-cap.sh` | the Actions runner | `mode=check` retention-cap assertion: fails loudly when any workflow's `retention-days` leaves the public-repo 1–90 band (H1: artifacts are a convenience copy, never the durable record) |

@@ -221,9 +221,10 @@ Visibility (C-E): identifiers in repo secrets always; public default once
 secrets land; the approval card is LOUD about what commit you approve
 (and shows SHA + diff vs default branch today; refuse-on-change pin pending the backend recorder); the repo is authoritative, any UI advisory.
 Thumbprint chain (H1): run artifact today (Actions → run → Artifacts,
-`retention-days: 400` = artifacts only — never rely on logs alone); ntfy +
-committed break-glass file via reviewable App PR are PENDING; `mode=check`
-warns on the repo retention setting.
+`retention-days: 90` = the public-repo cap — a 90-day convenience copy, never
+the durable record; never rely on logs or artifacts alone); ntfy + the durable
+legs — committed break-glass file via reviewable App PR and the platform
+registry — are PENDING; `mode=check` asserts the cap holds.
 
 ## Versioning & pinning
 
