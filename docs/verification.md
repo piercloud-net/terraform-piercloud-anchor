@@ -16,7 +16,7 @@ If a needed signal is missing from this file, that is a docs gap — add it in t
 
 ## 2. CI gates
 
-Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `validate-package-version` and `validate-release-pr` in their own workflows. Most run on every PR; two are path-gated and show as `skipping` when their trigger paths are untouched.
+Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `validate-package-version` and `validate-release-pr` in their own workflows. Most run on every PR; two are path-gated — when their trigger paths are untouched they still report `pass`, with the payload steps skipped.
 
 | Check (job name) | Trigger | What it proves |
 |---|---|---|
@@ -47,7 +47,7 @@ gh pr checks <pr> --watch    # wait until all checks settle
 gh run view <run-id> --log   # full log when something is red
 ```
 
-A `skipping` path-gated job is green for merge purposes: it means the changed paths cannot affect what that job proves. Anything else red is a blocker — fix on the branch and re-verify, because a verdict applies to the commit it reviewed (§3).
+A path-gated job that reports `pass` with its payload steps skipped is green for merge purposes: it means the changed paths cannot affect what that job proves. Anything else red is a blocker — fix on the branch and re-verify, because a verdict applies to the commit it reviewed (§3).
 
 ## 3. Independent review + verify
 

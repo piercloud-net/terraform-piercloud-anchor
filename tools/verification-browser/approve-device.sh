@@ -72,13 +72,25 @@ page_url() { "$PY" "$CDP" url 2>/dev/null || true; }
 preflight_session() {
   echo "pre-flight: checking the automation profile's netcup SCP session ..."
   "$PY" "$CDP" nav "$SCP_UI_URL" >/dev/null
-  local ui_url=""
+  # A signed-out profile shows scp-ui FIRST and only then bounces to the
+  # Keycloak login form (observed 4-6 s later), so the requested URL lying for
+  # one poll is not proof of a session. Classify only after the navigation
+  # settles: wait PREFLIGHT_SETTLE_SECS, then require the URL to hold for
+  # PREFLIGHT_SETTLE_POLLS consecutive polls. Detection stays URL-only (no
+  # account names, no DOM text).
+  local settle_secs="${PREFLIGHT_SETTLE_SECS:-6}"
+  local settle_polls="${PREFLIGHT_SETTLE_POLLS:-3}"
+  sleep "$settle_secs"
+  local ui_url="" prev="" stable=0
   for _ in $(seq 1 30); do
     ui_url="$(page_url)"
-    case "$ui_url" in
-      *login-actions/authenticate*|*protocol/openid-connect/auth*) break ;;
-      https://www.servercontrolpanel.de/scp-ui*) break ;;
-    esac
+    if [ -n "$ui_url" ] && [ "$ui_url" = "$prev" ]; then
+      stable=$((stable + 1))
+    else
+      stable=0
+    fi
+    prev="$ui_url"
+    [ "$stable" -ge "$settle_polls" ] && break
     sleep 1
   done
   case "$ui_url" in
