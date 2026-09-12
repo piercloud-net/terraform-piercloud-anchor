@@ -84,6 +84,31 @@ mkdir -p "$TMP/empty"
 check "empty dir fails closed" 1 "$TMP/empty"
 expect_out "empty dir says the scan proved nothing" "proved nothing"
 
+# 7b. Review-finding regression guards (2026-09-12).
+# Huge literal: bash's numeric test overflows and used to fail OPEN.
+mkdir -p "$TMP/huge"
+printf '          retention-days: 99999999999999999999\n' > "$TMP/huge/provision.yml"
+check "huge literal fails (no 64-bit overflow fail-open)" 1 "$TMP/huge"
+expect_out "huge literal reports the band" "outside the public-repo band"
+
+# Single-line flow style must be found just like block style.
+mkdir -p "$TMP/flow"
+printf '        with: {name: x, retention-days: 400}\n' > "$TMP/flow/provision.yml"
+check "flow-style over-cap fails" 1 "$TMP/flow"
+printf '        with: {name: x, retention-days: 90}\n' > "$TMP/flow/provision.yml"
+check "flow-style at-cap passes" 0 "$TMP/flow"
+
+# Quoted keys must be found too.
+mkdir -p "$TMP/quoted-key"
+printf '          "retention-days": 400\n' > "$TMP/quoted-key/provision.yml"
+check "quoted-key over-cap fails" 1 "$TMP/quoted-key"
+
+# A full-line comment is inactive YAML and must not fail the scan.
+mkdir -p "$TMP/comment-line"
+printf '          # retention-days: 400 was the old value\n          retention-days: 90\n' > "$TMP/comment-line/provision.yml"
+check "full-line comment is skipped" 0 "$TMP/comment-line"
+expect_out "full-line comment not counted" "retention-days literals checked: 1"
+
 # 8. The real tree passes and proves both uploads.
 check "real tree passes" 0 "$REPO_ROOT/.github/workflows"
 expect_out "real tree counts both literals" "retention-days literals checked: 2"
