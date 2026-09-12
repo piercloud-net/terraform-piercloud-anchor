@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - Passwordless bootstrap + zero-IP discovery (closes #50)
 - Caddy dashboard TLS + custom-domain pattern (closes #49)
 - *(dashboard)* Dashboard host status-<tenant> — one flat label, Universal SSL (closes #106)
+- *(hostname)* Anchor-01-<tenant> — canonical naming lib + real bind outputs (closes #105)
 
 ### 🐛 Bug Fixes
 
