@@ -78,6 +78,6 @@ Do this the day you provision, on paper, off the phone (lost-phone month-6 lesso
 
 - [ ] Recovery codes (GitHub + netcup) in the PM emergency kit, printed off-device.
 - [ ] Anchor root password in the PM emergency kit (it is locked via `passwd -l root` after provisioning — the printed copy is break-glass).
-- [ ] Tang thumbprint in the PM + committed break-glass file reviewed (H1 chain: run artifact with `retention-days: 400` = artifacts only — never rely on logs alone — plus the committed file via reviewable App PR; `mode=check` warns on the repo retention setting).
+- [ ] Tang thumbprint in the PM + committed break-glass file reviewed (H1 chain: run artifact with `retention-days: 90` = the public-repo cap, a 90-day convenience copy only — never rely on logs or artifacts alone — plus the committed file via reviewable App PR and the platform registry, both pending; `mode=check` asserts the cap).
 - [ ] LUKS passphrase keyslot confirmed as true root (you can unlock the main box with it, keyboard-only, right now).
 - [ ] ntfy topic test-delivered to a second device.

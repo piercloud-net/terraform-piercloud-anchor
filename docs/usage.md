@@ -70,7 +70,7 @@ If the runner is killed or the run is cancelled before teardown, the run's refre
 
 The run opens the hardened A1 self-open /32 SSH window, sets its own one-time root password when none was pasted (applied on the running box via the guest agent — no reboot, no tap needed; concurrent runs serialize on a lock-wait), and provisions the anchor (no standing SSH keys by design: the script ends with `passwd -l root`; console-recovery note: rescue disables the netcup firewall — any rescue boot → rotate tang keys afterwards), then closes the window (detach-then-delete, swept pre + `always()` post, all modes). Key rotation: dispatch `mode=apply` with `rotate_keys=true` (forwards `--rotate` to the provisioning script: dots out old tang keys per netcup procedure).
 
-The tang thumbprint reaches you via the H1 chain — run artifact (`retention-days: 400` = artifacts ONLY; committed break-glass file via reviewable App PR pending). Never rely on logs alone (repo logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the repo retention setting. **Save the thumbprint in your PM NOW** (and finish the [day-1 checklist](dr.md#day-1-off-device-checklist)).
+The tang thumbprint reaches you via the H1 chain — run artifact (`retention-days: 90` = the public-repo cap, a 90-day convenience copy only; the durable legs — committed break-glass file via reviewable App PR and the platform registry — are pending). Never rely on logs or artifacts alone (repo logs are a separate setting, also capped at 90 days on public repos). `mode=check` asserts every workflow's retention stays within the cap. **Save the thumbprint in your PM NOW** (and finish the [day-1 checklist](dr.md#day-1-off-device-checklist)).
 
 The run also creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://status-<you>.piercloud.net` (TLS terminated on the box by Caddy; nothing to enter).
 
@@ -101,7 +101,7 @@ Keep the passphrase keyslot forever — it is the true root. Disk unlock uses NB
 
 ## 6. Monthly one-tap `mode=check` (hygiene, not load-bearing)
 
-Planned — check mode currently answers a skeleton; the full drift/orphan/retention/versions report lands with live M0. Design: one dispatch: retention-setting warning + versions-behind notice. Under S1 there is nothing to keep alive (no stored tokens) — missed months degrade visibility, never availability. Until it lands, compare the anchor's policy in SCP → Firewall against the last run summary by eye.
+Planned — check mode currently answers a skeleton; the full drift/orphan/retention/versions report lands with live M0. Design: one dispatch: retention-cap assertion + versions-behind notice. Under S1 there is nothing to keep alive (no stored tokens) — missed months degrade visibility, never availability. Until it lands, compare the anchor's policy in SCP → Firewall against the last run summary by eye.
 
 ## 7. Tenant move: `mode=update-ip` (ADD-before-move)
 

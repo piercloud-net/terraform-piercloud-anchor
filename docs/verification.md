@@ -73,6 +73,14 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] No key material in state/plan (CI key-material grep + the provisioning script's own assertion); the thumbprint is saved in the password manager.
 - [ ] Firewall shape: main box + Cloudflare edge only, `:80` tang + ACME, `:443` edge only, egress ACCEPT-all, no SSH left open.
 
+### Retention cap / `mode=check` assert (workflow + docs)
+
+- [ ] CI green; a `mode=check` dispatch from the reviewed SHA exits 0 and the run log shows the assert output (`retention-days literals checked: N`, N ≥ 1).
+- [ ] The head-sha artifact upload log shows **no** `Retention days cannot be greater than the maximum allowed retention set` clamp warning (presence of that warning on an older run is the defect, not a pass).
+- [ ] `gh api repos/<owner>/<repo>/actions/artifacts` shows the fresh artifact's `expires_at` ≈ `created_at` + 90d — corroboration only (the platform clamps silently, so this alone proves nothing).
+- [ ] The fail path is reproduced locally against fixtures (`tests/retention-cap/run-test.sh`) — red with `file:line` on a >90 fixture.
+- [ ] No live `mode=apply` unless provisioning behaviour changed; say that explicitly in the PR (the thumbprint upload is apply-gated and shares the same action + value).
+
 ### Dashboard / edge
 
 - [ ] `https://status-<tenant>.piercloud.net/` is `200` over TLS; the certificate chain is valid well beyond the window (`external-watch.yml` asserts HTTP 200, live statuses data, and ≥14 days of cert validity).
