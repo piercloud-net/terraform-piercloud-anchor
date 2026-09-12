@@ -137,6 +137,9 @@ module) pass the same variables the workflow resolves from repo secrets —
 arriving ephemerally per run (never stored). Full walkthrough (including
 the `clevis luks bind` on your main box and the reboot test):
 [docs/usage.md](docs/usage.md).
+The verification checklist for maintainers and coding agents (CI gates, live
+proof per change type, device-flow approval):
+[docs/verification.md](docs/verification.md).
 
 ## What YOU must do
 
