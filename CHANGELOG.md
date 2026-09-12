@@ -49,6 +49,7 @@ All notable changes to this project will be documented in this file.
 - *(aop)* Verify the client cert + Caddy 2.11.4 + AOP-aware :443 proof (closes #97)
 - *(aop)* Probe hardening + CI compiles the client_auth stanza (closes #99)
 - *(tofu)* Firewall policy adopt/reuse — conditional import + orphan sweep (closes #101)
+- *(ci)* Cap artifact retention at 90 + fail-loud mode=check assert (closes #119)
 
 ### 📚 Documentation
 
