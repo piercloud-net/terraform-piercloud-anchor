@@ -139,8 +139,10 @@ resource "netcup_scp_server_interface_firewall" "anchor" {
 }
 
 locals {
-  # Stable policy key: server_id survives hostname renames (renamed from
-  # piercloud-tang-${hostname} during the repo rename; no deployments exist).
+  # Policy key: hostname + server_id (operator-readable). A hostname rename
+  # therefore mints a NEW policy name and leaves the old-name policy
+  # unattached; 020's sweep-post retires any unattached policy in the
+  # piercloud-anchor- family in the same run (D3, issue #105).
   policy_name = "piercloud-anchor-${var.hostname}-${local.resolved_server_id}"
 
   # Cloudflare edge ranges (public constants — same class as the Keycloak

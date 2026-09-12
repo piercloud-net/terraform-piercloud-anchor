@@ -90,7 +90,7 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    days — recovery: [dr.md, "Runner killed" row](docs/dr.md#dr-table).
    *(details: [walkthrough §3](docs/usage.md#3-dispatch-and-approve-s1))*
 4. **A1 provisions** — the run opens its own /32 window, installs `tang`,
-   creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net`),
+   creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net`),
    prints its **thumbprint** (to run artifact today — ntfy push + committed
    break-glass file pending; never logs alone), installs the Gatus monitor, and
    ends with `passwd -l root`. **Save the thumbprint in your password
@@ -106,7 +106,7 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
    automatically.
 6. **Bind your main box** — install `clevis clevis-luks clevis-initramfs`,
    run the printed `clevis luks bind` command against the DNS name
-   (`anchor-<alias>-01.piercloud.net`, e.g. `anchor-pier-01.piercloud.net`), confirming the thumbprint matches
+   (`anchor-01-<alias>.piercloud.net`, e.g. `anchor-01-pier.piercloud.net`), confirming the thumbprint matches
    out-of-band — never `-y` blind — then rebuild the initramfs.
    *(details: [walkthrough §5](docs/usage.md#5-bind-your-main-box-clevis))*
 7. **Reboot-test twice + monthly one-tap check.** The unlock prompt may
@@ -145,7 +145,7 @@ the `clevis luks bind` on your main box and the reboot test):
    You will compare it by eye when binding your main box.
 2. **Wire your main box — at its keyboard, not your phone**: install
    `clevis clevis-luks clevis-initramfs`, run
-   the printed `clevis luks bind -d /dev/sda3 tang '{"url":"http://anchor-pier-01.piercloud.net"}'`
+   the printed `clevis luks bind -d /dev/sda3 tang '{"url":"http://anchor-01-pier.piercloud.net"}'`
    (your LUKS device — find it with `lsblk -f`, see walkthrough §5)
    — confirming the thumbprint matches what you saved — then
    `update-initramfs -u` and reboot-test twice.
