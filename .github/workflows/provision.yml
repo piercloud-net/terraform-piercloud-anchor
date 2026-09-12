@@ -140,8 +140,10 @@ jobs:
         with:
           name: head-sha-${{ vars.TENANT_USER }}
           path: head-sha.txt
-          # Same horizon as the thumbprint artifact: audit trail, not logs.
-          retention-days: 400
+          # 90 = the public-repo cap: a convenience copy, not logs and not
+          # the durable record (H1: the committed break-glass file +
+          # platform registry are the durable legs).
+          retention-days: 90
           if-no-files-found: error
 
       - name: ntfy verdict (verbatim strings)
@@ -1184,14 +1186,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
         with:
           persist-credentials: false
-      - name: Retention-setting warning (H1)
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Retention-cap assertion (H1)
         run: |
           set -euo pipefail
-          echo "::warning::Run artifacts keep the thumbprint (retention-days: 400 covers artifacts ONLY) — never rely on logs alone; repo log retention is a separate setting."
-          # TODO(M2): read the repo retention setting via the API here and
-          # warn when it is below the 400-day artifact horizon.
+          # The run artifact (head-sha + thumbprint) is a 90-day convenience
+          # copy, never the durable record: the durable thumbprint legs are
+          # the committed break-glass file (reviewable App PR) and the
+          # platform registry (both pending). This step fails loudly when any
+          # workflow's retention-days leaves the public-repo band, because
+          # GitHub clamps an over-cap value silently at upload (false
+          # durability).
+          bash .github/scripts/040-retention-cap.sh
           echo "mode=check skeleton: drift report + orphan list land in M2; hygiene only, nothing to keep alive (S1)."
       - name: Versions-behind notice
         run: |
@@ -1278,9 +1283,11 @@ jobs:
         with:
           name: thumbprint-${{ vars.TENANT_USER }}
           path: thumbprint.txt
-          # 400d = artifacts ONLY (H1 rule: never rely on logs alone — repo
-          # log retention is a separate setting; runs/checks get deleted).
-          retention-days: 400
+          # 90 = the public-repo cap: a convenience copy, never the durable
+          # record (H1 rule: never rely on logs or artifacts alone; the
+          # committed break-glass file + platform registry are the durable
+          # legs).
+          retention-days: 90
           if-no-files-found: error
       # NOTE (H1, committed break-glass file): the runner holds
       # contents:read and cannot push — the committed copy arrives via a
