@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-ANCHOR_URL="http://anchor-USER-01.piercloud.net"  # tenant anchor, DNS name (same-URL rebuilds need no change here)
+ANCHOR_URL="http://anchor-01-USER.piercloud.net"  # tenant anchor, DNS name (same-URL rebuilds need no change here)
 NTFY_BASE="https://ntfy.sh"                       # or your own ntfy server
 NTFY_TOPIC="piercloud-anchor"                     # publish-scoped token below
 NTFY_TOKEN=""                                     # empty = log locally only

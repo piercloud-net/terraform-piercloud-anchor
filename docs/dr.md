@@ -35,11 +35,11 @@ Your main box dropped to a passphrase prompt instead of unlocking via the anchor
 
 ## Discovery fallback (multi-server accounts only)
 
-Single-server accounts never need this. If a run aborts with `expected 1 server, found N`, set `ANCHOR_IPV4` (repo secret) to the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it) and re-dispatch. Prefer renaming one box to `anchor-<you>-01` so discovery stays automatic.
+Single-server accounts never need this. If a run aborts with `expected 1 server, found N`, set `ANCHOR_IPV4` (repo secret) to the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it) and re-dispatch. Prefer renaming one box to `anchor-01-<you>` so discovery stays automatic.
 
 ## Same-URL rebuild = `regen` (2-minute DR)
 
-Bind clevis to a DNS name (`anchor-<alias>-01.piercloud.net`, see `anchor_hostname`), never the raw IP. A rebuilt anchor at the same URL needs only `clevis luks regen -d <device> tang` — same URL, fresh keys, no unbind+bind ceremony.
+Bind clevis to a DNS name (`anchor-01-<alias>.piercloud.net`, see `anchor_hostname`), never the raw IP. A rebuilt anchor at the same URL needs only `clevis luks regen -d <device> tang` — same URL, fresh keys, no unbind+bind ceremony.
 
 ## Caddy dashboard: edge checklist + cutover reversibility
 

@@ -72,7 +72,7 @@ The run opens the hardened A1 self-open /32 SSH window, sets its own one-time ro
 
 The tang thumbprint reaches you via the H1 chain — run artifact (`retention-days: 400` = artifacts ONLY; committed break-glass file via reviewable App PR pending). Never rely on logs alone (repo logs live 90d/400max, runs/checks get deleted). `mode=check` warns on the repo retention setting. **Save the thumbprint in your PM NOW** (and finish the [day-1 checklist](dr.md#day-1-off-device-checklist)).
 
-The run also creates/verifies the anchor DNS record (`anchor-<alias>-01.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://status-<you>.piercloud.net` (TLS terminated on the box by Caddy; nothing to enter).
+The run also creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://status-<you>.piercloud.net` (TLS terminated on the box by Caddy; nothing to enter).
 
 ## 5. Bind your main box (clevis) — at its keyboard, not your phone
 
@@ -86,7 +86,7 @@ apt-get install clevis clevis-luks clevis-initramfs
 # sda
 # ├─sda1 vfat
 # └─sda3 crypto_LUKS        ← this one
-clevis luks bind -d /dev/sda3 tang '{"url":"http://anchor-pier-01.piercloud.net"}'
+clevis luks bind -d /dev/sda3 tang '{"url":"http://anchor-01-pier.piercloud.net"}'
 ```
 
 **Verify the thumbprint** shown at bind time against the value you saved in step 4 — out-of-band, never `-y` blind. If it doesn't match, answer NO and investigate. Binding the DNS name (`anchor_hostname`) means a future same-URL rebuild is just `regen` (see [dr.md](dr.md)). Then:

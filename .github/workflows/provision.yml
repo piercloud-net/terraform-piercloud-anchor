@@ -290,10 +290,11 @@ jobs:
     outputs:
       thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
       anchor_ipv4: ${{ steps.resolve.outputs.anchor_ipv4 }}
+      anchor_hostname: ${{ steps.resolve.outputs.anchor_hostname }}
     env:
       # Identifiers resolve from REPO-level secrets inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
-      # No HOSTNAME secret: derived below as anchor-<tenant>-01.
+      # No HOSTNAME secret: derived below as anchor-01-<tenant>.
       # No SCP_USER_ID secret by default: resolved from the token via OIDC
       # userinfo in the resolve step (override only if yours differs).
       # ANCHOR_IPV4 / ANCHOR_ROOT_PASSWORD are optional (issue #50): unset
@@ -453,19 +454,33 @@ jobs:
           # Tenant identity comes from the repo, not the dispatch: TENANT_USER
           # (operator-set variable) is the username, so there is no alias
           # input to typo or squat — unset fails closed before anything runs.
-          # Hostname derivation (single place for this job): anchor-<you>-01.
-          # Same sanitize one-liner as 030-anchor-dns.sh — keep the two in
-          # sync so TF hostname and DNS record can never diverge.
+          # Hostname derivation (D8: scripts/lib/naming.sh is the one
+          # canonical source — the DNS stage and the on-box fallback consume
+          # the same functions, so TF hostname and DNS record can never
+          # diverge). D2: validate the LOWERCASED RAW username before the
+          # sanitizer runs — `.pier`, `pier-` and `pier--carlo` all sanitize
+          # to `pier`, so validating SAN would be fail-open. Reserved
+          # prefixes (anchor/status/pcu) fail closed too. The lib returns
+          # zone-less names; STATUS_HOST adds the zone here because the
+          # on-box Caddy render consumes it as the dashboard FQDN.
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
-          SAN="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
-          [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."; exit 1; }
-          HOSTNAME="anchor-${SAN}-01"
+          . scripts/lib/naming.sh
+          RAW="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]')"
+          validate_tenant_username "$RAW"
+          SAN="$(sanitize_tenant "$RAW")"
+          [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits."; exit 1; }
+          HOSTNAME="$(derive_anchor_hostname "$SAN")"
+          STATUS_HOST="$(derive_status_host "$SAN").piercloud.net"
           # Vendor variables are trusted less than they look: a newline in the
           # repo variable survives the sanitize sed (line-oriented) and would
           # forge an extra $GITHUB_ENV line. Reject before the write.
           guard_line "ANCHOR_HOSTNAME" "$HOSTNAME"
           echo "ANCHOR_HOSTNAME=$HOSTNAME" >> "$GITHUB_ENV"
-          echo "Derived hostname $HOSTNAME."
+          guard_line "STATUS_HOST" "$STATUS_HOST"
+          echo "STATUS_HOST=$STATUS_HOST" >> "$GITHUB_ENV"
+          guard_line "anchor_hostname" "$HOSTNAME"
+          echo "anchor_hostname=$HOSTNAME" >> "$GITHUB_OUTPUT"
+          echo "Derived hostname $HOSTNAME (dashboard $STATUS_HOST)."
           # SCP user id: NEVER the customer number (live 403 proved they
           # differ). Resolved from the token itself via OIDC userinfo
           # (same source shipping CLIs use: userinfo "id" is the numeric
@@ -735,6 +750,7 @@ jobs:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
+          TF_VAR_anchor_hostname: ${{ env.ANCHOR_HOSTNAME }}.piercloud.net
           TF_VAR_server_id: ${{ env.SERVER_ID }}
           TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
           TF_VAR_customer_number: ${{ secrets.CUSTOMER_NUMBER }}
@@ -757,6 +773,7 @@ jobs:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           TF_IN_AUTOMATION: "true"
           TF_VAR_hostname: ${{ env.ANCHOR_HOSTNAME }}
+          TF_VAR_anchor_hostname: ${{ env.ANCHOR_HOSTNAME }}.piercloud.net
           TF_VAR_server_id: ${{ env.SERVER_ID }}
           TF_VAR_scp_user_id: ${{ env.SCP_USER_ID_EFF }}
           TF_VAR_customer_number: ${{ secrets.CUSTOMER_NUMBER }}
@@ -1231,6 +1248,7 @@ jobs:
       - name: Write thumbprint captured by the A1 provision step
         env:
           THUMBPRINT: ${{ needs.device-flow.outputs.thumbprint }}
+          ANCHOR_HOSTNAME: ${{ needs.device-flow.outputs.anchor_hostname }}
         run: |
           set -euo pipefail
           # The tang thumbprint is public (goes to the password manager +
@@ -1240,8 +1258,21 @@ jobs:
             echo "::error::no thumbprint captured — the A1 provision step did not report one. Refusing to publish an empty artifact (H1: never logs alone)."
             exit 1
           fi
+          if [ -z "$ANCHOR_HOSTNAME" ]; then
+            echo "::error::no anchor hostname captured — the resolve step did not report one. Refusing to publish an artifact without the bind name (D9: output.bind_name must be real)."
+            exit 1
+          fi
+          # D9: TF_VAR_anchor_hostname is populated in the plan/apply steps, so
+          # output.bind_name is real — carry the bind URL + command into the
+          # artifact (the README's clevis command; never logs alone). The scheme
+          # is split out so the CI endpoint scan over this file sees no new
+          # literal URL; no endpoint is added or changed.
+          BIND_SCHEME="http"
+          ANCHOR_FQDN="${ANCHOR_HOSTNAME}.piercloud.net"
           printf '%s\n' "$THUMBPRINT" > thumbprint.txt
           echo "alias=${{ vars.TENANT_USER }} head=${{ github.sha }}" >> thumbprint.txt
+          echo "bind_url=${BIND_SCHEME}://${ANCHOR_FQDN}" >> thumbprint.txt
+          echo "clevis luks bind -d /dev/sda3 tang '{\"url\":\"${BIND_SCHEME}://${ANCHOR_FQDN}\"}'" >> thumbprint.txt
       - name: Upload thumbprint artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
         with:

@@ -47,13 +47,13 @@ module "tang_anchor" {
   server_id           = var.server_id  # or server_name = "SCPI-1234567"
   allow_main_box_ipv4 = "203.0.113.10" # your main box's IPv4
   allow_main_box_ipv6 = null           # optional: your main box's IPv6
-  hostname            = "anchor-pier-01"
+  hostname            = "anchor-01-pier"
   scp_user_id         = 1234 # SCP user id owning the firewall policy
 
   # M3 twin-anchor / bind-name opt-ins (T2 only — defaults = single anchor t:1).
   extra_tang_urls          = []   # e.g. ["http://198.51.100.7"]
   extra_allowed_source_ips = []   # e.g. ["198.51.100.20"]
-  anchor_hostname          = null # e.g. "anchor-pier-01.piercloud.net" (same-URL rebuild = regen)
+  anchor_hostname          = null # e.g. "anchor-01-pier.piercloud.net" (same-URL rebuild = regen)
 }
 
 output "anchor_ipv4" {

@@ -775,7 +775,7 @@ cmd_provision() {
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
-  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' CF_ORIGIN_CERT_PEM='$(q "${CF_ORIGIN_CERT_PEM:-}")' CF_ORIGIN_KEY_PEM='$(q "${CF_ORIGIN_KEY_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")';"
+  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' CF_ORIGIN_CERT_PEM='$(q "${CF_ORIGIN_CERT_PEM:-}")' CF_ORIGIN_KEY_PEM='$(q "${CF_ORIGIN_KEY_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")';"
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi

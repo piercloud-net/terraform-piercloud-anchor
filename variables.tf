@@ -76,13 +76,13 @@ variable "extra_allowed_source_ips" {
 }
 
 variable "anchor_hostname" {
-  description = "Optional DNS name clients bind instead of the anchor IP (e.g. anchor-pier-01.piercloud.net): same-URL rebuild = regen with no main-box change. Null (default) = bind output.ipv4. No DNS records are managed — point the name at the anchor IP yourself."
+  description = "Optional DNS name clients bind instead of the anchor IP (e.g. anchor-01-pier.piercloud.net): same-URL rebuild = regen with no main-box change. Null (default) = bind output.ipv4. No DNS records are managed — point the name at the anchor IP yourself."
   type        = string
   default     = null
 
   validation {
     condition     = var.anchor_hostname == null || can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$", var.anchor_hostname))
-    error_message = "Must be a plain DNS hostname (e.g. anchor-pier-01.piercloud.net): no scheme, no port, no path, no trailing dot."
+    error_message = "Must be a plain DNS hostname (e.g. anchor-01-pier.piercloud.net): no scheme, no port, no path, no trailing dot."
   }
 }
 

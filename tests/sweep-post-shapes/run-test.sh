@@ -103,7 +103,7 @@ tmp_entry() { # $1 id, $2 run-id suffix, $3 age-seconds ("orphan" = unstamped de
 }
 
 # One steady-state policy (id 42) — the live attachment under test.
-STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-pier-01-933556","description":""}]'
+STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'
 
 RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]
   local l="$1" rc=0
@@ -120,11 +120,11 @@ RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]
 ACTIONS() { [ -f "$WORK/actions.$1" ] && paste -sd' ' "$WORK/actions.$1" || echo ""; }
 
 # ---- cases 1-4: tolerant attached shapes -> live policy KEPT, no mutation ---
-rc="$(RC_OF c1 "[]" '{"userPolicies":[{"id":42,"name":"piercloud-anchor-anchor-pier-01-933556"}]}' "$STEADY_LIVE")"
+rc="$(RC_OF c1 "[]" '{"userPolicies":[{"id":42,"name":"piercloud-anchor-anchor-01-pier-933556"}]}' "$STEADY_LIVE")"
 is "c1 rc" "0" "$rc"
 is "c1 actions (live kept)" "" "$(ACTIONS c1)"
 is "c1 kept log" "1" "$(grep -c 'is attached — kept' "$WORK/out.c1" || true)"
-rc="$(RC_OF c2 "[]" '{"userPolicies":[{"id":"42","name":"piercloud-anchor-anchor-pier-01-933556"}]}' "$STEADY_LIVE")"
+rc="$(RC_OF c2 "[]" '{"userPolicies":[{"id":"42","name":"piercloud-anchor-anchor-01-pier-933556"}]}' "$STEADY_LIVE")"
 is "c2 rc" "0" "$rc"
 is "c2 actions (live kept)" "" "$(ACTIONS c2)"
 rc="$(RC_OF c3 "[]" '{"userPolicies":["42"]}' "$STEADY_LIVE")"
@@ -165,7 +165,7 @@ ambiguous_case c8c '{"userPolicies":null}'                                      
 ambiguous_case c8d '{"userPolicies":[null]}'                                                   # null entry
 ambiguous_case c8e '{"userPolicies":[{"id":null}]}'                                            # id null
 ambiguous_case c8f '{"userPolicies":[{"id":""}]}'                                              # id empty
-ambiguous_case c8g '{"userPolicies":[{"name":"piercloud-anchor-anchor-pier-01-933556"}]}'      # THE live-policy repro: object without id
+ambiguous_case c8g '{"userPolicies":[{"name":"piercloud-anchor-anchor-01-pier-933556"}]}'      # THE live-policy repro: object without id
 ambiguous_case c8h '{"userPolicies":[42,{"name":"x"}]}'                                        # mixed usable + ambiguous
 ambiguous_case c8i '{"userPolicies":[""]}'                                                     # bare empty string
 ambiguous_case c8j '{"userPolicies":[true]}'                                                   # boolean entry
@@ -210,10 +210,10 @@ fi
 # netcup policy ids are >= 1 in practice; allowing the literal 0 uniformly
 # keeps one rule for both sides. Attached bare 0 and "0" must read as
 # attached to steady id 0 and mutate nothing.
-rc="$(RC_OF c8x "[]" '{"userPolicies":[0]}' '[{"id":0,"name":"piercloud-anchor-anchor-pier-01-933556","description":""}]')"
+rc="$(RC_OF c8x "[]" '{"userPolicies":[0]}' '[{"id":0,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]')"
 is "c8x rc" "0" "$rc"
 is "c8x actions (id 0 kept)" "" "$(ACTIONS c8x)"
-rc="$(RC_OF c8y "[]" '{"userPolicies":["0"]}' '[{"id":0,"name":"piercloud-anchor-anchor-pier-01-933556","description":""}]')"
+rc="$(RC_OF c8y "[]" '{"userPolicies":["0"]}' '[{"id":0,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]')"
 is "c8y rc" "0" "$rc"
 is "c8y actions (string 0 kept)" "" "$(ACTIONS c8y)"
 
@@ -231,11 +231,11 @@ steady_case() { # $1 label, $2 STUB_STEADY (attached stays numeric 42)
   is "$1 actions (live untouched)" "" "$(ACTIONS "$1")"
   is "$1 refusal logged" "1" "$(grep -c 'refusing the steady-state orphan sweep' "$WORK/out.$1" || true)"
 }
-steady_case c9a '[{"id":"0042","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]'  # leading zero (F2 proof)
-steady_case c9b '[{"id":"42\n","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]' # trailing LF (F2 proof)
-steady_case c9c '[{"id":"","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]'     # empty id (F2 proof)
+steady_case c9a '[{"id":"0042","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'  # leading zero (F2 proof)
+steady_case c9b '[{"id":"42\n","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]' # trailing LF (F2 proof)
+steady_case c9c '[{"id":"","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'     # empty id (F2 proof)
 # positive control: a canonical STRING steady id still matches live id 42
-rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anchor-anchor-pier-01-933556","description":""}]')"
+rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]')"
 is "c9d rc" "0" "$rc"
 is "c9d actions (live kept)" "" "$(ACTIONS c9d)"
 

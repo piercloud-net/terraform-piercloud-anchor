@@ -13,7 +13,7 @@ tofu apply \
   -var server_id=1234567 \
   -var allow_main_box_ipv4="203.0.113.10" \
   -var allow_main_box_ipv6="2001:db8::10" \
-  -var hostname="anchor-pier-01" \
+  -var hostname="anchor-01-pier" \
   -var scp_user_id=1234
 ```
 

@@ -9,7 +9,7 @@
 # by name against a record we didn't just verify). CI-called, never `scripts/`.
 #
 # WHAT IT DOES: derives the flat anchor name from TENANT_USER (D5:
-# `anchor-<sanitized>-01.piercloud.net`; NN=01 — a second operator anchor
+# `anchor-01-<sanitized>.piercloud.net`; NN=01 — a second operator anchor
 # for one alias (-02+) is a future multi-anchor case, not handled here),
 # plus the flat dashboard name `status-<sanitized>.piercloud.net`
 # (per-tenant singleton, no NN; ONE label deep, so Cloudflare's free
@@ -25,7 +25,7 @@
 # module's extra_tang_urls input — no record is minted here for twins.
 #
 # ENV (identifiers arrive via environment — never argv, never logs):
-#   TENANT_USER            repo tenant username, e.g. "pier" -> anchor-pier-01.
+#   TENANT_USER            repo tenant username, e.g. "pier" -> anchor-01-pier.
 #   ANCHOR_IPV4            exact anchor IPv4 the A record must carry.
 #   CLOUDFLARE_DNS_TOKEN   API token with DNS-edit on piercloud.net.
 #                          Absent + this job running (mode=apply) = explicit
@@ -46,6 +46,10 @@
 # No new GitHub Actions needed: curl + jq (preinstalled on runners) suffice.
 
 set -euo pipefail
+
+# D8: naming comes from the one canonical lib (single source — the workflow
+# resolve step and the on-box 010 fallback consume the same functions).
+. scripts/lib/naming.sh
 
 CF_ZONE="piercloud.net" # public DNS info, not a secret.
 CF_API="https://api.cloudflare.com/client/v4"
@@ -68,13 +72,13 @@ echo "::add-mask::$CLOUDFLARE_DNS_TOKEN"
 
 # D5: lowercase, alnum + hyphen only; anything else becomes a hyphen, runs
 # collapse, edges trim. Empty after cleaning = refuse.
-san="$(printf '%s' "$alias" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+san="$(sanitize_tenant "$alias")"
 if [ -z "$san" ]; then
-  echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits/hyphens."
+  echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits."
   exit 1
 fi
-record="anchor-${san}-01" # NN=01; -02+ is a future multi-anchor case.
-status="status-${san}"    # dashboard singleton: flat, one label — free Universal SSL covers it.
+record="$(derive_anchor_hostname "$san")" # NN=01; -02+ is a future multi-anchor case.
+status="$(derive_status_host "$san")"     # dashboard singleton: flat, one label — free Universal SSL covers it.
 
 auth=(-sS -H "Authorization: Bearer $CLOUDFLARE_DNS_TOKEN" -H "Content-Type: application/json")
 

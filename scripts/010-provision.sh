@@ -46,16 +46,60 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root (netcup SCP remote console, root login)"
 
 # --- BEGIN CADDY RENDER (tests/bind-e2e/run-bind-e2e.sh extracts this span; keep markers) ---
-caddy_status_names() { # STATUS_HOST/STATUS_MATCH from TENANT_USER
-# Dispatch-managed hostnames (same sanitize one-liner as the workflow
-# resolve step and .github/scripts/030-anchor-dns.sh — keep the three in
-# sync). Empty on hand runs without env (console fallback): the :80 tang
-# proxy still renders below, but the :443 dashboard block and the TLS-expiry
+# Tenant naming is canonical in scripts/lib/naming.sh (the workflow resolve
+# step and .github/scripts/030-anchor-dns.sh source it). Inside the nested
+# NAMING markers below sits the embedded fallback for console hand runs
+# (dispatched runs receive STATUS_HOST as the dashboard FQDN via 020's
+# ENV_PREFIX; ANCHOR_HOSTNAME stays the zone-less SCP hostname);
+# tests/naming-scheme/run-test.sh diffs the block against the lib — edit the
+# lib and copy the block, never fork it.
+# --- BEGIN NAMING ---
+validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
+  case "$1" in
+    *[!a-z0-9]* | '')
+      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+      return 1 ;;
+  esac
+  if [ "${#1}" -gt 20 ]; then
+    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+    return 1
+  fi
+  case "$1" in
+    anchor* | status* | pcu*)
+      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu are platform labels, not tenants.\n' "$1" >&2
+      return 1 ;;
+  esac
+  return 0
+}
+
+sanitize_tenant() { # $1 = raw tenant username -> lowercase [a-z0-9-], hyphen runs collapsed, edges trimmed
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+derive_anchor_hostname() { # $1 = sanitized tenant -> anchor-<NN>-<tenant> (NN=01; -02+ is future)
+  printf 'anchor-01-%s\n' "$1"
+}
+
+derive_status_host() { # $1 = sanitized tenant -> status-<tenant> (dashboard singleton, one label)
+  printf 'status-%s\n' "$1"
+}
+# --- END NAMING ---
+caddy_status_names() { # STATUS_HOST/ANCHOR_HOSTNAME from dispatch env, else derived from TENANT_USER
+# Empty on hand runs without env (console fallback): the :80 tang proxy
+# still renders below, but the :443 dashboard block and the TLS-expiry
 # probe wait for a re-dispatch with TENANT_USER.
-SAN="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
-if [ -n "$SAN" ]; then
-  STATUS_HOST="status-${SAN}.piercloud.net"
-else
+local raw san
+if [ -z "${STATUS_HOST:-}" ] || [ -z "${ANCHOR_HOSTNAME:-}" ]; then
+  raw="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ -n "$raw" ]; then
+    san="$(sanitize_tenant "$raw")"
+    if [ -n "$san" ]; then
+      [ -n "${STATUS_HOST:-}" ] || STATUS_HOST="$(derive_status_host "$san").piercloud.net"
+      [ -n "${ANCHOR_HOSTNAME:-}" ] || ANCHOR_HOSTNAME="$(derive_anchor_hostname "$san")"
+    fi
+  fi
+fi
+if [ -z "${STATUS_HOST:-}" ]; then
   STATUS_HOST=""
   warn "TENANT_USER unset — dashboard TLS block and TLS-expiry probe skipped (re-dispatch with TENANT_USER to converge them)"
 fi
@@ -961,4 +1005,4 @@ if [ -n "${STATUS_HOST:-}" ]; then
   fi
 fi
 
-log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box)."
+log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."
