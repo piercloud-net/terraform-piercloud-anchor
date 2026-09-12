@@ -36,6 +36,10 @@ if [ "${1:-}" = "--preflight" ]; then
 fi
 RUN_ID="${1:-}"
 REPO="${2:-${GITHUB_REPOSITORY:-}}"
+if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+  # --preflight [owner/repo]: the optional repo arrives as $1, not $2.
+  case "${RUN_ID:-}" in */*) REPO="${RUN_ID}"; RUN_ID="" ;; esac
+fi
 CDP_PORT="${CDP_PORT:-9333}"
 BROWSER_HOME="${BROWSER_HOME:-$HOME/.piercloud/test-browser}"
 PROFILE="${PROFILE:-$BROWSER_HOME/cft-profile}"
@@ -114,12 +118,12 @@ command -v gh >/dev/null 2>&1 || die "gh CLI not found — install it and log in
 command -v "$PY" >/dev/null 2>&1 || die "python3 not found"
 [ -x "$CDP" ] || die "cdp.py missing at $CDP"
 
-if [ -z "$REPO" ]; then
+if [ -z "$REPO" ] && [ "$PREFLIGHT_ONLY" -eq 0 ]; then
   REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" \
     || die "cannot determine the repo — pass owner/repo or run from inside the clone"
 fi
 
-echo "repo=$REPO"
+echo "repo=${REPO:-<unused in --preflight>}"
 [ -n "$RUN_ID" ] && echo "run=$RUN_ID"
 echo "BROWSER_HOME=$BROWSER_HOME"
 echo "CDP_PORT=$CDP_PORT"
