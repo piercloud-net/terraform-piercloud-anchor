@@ -316,7 +316,7 @@ jobs:
           # endpoint allowlist sees no new URL.
           REVIEW_LINK="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }}"
           ANTI_PHISH="we will never email or message you a code to re-confirm."
-          NEW_TAB_HINT="long-press the link to open in a new tab — keeps this page for the code."
+          NEW_TAB_HINT="long-press the link to open in a new tab — keeps this page open to follow the deployment progress."
           # C-b: print ONLY the verification URL + user_code (+ alias, mode,
           # commit, review link). Quiet curl flags only; no verbose dumps; no
           # trace-level log variables; device_code is masked and never printed.
