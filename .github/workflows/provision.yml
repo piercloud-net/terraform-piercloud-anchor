@@ -303,6 +303,12 @@ jobs:
             echo "::error::device authorization response carried no verification URI — the approval card cannot be shown; refusing to continue (fail closed)."
             exit 1
           fi
+          # Review finding F1: user_code/verify_uri are API-derived and reach
+          # the log, the summary, ntfy and a runner command (::notice) — reject
+          # newline/CR/non-printable values so the response cannot forge
+          # runner commands or split the card (same guard as the token writes).
+          guard_line "user_code" "$USER_CODE"
+          guard_line "verify_uri" "$VERIFY_URI"
           INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
           SHORT="$(echo "$HEAD_SHA" | cut -c1-7)"
           # C2b card fields: action + pinned commit + review link. The compare
