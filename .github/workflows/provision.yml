@@ -174,119 +174,18 @@ jobs:
           # TODO(M2): red verdict hides the netcup URL/code behind an
           # acknowledge-checkbox on the no-account path (open design Q5).
 
-  device-request:
-    name: "Device code request (card renders on job completion)"
-    runs-on: ubuntu-latest
-    needs: [visibility-banner]
-    outputs:
-      device_code: ${{ steps.request.outputs.device_code }}
-      token_endpoint: ${{ steps.request.outputs.token_endpoint }}
-      interval: ${{ steps.request.outputs.interval }}
-    env:
-      # Public, constant Keycloak discovery doc (same realm for every tenant).
-      NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
-      TENANT_USER: ${{ vars.TENANT_USER }}
-      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-    steps:
-      - name: Request code + write approval card
-        id: request
-        run: |
-          set -euo pipefail
-          # Handoff-write guard (review security): API-derived values are
-          # written to $GITHUB_OUTPUT line-by-line, so a crafted value with an
-          # embedded newline would forge additional outputs. Reject newline/CR
-          # and any non-printable characters before every such write.
-          guard_line() { # $1 label, $2 API-derived value
-            case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
-            if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
-          }
-          # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
-          # (prior literals were probed, never recorded). Endpoints are
-          # recovered from the Keycloak OIDC discovery document FIRST.
-          DISCO="$(curl -sS "$NETCUP_OIDC_DISCOVERY_URL")"
-          DEVICE_ENDPOINT="$(echo "$DISCO" | jq -r '.device_authorization_endpoint')"
-          TOKEN_ENDPOINT="$(echo "$DISCO" | jq -r '.token_endpoint')"
-          test "$DEVICE_ENDPOINT" != "null" || { echo "::error::discovery doc lacks device_authorization_endpoint — STOP, escalate."; exit 1; }
-          # Endpoint pin (review security MEDIUM): only the live SCP Keycloak
-          # realm may receive auth traffic — a tampered discovery document
-          # must not receive the device code (or, later, the tokens).
-          require_scp_endpoint() { # $1 label, $2 URL
-            case "$2" in
-              https://www.servercontrolpanel.de/realms/scp/*) ;;
-              *) echo "::error::$1 is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
-            esac
-          }
-          require_scp_endpoint "device_authorization_endpoint" "$DEVICE_ENDPOINT"
-          require_scp_endpoint "token_endpoint" "$TOKEN_ENDPOINT"
-          RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" --data-urlencode "client_id=scp" --data-urlencode "scope=offline_access openid")"
-          # C-f: grant disabled (or any refusal) → STOP + escalate.
-          # No downgrade path exists by design (C-A) — this job exits here.
-          if echo "$RESP" | jq -e 'has("error")' >/dev/null; then
-            DESC="$(echo "$RESP" | jq -r '.error_description // .error')"
-            echo "::error::device authorization refused ($DESC). STOP — the device grant may be disabled. Escalate to the operator. No fallback of any kind exists (C-A)."
-            exit 1
-          fi
-          # C-a: the authorization secret below is masked FIRST, on the very
-          # next line after extraction — never printed or dumped (C-a/C-b).
-          DEVICE_CODE="$(echo "$RESP" | jq -r '.device_code')"
-          # C-a: NO ::add-mask:: here by design — GitHub silently drops masked
-          # values from GITHUB_OUTPUT ("Skip output since it may contain
-          # secret"), which would hand the poll job an empty code and fail
-          # every run. Containment instead: the code is never printed, never
-          # leaves this job except via outputs to the poll step, lives 600s,
-          # and is useless without the tenant's own netcup session (C-b).
-          USER_CODE="$(echo "$RESP" | jq -r '.user_code')"
-          VERIFY_URI="$(echo "$RESP" | jq -r '.verification_uri_complete // .verification_uri')"
-          INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
-          # C-b: print ONLY the verification URL + user_code (+ alias).
-          # Quiet curl flags only; no verbose dumps; no trace-level log variables.
-          echo "alias: $TENANT_USER"
-          echo "Open this URL on your phone to approve: $VERIFY_URI"
-          echo "Code: $USER_CODE"
-          echo "we will never email or message you a code to re-confirm."
-          # Live card: this job ENDS here, so the summary below renders on
-          # the run page while the code is still live. verification_uri_complete
-          # pre-fills the code — one tap, no typing. Staleness guards land in
-          # the poll job on every terminal branch.
-          {
-            echo "### 📲 Approve at netcup (code expires in ~10 min)"
-            echo ""
-            echo "[👉 TAP TO APPROVE]($VERIFY_URI)"
-            echo ""
-            echo "Code: \`$USER_CODE\` (already filled if you tapped the link)"
-            echo ""
-            echo "alias: $TENANT_USER — approving lets this run touch your netcup account ONCE; the token dies with the runner."
-            echo "we will never email or message you a code to re-confirm."
-          } >> "$GITHUB_STEP_SUMMARY"
-          # Live push (the true phone channel): ntfy carries the real code
-          # out-of-band the moment it exists. Unset topic = summary only.
-          if [ -n "$NTFY_TOPIC" ]; then
-            # Empty token = no header at all (ntfy.sh 401s on an empty Basic).
-            NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
-            curl -sS --fail "${NTFY_AUTH[@]}" -d "piercloud: approve $TENANT_USER: $VERIFY_URI code $USER_CODE (expires 10 min). We never email codes." "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
-          fi
-          # Handoff to the poll job (device_code only: short-lived,
-          # user-mediated, already log-printed. The ACCESS token is minted
-          # and consumed inside the poll job — it never crosses jobs (C-d).
-          guard_line "device_code" "$DEVICE_CODE"
-          guard_line "token_endpoint" "$TOKEN_ENDPOINT"
-          guard_line "interval" "$INTERVAL"
-          echo "device_code=$DEVICE_CODE" >> "$GITHUB_OUTPUT"
-          echo "token_endpoint=$TOKEN_ENDPOINT" >> "$GITHUB_OUTPUT"
-          echo "interval=$INTERVAL" >> "$GITHUB_OUTPUT"
-
   device-flow:
     name: "S1 device-flow (C-a..C-f) + A1 window + stateless apply"
     runs-on: ubuntu-latest
-    needs: [visibility-banner, device-request]
+    needs: [visibility-banner]
     # C-E power path: required-reviewer gate lives in repo SETTINGS
     # (environment `anchor` → tenant GitHub user), not in code. Where a
-    # tenant reviewer identity exists, this pauses the run for their tap
-    # BEFORE any token exists (execution approval); the device approval at
-    # netcup follows (account approval). Two taps, correct order. Where no
-    # reviewer exists (no-GitHub path), the environment auto-creates with
-    # no rules and runs proceed — the LOUD banner is the mechanism there.
+    # tenant reviewer identity exists, this pauses the run for the tap
+    # BEFORE any token exists (execution approval); only then does the
+    # merged request → card → poll step below mint the device card
+    # (account approval). Two taps, correct order. Where no reviewer
+    # exists (no-GitHub path), the environment auto-creates with no rules
+    # and runs proceed — the LOUD banner is the mechanism there.
     # Banner stays ungated so the card exists to review first.
     environment: anchor
     outputs:
@@ -314,14 +213,38 @@ jobs:
           # must check it out to call it (full checkout: tofu below needs
           # the module files too).
 
-      - name: Poll for approval (code already on the run summary)
-        id: device
-        env:
-          DEVICE_CODE: ${{ needs.device-request.outputs.device_code }}
-          TOKEN_ENDPOINT: ${{ needs.device-request.outputs.token_endpoint }}
-          INTERVAL: ${{ needs.device-request.outputs.interval }}
+      - name: Red-banner acknowledge gate (C-E, no-GitHub path)
+        if: needs.visibility-banner.outputs.workflows_changed == 'true'
         run: |
           set -euo pipefail
+          # Red banner = workflows changed: the run stops here unless the
+          # dispatcher checked acknowledge_changed_workflows AFTER reviewing
+          # the diff themselves. Moved BEFORE the merged device step (D4):
+          # a red run must never mint a device code nor ask the tenant to
+          # approve anything. Boolean input (true/false only) — safe in the
+          # test. Green banners skip this step entirely.
+          if [ "${{ inputs.acknowledge_changed_workflows }}" != "true" ]; then
+            echo "::error::workflows CHANGED since baseline and acknowledge_changed_workflows is unchecked. Review the diff from the banner card first, then re-dispatch with the box checked. Nothing runs until you do."
+            exit 1
+          fi
+          echo "Red-banner acknowledged — proceeding."
+
+      - name: "S1 device flow: request → card → poll (single runner, C2)"
+        id: device
+        env:
+          # Public, constant Keycloak discovery doc (same realm for every tenant).
+          NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
+          TENANT_USER: ${{ vars.TENANT_USER }}
+          MODE: ${{ inputs.mode }}
+          HEAD_SHA: ${{ github.sha }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # C2: device_code never crosses a job boundary. The old split
+          # (ungated request job → job outputs → consumer step env) leaked it
+          # into the public run log via the env dump; request, card and poll
+          # now live in this one step and the secret is masked at birth.
           # Handoff-write guard (review security): the token response is
           # API-derived; a crafted value with an embedded newline would forge
           # additional $GITHUB_ENV lines (e.g. redirect NETCUP_API_BASE).
@@ -329,29 +252,121 @@ jobs:
             case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
             if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
           }
-          # Endpoint pin (review security MEDIUM): the device-code POST may
-          # only ever go to the live SCP Keycloak realm (the value arrives via
-          # the request job's output; re-checked here at the point of use).
-          case "$TOKEN_ENDPOINT" in
-            https://www.servercontrolpanel.de/realms/scp/*) ;;
-            *) echo "::error::token_endpoint is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
-          esac
-          # No re-mask (see request job): masked values can't cross via outputs;
-          # the code arrives unmasked by design and is never printed anywhere.
+          # M0-gate: literal device/token endpoint URLs are NOT hardcoded here
+          # (prior literals were probed, never recorded). Endpoints are
+          # recovered from the Keycloak OIDC discovery document FIRST.
+          DISCO="$(curl -sS "$NETCUP_OIDC_DISCOVERY_URL")"
+          DEVICE_ENDPOINT="$(echo "$DISCO" | jq -r '.device_authorization_endpoint')"
+          TOKEN_ENDPOINT="$(echo "$DISCO" | jq -r '.token_endpoint')"
+          test "$DEVICE_ENDPOINT" != "null" || { echo "::error::discovery doc lacks device_authorization_endpoint — STOP, escalate."; exit 1; }
+          # Endpoint pin (review security MEDIUM): only the live SCP Keycloak
+          # realm may receive auth traffic — a tampered discovery document
+          # must not receive the device code (or, later, the tokens).
+          require_scp_endpoint() { # $1 label, $2 URL
+            case "$2" in
+              https://www.servercontrolpanel.de/realms/scp/*) ;;
+              *) echo "::error::$1 is not an https://www.servercontrolpanel.de/realms/scp/ endpoint — refusing to POST (endpoint pin)."; exit 1 ;;
+            esac
+          }
+          require_scp_endpoint "device_authorization_endpoint" "$DEVICE_ENDPOINT"
+          require_scp_endpoint "token_endpoint" "$TOKEN_ENDPOINT"
+          RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" --data-urlencode "client_id=scp" --data-urlencode "scope=offline_access openid")"
+          # C-f: grant disabled (or any refusal) → STOP + escalate.
+          # No downgrade path exists by design (C-A) — this run exits here.
+          if echo "$RESP" | jq -e 'has("error")' >/dev/null; then
+            DESC="$(echo "$RESP" | jq -r '.error_description // .error')"
+            echo "::error::device authorization refused ($DESC). STOP — the device grant may be disabled. Escalate to the operator. No fallback of any kind exists (C-A)."
+            exit 1
+          fi
+          # C-a: the authorization secret is masked at birth, immediately
+          # after the fail-closed guard — safe now that it never crosses a
+          # job boundary (a masked value silently disappears from
+          # GITHUB_OUTPUT, so an output would be impossible; there is none).
+          # jq yields the literal null for a missing key: fail closed BEFORE
+          # masking (masking null would redact unrelated text later).
+          DEVICE_CODE="$(echo "$RESP" | jq -r '.device_code // empty')"
+          if [ -z "$DEVICE_CODE" ] || [ "$DEVICE_CODE" = "null" ]; then
+            echo "::error::device authorization response carried no device_code — refusing to continue (fail closed, no fallback)."
+            exit 1
+          fi
+          echo "::add-mask::$DEVICE_CODE"
+          # C2b: the public half of the grant (user code + verification URL)
+          # is the approval surface by design. Fail closed on missing/empty
+          # values before the card is built.
+          USER_CODE="$(echo "$RESP" | jq -r '.user_code // empty')"
+          VERIFY_URI="$(echo "$RESP" | jq -r '.verification_uri_complete // .verification_uri // empty')"
+          if [ -z "$USER_CODE" ] || [ "$USER_CODE" = "null" ]; then
+            echo "::error::device authorization response carried no user_code — the approval card cannot be shown; refusing to continue (fail closed)."
+            exit 1
+          fi
+          if [ -z "$VERIFY_URI" ] || [ "$VERIFY_URI" = "null" ]; then
+            echo "::error::device authorization response carried no verification URI — the approval card cannot be shown; refusing to continue (fail closed)."
+            exit 1
+          fi
+          INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
+          SHORT="$(echo "$HEAD_SHA" | cut -c1-7)"
+          # C2b card fields: action + pinned commit + review link. The compare
+          # link is expression-built (no literal scheme/host) so the CI
+          # endpoint allowlist sees no new URL.
+          REVIEW_LINK="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }}"
+          ANTI_PHISH="we will never email or message you a code to re-confirm."
+          # C-b: print ONLY the verification URL + user_code (+ alias, mode,
+          # commit, review link). Quiet curl flags only; no verbose dumps; no
+          # trace-level log variables; device_code is masked and never printed.
+          echo "alias: $TENANT_USER"
+          echo "Open this URL on your phone to approve: $VERIFY_URI"
+          echo "Code: $USER_CODE"
+          echo "action: $MODE"
+          echo "commit: $HEAD_SHA ($SHORT)"
+          echo "review (diff vs main, last-approved pin pending): $REVIEW_LINK"
+          echo "$ANTI_PHISH"
+          # Live card: this step does not end until the poll does, so the live
+          # log is the immediate channel; the summary below renders at step
+          # end (post-run record); ntfy (when configured) and the notice
+          # annotation are the live channels the operator tooling reads.
+          {
+            echo "### 📲 Approve at netcup (code expires in ~10 min)"
+            echo ""
+            echo "[👉 TAP TO APPROVE]($VERIFY_URI)"
+            echo ""
+            echo "Code: \`$USER_CODE\` (already filled if you tapped the link)"
+            echo ""
+            echo "action: $MODE"
+            echo "commit: \`$SHORT\` (\`$HEAD_SHA\`)"
+            echo "review (diff vs main, last-approved pin pending): $REVIEW_LINK"
+            echo ""
+            echo "alias: $TENANT_USER — approving lets this run touch your netcup account ONCE; the token dies with the runner."
+            echo "$ANTI_PHISH"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Live push (the true phone channel): ntfy carries the approval
+          # surface out-of-band the moment the code exists. Unset topic =
+          # live log + summary only.
+          if [ -n "$NTFY_TOPIC" ]; then
+            # Empty token = no header at all (ntfy.sh 401s on an empty Basic).
+            NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
+            curl -sS --fail "${NTFY_AUTH[@]}" -d "piercloud: approve $TENANT_USER: $VERIFY_URI code $USER_CODE (expires 10 min) action=$MODE commit=$SHORT review=$REVIEW_LINK. $ANTI_PHISH" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+          fi
+          # Live-best-effort machine-readable channel: the check-run notice
+          # annotation the operator tooling looks up (user_code is public by
+          # design; the annotation carries the verification URL only).
+          echo "::notice title=PierCloud device approval::$VERIFY_URI"
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
           # re-dispatch message (device codes live ~600s).
           DEADLINE=$((SECONDS + 570))
           DELAY="$INTERVAL"
           while [ "$SECONDS" -lt "$DEADLINE" ]; do
             sleep "$DELAY"
-            # C-a: the poll payload carries the device_code (unmasked by design,
-            # see request job) — keep the response out of logs (it may echo
-            # the code back on errors).
-            POLL="$(curl -sS -X POST "$TOKEN_ENDPOINT" --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" --data-urlencode "client_id=scp" --data-urlencode "device_code=$DEVICE_CODE")" # C-a: code never printed (C-b)
+            # C2: the poll payload carries the masked device_code — keep the
+            # response out of logs (it may echo the code back on errors).
+            POLL="$(curl -sS -X POST "$TOKEN_ENDPOINT" --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" --data-urlencode "client_id=scp" --data-urlencode "device_code=$DEVICE_CODE")" # C2: masked value, never printed
             STATUS="$(echo "$POLL" | jq -r '.error // "ok"')"
             case "$STATUS" in
               ok)
-                ACCESS_TOKEN="$(echo "$POLL" | jq -r '.access_token')"
+                ACCESS_TOKEN="$(echo "$POLL" | jq -r '.access_token // empty')"
+                if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+                  echo "::error::token response carried no access_token — refusing to hand off an empty credential (fail closed; a downstream 401 would hide this)."
+                  exit 1
+                fi
                 guard_line "access_token" "$ACCESS_TOKEN"
                 echo "::add-mask::$ACCESS_TOKEN"
                 echo "authorized=true" >> "$GITHUB_OUTPUT"
@@ -606,20 +621,6 @@ jobs:
           echo "ANCHOR_HOST=$HOST4" >> "$GITHUB_ENV"
           echo "anchor_ipv4=$HOST4" >> "$GITHUB_OUTPUT"
           echo "Resolved server_id=$RESOLVED_ID (ssh/dns target set)."
-
-      - name: Red-banner acknowledge gate (C-E, no-GitHub path)
-        if: needs.visibility-banner.outputs.workflows_changed == 'true'
-        run: |
-          set -euo pipefail
-          # Red banner = workflows changed: the run stops here unless the
-          # dispatcher checked acknowledge_changed_workflows AFTER reviewing
-          # the diff themselves. Boolean input (true/false only) — safe in
-          # the test. Green banners skip this step entirely.
-          if [ "${{ inputs.acknowledge_changed_workflows }}" != "true" ]; then
-            echo "::error::workflows CHANGED since baseline and acknowledge_changed_workflows is unchecked. Review the diff from the banner card first, then re-dispatch with the box checked. Nothing runs until you do."
-            exit 1
-          fi
-          echo "Red-banner acknowledged — proceeding."
 
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
@@ -957,9 +958,9 @@ jobs:
         env:
           NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           # Public, constant Keycloak discovery doc (same realm for every
-          # tenant) — same pattern as the device-request job. The revocation
-          # endpoint is read from it at runtime, so no endpoint literal is
-          # hardcoded here.
+          # tenant) — same pattern as the merged device-flow step. The
+          # revocation endpoint is read from it at runtime, so no endpoint
+          # literal is hardcoded here.
           NETCUP_OIDC_DISCOVERY_URL: "https://www.servercontrolpanel.de/realms/scp/.well-known/openid-configuration"
         run: |
           set -euo pipefail

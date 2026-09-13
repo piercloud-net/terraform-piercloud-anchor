@@ -83,7 +83,7 @@
 #   NETCUP_SCP_REFRESH_TOKEN_FILE  path to that 0600 file (the CI handoff).
 #   NETCUP_SCP_TOKEN_ENDPOINT Keycloak token endpoint for that refresh grant
 #                            (resolved from the OIDC discovery doc by the
-#                            device-request job; public, not a secret).
+#                            device-flow job; public, not a secret).
 #   NETCUP_API_BASE          SCP REST base (default verified against the
 #                            provider source: defaultBaseURL in
 #                            rixlhq/terraform-provider-netcup
