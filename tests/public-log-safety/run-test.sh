@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# tests/public-log-safety/run-test.sh — issue #121 public-run hygiene proofs.
+#
+# Static, cred-free, offline assertions over the shipped artifacts:
+#   (a) every identifier is masked at first receipt and never echoes raw
+#       (SCP_EFF, RESOLVED_ID at all three assignment sites via
+#       mask_server_id, API_USER, ORDER_NAME, OLD_HOSTNAME, MAC; the
+#       server id at the top of 020-provision-anchor.sh);
+#   (b) the wrong-account error carries no approver value;
+#   (c) the discovery-failure path prints no server list (no nickname dump);
+#   (d) the SSH host-key fingerprint print is gone from 020;
+#   (e) the published artifacts (head-sha, thumbprint) reference no netcup
+#       account identifiers;
+#   (f) the 020 tmp/steady filter shapes + the sweep-post hostname guard +
+#       the fail-closed order-name guard;
+#   (g) the module identifier inputs and id outputs are sensitive.
+#
+# These are the regression teeth for the exposure sweep: they fail on the
+# exact pre-#121 shapes (echoed ids, `'$API_USER'` in the error, the
+# nickname dump, the keyscan pipe, the id-suffixed policy name).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROV="$ROOT/.github/workflows/provision.yml"
+SCRIPT="$ROOT/.github/scripts/020-provision-anchor.sh"
+VARS="$ROOT/variables.tf"
+OUTS="$ROOT/outputs.tf"
+
+pass=0
+fail=0
+ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+is()  { # $1 label, $2 expected, $3 actual
+  if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
+}
+has()  { if grep -qF -- "$2" "$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+lack() { if grep -qF -- "$2" "$1"; then bad "$3 (found: $2)"; else ok "$3"; fi; }
+
+first_line() { # $1 fixed string, $2 file -> first matching line number or empty
+  grep -nF -- "$1" "$2" 2>/dev/null | head -n1 | cut -d: -f1 || true
+}
+before() { # $1 label, $2 earlier, $3 later
+  if [ -n "$2" ] && [ -n "$3" ] && [ "$2" -lt "$3" ]; then ok "$1"; else bad "$1 (line order: $2 then $3)"; fi
+}
+
+# Leaky echo lines for a variable: echo lines that reference it, excluding
+# the mask itself and the $GITHUB_ENV/$GITHUB_OUTPUT handoff writes.
+echo_refs() { # $1 file, $2 variable name (no $)
+  awk -v v="$2" '
+    /::add-mask::/ { next }
+    /\$GITHUB_ENV/ { next }
+    /\$GITHUB_OUTPUT/ { next }
+    $0 ~ ("(^|[^A-Za-z0-9_])echo .*\\$" v "([^A-Za-z0-9_]|$)") { print FILENAME":"FNR": "$0 }
+  ' "$1" || true
+}
+no_echo() { # $1 label, $2 file, $3 variable name (no $)
+  local hits
+  hits="$(echo_refs "$2" "$3")"
+  if [ -z "$hits" ]; then ok "$1"; else bad "$1 — raw echo found:"; printf '%s\n' "$hits"; fi
+}
+
+# ---- (a) masks exist and are ordered at each assignment site -------------
+has "$PROV" 'echo "::add-mask::$SCP_EFF"' "SCP id mask present"
+before "SCP id: digits guard before mask" \
+  "$(first_line 'resolved SCP user id is not all-digits' "$PROV")" \
+  "$(first_line 'echo "::add-mask::$SCP_EFF"' "$PROV")"
+has "$PROV" 'echo "::add-mask::$API_USER"' "approver mask present"
+before "approver: non-empty guard before mask" \
+  "$(first_line 'could not read the approver' "$PROV")" \
+  "$(first_line 'echo "::add-mask::$API_USER"' "$PROV")"
+has "$PROV" 'echo "::add-mask::$ORDER_NAME"' "order-name mask present"
+before "order name: fail-closed guard before mask" \
+  "$(first_line 'without masking the order name' "$PROV")" \
+  "$(first_line 'echo "::add-mask::$ORDER_NAME"' "$PROV")"
+has "$PROV" 'echo "::add-mask::$OLD_HOSTNAME"' "old-hostname mask present"
+has "$PROV" 'echo "::add-mask::$MAC"' "MAC mask present"
+before "MAC: shape validation before mask" \
+  "$(first_line 'resolved interface MAC is not a 17-char' "$PROV")" \
+  "$(first_line 'echo "::add-mask::$MAC"' "$PROV")"
+has "$PROV" 'mask_server_id() {' "mask_server_id helper defined"
+if grep -A4 -F 'mask_server_id() {' "$PROV" | grep -qF '::add-mask::'; then
+  ok "mask_server_id masks inside the helper"
+else
+  bad "mask_server_id helper does not mask"
+fi
+is "mask_server_id called at all three sites" "3" "$(grep -cF 'mask_server_id "$RESOLVED_ID"' "$PROV" || true)"
+before "mask_server_id defined before first call" \
+  "$(first_line 'mask_server_id() {' "$PROV")" \
+  "$(first_line 'mask_server_id "$RESOLVED_ID"' "$PROV")"
+before "020: server-id digits guard before mask" \
+  "$(first_line 'all_digits "$SERVER_ID"' "$SCRIPT")" \
+  "$(first_line 'echo "::add-mask::$SERVER_ID" >&2' "$SCRIPT")"
+has "$SCRIPT" 'echo "::add-mask::$mac" >&2' "020 resolved MAC masked on stderr"
+has "$SCRIPT" 'echo "::add-mask::$INTERFACE_MAC" >&2' "020 override MAC masked on stderr"
+
+# No identifier is ever echoed raw (mask/env/output lines excluded) --------
+no_echo "SCP id never echoed raw" "$PROV" SCP_EFF
+no_echo "server id never echoed raw" "$PROV" RESOLVED_ID
+no_echo "approver username never echoed raw" "$PROV" API_USER
+no_echo "order name never echoed raw" "$PROV" ORDER_NAME
+no_echo "old hostname never echoed raw" "$PROV" OLD_HOSTNAME
+no_echo "MAC never echoed raw" "$PROV" MAC
+
+# ---- (b) wrong-account error carries no value ----------------------------
+wa="$(grep -nF 'WRONG-ACCOUNT APPROVAL' "$PROV" | head -n1 | cut -d: -f1 || true)"
+is "wrong-account error is a single line" "1" "$(grep -cF 'WRONG-ACCOUNT APPROVAL' "$PROV" || true)"
+if [ -n "$wa" ] && sed -n "${wa}p" "$PROV" | grep -qF '$API_USER'; then
+  bad "wrong-account error still prints the approver value"
+else
+  ok "wrong-account error carries no approver value"
+fi
+
+# ---- (c) discovery failure prints count + action, never a server list ----
+lack "$PROV" 'nickname' "no server-list dump (nickname) in provision.yml"
+lack "$PROV" "Your account's servers" "old discovery-failure dump text gone"
+has "$PROV" 'none is named $HOSTNAME. Rename the anchor to $HOSTNAME' "discovery failure carries count + action"
+
+# ---- (d) no host-key fingerprint pipe in 020 -----------------------------
+is "no ssh-keyscan/ssh-keygen in 020" "0" "$(grep -cE 'ssh-keyscan|ssh-keygen' "$SCRIPT" || true)"
+
+# ---- (e) artifacts carry no netcup account identifiers -------------------
+span() { # $1 file, $2 begin marker, $3 end marker
+  awk -v a="$2" -v b="$3" '$0 ~ a {f=1} f && $0 ~ b {exit} f {print}' "$1"
+}
+artifact_ids='(^|[^A-Za-z0-9_])(SERVER_ID|ANCHOR_HOST|MAC|SCP_USER_ID|ORDER_NAME|API_USER|CUSTOMER_NUMBER)([^A-Za-z0-9_]|$)'
+for pair in "head-sha|Record head SHA for the backend approval pin|Upload head-SHA artifact" \
+  "thumbprint|Write thumbprint captured by the A1 provision step|Upload thumbprint artifact"; do
+  label="${pair%%|*}"; rest="${pair#*|}"; begin="${rest%%|*}"; end="${rest#*|}"
+  body="$(span "$PROV" "$begin" "$end")"
+  if [ -z "$body" ]; then
+    bad "$label artifact span not found"
+    continue
+  fi
+  if printf '%s\n' "$body" | grep -qE "$artifact_ids"; then
+    bad "$label artifact references a netcup account identifier"
+    printf '%s\n' "$body" | grep -nE "$artifact_ids" || true
+  else
+    ok "$label artifact has no netcup account identifiers"
+  fi
+done
+
+# ---- (f) 020 filter shapes, guards, and gone fingerprint/test bits -------
+has "$SCRIPT" '^piercloud-tmp-[0-9]+\z' "tmp filter uses the anchored new shape"
+has "$SCRIPT" 'startswith($legacy)' "tmp filter keeps the legacy this-server shape"
+has "$SCRIPT" '--arg legacy "piercloud-tmp-${SERVER_ID}-"' "tmp legacy prefix is the server id prefix"
+has "$SCRIPT" 'endswith($h)' "steady filter uses the hostname anchor"
+has "$SCRIPT" 'endswith($s)' "steady filter uses the migration id anchor"
+has "$SCRIPT" '--arg h "-${ANCHOR_HOSTNAME}"' "steady hostname anchor wired"
+before "sweep-post: hostname guard after the no-token no-op" \
+  "$(first_line 'no token held (approval never completed)' "$SCRIPT")" \
+  "$(first_line 'ANCHOR_HOSTNAME is required to scope' "$SCRIPT")"
+
+# ---- (g) module sensitivity marks ----------------------------------------
+block_of() { # $1 file, $2 kind (variable|output), $3 name
+  sed -n "/^$2 \"$3\" {/,/^}/p" "$1"
+}
+sensitive() { # $1 label, $2 block text
+  if printf '%s\n' "$2" | grep -qE '^[[:space:]]*sensitive[[:space:]]*=[[:space:]]*true'; then
+    ok "$1"
+  else
+    bad "$1 (missing sensitive = true)"
+  fi
+}
+for v in server_id scp_user_id customer_number; do
+  sensitive "variable $v is sensitive" "$(block_of "$VARS" variable "$v")"
+done
+for o in server_id firewall_policy_id; do
+  sensitive "output $o is sensitive" "$(block_of "$OUTS" output "$o")"
+done
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
