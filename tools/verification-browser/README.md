@@ -12,7 +12,7 @@ CfT uses its own macOS keychain item (`Chromium Safe Storage`), separate from pe
 
 - macOS for the branded bundle (`build-app.sh`); Linux/headless uses a documented plain-Chromium equivalent (below).
 - `python3` with the `websocket-client` package: `python3 -m pip install --user websocket-client`. On PEP 668 externally-managed Pythons (Homebrew/System) a bare `pip install` fails — use `--user` or a virtualenv; `cdp.py` prints this hint when the import fails.
-- `gh` CLI, logged in, for `approve-device.sh` (run and job-log reads).
+- `gh` CLI, logged in, for the `approve-device.sh` run/annotation lookups (not needed when passing `--device-url`).
 - `curl` (CDP health check + CfT download).
 
 ## Environment knobs
@@ -55,15 +55,15 @@ The browser is a normal visible window: sign-ins, keychain prompts, and 2FA happ
 
 `./approve-device.sh <run-id> [owner/repo]` (repo defaults to the clone's `origin`) encapsulates the proven sequence:
 
-1. waits (bounded, ~180 s) for the run's `Device code request` job to complete and reads the device URL from its log;
+1. resolves the device URL from the first available source — `--device-url <url>` / `DEVICE_URL`, then the ntfy topic (`--ntfy-topic` / `NTFY_TOPIC`, optional `--ntfy-token` / `NTFY_TOKEN`; bounded JSON-API polling), then the check-run notice annotation titled `PierCloud device approval` (bounded), else it stops with instructions;
 2. pre-flights the automation profile's netcup SCP session on `/scp-ui/` (URL-only detection);
 3. navigates to the device URL and confirms the Keycloak Grant Access page;
 4. clicks Grant Access once with a bare `.click()`, allows one retry, then polls for `/realms/scp/device/status` + `Device Login Successful` within the ~570 s approval window;
 5. prints `DEVICE_LOGIN_SUCCESSFUL`, or fails closed with `NOT_CONFIRMED` and recovery steps.
 
-Run `./approve-device.sh --preflight` any time (no run id) to check the profile's SCP session before dispatching.
+The `provision.yml` device flow is one long step: its log is not readable through the API until the job completes (i.e. after approval), so the live channels are the run page's streaming log, the ntfy push and the notice annotation. With `--device-url` the run id is optional — copy the URL from the live run page and pass it directly. Run `./approve-device.sh --preflight` any time (no run id) to check the profile's SCP session before dispatching.
 
-**Redaction rule:** the device `user_code` is never printed or pasted — every URL `approve-device.sh` prints passes through a `user_code=<redacted>` filter, and the job log is never dumped. The code is short-lived (~10 min) and useless without the profile's own netcup session; still keep it out of logs and chats.
+**Redaction rule:** the device `user_code` is never printed or pasted — every URL `approve-device.sh` prints passes through a `user_code=<redacted>` filter, and job logs are never dumped. The `device_code` itself never leaves the single runner step (masked at birth), so it cannot appear in a log; the `user_code` is public by design (it is the approval surface) but short-lived (~10 min) and useless without the profile's own netcup session — still keep it out of logs and chats.
 
 ### Session loss and NOT_CONFIRMED
 
