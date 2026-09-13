@@ -328,8 +328,9 @@ jobs:
           echo "$ANTI_PHISH"
           # Live card: this step does not end until the poll does, so the live
           # log is the immediate channel; the summary below renders at step
-          # end (post-run record); ntfy (when configured) and the notice
-          # annotation are the live channels the operator tooling reads.
+          # end (post-run record); ntfy (when configured) is the live push
+          # channel, and the operator tooling reads the live run-page log
+          # through the verification browser (see tools/verification-browser/).
           {
             echo "### 📲 Approve at netcup (code expires in ~10 min)"
             echo ""
@@ -352,9 +353,11 @@ jobs:
             NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
             curl -sS --fail "${NTFY_AUTH[@]}" -d "piercloud: approve $TENANT_USER: $VERIFY_URI code $USER_CODE (expires 10 min) action=$MODE commit=$SHORT review=$REVIEW_LINK. $ANTI_PHISH" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
           fi
-          # Live-best-effort machine-readable channel: the check-run notice
-          # annotation the operator tooling looks up (user_code is public by
-          # design; the annotation carries the verification URL only).
+          # Post-step machine-readable channel: the check-run notice
+          # annotation becomes readable only after this step ends (observed
+          # live: annotations_count stayed 0 for the whole approval wait), so
+          # it is a transcript/audit aid, not a live source. Carries the
+          # verification URL only (user_code is public by design).
           echo "::notice title=PierCloud device approval::$VERIFY_URI"
           # C-c: honor interval/slow_down; self-stop ~570s with a clean
           # re-dispatch message (device codes live ~600s).
