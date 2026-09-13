@@ -61,6 +61,7 @@ All notable changes to this project will be documented in this file.
 - Review protocol — independent review, security first (closes #108)
 - Data trust disclosure — at rest, in transit, at runtime (closes #103)
 - *(verification)* /impl checklist + portable CfT PierCloud browser tooling (closes #116)
+- One line per paragraph in README + component READMEs (closes #112)
 
 ### ⚙️ Miscellaneous Tasks
 
