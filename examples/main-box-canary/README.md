@@ -17,9 +17,4 @@ systemctl enable --now piercloud-anchor-canary.timer
 #    CURRENT public IP + apply snippet.
 ```
 
-Why this exists: Gatus on the anchor never traverses the anchor's ingress
-firewall, so drift, policy deletion, and stale bindings are invisible to it.
-The canary checks from the other direction; together neither side can fail
-silently. Either side alerting is actionable: the push always carries the
-current main-box IP (which the anchor cannot discover itself) so a
-`mode=apply` re-converge is one dispatch away.
+Why this exists: Gatus on the anchor never traverses the anchor's ingress firewall, so drift, policy deletion, and stale bindings are invisible to it. The canary checks from the other direction; together neither side can fail silently. Either side alerting is actionable: the push always carries the current main-box IP (which the anchor cannot discover itself) so a `mode=apply` re-converge is one dispatch away.
