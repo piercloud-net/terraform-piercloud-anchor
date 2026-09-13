@@ -55,7 +55,7 @@ The browser is a normal visible window: sign-ins, keychain prompts, and 2FA happ
 
 `./approve-device.sh <run-id> [owner/repo]` (repo defaults to the clone's `origin`) encapsulates the proven sequence:
 
-1. resolves the device URL from the first available source — `--device-url <url>` / `DEVICE_URL`, then the ntfy topic (`--ntfy-topic` / `NTFY_TOPIC`, optional `--ntfy-token` / `NTFY_TOKEN`; bounded JSON-API polling), then the check-run notice annotation titled `PierCloud device approval` (bounded), else it stops with instructions;
+1. resolves the device URL from the first available source — `--device-url <url>` / `DEVICE_URL`, then the ntfy topic (`--ntfy-topic` / `NTFY_TOPIC` **with** `--ntfy-token` / `NTFY_TOKEN`, required — a public topic is spoofable and would phish the warm session; the token needs read access; bounded JSON-API polling), then the check-run notice annotation titled `PierCloud device approval` (bounded), else it stops with instructions;
 2. pre-flights the automation profile's netcup SCP session on `/scp-ui/` (URL-only detection);
 3. navigates to the device URL and confirms the Keycloak Grant Access page;
 4. clicks Grant Access once with a bare `.click()`, allows one retry, then polls for `/realms/scp/device/status` + `Device Login Successful` within the ~570 s approval window;

@@ -13,8 +13,9 @@
 #
 # What it does (full mode):
 #   1. resolves the device URL from the first available source: --device-url /
-#      DEVICE_URL, then the ntfy topic (--ntfy-topic / NTFY_TOPIC, optional
-#      --ntfy-token / NTFY_TOKEN; bounded JSON-API polling), then the
+#      DEVICE_URL, then the ntfy topic (--ntfy-topic / NTFY_TOPIC, requires
+#      --ntfy-token / NTFY_TOKEN — a public topic is spoofable and would
+#      phish this warm netcup session; bounded JSON-API polling), then the
 #      check-run notice annotation titled "PierCloud device approval"
 #      (bounded), else it stops with instructions. The device flow is now a
 #      single long step whose log is NOT readable through the API until the
@@ -55,7 +56,8 @@ usage: approve-device.sh [--device-url <url>] [--ntfy-topic <topic> [--ntfy-toke
 
   --device-url <url>    explicit device approval URL (run id optional; skips lookups)
   --ntfy-topic <topic>  ntfy topic carrying the approval card (or NTFY_TOPIC env)
-  --ntfy-token <token>  ntfy token for protected topics (or NTFY_TOKEN env)
+  --ntfy-token <token>  ntfy token for the topic — REQUIRED with --ntfy-topic
+                        (a public topic can be spoofed; needs read access)
   --preflight           check the profile's netcup SCP session only
 MSG
 }
@@ -200,6 +202,14 @@ for record in records:
 
 fetch_device_url_via_ntfy() {
   [ -n "$NTFY_TOPIC_IN" ] || return 1
+  # Security (review finding F2): an untokened topic is a spoofable approval
+  # channel — a forged card would phish this warm netcup session. The ntfy
+  # lookup therefore requires a token-protected topic; --device-url and the
+  # authenticated check-run notice path remain available otherwise.
+  if [ -z "$NTFY_TOKEN_IN" ]; then
+    echo "refusing the ntfy lookup for topic '$NTFY_TOPIC_IN': no token supplied (a public/leaked topic can be spoofed). Pass --ntfy-token/NTFY_TOKEN, use --device-url, or rely on the notice annotation." >&2
+    return 1
+  fi
   echo "polling ntfy topic '$NTFY_TOPIC_IN' for the approval card (bound: $((NTFY_LOOKUP_ATTEMPTS * 3))s) ..." >&2
   local attempt url
   for ((attempt = 1; attempt <= NTFY_LOOKUP_ATTEMPTS; attempt++)); do
