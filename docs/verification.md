@@ -127,11 +127,11 @@ Every netcup use is human-approved per run (S1) through Keycloak's device grant.
 
 **Approval sequence:**
 
-1. Dispatch `provision.yml` `mode=apply`; the run mints a device code and its `Device code request` job renders the card (code lifetime ~10 min, poll window ~570 s).
-2. Run `tools/verification-browser/approve-device.sh <run-id>`: it reads the device URL from the job log, pre-flights the profile, navigates, confirms the Keycloak Grant Access page, clicks `#kc-login`, and polls for `/realms/scp/device/status` + `Device Login Successful` → prints `DEVICE_LOGIN_SUCCESSFUL`.
-3. Manual fallback: read the device URL from the `Device code request` job log, navigate the CfT window there, click Grant Access, confirm the success page.
+1. Dispatch `provision.yml` `mode=apply`; the run's single gated `device-flow` job mints the netcup `device_code` inside one step (masked at birth; it never crosses a job boundary, so it cannot appear in the public log) and renders the approval card. The card's live channels are the streaming job log on the public run page and the ntfy push (when a topic is set); the check-run notice annotation titled `PierCloud device approval` becomes readable only after the step ends; `$GITHUB_STEP_SUMMARY` renders when the step ends (post-run record). Code lifetime ~10 min, poll window ~570 s.
+2. Run `tools/verification-browser/approve-device.sh <run-id>`: it resolves the device URL from `--device-url` / `DEVICE_URL`, then ntfy (`--ntfy-topic` / `NTFY_TOPIC` with a required `--ntfy-token` / `NTFY_TOKEN` — an untokened topic is spoofable and refused; the token needs read access), then the live run-page log read through the verification browser itself (the CfT window is navigated to the device-flow job page; bounded), then the notice annotation (bounded; post-step only) — pre-flights the profile, navigates, confirms the Keycloak Grant Access page, clicks `#kc-login`, and polls for `/realms/scp/device/status` + `Device Login Successful` → prints `DEVICE_LOGIN_SUCCESSFUL`.
+3. Manual fallback: open the live run page, read the device URL from the streaming `S1 device-flow` step log, navigate the CfT window there, click Grant Access, confirm the success page — or pass that URL to the script with `--device-url` (run id optional on that path).
 
-**Redaction:** never print or paste the `user_code`; `approve-device.sh` redacts `user_code=…` in every URL it prints. The code is not masked in the run card by design (masking breaks the job handoff) — it lives ~600 s and is useless without the profile's own session.
+**Redaction:** never print or paste the `user_code`; `approve-device.sh` redacts `user_code=…` in every URL it prints. The `device_code` is masked at birth inside the single-job flow and never crosses job boundaries; the `user_code` is public by design (it is the approval surface), lives ~600 s, and is useless without the profile's own session.
 
 **Failure modes:**
 
