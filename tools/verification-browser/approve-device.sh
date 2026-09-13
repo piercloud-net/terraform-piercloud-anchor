@@ -16,11 +16,15 @@
 #      DEVICE_URL, then the ntfy topic (--ntfy-topic / NTFY_TOPIC, requires
 #      --ntfy-token / NTFY_TOKEN — a public topic is spoofable and would
 #      phish this warm netcup session; bounded JSON-API polling), then the
+#      LIVE run-page log read through this same verification browser (the
+#      CfT window is navigated to the run's device-flow job page and the
+#      streaming log is scraped for the approval link; bounded), then the
 #      check-run notice annotation titled "PierCloud device approval"
-#      (bounded), else it stops with instructions. The device flow is now a
-#      single long step whose log is NOT readable through the API until the
-#      job completes (i.e. after approval) — with no source, open the LIVE
-#      run page and pass --device-url;
+#      (bounded; it only becomes readable after the step ends, so it is a
+#      last resort, not a live source), else it stops with instructions.
+#      The device flow is a single long step whose log is NOT readable
+#      through the REST API until the job completes (i.e. after approval) —
+#      with no source, open the LIVE run page and pass --device-url;
 #   2. pre-flights the automation profile's netcup SCP session (URL-only);
 #   3. navigates to the device URL and confirms the Keycloak Grant Access page;
 #   4. clicks #kc-login once (one retry allowed), then polls for
@@ -32,8 +36,8 @@
 # The device user_code is NEVER printed: every URL this script prints is passed
 # through redact(). Job logs are never dumped.
 #
-# Requirements: gh (logged in) for the run/annotation lookups — not needed
-# with --device-url — plus python3 + websocket-client, and a running
+# Requirements: gh (logged in) for the run/job/annotation lookups — not
+# needed with --device-url — plus python3 + websocket-client, and a running
 # verification browser (launch.sh) whose profile is signed in to netcup SCP.
 #
 # Env knobs: CDP_PORT (default 9333); PROFILE / BROWSER_HOME are reported only.
@@ -45,6 +49,7 @@ APPROVAL_WINDOW_SECONDS=570      # live netcup device window is ~570s
 POLL_SECONDS=3
 NTFY_LOOKUP_ATTEMPTS=20          # attempts; ~13s worst case each (10s curl cap + 3s sleep)
 NOTICE_LOOKUP_ATTEMPTS=40        # attempts; gh-call latency + 3s sleep each
+BROWSER_LOOKUP_ATTEMPTS=60       # attempts; CDP eval latency + 3s sleep each (<=~3 min)
 JOB_PREFIX="S1 device-flow"      # job name prefix (the live name has a suffix; used to pick the check run)
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -160,9 +165,10 @@ preflight_session() {
 
 # The device-flow step is ONE long step: its job log does not exist through
 # the API until the job completes (and the job completes only after the
-# approval). The live channels are the run page's streaming log, the ntfy
-# push, and the check-run notice annotation. Every lookup below is bounded
-# numerically and never dumps the message body.
+# approval). Live channels: the run page's streaming log (read through the
+# verification browser below) and the ntfy push; the check-run notice
+# annotation only becomes readable after the step ends. Every lookup below
+# is bounded numerically and never dumps the message body.
 ntfy_get() { # $1 = URL
   if [ -n "$NTFY_TOKEN_IN" ]; then
     curl -fsS --max-time 10 -u ":$NTFY_TOKEN_IN" "$1"
@@ -275,6 +281,55 @@ for annotation in data:
   return 1
 }
 
+# Live run-page log through the verification browser: the CfT window can
+# reach the public run page and the step log streams there (shadow DOM
+# included) while the code is still valid. This is the autonomous source
+# when no ntfy topic is configured — the REST log API 404s mid-step and the
+# notice annotation is only readable after the step ends.
+fetch_device_url_via_browser() {
+  [ -n "$RUN_ID" ] || return 1
+  command -v gh >/dev/null 2>&1 || { echo "gh CLI not found — cannot resolve the run's job id" >&2; return 1; }
+  if [ -z "$REPO" ]; then
+    REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+    [ -n "$REPO" ] || { echo "cannot determine the repo — pass owner/repo or run from inside the clone" >&2; return 1; }
+  fi
+  local job_id job_url
+  job_id="$(gh run view "$RUN_ID" --repo "$REPO" --json jobs 2>/dev/null | "$PY" -c '
+import json, sys
+prefix = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for job in data.get("jobs", []):
+    if job.get("name", "").startswith(prefix):
+        print(job["databaseId"])
+        break
+' "$JOB_PREFIX" || true)"
+  if [ -z "$job_id" ]; then
+    echo "the '$JOB_PREFIX' job is not visible on run $RUN_ID yet — trying the next source" >&2
+    return 1
+  fi
+  job_url="https://github.com/$REPO/actions/runs/$RUN_ID/job/$job_id"
+  echo "reading the live run-page log through the verification browser (up to $BROWSER_LOOKUP_ATTEMPTS attempts) ..." >&2
+  "$PY" "$CDP" nav "$job_url" >/dev/null 2>&1 \
+    || { echo "could not navigate the verification browser to the run job page" >&2; return 1; }
+  local attempt url
+  for ((attempt = 1; attempt <= BROWSER_LOOKUP_ATTEMPTS; attempt++)); do
+    # Scrape only the approval link; the card carries the public user_code
+    # by design (the device_code is masked at birth and never printed).
+    url="$("$PY" "$CDP" eval '(function(){var t="";document.querySelectorAll("*").forEach(function(e){var r=e.shadowRoot;t+=(r?r.textContent:e.textContent)||"";});var m=t.match(/https:\/\/[^\s"<>]*user_code=[^\s"<>]*/);return m?m[0]:"NOTFOUND";})()' 2>/dev/null \
+      | grep -oE 'https://[^" ]*user_code=[^" ]*' | head -n1 || true)"
+    if [ -n "$url" ]; then
+      printf '%s' "$url"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "no approval link appeared in the live run-page log within the bound — trying the next source" >&2
+  return 1
+}
+
 command -v "$PY" >/dev/null 2>&1 || die "python3 not found"
 [ -x "$CDP" ] || die "cdp.py missing at $CDP"
 
@@ -303,6 +358,10 @@ else
     [ -n "$device_url" ] && device_url_source="ntfy topic '$NTFY_TOPIC_IN'"
   fi
   if [ -z "$device_url" ] && [ -n "$RUN_ID" ]; then
+    device_url="$(fetch_device_url_via_browser || true)"
+    [ -n "$device_url" ] && device_url_source="live run-page log (verification browser)"
+  fi
+  if [ -z "$device_url" ] && [ -n "$RUN_ID" ]; then
     device_url="$(fetch_device_url_via_notice || true)"
     [ -n "$device_url" ] && device_url_source="check-run notice annotation"
   fi
@@ -312,14 +371,16 @@ if [ -z "$device_url" ]; then
 error: no device URL could be resolved from the available sources.
 
 The device flow is a single long step, so its log is not readable through the
-API while the run waits for approval. To finish the approval:
+REST API while the run waits for approval. To finish the approval:
   1. Open the LIVE run page in the GitHub web UI — the step log streams the
      approval card while the code is still valid.
   2. Copy the "Open this URL on your phone to approve" link.
   3. Re-run this script with --device-url <url> (the run id is optional on
      that path), or set an ntfy topic so the card is pushed to ntfy.
-The card is also exposed as a check-run notice annotation titled
-"PierCloud device approval" once the step has minted the code.
+When the verification browser is running, this script reads that live log
+through the browser itself — no manual copy needed. The check-run notice
+annotation titled "PierCloud device approval" only becomes readable after
+the step ends, so it cannot resolve a pending approval.
 MSG
   exit 1
 fi
