@@ -51,6 +51,11 @@ All notable changes to this project will be documented in this file.
 - *(tofu)* Firewall policy adopt/reuse — conditional import + orphan sweep (closes #101)
 - *(ci)* Cap artifact retention at 90 + fail-loud mode=check assert (closes #119)
 - *(security)* Contain device_code to a single runner step (closes #120)
+- *(device-flow)* Card copy nits — new-tab hint + drop "dead" (closes #70)
+
+### 💼 Other
+
+- Public-run exposure sweep — mask netcup ids, fix failure dumps, artifacts, reviewer PII (closes #121)
 
 ### 📚 Documentation
 
