@@ -213,7 +213,7 @@ fetch_device_url_via_ntfy() {
   # lookup therefore requires a token-protected topic; --device-url and the
   # authenticated check-run notice path remain available otherwise.
   if [ -z "$NTFY_TOKEN_IN" ]; then
-    echo "refusing the ntfy lookup for topic '$NTFY_TOPIC_IN': no token supplied (a public/leaked topic can be spoofed). Pass --ntfy-token/NTFY_TOKEN, use --device-url, or rely on the notice annotation." >&2
+    echo "refusing the ntfy lookup for topic '$NTFY_TOPIC_IN': no token supplied (a public/leaked topic can be spoofed). Pass --ntfy-token/NTFY_TOKEN, use --device-url, or let the browser live-log source below resolve it." >&2
     return 1
   fi
   echo "polling ntfy topic '$NTFY_TOPIC_IN' for the approval card (up to $NTFY_LOOKUP_ATTEMPTS attempts, ~$((NTFY_LOOKUP_ATTEMPTS * 13))s worst case) ..." >&2
