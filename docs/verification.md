@@ -25,7 +25,7 @@ Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `
 | `key-material grep (from main)` | always | No JWK private `d` scalar and no PEM private-key block in tracked code; the patterns are enforced from `main`, so a PR cannot weaken its own check. |
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist; also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, sweep pre/post, naming scheme) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, sweep pre/post, naming scheme, retention cap, policy naming, public-log safety) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -34,7 +34,7 @@ Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme)/)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety)/)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -127,7 +127,7 @@ Every netcup use is human-approved per run (S1) through Keycloak's device grant.
 
 **Approval sequence:**
 
-1. Dispatch `provision.yml` `mode=apply`; the run's single gated `device-flow` job mints the netcup `device_code` inside one step (masked at birth; it never crosses a job boundary, so it cannot appear in the public log) and renders the approval card. The card's live channels are the streaming job log on the public run page and the ntfy push (when a topic is set); the check-run notice annotation titled `PierCloud device approval` becomes readable only after the step ends; `$GITHUB_STEP_SUMMARY` renders when the step ends (post-run record). Code lifetime ~10 min, poll window ~570 s.
+1. Dispatch `provision.yml` `mode=apply`; the run's single gated `device-flow` job mints the netcup `device_code` inside one step (masked at birth; it never crosses a job boundary, so the runner redacts it from every later log line) and renders the approval card. The card's live channels are the streaming job log on the public run page and the ntfy push (when a topic is set); the check-run notice annotation titled `PierCloud device approval` becomes readable only after the step ends; `$GITHUB_STEP_SUMMARY` renders when the step ends (post-run record). Code lifetime ~10 min, poll window ~570 s.
 2. Run `tools/verification-browser/approve-device.sh <run-id>`: it resolves the device URL from `--device-url` / `DEVICE_URL`, then ntfy (`--ntfy-topic` / `NTFY_TOPIC` with a required `--ntfy-token` / `NTFY_TOKEN` — an untokened topic is spoofable and refused; the token needs read access), then the live run-page log read through the verification browser itself (the CfT window is navigated to the device-flow job page; bounded), then the notice annotation (bounded; post-step only) — pre-flights the profile, navigates, confirms the Keycloak Grant Access page, clicks `#kc-login`, and polls for `/realms/scp/device/status` + `Device Login Successful` → prints `DEVICE_LOGIN_SUCCESSFUL`.
 3. Manual fallback: open the live run page, read the device URL from the streaming `S1 device-flow` step log, navigate the CfT window there, click Grant Access, confirm the success page — or pass that URL to the script with `--device-url` (run id optional on that path).
 
