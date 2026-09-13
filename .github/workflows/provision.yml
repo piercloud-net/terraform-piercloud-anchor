@@ -178,14 +178,17 @@ jobs:
     name: "S1 device-flow (C-a..C-f) + A1 window + stateless apply"
     runs-on: ubuntu-latest
     needs: [visibility-banner]
-    # C-E power path: required-reviewer gate lives in repo SETTINGS
-    # (environment `anchor` → tenant GitHub user), not in code. Where a
-    # tenant reviewer identity exists, this pauses the run for the tap
-    # BEFORE any token exists (execution approval); only then does the
-    # merged request → card → poll step below mint the device card
-    # (account approval). Two taps, correct order. Where no reviewer
-    # exists (no-GitHub path), the environment auto-creates with no rules
-    # and runs proceed — the LOUD banner is the mechanism there.
+    # Reviewer policy (deliberate, matches the live settings): NO required
+    # reviewer is configured by default — the environment exists only as a
+    # stable gate name, and the LOUD banner + the approval card are the
+    # review mechanism (S1: no standing credential exists; the per-run
+    # approval is the anchor). A tenant MAY opt into a required reviewer in
+    # repo settings, but that makes their GitHub login anonymous-readable
+    # through the environments API — the reason it is never the default and
+    # never names an operator identity. Where a reviewer is configured,
+    # GitHub pauses the run for the tap BEFORE any token exists (execution
+    # approval); only then does the merged request → card → poll step below
+    # mint the device card (account approval). Two taps, correct order.
     # Banner stays ungated so the card exists to review first.
     environment: anchor
     outputs:
@@ -477,10 +480,31 @@ jobs:
             case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
             if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
           }
-          # The numeric server id is the stable key (policy names, tmp tags,
-          # module adopt) but it appears in no email — so the run resolves it
-          # itself. Runs before every consumer below; ids are identifiers,
-          # not secrets, and are safe to log.
+          # ::add-mask:: data is a runner workflow command: the runner
+          # unescapes %0D/%0A/%25 in command data, so a value containing a
+          # literal '%' (e.g. a free-form order name) would register a
+          # DIFFERENT string as the mask and the real literal would never be
+          # redacted. guard_line already rejects CR/LF, so escaping '%'
+          # first is sufficient. Used for the free-form provider reads
+          # (order name, old hostname); the digits/hex identifiers cannot
+          # carry a '%' and stay plain.
+          mask_escaped() { printf '::add-mask::%s\n' "${1//'%'/'%25'}"; }
+          # Mask-at-first-receipt for the server id (issue #121): validate
+          # the shape, then mask BEFORE the value can reach any echo. Call
+          # it immediately after each non-empty assignment site below; an
+          # empty value returns early (nothing to mask) and falls through
+          # to the pasted-IP fallback exactly as before.
+          mask_server_id() { # $1 = server id
+            [ -n "$1" ] || return 0
+            guard_line "SERVER_ID" "$1"
+            case "$1" in '' | *[!0-9]*) echo "::error::resolved server id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
+            echo "::add-mask::$1"
+          }
+          # The numeric server id is the stable key (module adopt) but it
+          # appears in no email — so the run resolves it itself. It is also
+          # the alias → netcup-account join key: mask it at first receipt
+          # (mask_server_id below) and never log it; once masked, the
+          # runner redacts every later log line.
           # Tenant identity comes from the repo, not the dispatch: TENANT_USER
           # (operator-set variable) is the username, so there is no alias
           # input to typo or squat — unset fails closed before anything runs.
@@ -517,18 +541,20 @@ jobs:
           # SCP id); explicit SCP_USER_ID secret wins when set.
           if [ -n "${SCP_USER_ID_IN:-}" ]; then
             SCP_EFF="$SCP_USER_ID_IN"
-            echo "SCP user id from explicit secret."
           else
             SCP_EFF="$(curl -sS 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/userinfo' \
               -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" | jq -r '.id // empty')"
             [ -n "$SCP_EFF" ] || { echo "::error::userinfo returned no numeric id — token scope may lack openid, or the grant changed. Escalate, no fallback."; exit 1; }
-            echo "Resolved SCP user id=$SCP_EFF from token userinfo."
           fi
-          # Parse-time validation (review security): the userinfo id is
-          # interpolated into API paths, TF vars and policy-import HCL — it
-          # must be all-digits before it goes anywhere. Fail closed.
+          # Parse-time validation BEFORE any print (review security): the
+          # userinfo id is interpolated into API paths, TF vars and
+          # policy-import HCL — it must be all-digits before it goes
+          # anywhere. Fail closed; then mask at first receipt (the id is an
+          # account identifier, never log text).
           case "$SCP_EFF" in '' | *[!0-9]*) echo "::error::resolved SCP user id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
           guard_line "SCP_USER_ID_EFF" "$SCP_EFF"
+          echo "::add-mask::$SCP_EFF"
+          echo "SCP user id resolved (explicit secret when set, else the token userinfo) — masked."
           echo "SCP_USER_ID_EFF=$SCP_EFF" >> "$GITHUB_ENV"
           # Approver guard (issue #50): the device approval the tenant
           # already tapped is the ONLY authorization moment — prove it came
@@ -538,9 +564,14 @@ jobs:
           [ -n "${CUSTOMER_NUMBER:-}" ] || { echo "::error::CUSTOMER_NUMBER secret is empty — it is the one required secret (paste the customer number from either account email)."; exit 1; }
           API_USER="$(curl -sS "https://www.servercontrolpanel.de/scp-core/api/v1/users/$SCP_EFF" \
             -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" | jq -r '.username // empty')"
-          [ -n "$API_USER" ] || { echo "::error::could not read the approver's user record (GET /users/$SCP_EFF) — token scope may have changed. Escalate, no fallback."; exit 1; }
+          [ -n "$API_USER" ] || { echo "::error::could not read the approver's user record — token scope may have changed. Escalate, no fallback."; exit 1; }
+          # Mask at first receipt, before the compare and before any print:
+          # the approver's username IS the customer number. The wrong-account
+          # verdict below must carry no value.
+          guard_line "API_USER" "$API_USER"
+          echo "::add-mask::$API_USER"
           if [ "$API_USER" != "$CUSTOMER_NUMBER" ]; then
-            echo "::error::WRONG-ACCOUNT APPROVAL: this run was approved from netcup account '$API_USER', but the repo expects the customer-number account. STOP — nothing runs. Re-dispatch and approve from the account that owns the anchor."
+            echo "::error::WRONG-ACCOUNT APPROVAL: this run was approved from a different netcup account than the repo expects. STOP — nothing runs. Re-dispatch and approve from the account that owns the anchor."
             exit 1
           fi
           echo "Approver guard ok: the approval came from the tenant's own account."
@@ -577,12 +608,14 @@ jobs:
           RESOLVED_ID=""
           if [ "$COUNT" -eq 1 ]; then
             RESOLVED_ID="$(printf '%s' "$LIST" | jq -r '.[0].id // empty')"
-            echo "Discovery: exactly one server in the account — adopting id $RESOLVED_ID (convention-free)."
+            mask_server_id "$RESOLVED_ID"
+            echo "Discovery: exactly one server in the account — adopting it (convention-free)."
           elif [ "$COUNT" -gt 1 ]; then
             MATCHES="$(printf '%s' "$LIST" | jq -r --arg h "$HOSTNAME" '[.[] | select(.hostname == $h) | .id]')"
             if [ "$(printf '%s' "$MATCHES" | jq 'length')" -eq 1 ]; then
               RESOLVED_ID="$(printf '%s' "$MATCHES" | jq -r '.[0]')"
-              echo "Discovery: $COUNT servers, exactly one named $HOSTNAME — adopting id $RESOLVED_ID."
+              mask_server_id "$RESOLVED_ID"
+              echo "Discovery: $COUNT servers, exactly one named $HOSTNAME — adopting it."
             fi
           fi
           if [ -z "$RESOLVED_ID" ]; then
@@ -599,20 +632,37 @@ jobs:
                 echo "::error::anchor IP matched $IP_COUNT servers (need exactly 1). Check ANCHOR_IPV4, or rename duplicates in the SCP. Full list shape unexpected — escalate, no fallback."
                 exit 1
               fi
-              echo "Discovery fell back to the pasted IP (legacy path): server_id=$RESOLVED_ID."
+              mask_server_id "$RESOLVED_ID"
+              echo "Discovery fell back to the pasted IP (legacy path): adopting the matched server."
             else
-              echo "::error::expected 1 server, found $COUNT — and none is named $HOSTNAME. Your account's servers (id / name / hostname / nickname):"
-              printf '%s' "$LIST" | jq -r '.[] | "\(.id) / \(.name) / \(.hostname) / \(.nickname)"'
-              echo "::error::set the ANCHOR_IPV4 secret to the anchor IP and re-dispatch (or rename the anchor to $HOSTNAME so discovery can pick it). No cross-tenant data: the token sees this account only."
+              echo "::error::expected 1 server, found $COUNT — and none is named $HOSTNAME. Rename the anchor to $HOSTNAME, or set the ANCHOR_IPV4 secret to the anchor IP, then re-dispatch."
               exit 1
             fi
           fi
           # Parse-time validation (review security): the discovered server id
           # is interpolated into API paths and the generated import HCL — it
-          # must be all-digits before it goes anywhere. Fail closed.
+          # must be all-digits before it goes anywhere. Fail closed. (The
+          # per-site mask_server_id calls above already masked it, so this
+          # check is defense-in-depth.)
           case "$RESOLVED_ID" in '' | *[!0-9]*) echo "::error::resolved server id is not all-digits — refusing to use it (injection guard)."; exit 1 ;; esac
           guard_line "SERVER_ID" "$RESOLVED_ID"
           echo "SERVER_ID=$RESOLVED_ID" >> "$GITHUB_ENV"
+          # Server detail (read-only, UNCONDITIONAL — the pasted-IP path
+          # included): the order name, the pre-change hostname and the IPv4
+          # all come from provider reads that tofu plan prints; mask the
+          # identifiers at first receipt so no later log line can leak
+          # them. The order name must be maskable: an absent one fails
+          # closed here rather than reaching the plan unmasked.
+          DETAIL="$(curl -sS "$SCP/api/v1/servers/$RESOLVED_ID" -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
+          ORDER_NAME="$(printf '%s' "$DETAIL" | jq -r '.name // empty')"
+          [ -n "$ORDER_NAME" ] || { echo "::error::could not read the server's order name — refusing to plan without masking the order name (fail closed, no fallback)."; exit 1; }
+          guard_line "ORDER_NAME" "$ORDER_NAME"
+          mask_escaped "$ORDER_NAME"
+          OLD_HOSTNAME="$(printf '%s' "$DETAIL" | jq -r '.hostname // empty')"
+          if [ -n "$OLD_HOSTNAME" ] && [ "$OLD_HOSTNAME" != "$HOSTNAME" ]; then
+            guard_line "OLD_HOSTNAME" "$OLD_HOSTNAME"
+            mask_escaped "$OLD_HOSTNAME"
+          fi
           # SSH/DNS target: the pasted IP wins when set (legacy,
           # byte-for-byte); else the server detail's first IPv4 (IPv6-only
           # resolves via detail/interfaces, never q — and fails closed here
@@ -621,9 +671,8 @@ jobs:
             HOST4="${ANCHOR_IPV4%%/*}"
             case "$HOST4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix."; exit 1;; esac
           else
-            DETAIL="$(curl -sS "$SCP/api/v1/servers/$RESOLVED_ID" -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
             HOST4="$(printf '%s' "$DETAIL" | jq -r '.ipv4Addresses[0].ip // empty')"
-            [ -n "$HOST4" ] || { echo "::error::server $RESOLVED_ID reports no IPv4 address (IPv6-only is unsupported — runners have no IPv6). Attach an IPv4, or set ANCHOR_IPV4 and re-dispatch."; exit 1; }
+            [ -n "$HOST4" ] || { echo "::error::server reports no IPv4 address (IPv6-only is unsupported — runners have no IPv6). Attach an IPv4, or set ANCHOR_IPV4 and re-dispatch."; exit 1; }
             echo "Discovery: anchor IPv4 from server detail, no pasted IP needed."
           fi
           # Parse-time validation (review security): the SSH/DNS target must
@@ -633,7 +682,7 @@ jobs:
           guard_line "ANCHOR_HOST" "$HOST4"
           echo "ANCHOR_HOST=$HOST4" >> "$GITHUB_ENV"
           echo "anchor_ipv4=$HOST4" >> "$GITHUB_OUTPUT"
-          echo "Resolved server_id=$RESOLVED_ID (ssh/dns target set)."
+          echo "Server adopted and anchor host resolved (ssh/dns target set; identifiers masked)."
 
       - name: A1 pre-sweep (surplus fail-closed, every run, all modes)
         env:
@@ -647,7 +696,7 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
-          # TTL tag piercloud-tmp-<server_id>-<run_id>, description
+          # TTL tag piercloud-tmp-<run_id>, description
           # created_at=<RFC3339-UTC> purpose=A1-ssh. Classify first, then
           # retire EVERY non-own tmp (aged or leaked-fresh — the workflow
           # mutex means no foreign run can be live); only an orphan (no
@@ -725,7 +774,14 @@ jobs:
           # in-place PUT (provider has no ForceNew): create path only when no
           # matching policy is attached. Fail closed on ambiguity.
           SCP="${NETCUP_API_BASE:-https://www.servercontrolpanel.de/scp-core}"
-          POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}-${SERVER_ID}"
+          # The steady-state policy name carries the public hostname ONLY
+          # (issue #121): the server id is the alias → netcup-account join
+          # key and must never appear in a name that lands in public logs
+          # or step summaries. The sweep in 020-provision-anchor.sh keeps a
+          # one-time migration clause for the pre-change
+          # piercloud-anchor-<hostname>-<id> shape, so the first
+          # post-change apply retires the old unattached policy.
+          POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}"
           # Lexicographically smallest MAC — character-for-character the same
           # jq rule as resolve_mac() in .github/scripts/020-provision-anchor.sh
           # and main.tf local.interface_mac (`try(sort([...mac])[0], null)`,
@@ -741,6 +797,10 @@ jobs:
           # newline/CR explicitly before the whole-value shape check.
           case "$MAC" in '' | *[$'\n\r']*) echo "::error::resolved interface MAC contains a newline/CR — refusing to interpolate it (injection guard)."; exit 1 ;; esac
           printf '%s' "$MAC" | grep -qE '^[0-9a-fA-F:]{17}$' || { echo "::error::resolved interface MAC is not a 17-char hex/colon value — refusing to interpolate it (injection guard)."; exit 1; }
+          # Mask at first receipt (after the shape check): the MAC is a
+          # provider-read account identifier — the runner redacts it from
+          # every later log line.
+          echo "::add-mask::$MAC"
           POLICY_ID="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
             "$SCP/api/v1/servers/${SERVER_ID}/interfaces/${MAC}/firewall" \
             | jq -r --arg n "$POLICY_NAME" '[.userPolicies[]? | select(.name == $n) | .id | tostring] | if length == 0 then "" elif length == 1 then .[0] else "AMBIGUOUS" end')"
@@ -781,6 +841,15 @@ jobs:
           # GATUS_ENDPOINTS (comma-separated name=url), NTFY_TOPIC/NTFY_TOKEN.
           # (NETCUP_SERVER_ID retired: the resolve step derives server_id
           # at runtime from ANCHOR_IPV4 — nothing numeric to copy.)
+          # Public-log hygiene (issue #121): the identifier INPUTS
+          # (server_id, scp_user_id, customer_number) are sensitive in the
+          # module and the id outputs are sensitive too, so plan output
+          # renders them as (sensitive value); provider-read identifiers
+          # (order name, old hostname, MAC) were masked at first receipt in
+          # the resolve/import steps, so the runner redacts those values
+          # wherever the plan prints them. Never rely on TF_LOG: it is not
+          # set here, and every identifier is handled by masking, not by
+          # hoping the provider stays quiet.
           tofu plan -input=false -out=tfplan
 
       - name: tofu apply (steady-state policy, then hand off to A1 ssh)
@@ -1182,7 +1251,7 @@ jobs:
           tofu_version: "1.12.2"
       # M2: the real path (ephemeral exchange → data-source resolve →
       # plan → apply → state dies with the runner; policy name
-      # piercloud-anchor-${hostname}-${server_id} lands fully in M3) now runs
+      # piercloud-anchor-${hostname} lands fully in M3) now runs
       # in the device-flow job on the SAME runner (token never crosses
       # jobs). This job stays a mode-scope marker.
       - name: Mode marker (real steps run in the device-flow job)

@@ -139,11 +139,14 @@ resource "netcup_scp_server_interface_firewall" "anchor" {
 }
 
 locals {
-  # Policy key: hostname + server_id (operator-readable). A hostname rename
-  # therefore mints a NEW policy name and leaves the old-name policy
-  # unattached; 020's sweep-post retires any unattached policy in the
-  # piercloud-anchor- family in the same run (D3, issue #105).
-  policy_name = "piercloud-anchor-${var.hostname}-${local.resolved_server_id}"
+  # Policy key: the canonical hostname (operator-readable, public). The
+  # server id deliberately left the name (issue #121): it is the alias →
+  # netcup-account join key and policy names land in public logs/summaries.
+  # 020's sweep-post retires any unattached policy in the
+  # piercloud-anchor- family in the same run — including the pre-change
+  # <hostname>-<server_id> shape (one-time migration), while the attached
+  # live policy is never touched (D3, issues #101/#121).
+  policy_name = "piercloud-anchor-${var.hostname}"
 
   # Cloudflare edge ranges (public constants — same class as the Keycloak
   # discovery URL baked into the workflow; source: the IP Ranges page

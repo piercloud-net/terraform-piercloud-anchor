@@ -7,7 +7,7 @@
 #       the BEGIN/END NAMING markers must stay byte-identical to the lib;
 #   (c) no tracked .sh/.tf/.md/.yml may still carry the legacy
 #       anchor-<tenant>-01 shape (ordinal-boundary regex: the new shape and
-#       the firewall policy name piercloud-anchor-anchor-01-pier-<id> must
+#       the firewall policy name piercloud-anchor-anchor-01-pier must
 #       NOT match).
 # Cred-free, offline, read-only: sources the lib and reads tracked files.
 set -euo pipefail
@@ -98,7 +98,7 @@ fi
 # ---- (c) legacy anchor-<tenant>-01 shape must be gone --------------------
 # Ordinal boundary: the OLD shape ends in -01 and is followed by a non-hyphen
 # boundary. The NEW shape (anchor-01-<tenant>) and the policy name
-# piercloud-anchor-anchor-01-pier-933556 sit on the correct side of it.
+# piercloud-anchor-anchor-01-pier sit on the correct side of it.
 legacy_re='anchor-[A-Za-z0-9${}<>._-]+-01([^A-Za-z0-9-]|$)'
 matches() { printf '%s' "$1" | grep -qE "$legacy_re"; }
 mismatches() { ! printf '%s' "$1" | grep -qE "$legacy_re"; }
@@ -106,7 +106,7 @@ mismatches() { ! printf '%s' "$1" | grep -qE "$legacy_re"; }
 matches 'anchor-pier-01' && ok "guard matches legacy anchor-pier-01" || bad "guard misses legacy anchor-pier-01"
 matches 'anchor-${SAN}-01' && ok "guard matches legacy anchor-\${SAN}-01" || bad "guard misses legacy anchor-\${SAN}-01"
 matches 'anchor-USER-01.piercloud.net' && ok "guard matches legacy anchor-USER-01.piercloud.net" || bad "guard misses legacy anchor-USER-01.piercloud.net"
-if mismatches 'piercloud-anchor-anchor-01-pier-933556'; then ok "guard ignores new policy name"; else bad "guard hits new policy name"; fi
+if mismatches 'piercloud-anchor-anchor-01-pier'; then ok "guard ignores new policy name"; else bad "guard hits new policy name"; fi
 if mismatches 'anchor-01-${SAN}'; then ok "guard ignores new anchor-01-\${SAN}"; else bad "guard hits new anchor-01-\${SAN}"; fi
 # Sweep tracked files; exclude this harness (it carries the pattern by design).
 hits=""

@@ -46,5 +46,16 @@ This file holds the engineering conventions of this repo. The two hard invariant
 
 ## Public-safety rules for content
 
-- Nothing sensitive in committed files: no credentials, no hostnames/IPs of real deployments, no internal strategy. This is a public repo — write for the public reader.
+This is a public repo — every byte can be published, run logs, summaries and artifacts included. Anyone with a (free) GitHub account can read every run log, summary and artifact; anonymous visitors see run and artifact metadata. Never rely on `TF_LOG` (or any verbose provider logging) for CI debugging.
+
+**Explicit deny-list** — none of these may ever appear in a log, summary, artifact or committed file:
+
+- netcup customer number; SCP user id; server id; server order name; interface MAC;
+- device/access/refresh tokens; root-password paths or values; private keys;
+- the account's server list; tenant GitHub identities;
+- SSH host keys and tang fingerprints (the thumbprint is published only through its H1 legs — the run artifact, the password manager, and the pending committed break-glass file / platform registry).
+
+**Identifier handling** — identifier inputs (`server_id`, `scp_user_id`, `customer_number`) are `sensitive = true` in the module; provider-read identifiers (order name, old hostname, MAC) are `::add-mask::`ed at first receipt, before any print. Masks live for the job lifetime and redact later log lines, so mask-before-print ordering is the review-critical property. Policy names carry public values only (hostname, run id) — never the server id.
+
+- Nothing sensitive in committed files: no credentials, no hostnames/IPs of real deployments, no internal strategy.
 - Scripts print one-time values (thumbprint, generated passwords) to the console only; never log them to files that could be committed.

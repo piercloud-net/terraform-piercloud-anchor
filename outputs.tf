@@ -1,6 +1,7 @@
 output "server_id" {
-  description = "Id of the adopted server."
+  description = "Id of the adopted server. Sensitive: redacted from plan output."
   value       = local.resolved_server_id
+  sensitive   = true
 }
 
 output "ipv4" {
@@ -17,8 +18,9 @@ output "ipv6" {
 }
 
 output "firewall_policy_id" {
-  description = "Id of the managed firewall policy (null when var.scp_user_id is unset and the firewall is not managed)."
+  description = "Id of the managed firewall policy (null when var.scp_user_id is unset and the firewall is not managed). Sensitive: the provider id embeds the SCP user id."
   value       = var.scp_user_id != null ? netcup_scp_user_firewall_policy.tang[0].id : null
+  sensitive   = true
 }
 
 output "bind_name" {
