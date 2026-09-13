@@ -476,6 +476,15 @@ jobs:
             case "$2" in *[$'\n\r']*) echo "::error::$1 contains a newline/CR — refusing the handoff write (injection guard)."; exit 1 ;; esac
             if [ -n "$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]')" ]; then echo "::error::$1 contains non-printable characters — refusing the handoff write (injection guard)."; exit 1; fi
           }
+          # ::add-mask:: data is a runner workflow command: the runner
+          # unescapes %0D/%0A/%25 in command data, so a value containing a
+          # literal '%' (e.g. a free-form order name) would register a
+          # DIFFERENT string as the mask and the real literal would never be
+          # redacted. guard_line already rejects CR/LF, so escaping '%'
+          # first is sufficient. Used for the free-form provider reads
+          # (order name, old hostname); the digits/hex identifiers cannot
+          # carry a '%' and stay plain.
+          mask_escaped() { printf '::add-mask::%s\n' "${1//'%'/'%25'}"; }
           # Mask-at-first-receipt for the server id (issue #121): validate
           # the shape, then mask BEFORE the value can reach any echo. Call
           # it immediately after each non-empty assignment site below; an
@@ -644,11 +653,11 @@ jobs:
           ORDER_NAME="$(printf '%s' "$DETAIL" | jq -r '.name // empty')"
           [ -n "$ORDER_NAME" ] || { echo "::error::could not read the server's order name — refusing to plan without masking the order name (fail closed, no fallback)."; exit 1; }
           guard_line "ORDER_NAME" "$ORDER_NAME"
-          echo "::add-mask::$ORDER_NAME"
+          mask_escaped "$ORDER_NAME"
           OLD_HOSTNAME="$(printf '%s' "$DETAIL" | jq -r '.hostname // empty')"
           if [ -n "$OLD_HOSTNAME" ] && [ "$OLD_HOSTNAME" != "$HOSTNAME" ]; then
             guard_line "OLD_HOSTNAME" "$OLD_HOSTNAME"
-            echo "::add-mask::$OLD_HOSTNAME"
+            mask_escaped "$OLD_HOSTNAME"
           fi
           # SSH/DNS target: the pasted IP wins when set (legacy,
           # byte-for-byte); else the server detail's first IPv4 (IPv6-only

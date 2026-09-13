@@ -43,21 +43,40 @@ before() { # $1 label, $2 earlier, $3 later
   if [ -n "$2" ] && [ -n "$3" ] && [ "$2" -lt "$3" ]; then ok "$1"; else bad "$1 (line order: $2 then $3)"; fi
 }
 
-# Leaky echo lines for a variable: echo lines that reference it, excluding
-# the mask itself and the $GITHUB_ENV/$GITHUB_OUTPUT handoff writes.
-echo_refs() { # $1 file, $2 variable name (no $)
+# Leaky print lines for a variable: shell print builtins (echo/printf) that
+# reference it, excluding the mask itself and the $GITHUB_ENV/$GITHUB_OUTPUT
+# handoff writes. printf is covered on purpose (review finding on SHA
+# 2b422f8: echo-only matching passed while a printf leak was inserted).
+# A printf feeding another command through a pipe (`printf '%s' "$V" |
+# grep ...`) is a data feeder, not a log print — excluded; the self-test
+# below proves the matcher still catches a real printf print.
+print_refs() { # $1 file, $2 variable name (no $)
   awk -v v="$2" '
     /::add-mask::/ { next }
     /\$GITHUB_ENV/ { next }
     /\$GITHUB_OUTPUT/ { next }
-    $0 ~ ("(^|[^A-Za-z0-9_])echo .*\\$" v "([^A-Za-z0-9_]|$)") { print FILENAME":"FNR": "$0 }
+    $0 ~ ("(^|[^A-Za-z0-9_])(echo|printf) .*\\$" v "([^A-Za-z0-9_]|$)") \
+      && $0 !~ ("printf [^|]*\\$" v "([^A-Za-z0-9_]|$)[^|]*\\|") { print FILENAME":"FNR": "$0 }
   ' "$1" || true
 }
-no_echo() { # $1 label, $2 file, $3 variable name (no $)
+no_raw_print() { # $1 label, $2 file, $3 variable name (no $)
   local hits
-  hits="$(echo_refs "$2" "$3")"
-  if [ -z "$hits" ]; then ok "$1"; else bad "$1 — raw echo found:"; printf '%s\n' "$hits"; fi
+  hits="$(print_refs "$2" "$3")"
+  if [ -z "$hits" ]; then ok "$1"; else bad "$1 — raw print found:"; printf '%s\n' "$hits"; fi
 }
+
+# Self-test: the matcher must catch a printf leak, not just echo (the
+# reverted-fix shape the review used against the pre-fix harness).
+selftest="$(mktemp)"
+cat > "$selftest" <<'EOF'
+printf 'DEBUG raw id=%s\n' "$RESOLVED_ID"
+EOF
+if [ -n "$(print_refs "$selftest" RESOLVED_ID)" ]; then
+  ok "matcher catches a printf leak (self-test)"
+else
+  bad "matcher misses a printf leak (self-test)"
+fi
+rm -f "$selftest"
 
 # ---- (a) masks exist and are ordered at each assignment site -------------
 has "$PROV" 'echo "::add-mask::$SCP_EFF"' "SCP id mask present"
@@ -68,11 +87,13 @@ has "$PROV" 'echo "::add-mask::$API_USER"' "approver mask present"
 before "approver: non-empty guard before mask" \
   "$(first_line 'could not read the approver' "$PROV")" \
   "$(first_line 'echo "::add-mask::$API_USER"' "$PROV")"
-has "$PROV" 'echo "::add-mask::$ORDER_NAME"' "order-name mask present"
+has "$PROV" 'mask_escaped "$ORDER_NAME"' "order-name mask present (runner-escaped)"
+has "$PROV" 'mask_escaped "$OLD_HOSTNAME"' "old-hostname mask present (runner-escaped)"
+has "$PROV" 'mask_escaped()' "mask_escaped helper defined"
+has "$PROV" "%25" "mask_escaped escapes '%' per workflow-command data rules"
 before "order name: fail-closed guard before mask" \
   "$(first_line 'without masking the order name' "$PROV")" \
-  "$(first_line 'echo "::add-mask::$ORDER_NAME"' "$PROV")"
-has "$PROV" 'echo "::add-mask::$OLD_HOSTNAME"' "old-hostname mask present"
+  "$(first_line 'mask_escaped "$ORDER_NAME"' "$PROV")"
 has "$PROV" 'echo "::add-mask::$MAC"' "MAC mask present"
 before "MAC: shape validation before mask" \
   "$(first_line 'resolved interface MAC is not a 17-char' "$PROV")" \
@@ -93,13 +114,13 @@ before "020: server-id digits guard before mask" \
 has "$SCRIPT" 'echo "::add-mask::$mac" >&2' "020 resolved MAC masked on stderr"
 has "$SCRIPT" 'echo "::add-mask::$INTERFACE_MAC" >&2' "020 override MAC masked on stderr"
 
-# No identifier is ever echoed raw (mask/env/output lines excluded) --------
-no_echo "SCP id never echoed raw" "$PROV" SCP_EFF
-no_echo "server id never echoed raw" "$PROV" RESOLVED_ID
-no_echo "approver username never echoed raw" "$PROV" API_USER
-no_echo "order name never echoed raw" "$PROV" ORDER_NAME
-no_echo "old hostname never echoed raw" "$PROV" OLD_HOSTNAME
-no_echo "MAC never echoed raw" "$PROV" MAC
+# No identifier is ever printed raw (mask/env/output lines excluded) ------
+no_raw_print "SCP id never printed raw" "$PROV" SCP_EFF
+no_raw_print "server id never printed raw" "$PROV" RESOLVED_ID
+no_raw_print "approver username never printed raw" "$PROV" API_USER
+no_raw_print "order name never printed raw" "$PROV" ORDER_NAME
+no_raw_print "old hostname never printed raw" "$PROV" OLD_HOSTNAME
+no_raw_print "MAC never printed raw" "$PROV" MAC
 
 # ---- (b) wrong-account error carries no value ----------------------------
 wa="$(grep -nF 'WRONG-ACCOUNT APPROVAL' "$PROV" | head -n1 | cut -d: -f1 || true)"
