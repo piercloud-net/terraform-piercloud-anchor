@@ -50,6 +50,7 @@ All notable changes to this project will be documented in this file.
 - *(aop)* Probe hardening + CI compiles the client_auth stanza (closes #99)
 - *(tofu)* Firewall policy adopt/reuse — conditional import + orphan sweep (closes #101)
 - *(ci)* Cap artifact retention at 90 + fail-loud mode=check assert (closes #119)
+- *(security)* Contain device_code to a single runner step (closes #120)
 
 ### 📚 Documentation
 
