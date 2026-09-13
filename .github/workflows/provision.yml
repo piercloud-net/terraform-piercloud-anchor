@@ -319,11 +319,13 @@ jobs:
           # endpoint allowlist sees no new URL.
           REVIEW_LINK="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }}"
           ANTI_PHISH="we will never email or message you a code to re-confirm."
+          NEW_TAB_HINT="long-press the link to open in a new tab — keeps this page open to follow the deployment progress."
           # C-b: print ONLY the verification URL + user_code (+ alias, mode,
           # commit, review link). Quiet curl flags only; no verbose dumps; no
           # trace-level log variables; device_code is masked and never printed.
           echo "alias: $TENANT_USER"
           echo "Open this URL on your phone to approve: $VERIFY_URI"
+          echo "$NEW_TAB_HINT"
           echo "Code: $USER_CODE"
           echo "action: $MODE"
           echo "commit: $HEAD_SHA ($SHORT)"
@@ -338,6 +340,8 @@ jobs:
             echo "### 📲 Approve at netcup (code expires in ~10 min)"
             echo ""
             echo "[👉 TAP TO APPROVE]($VERIFY_URI)"
+            echo ""
+            echo "_${NEW_TAB_HINT}_"
             echo ""
             echo "Code: \`$USER_CODE\` (already filled if you tapped the link)"
             echo ""
@@ -354,7 +358,7 @@ jobs:
           if [ -n "$NTFY_TOPIC" ]; then
             # Empty token = no header at all (ntfy.sh 401s on an empty Basic).
             NTFY_AUTH=(); [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-u ":$NTFY_TOKEN")
-            curl -sS --fail "${NTFY_AUTH[@]}" -d "piercloud: approve $TENANT_USER: $VERIFY_URI code $USER_CODE (expires 10 min) action=$MODE commit=$SHORT review=$REVIEW_LINK. $ANTI_PHISH" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+            curl -sS --fail "${NTFY_AUTH[@]}" -d "piercloud: approve $TENANT_USER: $VERIFY_URI code $USER_CODE (expires 10 min) action=$MODE commit=$SHORT review=$REVIEW_LINK. $NEW_TAB_HINT $ANTI_PHISH" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
           fi
           # Post-step machine-readable channel: the check-run notice
           # annotation becomes readable only after this step ends (observed
@@ -427,7 +431,7 @@ jobs:
                 echo "Approved. Token held on this runner only (local handoff file)."
                 echo "::notice::netcup approval received for $TENANT_USER — token in the runner-local handoff, provisioning continues."
                 echo "" >> "$GITHUB_STEP_SUMMARY"
-                echo "✅ Approved — the code above is dead. Provisioning continues." >> "$GITHUB_STEP_SUMMARY"
+                echo "✅ Approved — provisioning continues." >> "$GITHUB_STEP_SUMMARY"
                 exit 0
                 ;;
               authorization_pending)
@@ -436,12 +440,12 @@ jobs:
                 DELAY=$((DELAY + 5)) # C-c: cumulative +5s backoff
                 ;;
               expired_token)
-                echo "❌ Code expired — the card above is dead. Re-dispatch the workflow for a fresh code (clean re-dispatch path)." >> "$GITHUB_STEP_SUMMARY"
+                echo "❌ Code expired — re-dispatch the workflow for a fresh code (clean re-dispatch path)." >> "$GITHUB_STEP_SUMMARY"
                 echo "::error::device code expired before approval. Re-dispatch the workflow for a fresh code (clean re-dispatch path)."
                 exit 1
                 ;;
               access_denied)
-                echo "❌ Approval denied — nothing runs. The card above is dead." >> "$GITHUB_STEP_SUMMARY"
+                echo "❌ Approval denied — nothing runs." >> "$GITHUB_STEP_SUMMARY"
                 echo "::error::approval denied at netcup. STOP — nothing runs. Escalate to the operator if unexpected."
                 exit 1
                 ;;
