@@ -43,8 +43,8 @@ set -euo pipefail
 
 APPROVAL_WINDOW_SECONDS=570      # live netcup device window is ~570s
 POLL_SECONDS=3
-NTFY_LOOKUP_ATTEMPTS=20          # x (request + 3s) bound for the ntfy card
-NOTICE_LOOKUP_ATTEMPTS=40        # x (request + 3s) bound for the notice annotation
+NTFY_LOOKUP_ATTEMPTS=20          # attempts; ~13s worst case each (10s curl cap + 3s sleep)
+NOTICE_LOOKUP_ATTEMPTS=40        # attempts; gh-call latency + 3s sleep each
 JOB_PREFIX="S1 device-flow"      # job name prefix (the live name has a suffix; used to pick the check run)
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -210,7 +210,7 @@ fetch_device_url_via_ntfy() {
     echo "refusing the ntfy lookup for topic '$NTFY_TOPIC_IN': no token supplied (a public/leaked topic can be spoofed). Pass --ntfy-token/NTFY_TOKEN, use --device-url, or rely on the notice annotation." >&2
     return 1
   fi
-  echo "polling ntfy topic '$NTFY_TOPIC_IN' for the approval card (bound: $((NTFY_LOOKUP_ATTEMPTS * 3))s) ..." >&2
+  echo "polling ntfy topic '$NTFY_TOPIC_IN' for the approval card (up to $NTFY_LOOKUP_ATTEMPTS attempts, ~$((NTFY_LOOKUP_ATTEMPTS * 13))s worst case) ..." >&2
   local attempt url
   for ((attempt = 1; attempt <= NTFY_LOOKUP_ATTEMPTS; attempt++)); do
     url="$(ntfy_get "https://ntfy.sh/$NTFY_TOPIC_IN/json?poll=1&since=10m" 2>/dev/null | extract_scp_device_url || true)"
@@ -230,7 +230,7 @@ fetch_device_url_via_notice() {
     REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
     [ -n "$REPO" ] || { echo "cannot determine the repo — pass owner/repo or run from inside the clone" >&2; return 1; }
   fi
-  echo "looking up the '$JOB_PREFIX' check-run notice annotation (bound: $((NOTICE_LOOKUP_ATTEMPTS * 3))s) ..." >&2
+  echo "looking up the '$JOB_PREFIX' check-run notice annotation (up to $NOTICE_LOOKUP_ATTEMPTS attempts, gh-call latency + 3s each) ..." >&2
   local attempt sha ids id url
   for ((attempt = 1; attempt <= NOTICE_LOOKUP_ATTEMPTS; attempt++)); do
     sha="$(gh run view "$RUN_ID" --repo "$REPO" --json headSha --jq '.headSha' 2>/dev/null || true)"
