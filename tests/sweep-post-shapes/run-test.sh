@@ -35,6 +35,13 @@
 # non-negative, canonical after tostring, so 42.0/1e2/-3 fail; the
 # literal 0 is allowed uniformly).
 #
+# Issue #121 (policy naming): steady-state names are
+# piercloud-anchor-<hostname> — the server id left the name. This harness
+# feeds cmd_sweep_post the names the real list_steady_policies returns
+# (new shape + pre-change id-suffixed migration shape) and asserts the
+# attachment compare still protects the live policy in both; the filter
+# itself is covered by tests/policy-naming.
+#
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
@@ -96,14 +103,18 @@ stamp() { # $1 = seconds ago -> RFC 3339 UTC timestamp (same shape the workflow 
 }
 tmp_entry() { # $1 id, $2 run-id suffix, $3 age-seconds ("orphan" = unstamped description)
   if [ "$3" = "orphan" ]; then
-    printf '{"id":"%s","name":"piercloud-tmp-933556-%s","description":"hand-made policy"}' "$1" "$2"
+    printf '{"id":"%s","name":"piercloud-tmp-%s","description":"hand-made policy"}' "$1" "$2"
   else
-    printf '{"id":"%s","name":"piercloud-tmp-933556-%s","description":"created_at=%s purpose=A1-ssh"}' "$1" "$2" "$(stamp "$3")"
+    printf '{"id":"%s","name":"piercloud-tmp-%s","description":"created_at=%s purpose=A1-ssh"}' "$1" "$2" "$(stamp "$3")"
   fi
 }
 
-# One steady-state policy (id 42) — the live attachment under test.
-STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'
+# One steady-state policy (id 42) — the live attachment under test. New
+# (#121) piercloud-anchor-<hostname> shape.
+STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-01-pier","description":""}]'
+# Pre-change (#121) id-suffixed shape — kept only as the migration clause's
+# input; the real filter recognizes it once (tests/policy-naming).
+STEADY_LEGACY='[{"id":43,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'
 
 RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]
   local l="$1" rc=0
@@ -111,8 +122,8 @@ RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]
   STUB_LIST_TMP="$2" STUB_IFACE="$3" STUB_STEADY="${4:-[]}" \
   PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" \
   GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE=apply \
-  SERVER_ID=933556 SCP_USER_ID=1 RUN_ID=999 \
-  OWN_NAME="piercloud-tmp-933556-999" NETCUP_SCP_ACCESS_TOKEN=AT TMP_TTL_SECONDS=7200 \
+  SERVER_ID=933556 SCP_USER_ID=1 RUN_ID=999 ANCHOR_HOSTNAME=anchor-01-pier \
+  OWN_NAME="piercloud-tmp-999" NETCUP_SCP_ACCESS_TOKEN=AT TMP_TTL_SECONDS=7200 \
   bash -c 'set -euo pipefail; source "$1"; cmd_sweep_post' _ "$WORK/functions.sh" \
     > "$WORK/out.$l" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -120,11 +131,11 @@ RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]
 ACTIONS() { [ -f "$WORK/actions.$1" ] && paste -sd' ' "$WORK/actions.$1" || echo ""; }
 
 # ---- cases 1-4: tolerant attached shapes -> live policy KEPT, no mutation ---
-rc="$(RC_OF c1 "[]" '{"userPolicies":[{"id":42,"name":"piercloud-anchor-anchor-01-pier-933556"}]}' "$STEADY_LIVE")"
+rc="$(RC_OF c1 "[]" '{"userPolicies":[{"id":42,"name":"piercloud-anchor-anchor-01-pier"}]}' "$STEADY_LIVE")"
 is "c1 rc" "0" "$rc"
 is "c1 actions (live kept)" "" "$(ACTIONS c1)"
 is "c1 kept log" "1" "$(grep -c 'is attached — kept' "$WORK/out.c1" || true)"
-rc="$(RC_OF c2 "[]" '{"userPolicies":[{"id":"42","name":"piercloud-anchor-anchor-01-pier-933556"}]}' "$STEADY_LIVE")"
+rc="$(RC_OF c2 "[]" '{"userPolicies":[{"id":"42","name":"piercloud-anchor-anchor-01-pier"}]}' "$STEADY_LIVE")"
 is "c2 rc" "0" "$rc"
 is "c2 actions (live kept)" "" "$(ACTIONS c2)"
 rc="$(RC_OF c3 "[]" '{"userPolicies":["42"]}' "$STEADY_LIVE")"
@@ -138,6 +149,17 @@ is "c4 actions (bare number id kept)" "" "$(ACTIONS c4)"
 rc="$(RC_OF c5 "[]" '{"userPolicies":[]}' "$STEADY_LIVE")"
 is "c5 rc" "0" "$rc"
 is "c5 actions (orphan retired)" "detach 42 delete 42" "$(ACTIONS c5)"
+
+# ---- case 5b: pre-change id-suffixed name, unattached -> retired (migration) -
+rc="$(RC_OF c5b "[]" '{"userPolicies":[]}' "$STEADY_LEGACY")"
+is "c5b rc" "0" "$rc"
+is "c5b actions (legacy orphan retired)" "detach 43 delete 43" "$(ACTIONS c5b)"
+
+# ---- case 5c: pre-change id-suffixed name, ATTACHED -> kept (migration) -----
+rc="$(RC_OF c5c "[]" '{"userPolicies":[43]}' "$STEADY_LEGACY")"
+is "c5c rc" "0" "$rc"
+is "c5c actions (legacy live kept)" "" "$(ACTIONS c5c)"
+is "c5c kept log" "1" "$(grep -c 'is attached — kept' "$WORK/out.c5c" || true)"
 
 # ---- case 6: tmp orphan (no parseable created_at) still retired in apply ----
 rc="$(RC_OF c6 "[$(tmp_entry 7 other orphan)]" '{"userPolicies":[]}' "[]")"
@@ -165,7 +187,7 @@ ambiguous_case c8c '{"userPolicies":null}'                                      
 ambiguous_case c8d '{"userPolicies":[null]}'                                                   # null entry
 ambiguous_case c8e '{"userPolicies":[{"id":null}]}'                                            # id null
 ambiguous_case c8f '{"userPolicies":[{"id":""}]}'                                              # id empty
-ambiguous_case c8g '{"userPolicies":[{"name":"piercloud-anchor-anchor-01-pier-933556"}]}'      # THE live-policy repro: object without id
+ambiguous_case c8g '{"userPolicies":[{"name":"piercloud-anchor-anchor-01-pier"}]}'             # THE live-policy repro: object without id
 ambiguous_case c8h '{"userPolicies":[42,{"name":"x"}]}'                                        # mixed usable + ambiguous
 ambiguous_case c8i '{"userPolicies":[""]}'                                                     # bare empty string
 ambiguous_case c8j '{"userPolicies":[true]}'                                                   # boolean entry
@@ -210,10 +232,10 @@ fi
 # netcup policy ids are >= 1 in practice; allowing the literal 0 uniformly
 # keeps one rule for both sides. Attached bare 0 and "0" must read as
 # attached to steady id 0 and mutate nothing.
-rc="$(RC_OF c8x "[]" '{"userPolicies":[0]}' '[{"id":0,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]')"
+rc="$(RC_OF c8x "[]" '{"userPolicies":[0]}' '[{"id":0,"name":"piercloud-anchor-anchor-01-pier","description":""}]')"
 is "c8x rc" "0" "$rc"
 is "c8x actions (id 0 kept)" "" "$(ACTIONS c8x)"
-rc="$(RC_OF c8y "[]" '{"userPolicies":["0"]}' '[{"id":0,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]')"
+rc="$(RC_OF c8y "[]" '{"userPolicies":["0"]}' '[{"id":0,"name":"piercloud-anchor-anchor-01-pier","description":""}]')"
 is "c8y rc" "0" "$rc"
 is "c8y actions (string 0 kept)" "" "$(ACTIONS c8y)"
 
@@ -231,11 +253,11 @@ steady_case() { # $1 label, $2 STUB_STEADY (attached stays numeric 42)
   is "$1 actions (live untouched)" "" "$(ACTIONS "$1")"
   is "$1 refusal logged" "1" "$(grep -c 'refusing the steady-state orphan sweep' "$WORK/out.$1" || true)"
 }
-steady_case c9a '[{"id":"0042","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'  # leading zero (F2 proof)
-steady_case c9b '[{"id":"42\n","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]' # trailing LF (F2 proof)
-steady_case c9c '[{"id":"","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'     # empty id (F2 proof)
+steady_case c9a '[{"id":"0042","name":"piercloud-anchor-anchor-01-pier","description":""}]'  # leading zero (F2 proof)
+steady_case c9b '[{"id":"42\n","name":"piercloud-anchor-anchor-01-pier","description":""}]' # trailing LF (F2 proof)
+steady_case c9c '[{"id":"","name":"piercloud-anchor-anchor-01-pier","description":""}]'     # empty id (F2 proof)
 # positive control: a canonical STRING steady id still matches live id 42
-rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anchor-anchor-01-pier-933556","description":""}]')"
+rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anchor-anchor-01-pier","description":""}]')"
 is "c9d rc" "0" "$rc"
 is "c9d actions (live kept)" "" "$(ACTIONS c9d)"
 

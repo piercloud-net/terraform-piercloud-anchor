@@ -90,7 +90,7 @@
 #                            internal/scpclient/client.go).
 #   SERVER_ID / SCP_USER_ID  adopted server + policy-owning SCP user.
 #   RUN_ID                   github.run_id — the idempotency key; the tmp
-#                            policy name is piercloud-tmp-<server>-<run>.
+#                            policy name is piercloud-tmp-<run>.
 #   ANCHOR_HOST              ssh target (anchor IPv4). ANCHOR_SSH_PORT (22).
 #   ROOT_PASSWORD            emailed one-run root password. Add-masked in
 #                            the workflow step before use (plus repo-secret
@@ -126,6 +126,13 @@
 #   PINNED_IP                runner IP pinned at open; provision re-fetches
 #                            and aborts to sweep on mismatch (fail-closed).
 #   INTERFACE_MAC            override NIC MAC (default: resolved via API).
+#
+# PUBLIC-LOG HYGIENE (issue #121): identifier values are masked at first
+# receipt on stderr (stdout is captured as data by callers, and a mask line
+# there would corrupt the capture); policy names carry the public hostname /
+# run id only — never the server id; the SSH host-key fingerprint is never
+# printed (TOFU accept-new stays; the tang thumbprint is the out-of-band
+# value); failure dumps print only scrubbed, bounded metadata.
 #
 # EXIT CODES: 0 ok · 1 error / cleanup incomplete (fail-closed, fail loudly) ·
 #   3 fail-closed at pre-step (orphan tmp or a failed retire — operator must
@@ -212,12 +219,23 @@ case "$CMD" in
     [ -n "$SCP_USER_ID" ] || die "SCP_USER_ID is required"
     all_digits "$SCP_USER_ID" || die "SCP_USER_ID is not all-digits — refusing to interpolate it into API paths (injection guard)"
     [ -n "$RUN_ID" ] || die "RUN_ID is required (idempotency key)"
+    # Public-log hygiene: the server id is a netcup-account join key — mask
+    # it right after the guards. stderr deliberately (stdout is captured as
+    # data by callers); the runner scans both streams for workflow
+    # commands. The workflow masks it too; this keeps the script
+    # self-sufficient (and covers the task-failure dump's id field).
+    echo "::add-mask::$SERVER_ID" >&2
     ;;
 esac
 
-TMP_PREFIX="piercloud-tmp-${SERVER_ID}-"
-OWN_NAME="piercloud-tmp-${SERVER_ID}-${RUN_ID}"
-# Steady-state (module-managed) policy family: piercloud-anchor-<hostname>-<server_id>.
+# Policy names carry public values only (issue #121): the run id for tmp
+# windows, the canonical hostname for the steady-state family. The server
+# id left the names — it is the alias → netcup-account join key and must
+# never land in public logs/summaries.
+OWN_NAME="piercloud-tmp-${RUN_ID}"
+# Steady-state (module-managed) policy family: piercloud-anchor-<hostname>.
+# The filter in list_steady_policies also recognizes the pre-change
+# piercloud-anchor-<hostname>-<server_id> shape (migration clause).
 STEADY_PREFIX="piercloud-anchor-"
 
 require_token() {
@@ -429,6 +447,12 @@ api_ok() { # $1 = status; 2xx (+404-as-gone when $2=gone-ok)
 policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
 
 list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
+  # Family scope (issue #121): the piercloud-anchor- prefix AND either the
+  # new hostname anchor (endswith -<hostname>) or the pre-change id anchor
+  # (endswith -<server id>, migration only). A hostname renamed to ANOTHER
+  # hostname, or another server's legacy name, matches neither — never
+  # swept, never logged. The attached-policy compare in cmd_sweep_post
+  # still protects the live policy.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -440,12 +464,18 @@ list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-s
      elif has("policies") then .policies
      elif has("firewallPolicy") then [.firewallPolicy]
      else [] end
-     | map(select(((.name // "") | startswith($p)) and ((.name // "") | endswith($s)))
+     | map(select((.name // "") as $n
+           | ($n | startswith($p)) and (($n | endswith($h)) or ($n | endswith($s))))
            | {id: .id, name: .name, description: (.description // "")})' \
-    --arg p "$STEADY_PREFIX" --arg s "-${SERVER_ID}"
+    --arg p "$STEADY_PREFIX" --arg h "-${ANCHOR_HOSTNAME}" --arg s "-${SERVER_ID}"
 }
 
 list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only)
+  # Scope (issue #121): the new tmp shape is piercloud-tmp-<run>, matched
+  # by an ANCHORED digits-only suffix (\z, never $: Oniguruma's $ also
+  # matches immediately before a trailing newline), PLUS the legacy
+  # this-server shape piercloud-tmp-<server>-<run>. Another server's legacy
+  # name matches neither: it is never swept and never logged by this run.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -457,9 +487,10 @@ list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only
      elif has("policies") then .policies
      elif has("firewallPolicy") then [.firewallPolicy]
      else [] end
-     | map(select((.name // "") | startswith($p))
+     | map(select((.name // "") as $n
+           | ($n | test($run_re)) or ($n | startswith($legacy)))
            | {id: .id, name: .name, description: (.description // "")})' \
-    --arg p "$TMP_PREFIX"
+    --arg run_re '^piercloud-tmp-[0-9]+\z' --arg legacy "piercloud-tmp-${SERVER_ID}-"
 }
 
 policy_age() { # $1 = description -> seconds | "orphan" (no valid created_at)
@@ -498,6 +529,7 @@ resolve_mac() {
   local resp mac
   if [ -n "${INTERFACE_MAC:-}" ]; then
     valid_mac "$INTERFACE_MAC" || die "INTERFACE_MAC override is not a 17-char hex/colon MAC — refusing to interpolate it into API paths (injection guard)"
+    echo "::add-mask::$INTERFACE_MAC" >&2
     printf '%s' "$INTERFACE_MAC"
     return 0
   fi
@@ -511,6 +543,9 @@ resolve_mac() {
   mac="$(printf '%s' "$resp" | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
   [ -n "$mac" ] || die "could not resolve NIC MAC for server $SERVER_ID (set INTERFACE_MAC)"
   valid_mac "$mac" || die "resolved NIC MAC is not a 17-char hex/colon value — refusing to interpolate it into API paths (injection guard)"
+  # Mask at first receipt on stderr: stdout is captured as data by callers
+  # (attach/detach/sweep), a mask line there would corrupt the capture.
+  echo "::add-mask::$mac" >&2
   printf '%s' "$mac"
 }
 
@@ -767,8 +802,10 @@ cmd_provision() {
     log "installing sshpass on the runner (password transport for the one-run credential)"
     sudo apt-get install -y -qq sshpass >/dev/null
   }
-  log "anchor host key (first-install TOFU — pin this fingerprint out-of-band):"
-  ssh-keyscan -p "${ANCHOR_SSH_PORT:-22}" "$ANCHOR_HOST" 2>/dev/null | ssh-keygen -lf - || true
+  # Host-key fingerprint deliberately NOT printed (issue #121): the public
+  # run log must not carry account-adjacent identifiers, and the SSH host
+  # key is deny-listed. TOFU stays (StrictHostKeyChecking=accept-new); the
+  # value the tenant pins out-of-band is the tang thumbprint, not this.
   export SSHPASS="$EFFECTIVE_PASSWORD"
   EFFECTIVE_PASSWORD=""
   log "running on-box provision (plain ssh, no ansible)"
@@ -1209,6 +1246,11 @@ cmd_sweep_post() {
     log "post-sweep: no token held (approval never completed) — nothing created, nothing to sweep"
     return 0
   fi
+  # The steady-state family is anchored on the canonical hostname; an empty
+  # ANCHOR_HOSTNAME would degrade the scope to the legacy id suffix only.
+  # Fail closed — but only AFTER the no-token no-op above, so a
+  # device-timeout run stays a clean no-op.
+  [ -n "${ANCHOR_HOSTNAME:-}" ] || die "post-sweep: ANCHOR_HOSTNAME is required to scope the steady-state policy family — refusing to sweep blind"
   local list entry name desc age pid failures=0 swept=0
   list="$(list_tmp_policies)"
   while IFS= read -r entry; do
@@ -1235,12 +1277,13 @@ cmd_sweep_post() {
     fi
   done < <(printf '%s' "$list" | jq -c '.[]')
   # Steady-state orphans (pre-import backlog, issue #101): stateless applies
-  # before the conditional import created a fresh
-  # piercloud-anchor-<hostname>-<server_id> policy each run and orphaned the
-  # previous one (cap incidents 2026-09-10). Any policy in that family that is
-  # NOT attached is a leftover by definition — retire it (close_policy is
-  # detach-then-delete; the detach no-ops when it is already unattached). The
-  # attached policy is never touched.
+  # before the conditional import created a fresh steady-state policy each
+  # run and orphaned the previous one (cap incidents 2026-09-10). Any policy
+  # in the family (new piercloud-anchor-<hostname> shape, or the pre-change
+  # piercloud-anchor-<hostname>-<server_id> migration shape) that is NOT
+  # attached is a leftover by definition — retire it (close_policy is
+  # detach-then-delete; the detach no-ops when it is already unattached).
+  # The attached policy is never touched.
   local steady attached mac canon_jq
   mac="$(resolve_mac)"
   # One canonical-id rule, applied to BOTH sides of the attachment
