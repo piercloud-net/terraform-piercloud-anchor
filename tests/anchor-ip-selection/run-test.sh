@@ -145,11 +145,34 @@ for pair in \
   contains "$tag unexpected shape message" "unexpected shape, escalate (fail closed)" "$(ERR "$tag")"
 done
 
-# A non-IPv4 entry fails is_bare_ipv4; a valid first entry must NOT be
-# emitted when a later entry is bad (validate-before-emit, no streaming).
+# Non-dotted-quad bytes fail the shape guard (the literal "never a silent
+# drop" contract): whitespace/NUL/newline/letters all fail closed with no
+# stdout. Canonical-octet failures (range, leading zeros) fall through to
+# is_bare_ipv4 and are reported as "not a bare IPv4".
 rc="$(RUN f12 '{"ipv4Addresses":[{"ip":"not-an-ip"}]}' "" "$LABEL")"
-is "f12 non-IPv4 entry rc" "1" "$rc"
-contains "f12 non-IPv4 entry fails closed" "not a bare IPv4" "$(ERR f12)"
+is "f12 non-dotted-quad entry rc" "1" "$rc"
+is "f12 non-dotted-quad entry no stdout" "" "$(OUT f12)"
+contains "f12 non-dotted-quad entry fails closed" "unexpected shape, escalate (fail closed)" "$(ERR f12)"
+
+rc="$(RUN f12c '{"ipv4Addresses":[{"ip":"999.1.1.1"}]}' "" "$LABEL")"
+is "f12c non-canonical octet rc" "1" "$rc"
+contains "f12c non-canonical octet fails is_bare_ipv4" "not a bare IPv4" "$(ERR f12c)"
+
+rc="$(RUN f12d '{"ipv4Addresses":[{"ip":"203.0.113.10\n"}]}' "" "$LABEL")"
+is "f12d trailing-newline entry rc" "1" "$rc"
+is "f12d trailing-newline entry no stdout" "" "$(OUT f12d)"
+contains "f12d trailing-newline is a shape failure" "unexpected shape, escalate (fail closed)" "$(ERR f12d)"
+
+rc="$(RUN f12e '{"ipv4Addresses":[{"ip":"\n"}]}' "" "$LABEL")"
+is "f12e whitespace-only entry rc" "1" "$rc"
+is "f12e whitespace-only entry no stdout" "" "$(OUT f12e)"
+
+rc="$(RUN f12f '{"ipv4Addresses":[{"ip":"\u0000198.51.100.7"}]}' "" "$LABEL")"
+is "f12f NUL-prefixed entry rc" "1" "$rc"
+is "f12f NUL-prefixed entry no stdout" "" "$(OUT f12f)"
+
+# A valid first entry must NOT be emitted when a later entry is bad
+# (validate-before-emit, no streaming).
 
 rc="$(RUN f12b '{"ipv4Addresses":[{"ip":"203.0.113.10"},{"ip":"not-an-ip"}]}' "" "$LABEL")"
 is "f12b partial list rc" "1" "$rc"
@@ -186,6 +209,9 @@ before "explicit normalized before the resolve call" \
   "$(first_line 'resolve_anchor_ipv4 "$DETAIL"' "$PROV")"
 lack "$PROV" 'ipv4Addresses[0]' "no silent first-index pick remains in provision.yml"
 lack "$PROV" 'HOST4="${ANCHOR_IPV4' "no direct HOST4 override from the secret remains"
+# The count binding: a partial revert that keeps a second HOST4= assignment
+# (e.g. a fallback before the lib call) must fail this harness.
+is "exactly one HOST4 assignment (the resolve_anchor_ipv4 call site)" "1" "$(grep -cF 'HOST4=' "$PROV")"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

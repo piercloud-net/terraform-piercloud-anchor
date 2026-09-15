@@ -1223,9 +1223,10 @@ jobs:
     environment: anchor
     env:
       TENANT_USER: ${{ vars.TENANT_USER }}
-      # Resolved target from the device-flow job: discovery-first, and an
-      # explicit ANCHOR_IPV4 can only select among the resolved server's own
-      # addresses (never override) — resolve_anchor_ipv4 fails closed.
+      # Resolved target — the device-flow job's validated output, never the
+      # raw repo secret: API-derived, and an explicit ANCHOR_IPV4 can only
+      # have selected among the resolved server's own addresses (the
+      # producer, resolve_anchor_ipv4, fails closed on any mismatch).
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
       CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
     steps:

@@ -51,10 +51,13 @@ is_bare_ipv4() { # $1 = candidate string
 anchor_ipv4_candidates() { # $1 = netcup server detail JSON
   local detail="${1:-}" list="" validated="" ip
   # Strict shape guard: an object root, an array ipv4Addresses, and every
-  # element an object with a non-empty string .ip. A non-object element, a
-  # missing/null/empty .ip, a non-array ipv4Addresses or invalid JSON are
-  # ALL the same unexpected-shape failure — never a silent drop.
-  if ! printf '%s' "$detail" | jq -e 'type == "object" and (.ipv4Addresses | type == "array") and ([.ipv4Addresses[] | (type == "object" and (.ip | type == "string" and length > 0))] | all)' >/dev/null 2>&1; then
+  # element an object with a non-empty string .ip whose bytes are only
+  # digits and dots. A non-object element, a missing/null/empty .ip, a .ip
+  # carrying whitespace/NUL/letters, a non-array ipv4Addresses or invalid
+  # JSON are ALL the same unexpected-shape failure — never a silent drop.
+  # `\z` (not `$`) is load-bearing: Oniguruma's `$` matches before a
+  # trailing newline.
+  if ! printf '%s' "$detail" | jq -e 'type == "object" and (.ipv4Addresses | type == "array") and ([.ipv4Addresses[] | (type == "object" and (.ip | type == "string" and length > 0 and test("^[0-9.]+\\z")))] | all)' >/dev/null 2>&1; then
     printf '::error::server detail ipv4Addresses is not an array of {ip} objects — unexpected shape, escalate (fail closed).\n' >&2
     return 1
   fi
