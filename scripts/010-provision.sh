@@ -343,6 +343,9 @@ ORIGIN_CA_CSR="${ORIGIN_CA_CSR:-${ORIGIN_CA_DIR}/origin-ca.csr}"
 ORIGIN_CA_CRT="${ORIGIN_CA_CRT:-${ORIGIN_CA_DIR}/origin-ca.crt}"
 ORIGIN_CA_HASH="${ORIGIN_CA_HASH:-${ORIGIN_CA_DIR}/.origin-ca.crt.sha256}"
 ORIGIN_CA_ACTIVE="${ORIGIN_CA_ACTIVE:-${ORIGIN_CA_DIR}/.origin-ca-active}"
+# :443 target for the served-leaf probe (test override keeps the harness able
+# to drive it against a local s_server).
+ORIGIN_CA_PROBE_ADDR="${ORIGIN_CA_PROBE_ADDR:-127.0.0.1:443}"
 ORIGIN_CA_SUPPLIED=0
 
 # SHA-256 fingerprint (lowercase hex) of a PEM cert's DER form — different
@@ -378,7 +381,7 @@ origin_ca_dns_san_count() { # $1 = newline-separated SANs -> count
 }
 
 origin_ca_csr_selfcheck() { # $1 = CSR, $2 = key, $3 = expected host; reason on stderr
-  local csr="$1" key="$2" host="$3" sans
+  local csr="$1" key="$2" host="$3" sans text
   [ -s "$csr" ] || { printf 'CSR %s missing or empty' "$csr" >&2; return 1; }
   openssl req -in "$csr" -noout -verify >/dev/null 2>&1 \
     || { printf 'CSR %s fails self-signature verification' "$csr" >&2; return 1; }
@@ -390,6 +393,12 @@ origin_ca_csr_selfcheck() { # $1 = CSR, $2 = key, $3 = expected host; reason on 
   [ "$sans" = "$host" ] || { printf 'CSR SAN %s differs from %s' "$sans" "$host" >&2; return 1; }
   [ -n "$(origin_ca_key_pub "$key")" ] && [ "$(origin_ca_key_pub "$key")" = "$(origin_ca_csr_pub "$csr")" ] \
     || { printf 'CSR public key does not match %s' "$key" >&2; return 1; }
+  # Extensions are load-bearing (the operator/broker signs the CSR as-is): a
+  # pre-existing CSR must ask for serverAuth + the critical digitalSignature
+  # keyUsage, exactly like a generated one.
+  text="$(openssl req -in "$csr" -noout -text 2>/dev/null || true)"
+  case "$text" in *"TLS Web Server Authentication"*) ;; *) printf 'CSR %s lacks the serverAuth EKU' "$csr" >&2; return 1 ;; esac
+  case "$text" in *"Digital Signature"*) ;; *) printf 'CSR %s lacks the digitalSignature keyUsage' "$csr" >&2; return 1 ;; esac
   return 0
 }
 
@@ -427,10 +436,17 @@ origin_ca_generate() { # ensure key+CSR; the key is never regenerated while a ce
   log "per-anchor Origin CA CSR ready (publish it for signing; the key stays on this box)"
 }
 
-origin_ca_cert_pem_ok() { # $1 = PEM text -> bounded single-certificate shape
-  local pem="$1" bytes
-  case "$pem" in *"-----BEGIN CERTIFICATE-----"*) ;; *) return 1 ;; esac
-  case "$pem" in *"-----END CERTIFICATE-----"*) ;; *) return 1 ;; esac
+origin_ca_cert_pem_ok() { # $1 = PEM text -> exactly one bounded certificate, no leading/trailing junk
+  local pem="$1" bytes begins ends junk
+  begins="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
+  ends="$(printf '%s\n' "$pem" | grep -c -- '-----END CERTIFICATE-----' || true)"
+  # Multi-cert blobs must be rejected: only the first block would be
+  # validated/hashed while the whole blob got installed.
+  [ "$begins" = "1" ] && [ "$ends" = "1" ] || return 1
+  junk="$(printf '%s\n' "$pem" | awk '/-----BEGIN CERTIFICATE-----/{exit} {print}' | tr -d '[:space:]')"
+  [ -z "$junk" ] || return 1
+  junk="$(printf '%s\n' "$pem" | awk '/-----END CERTIFICATE-----/{f=1; next} f{print}' | tr -d '[:space:]')"
+  [ -z "$junk" ] || return 1
   bytes="$(printf '%s' "$pem" | wc -c | tr -d ' ')"
   [ "${bytes:-0}" -gt 0 ] && [ "${bytes:-0}" -le 16384 ]
 }
@@ -496,6 +512,78 @@ origin_ca_mark_active() { # one-way: the per-anchor pair has served on :443
   printf '%s\n' "per-anchor origin-ca pair has served on :443" >"${ORIGIN_CA_ACTIVE}"
   chmod 0644 "${ORIGIN_CA_ACTIVE}"
   log "one-way marker set (${ORIGIN_CA_ACTIVE}): the legacy shared pair can never be selected again on this box"
+}
+
+origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDATED before it may be selected
+  local reason
+  ORIGIN_TLS=0
+  ORIGIN_CA_PAIR=0
+  ORIGIN_CERT_CHANGED=0
+  ORIGIN_CA_HASH_WANT=""
+  if [ -s "${ORIGIN_CA_CRT}" ] && [ -s "${ORIGIN_CA_KEY}" ]; then
+    # Fail-closed selection (review F1): a key-matching but wrong-SAN (or
+    # expired/not-yet-valid) on-box pair would otherwise be selected and
+    # could satisfy the fingerprint-only probe while the edge→origin Full
+    # (Strict) leg breaks. Validate against the on-box key + STATUS_HOST
+    # first; never select (and never mark) an invalid pair.
+    if [ -n "${STATUS_HOST:-}" ]; then
+      if ! reason="$(origin_ca_validate_cert "${ORIGIN_CA_CRT}" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
+        die "on-box per-anchor Origin CA pair rejected for ${STATUS_HOST}: ${reason} — refusing to select or serve it (fix the cert, or remove origin-ca.{crt,key} to fall back/pending)"
+      fi
+    else
+      warn "STATUS_HOST unset — per-anchor pair validation skipped (no :443 vhost is rendered; re-dispatch with TENANT_USER)"
+    fi
+    CADDY_ORIGIN_CRT="${ORIGIN_CA_CRT}"
+    CADDY_ORIGIN_KEY="${ORIGIN_CA_KEY}"
+    ORIGIN_TLS=1
+    ORIGIN_CA_PAIR=1
+    ORIGIN_CA_HASH_WANT="$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
+    [ -n "${ORIGIN_CA_HASH_WANT}" ] || die "cannot hash ${ORIGIN_CA_CRT} — refusing to render TLS against an unreadable per-anchor cert"
+    if [ "$(cat "${ORIGIN_CA_HASH}" 2>/dev/null || true)" != "${ORIGIN_CA_HASH_WANT}" ]; then
+      ORIGIN_CERT_CHANGED=1
+    fi
+  elif [ "${ORIGIN_CA_SUPPLIED}" = "1" ]; then
+    die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not present on the box — refusing to select any fallback"
+  elif [ -s "${CADDY_ORIGIN_CRT}" ] && [ -s "${CADDY_ORIGIN_KEY}" ]; then
+    if [ -e "${ORIGIN_CA_ACTIVE}" ]; then
+      warn "per-anchor pair absent but ${ORIGIN_CA_ACTIVE} is set (one-way marker): the legacy shared pair is NOT resurrected — dashboard TLS pending until the per-anchor pair returns"
+    else
+      ORIGIN_TLS=1
+      warn "per-anchor pair absent — serving the legacy shared origin pair (transition fallback; suppressed forever once the per-anchor pair serves)"
+    fi
+  else
+    warn "no origin pair on this box — :443 uses Caddy automatic HTTPS (HTTP-01 via :80 below); re-dispatch with a signed per-anchor cert (ORIGIN_CA_CERT_PEM variable) for Origin-CA Full (Strict)"
+  fi
+  return 0
+}
+
+origin_ca_assert_served_pair() { # $1 = host -> 0 when the served :443 leaf IS the installed pair AND covers the host
+  local host="$1" want_fp served_pem served_fp
+  want_fp="$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
+  [ -n "${want_fp}" ] || { printf 'cannot hash %s' "${ORIGIN_CA_CRT}" >&2; return 1; }
+  served_pem="$(openssl s_client -connect "${ORIGIN_CA_PROBE_ADDR}" -servername "${host}" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)"
+  [ -n "${served_pem}" ] || { printf 'no certificate retrievable from %s for SNI %s' "${ORIGIN_CA_PROBE_ADDR}" "${host}" >&2; return 1; }
+  served_fp="$(printf '%s\n' "${served_pem}" | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+    | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+  [ -n "${served_fp}" ] || { printf 'cannot fingerprint the certificate served on %s' "${ORIGIN_CA_PROBE_ADDR}" >&2; return 1; }
+  [ "${served_fp}" = "${want_fp}" ] \
+    || { printf 'served certificate fingerprint %s differs from the installed pair %s' "${served_fp}" "${want_fp}" >&2; return 1; }
+  # Coverage, not just identity (review F1): a selected/installed cert that
+  # does not actually cover the site host must never satisfy the probe.
+  printf '%s\n' "${served_pem}" | openssl x509 -noout -checkhost "${host}" >/dev/null 2>&1 \
+    || { printf 'served certificate does not cover %s' "${host}" >&2; return 1; }
+  return 0
+}
+
+origin_ca_probe_and_mark() { # $1 = host; asserts the served pair FIRST, then sets the one-way marker
+  local host="$1" reason
+  [ "${ORIGIN_CA_PAIR}" = "1" ] || return 0
+  if ! reason="$(origin_ca_assert_served_pair "${host}" 2>&1)"; then
+    printf '%s' "${reason}" >&2
+    return 1
+  fi
+  origin_ca_mark_active
+  return 0
 }
 # --- origin-ca:end ---
 
@@ -866,38 +954,13 @@ if [ -f "${CADDY_CONFIG}" ] && [ ! -f "${CADDY_CONFIG}.pre-managed.bak" ] && ! g
   cp -p "${CADDY_CONFIG}" "${CADDY_CONFIG}.pre-managed.bak"
   log "Backed up pre-managed Caddyfile to ${CADDY_CONFIG}.pre-managed.bak (one-time)"
 fi
-# Origin pair selection (issue #123): per-anchor first; the legacy shared
+# Origin pair selection (issue #123): per-anchor first, VALIDATED against the
+# on-box key + STATUS_HOST before selection (review F1); the legacy shared
 # pair is a ONE-WAY transition fallback — once the per-anchor pair has served
 # (the :443 probe below), .origin-ca-active exists and the legacy pair is
-# never selected again. Pair paths feed the same CADDY_ORIGIN_CRT/KEY
-# variables the stanza builder below has always used.
-ORIGIN_TLS=0
-ORIGIN_CA_PAIR=0
-ORIGIN_CERT_CHANGED=0
-if [ -s "${ORIGIN_CA_CRT}" ] && [ -s "${ORIGIN_CA_KEY}" ]; then
-  CADDY_ORIGIN_CRT="${ORIGIN_CA_CRT}"
-  CADDY_ORIGIN_KEY="${ORIGIN_CA_KEY}"
-  ORIGIN_TLS=1
-  ORIGIN_CA_PAIR=1
-elif [ "${ORIGIN_CA_SUPPLIED}" = "1" ]; then
-  die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not present on the box — refusing to select any fallback"
-elif [ -s "${CADDY_ORIGIN_CRT}" ] && [ -s "${CADDY_ORIGIN_KEY}" ]; then
-  if [ -e "${ORIGIN_CA_ACTIVE}" ]; then
-    warn "per-anchor pair absent but ${ORIGIN_CA_ACTIVE} is set (one-way marker): the legacy shared pair is NOT resurrected — dashboard TLS pending until the per-anchor pair returns"
-  else
-    ORIGIN_TLS=1
-    warn "per-anchor pair absent — serving the legacy shared origin pair (transition fallback; suppressed forever once the per-anchor pair serves)"
-  fi
-else
-  warn "no origin pair on this box — :443 uses Caddy automatic HTTPS (HTTP-01 via :80 below); re-dispatch with a signed per-anchor cert (ORIGIN_CA_CERT_PEM variable) for Origin-CA Full (Strict)"
-fi
-if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
-  ORIGIN_CA_HASH_WANT="$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
-  [ -n "${ORIGIN_CA_HASH_WANT}" ] || die "cannot hash ${ORIGIN_CA_CRT} — refusing to render TLS against an unreadable per-anchor cert"
-  if [ "$(cat "${ORIGIN_CA_HASH}" 2>/dev/null || true)" != "${ORIGIN_CA_HASH_WANT}" ]; then
-    ORIGIN_CERT_CHANGED=1
-  fi
-fi
+# never selected again. The selection function lives in the origin-ca span
+# above (tests/origin-ca drives the real one).
+origin_ca_select_pair
 # AOP bundle (public cert material — world-readable is fine).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
@@ -1226,16 +1289,13 @@ if [ -n "${STATUS_HOST:-}" ]; then
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale
-      # Caddy still serving the legacy pair): compare the :443 chain leaf
-      # fingerprint with the installed pair; only then may the one-way marker
-      # suppress the legacy fallback forever.
-      want_fp="$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
-      served_fp="$(openssl s_client -connect 127.0.0.1:443 -servername "${STATUS_HOST}" </dev/null 2>/dev/null \
-        | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
-        | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
-      [ -n "${served_fp}" ] && [ "${served_fp}" = "${want_fp}" ] \
-        || die "Caddy :443 serves a certificate that is not the installed per-anchor pair (served '${served_fp:-unreadable}' vs '${want_fp}') — refusing to mark the per-anchor pair active"
-      origin_ca_mark_active
+      # Caddy still serving the legacy pair) AND that it covers the site host
+      # (guards a key-matching wrong-SAN pair). Only then may the one-way
+      # marker suppress the legacy fallback forever — the probe function
+      # writes the marker only after every check passes (review F1).
+      if ! origin_ca_probe_and_mark "${STATUS_HOST}"; then
+        die "Caddy :443 does not serve the installed per-anchor pair for ${STATUS_HOST} (reason above) — refusing to mark the per-anchor pair active"
+      fi
     fi
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
   elif [ "${ORIGIN_TLS}" != "1" ]; then
