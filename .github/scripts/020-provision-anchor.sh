@@ -20,8 +20,9 @@
 #              existing policy, never duplicates) -> attach to the server NIC.
 #   provision  re-fetch egress IP pre-SSH (mismatch -> abort to sweep) ->
 #              plain ssh (no ansible): install 2 keys, pipe 010-provision.sh
-#              (--rotate passes through), capture thumbprint to artifact path,
-#              `passwd -l root` last. Prefers the pasted ROOT_PASSWORD when
+#              (--rotate passes through), capture the per-anchor Origin CA
+#              CSR + tang thumbprint to artifact paths, `passwd -l root`
+#              last. Prefers the pasted ROOT_PASSWORD when
 #              set (legacy path, byte-for-byte); else the caller-set
 #              BOOTSTRAP_ROOT_PASSWORD minted by bootstrap-password below.
 #   bootstrap-password
@@ -109,14 +110,20 @@
 #                            dispatch-managed monitor config (repo secret — tenant
 #                            service map stays write-only). NTFY_TOPIC/NTFY_TOKEN
 #                            arrive the same way (empty = checks without push).
-#   CF_ORIGIN_CERT_PEM     operator-planted Cloudflare Origin CA certificate
-#   CF_ORIGIN_KEY_PEM      ... and private key (repo secrets, masked at birth
-#   CF_AOP_CA_PEM          in the workflow like the root password; optional
-#                            zone-level AOP client-auth bundle). Deployed key
-#                            material for Caddy's :443 — NOT a standing API
-#                            token (the box presents, never rewrites the zone).
-#                            Empty = dashboard-TLS-pending (Caddy automatic
-#                            HTTPS instead); tang is unaffected either way.
+#   ORIGIN_CA_CERT_PEM      operator-planted per-anchor Cloudflare Origin CA
+#                            certificate (repo VARIABLE, cert-only public
+#                            material — NO key material ever travels; the key
+#                            is generated on the box by scripts/010). Empty =
+#                            nothing to install this run (the box keeps its
+#                            current pair); the CSR comes back as the run
+#                            artifact for operator-side signing.
+#   CF_AOP_CA_PEM            optional zone-level AOP client-auth bundle (repo
+#                            secret, masked at birth in the workflow like the
+#                            root password). Deployed cert material for
+#                            Caddy's :443 — NOT a standing API token (the box
+#                            presents, never rewrites the zone). Empty = edge
+#                            auth stays firewall-allowlist + Host binding.
+#                            Tang is unaffected either way.
 #   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
 #    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)
 #   TENANT_USER                operator-set username (default monitor target:
@@ -787,7 +794,7 @@ cmd_provision() {
   fi
   # No standing SSH keys (see header): password dies at root lock, re-entry is
   # per-event via SCP password-reset + re-dispatch — no credential stands anywhere.
-  local fresh thumb out
+  local fresh thumb out csr csr_sha
   out="${THUMBPRINT_FILE:-./thumbprint.txt}"
   if [ -n "${PINNED_IP:-}" ]; then
     fresh="$(fetch_egress_ip)"
@@ -812,7 +819,7 @@ cmd_provision() {
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
-  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' CF_ORIGIN_CERT_PEM='$(q "${CF_ORIGIN_CERT_PEM:-}")' CF_ORIGIN_KEY_PEM='$(q "${CF_ORIGIN_KEY_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")';"
+  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")';"
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi
@@ -821,6 +828,21 @@ cmd_provision() {
   else
     { echo "$ENV_PREFIX"; cat scripts/010-provision.sh; } | ssh_base 'bash -s'
   fi
+  log "capturing the per-anchor Origin CA CSR to the artifact path"
+  # The CSR is public material (no key material in it): the hand-off for
+  # operator-side signing; the signed cert returns via the ORIGIN_CA_CERT_PEM
+  # variable. 010 generated it moments ago in the same SSH window.
+  csr="$(ssh_base 'cat /etc/caddy/origin-ca.csr 2>/dev/null || true')"
+  [ -n "$csr" ] || die "no per-anchor Origin CA CSR on the box — 010 must generate one every apply run (re-dispatch; if this persists, inspect the 010 log)"
+  case "$csr" in *"-----BEGIN CERTIFICATE REQUEST-----"*) ;; *) die "captured per-anchor Origin CA CSR is not a PEM certificate request — refusing to publish it";; esac
+  case "$csr" in *"-----END CERTIFICATE REQUEST-----"*) ;; *) die "captured per-anchor Origin CA CSR is truncated (no END marker) — refusing to publish it";; esac
+  [ "$(printf '%s' "$csr" | wc -c | tr -d ' ')" -le 16384 ] \
+    || die "captured per-anchor Origin CA CSR exceeded the bounded size — refusing to publish it"
+  printf '%s\n' "$csr" > ./origin-ca.csr
+  openssl req -in ./origin-ca.csr -noout -verify >/dev/null 2>&1 \
+    || die "captured per-anchor Origin CA CSR fails openssl self-signature verification — refusing to publish it"
+  csr_sha="$(openssl dgst -sha256 ./origin-ca.csr | awk '{print $NF}')"
+  log "origin-ca.csr written (StatusHost=${STATUS_HOST:-unknown}; sha256=${csr_sha})"
   log "capturing tang thumbprint to the artifact path"
   # Thumbprint source order (live 2026-09-10, #87): the collapse records the
   # kept sign key in ${KD}/.published-thp; else upstream's tang-show-keys
