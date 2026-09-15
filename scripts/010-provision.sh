@@ -558,7 +558,7 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
 }
 
 origin_ca_assert_served_pair() { # $1 = host -> 0 when the served :443 leaf IS the installed pair AND covers the host
-  local host="$1" want_fp served_pem served_fp
+  local host="$1" want_fp served_pem served_fp checkhost_out
   want_fp="$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
   [ -n "${want_fp}" ] || { printf 'cannot hash %s' "${ORIGIN_CA_CRT}" >&2; return 1; }
   served_pem="$(openssl s_client -connect "${ORIGIN_CA_PROBE_ADDR}" -servername "${host}" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)"
@@ -570,8 +570,15 @@ origin_ca_assert_served_pair() { # $1 = host -> 0 when the served :443 leaf IS t
     || { printf 'served certificate fingerprint %s differs from the installed pair %s' "${served_fp}" "${want_fp}" >&2; return 1; }
   # Coverage, not just identity (review F1): a selected/installed cert that
   # does not actually cover the site host must never satisfy the probe.
-  printf '%s\n' "${served_pem}" | openssl x509 -noout -checkhost "${host}" >/dev/null 2>&1 \
-    || { printf 'served certificate does not cover %s' "${host}" >&2; return 1; }
+  # Output is parsed, not the exit code: OpenSSL < 3.2 exits 0 even on a
+  # mismatch (it only prints "does NOT match"), so the exit status alone is
+  # not a proof (found on CI, OpenSSL 3.0.13).
+  checkhost_out="$(printf '%s\n' "${served_pem}" | openssl x509 -noout -checkhost "${host}" 2>/dev/null || true)"
+  case "$checkhost_out" in
+    *"does NOT match"*) printf 'served certificate does not cover %s' "${host}" >&2; return 1 ;;
+    *"does match certificate"*) ;;
+    *) printf 'served certificate host-coverage check was inconclusive for %s' "${host}" >&2; return 1 ;;
+  esac
   return 0
 }
 
