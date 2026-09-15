@@ -546,16 +546,22 @@ jobs:
           extract_var() {
             grep -E "^[[:space:]]*SHARED_ORIGIN_PATTERN=" "$1" 2>/dev/null | head -n1 | cut -d"'" -f2 || true
           }
-          wt="$(extract_var .github/workflows/ci.yml)"
-          [ -n "$wt" ] || { echo "::error::SHARED_ORIGIN_PATTERN missing/empty in the working tree — the check cannot run"; exit 1; }
+          check_working_tree() { # completeness/sanity, mirroring the sibling from-main greps
+            local val
+            val="$(extract_var .github/workflows/ci.yml)"
+            if [ -z "$val" ]; then echo "::error::SHARED_ORIGIN_PATTERN missing/empty in the working tree — the check cannot run"; return 1; fi
+            case "$val" in
+              *CF_ORIGIN_*) ;; # ci-allowlist: sanity check naming the retired prefix the pattern must enforce.
+              *) echo "::error::SHARED_ORIGIN_PATTERN weakened/incomplete in the working tree: '$val'"; return 1 ;;
+            esac
+          }
+          check_working_tree || { echo "::error::working-tree pattern incomplete/weakened — FAIL"; exit 1; }
           main="$(extract_var /tmp/main-ci.yml)"
           if [ -n "$main" ]; then
             cp /tmp/main-ci.yml /tmp/contract-origin.yml
             echo "::notice::pattern enforced from origin/main (contract case A — full contract on main)"
-            echo "::warning::pattern enforced from origin/main (contract case A — full contract on main)"
           else
             cp .github/workflows/ci.yml /tmp/contract-origin.yml
-            echo "::notice::contract bootstrap from working tree — requires human review before merge (contract case B — origin/main lacks the pattern)"
             echo "::warning::contract bootstrap from working tree — requires human review before merge (contract case B — origin/main lacks the pattern)"
           fi
       - name: Fail on retired shared-pair secret references
