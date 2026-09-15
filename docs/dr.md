@@ -35,7 +35,7 @@ Your main box dropped to a passphrase prompt instead of unlocking via the anchor
 
 ## Discovery fallback (multi-server accounts only)
 
-Single-server accounts never need this. If a run aborts with `expected 1 server, found N`, set `ANCHOR_IPV4` (repo secret) to the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it) and re-dispatch. Prefer renaming one box to `anchor-01-<you>` so discovery stays automatic.
+Single-server accounts never need this. If a run aborts with `expected 1 server, found N`, set `ANCHOR_IPV4` (repo secret) to the server-ready email's "IP address" verbatim (`203.0.113.10/22`-style suffix included; the run strips it) and re-dispatch. The value only selects among the addresses the resolved server itself reports (`GET /servers/{id}`): a value that matches none of them fails the run closed at the resolve step — it can never point SSH or the A record at another host. When the resolved server reports several IPv4s, a run with no explicit value fails loud listing them (pick one). Prefer renaming one box to `anchor-01-<you>` so discovery stays automatic.
 
 ## Same-URL rebuild = `regen` (2-minute DR)
 
