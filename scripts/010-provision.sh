@@ -381,7 +381,7 @@ origin_ca_dns_san_count() { # $1 = newline-separated SANs -> count
 }
 
 origin_ca_csr_selfcheck() { # $1 = CSR, $2 = key, $3 = expected host; reason on stderr
-  local csr="$1" key="$2" host="$3" sans text
+  local csr="$1" key="$2" host="$3" sans text ext
   [ -s "$csr" ] || { printf 'CSR %s missing or empty' "$csr" >&2; return 1; }
   openssl req -in "$csr" -noout -verify >/dev/null 2>&1 \
     || { printf 'CSR %s fails self-signature verification' "$csr" >&2; return 1; }
@@ -395,10 +395,19 @@ origin_ca_csr_selfcheck() { # $1 = CSR, $2 = key, $3 = expected host; reason on 
     || { printf 'CSR public key does not match %s' "$key" >&2; return 1; }
   # Extensions are load-bearing (the operator/broker signs the CSR as-is): a
   # pre-existing CSR must ask for serverAuth + the critical digitalSignature
-  # keyUsage, exactly like a generated one.
+  # keyUsage, exactly like a generated one. Only the Requested Extensions
+  # region counts: the -text subject dump must never satisfy the check (a
+  # crafted DN can imitate both strings), and a missing/empty region fails
+  # closed (review N3).
   text="$(openssl req -in "$csr" -noout -text 2>/dev/null || true)"
-  case "$text" in *"TLS Web Server Authentication"*) ;; *) printf 'CSR %s lacks the serverAuth EKU' "$csr" >&2; return 1 ;; esac
-  case "$text" in *"Digital Signature"*) ;; *) printf 'CSR %s lacks the digitalSignature keyUsage' "$csr" >&2; return 1 ;; esac
+  ext="$(printf '%s\n' "$text" | awk '
+    /^[[:space:]]*(Requested Extensions:|X509v3 extensions:)[[:space:]]*$/ { seen = 1; next }
+    seen && /^[[:space:]]*Signature Algorithm/ { done = 1; exit }
+    seen { print }
+    END { if (!seen || !done) exit 1 }
+  ')" || ext=""
+  case "$ext" in *"TLS Web Server Authentication"*) ;; *) printf 'CSR %s lacks the serverAuth EKU' "$csr" >&2; return 1 ;; esac
+  case "$ext" in *"Digital Signature"*) ;; *) printf 'CSR %s lacks the digitalSignature keyUsage' "$csr" >&2; return 1 ;; esac
   return 0
 }
 

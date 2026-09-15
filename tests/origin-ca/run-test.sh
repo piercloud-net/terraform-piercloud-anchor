@@ -12,7 +12,8 @@
 #   (c) corrupt / mismatched-CSR recovery: the CSR is rebuilt, the key kept;
 #   (d) orphaned cert (cert without key) fails closed;
 #   (e) CSR self-check rejections: wrong CN, wrong SAN, extra SAN, foreign key,
-#       missing/partial extensions (serverAuth EKU + digitalSignature keyUsage);
+#       missing/partial extensions (serverAuth EKU + digitalSignature keyUsage),
+#       and a crafted DN that only imitates the extension strings (review N3);
 #   (f) install validation: a test-CA-signed cert for the exact SAN + key is
 #       accepted; wrong SAN, wrong public key, expired, not-yet-valid, non-PEM,
 #       oversized and multi-cert/junk-framed material are rejected fail-closed;
@@ -188,6 +189,11 @@ expect_csr_fail "self-check rejects a foreign public key" "${WORK}/csr-foreign.p
 openssl req -new -key "${ORIGIN_CA_KEY}" -subj "/CN=${STATUS_HOST}" \
   -addext "subjectAltName=DNS:${STATUS_HOST}" -out "${WORK}/csr-noext.pem" >/dev/null 2>&1
 expect_csr_fail "self-check rejects a CSR without any extensions" "${WORK}/csr-noext.pem" "${ORIGIN_CA_KEY}"
+# A crafted DN carrying the extension wording must not satisfy the check
+# (review N3: the check is scoped to the Requested Extensions region).
+openssl req -new -key "${ORIGIN_CA_KEY}" -subj "/CN=${STATUS_HOST}/O=TLS Web Server Authentication/OU=Digital Signature" \
+  -addext "subjectAltName=DNS:${STATUS_HOST}" -out "${WORK}/csr-crafted-dn.pem" >/dev/null 2>&1
+expect_csr_fail "self-check rejects a crafted DN that imitates the extensions" "${WORK}/csr-crafted-dn.pem" "${ORIGIN_CA_KEY}"
 openssl req -new -key "${ORIGIN_CA_KEY}" -subj "/CN=${STATUS_HOST}" \
   -addext "subjectAltName=DNS:${STATUS_HOST}" \
   -addext "keyUsage=critical,digitalSignature" -out "${WORK}/csr-ku-only.pem" >/dev/null 2>&1
