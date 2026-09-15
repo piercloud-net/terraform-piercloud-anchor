@@ -31,7 +31,8 @@
 #       (`-checkhost`) against a real local `openssl s_server`, and marks the
 #       pair active only after both hold (review F1);
 #   (l) 020's CSR capture runs on a FAILING 010 too and preserves the original
-#       status (review F2).
+#       status (review F2); a framed-but-corrupt CSR never replaces the
+#       published artifact — verification precedes the atomic publish (NIT).
 #
 # No root, no network, no cloud. macOS needs GNU-ish openssl on PATH (the
 # Homebrew one); a `date` shim below covers BSD date for the GNU `date -d`
@@ -522,9 +523,11 @@ if [ -z "$FAKE_CSR" ]; then
     -addext "extendedKeyUsage=serverAuth" -out "${WORK}/csr-capture-valid.pem" >/dev/null 2>&1
   FAKE_CSR="$(cat "${WORK}/csr-capture-valid.pem")"
 fi
+# PEM framing + a body openssl cannot parse/verify (framed-but-corrupt).
+FRAMED_CORRUPT_CSR="$(printf '%s\n%s\n%s\n' '-----BEGIN CERTIFICATE REQUEST-----' 'bm90IGEgY3Ny' '-----END CERTIFICATE REQUEST-----')"
 # Stubbed ssh_base: the 010 pipe fails with rc 7 and the CSR fetch returns
 # the fixture (mode controls which). All other ssh calls die loud.
-run_capture_case() { # $1 = out path, $2 = rc file, $3 = stderr file
+run_capture_case() { # $1 = out path, $2 = rc file, $3 = stderr file; $4 = 'direct' calls capture only
   ( set +e
     cd "$ROOT" || exit 90
     # shellcheck disable=SC1090
@@ -537,7 +540,7 @@ run_capture_case() { # $1 = out path, $2 = rc file, $3 = stderr file
           cat >/dev/null
           case "$(cat "$MODE_FILE" 2>/dev/null)" in fail*) return 7 ;; *) return 0 ;; esac ;;
         *'cat /etc/caddy/origin-ca.csr'*)
-          case "$(cat "$MODE_FILE" 2>/dev/null)" in *no-csr*) : ;; *) printf '%s\n' "$FAKE_CSR" ;; esac ;;
+          case "$(cat "$MODE_FILE" 2>/dev/null)" in *no-csr*) : ;; *corrupt*) printf '%s\n' "$FRAMED_CORRUPT_CSR" ;; *) printf '%s\n' "$FAKE_CSR" ;; esac ;;
         *) return 1 ;;
       esac
     }
@@ -545,7 +548,7 @@ run_capture_case() { # $1 = out path, $2 = rc file, $3 = stderr file
     ENV_PREFIX="export FOO='bar'"
     STATUS_HOST="$STATUS_HOST"
     ORIGIN_CA_CSR_OUT="$1"
-    run_onbox_provision
+    if [ "${4:-}" = "direct" ]; then capture_origin_ca_csr; else run_onbox_provision; fi
     printf '%s' "$?" >"$2"
   ) 2>"$3"
 }
@@ -575,6 +578,29 @@ rc=0
 run_capture_case "${WORK}/cap-d.csr" "${WORK}/rc-d" "${WORK}/err-d" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "020 capture missing on SUCCESS fails the run closed (rc=$rc)"; else bad "020 capture missing on success did not fail"; fi
 if grep -q 'capture failed' "${WORK}/err-d" 2>/dev/null; then ok "020 strict capture failure names the refusal"; else bad "020 strict capture failure message missing: $(cat "${WORK}/err-d" 2>/dev/null)"; fi
+
+# A framed-but-corrupt CSR: the previous artifact survives and the run fails
+# (verification runs on a temp sibling before the atomic publish).
+printf 'fail-corrupt-csr' >"${WORK}/capture-mode"
+printf 'sentinel\n' >"${WORK}/cap-e.csr"
+run_capture_case "${WORK}/cap-e.csr" "${WORK}/rc-e" "${WORK}/err-e"
+is "020 corrupt-CSR capture: the original 010 status is preserved" "7" "$(cat "${WORK}/rc-e" 2>/dev/null || echo missing)"
+is "020 corrupt-CSR capture: the previous artifact is untouched" "sentinel" "$(cat "${WORK}/cap-e.csr" 2>/dev/null)"
+if grep -q 'self-signature verification' "${WORK}/err-e" 2>/dev/null; then ok "020 corrupt-CSR capture: refusal names the verification failure"; else bad "020 corrupt-CSR capture: refusal message missing: $(cat "${WORK}/err-e" 2>/dev/null)"; fi
+if ls "${WORK}"/cap-e.csr.tmp.* >/dev/null 2>&1; then bad "020 corrupt-CSR capture: temp artifact left behind"; else ok "020 corrupt-CSR capture: temp artifact cleaned up"; fi
+
+printf 'fail-corrupt-csr' >"${WORK}/capture-mode"
+rm -f "${WORK}/cap-f.csr"
+run_capture_case "${WORK}/cap-f.csr" "${WORK}/rc-f" "${WORK}/err-f"
+if [ -e "${WORK}/cap-f.csr" ]; then bad "020 corrupt-CSR capture without a previous artifact published one"; else ok "020 corrupt-CSR capture without a previous artifact: destination untouched"; fi
+
+# Direct capture call: the capture function itself must fail closed and
+# publish nothing (the previous artifact survives).
+printf 'corrupt-csr' >"${WORK}/capture-mode"
+printf 'sentinel\n' >"${WORK}/cap-g.csr"
+run_capture_case "${WORK}/cap-g.csr" "${WORK}/rc-g" "${WORK}/err-g" direct
+if [ "$(cat "${WORK}/rc-g" 2>/dev/null)" = "1" ]; then ok "020 corrupt-CSR capture (direct): capture returns non-zero"; else bad "020 corrupt-CSR capture (direct): rc=$(cat "${WORK}/rc-g" 2>/dev/null || echo missing)"; fi
+is "020 corrupt-CSR capture (direct): the previous artifact is untouched" "sentinel" "$(cat "${WORK}/cap-g.csr" 2>/dev/null)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

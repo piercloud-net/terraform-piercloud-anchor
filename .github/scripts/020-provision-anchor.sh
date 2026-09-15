@@ -787,17 +787,25 @@ ssh_base() {
 # exactly when the artifact is most needed (review F2). The 010 status is
 # preserved by the caller.
 capture_origin_ca_csr() { # fetch + validate the public CSR into ${ORIGIN_CA_CSR_OUT}; reason on stderr
-  local csr csr_sha
+  local csr csr_sha tmp
   csr="$(ssh_base 'cat /etc/caddy/origin-ca.csr 2>/dev/null || true')"
   [ -n "$csr" ] || { printf 'no per-anchor Origin CA CSR on the box — 010 must generate one every apply run (re-dispatch; if this persists, inspect the 010 log)' >&2; return 1; }
   case "$csr" in *"-----BEGIN CERTIFICATE REQUEST-----"*) ;; *) printf 'captured per-anchor Origin CA CSR is not a PEM certificate request — refusing to publish it' >&2; return 1 ;; esac
   case "$csr" in *"-----END CERTIFICATE REQUEST-----"*) ;; *) printf 'captured per-anchor Origin CA CSR is truncated (no END marker) — refusing to publish it' >&2; return 1 ;; esac
   [ "$(printf '%s' "$csr" | wc -c | tr -d ' ')" -le 16384 ] \
     || { printf 'captured per-anchor Origin CA CSR exceeded the bounded size — refusing to publish it' >&2; return 1; }
-  printf '%s\n' "$csr" >"${ORIGIN_CA_CSR_OUT}"
-  openssl req -in "${ORIGIN_CA_CSR_OUT}" -noout -verify >/dev/null 2>&1 \
-    || { printf 'captured per-anchor Origin CA CSR fails openssl self-signature verification — refusing to publish it' >&2; return 1; }
-  csr_sha="$(openssl dgst -sha256 "${ORIGIN_CA_CSR_OUT}" | awk '{print $NF}')"
+  # Verify a temp sibling before publishing: a framed-but-corrupt CSR must
+  # never replace (or become) the artifact (review NIT). The destination is
+  # left untouched on any failure.
+  tmp="${ORIGIN_CA_CSR_OUT}.tmp.$$"
+  printf '%s\n' "$csr" >"$tmp"
+  if ! openssl req -in "$tmp" -noout -verify >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    printf 'captured per-anchor Origin CA CSR fails openssl self-signature verification — refusing to publish it' >&2
+    return 1
+  fi
+  csr_sha="$(openssl dgst -sha256 "$tmp" | awk '{print $NF}')"
+  mv -f -- "$tmp" "${ORIGIN_CA_CSR_OUT}"
   log "per-anchor CSR written to ${ORIGIN_CA_CSR_OUT} (StatusHost=${STATUS_HOST:-unknown}; sha256=${csr_sha})"
 }
 
