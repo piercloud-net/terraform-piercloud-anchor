@@ -880,7 +880,7 @@ if [ -s "${ORIGIN_CA_CRT}" ] && [ -s "${ORIGIN_CA_KEY}" ]; then
   ORIGIN_TLS=1
   ORIGIN_CA_PAIR=1
 elif [ "${ORIGIN_CA_SUPPLIED}" = "1" ]; then
-  die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not on disk — refusing to select any fallback"
+  die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not present on the box — refusing to select any fallback"
 elif [ -s "${CADDY_ORIGIN_CRT}" ] && [ -s "${CADDY_ORIGIN_KEY}" ]; then
   if [ -e "${ORIGIN_CA_ACTIVE}" ]; then
     warn "per-anchor pair absent but ${ORIGIN_CA_ACTIVE} is set (one-way marker): the legacy shared pair is NOT resurrected — dashboard TLS pending until the per-anchor pair returns"
