@@ -16,7 +16,7 @@ If a needed signal is missing from this file, that is a docs gap — add it in t
 
 ## 2. CI gates
 
-Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `validate-package-version` and `validate-release-pr` in their own workflows. Most run on every PR; two are path-gated — when their trigger paths are untouched they still report `pass`, with the payload steps skipped.
+Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `validate-package-version` and `validate-release-pr` in their own workflows. Most run on every PR; two are path-gated — when their trigger paths are untouched they still report `pass`, with the payload steps skipped.
 
 | Check (job name) | Trigger | What it proves |
 |---|---|---|
@@ -25,7 +25,8 @@ Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `
 | `key-material grep (from main)` | always | No JWK private `d` scalar and no PEM private-key block in tracked code; the patterns are enforced from `main`, so a PR cannot weaken its own check. |
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist; also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, sweep pre/post, naming scheme, retention cap, policy naming, public-log safety) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, sweep pre/post, naming scheme, retention cap, policy naming, public-log safety, per-anchor origin-ca) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -34,7 +35,7 @@ Eleven checks run per PR: nine in [`ci.yml`](../.github/workflows/ci.yml) plus `
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety)/)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety|origin-ca)/)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -70,6 +71,7 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] `dig +short anchor-01-<tenant>.piercloud.net` returns the anchor IPv4 (DNS-only record — clevis must reach tang directly, no edge in front).
 - [ ] `curl -s -o /dev/null -w '%{http_code}' http://anchor-01-<tenant>.piercloud.net/adv` prints `200` from the main box, and times out from an unlisted address (the firewall actually gates tang).
 - [ ] `curl -s -o /dev/null -w '%{http_code}' https://status-<tenant>.piercloud.net/` prints `200`, and the statuses API returns data.
+- [ ] Per-anchor Origin CA (issue #123): the run log shows the on-box key + CSR present-or-generated (never any key material), the `origin-ca-csr-<tenant>` artifact is uploaded, the cert-only `ORIGIN_CA_CERT_PEM` variable (when set) validates fail-closed and installs; no retired shared-pair secret prefix appears in the run env or logs; the CSR artifact carries no netcup account identifiers.
 - [ ] No key material in state/plan (CI key-material grep + the provisioning script's own assertion); the thumbprint is saved in the password manager.
 - [ ] Firewall shape: main box + Cloudflare edge only, `:80` tang + ACME, `:443` edge only, egress ACCEPT-all, no SSH left open.
 
@@ -85,7 +87,8 @@ Live proof means running the real flow against a real anchor and capturing the a
 
 - [ ] `https://status-<tenant>.piercloud.net/` is `200` over TLS; the certificate chain is valid well beyond the window (`external-watch.yml` asserts HTTP 200, live statuses data, and ≥14 days of cert validity).
 - [ ] Visitor→edge leg: Cloudflare Universal SSL covers the ONE flat label — no Advanced Certificate Manager / Total TLS needed (if a two-label hostname is ever needed, ACM returns; issue #107).
-- [ ] Edge→origin leg: Full (Strict) holds and the origin cert (`CF_ORIGIN_CERT_PEM`/`CF_ORIGIN_KEY_PEM`) verifies; Caddy auto-TLS is never relied on for proxied hosts (HTTP-01 catch-22, issue #88).
+- [ ] Edge→origin leg: Full (Strict) holds and the per-anchor Origin CA cert verifies; the served `:443` leaf fingerprint matches the installed pair (asserted in the run's non-AOP probe — under AOP the proof is the Caddyfile reference + hash marker after reload + edge 200, since a cert-less `s_client` cannot retrieve the served cert there); the cert carries exactly the one SAN `status-<tenant>.piercloud.net`. Caddy auto-TLS is never relied on for proxied hosts (HTTP-01 catch-22, issue #88).
+- [ ] Transition state: while the legacy shared wildcard pair still serves, the one-way `.origin-ca-active` marker is absent; once the per-anchor pair has served, the marker exists and the legacy pair is never selected again (no silent resurrection).
 - [ ] Edge ceremony: Cache Rule bypass on `/.well-known/acme-challenge/*`; no WAF / Bot-Fight block on it.
 - [ ] AOP, when `CF_AOP_CA_PEM` is set: cert-less origin pull is rejected at the handshake and the edge pull serves `200` — the run asserts both halves.
 - [ ] Tang unaffected throughout: `http://anchor-01-<tenant>.piercloud.net/adv` still answers `200`.

@@ -519,6 +519,83 @@ jobs:
           [ "$fail" -eq 0 ]
           echo "no sovereignty-downgrade print patterns (OK)"
 
+  shared-origin-grep:
+    name: shared-origin grep (from main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - name: Fetch origin/main (pattern source of truth; files scanned stay on this PR tree)
+        run: |
+          set -euo pipefail
+          # CONTRACT (same bootstrap-aware shape as the other from-main greps):
+          # the SHARED_ORIGIN_PATTERN VAR lives on one VAR='value' line (no
+          # single quotes inside the value; extraction is grep ^VAR= +
+          # cut -d"'" -f2).
+          # Case A (origin/main carries the pattern) -> enforcement source is
+          # origin/main strictly; the working tree must still carry a
+          # complete value (weakening fails). Case B (bootstrap: this PR
+          # introduces the check, as today) -> enforcement source is the
+          # working tree, announced loudly. Never silently falls back.
+          git fetch origin main --depth=1 >/dev/null 2>&1 || true
+          if git rev-parse --verify origin/main >/dev/null 2>&1 && git show origin/main:.github/workflows/ci.yml > /tmp/main-ci.yml 2>/dev/null; then
+            : # /tmp/main-ci.yml ready
+          else
+            echo "::warning::origin/main ci.yml unavailable — treating as contract bootstrap (working tree must carry the pattern)"
+            : > /tmp/main-ci.yml || true
+          fi
+          extract_var() {
+            grep -E "^[[:space:]]*SHARED_ORIGIN_PATTERN=" "$1" 2>/dev/null | head -n1 | cut -d"'" -f2 || true
+          }
+          wt="$(extract_var .github/workflows/ci.yml)"
+          [ -n "$wt" ] || { echo "::error::SHARED_ORIGIN_PATTERN missing/empty in the working tree — the check cannot run"; exit 1; }
+          main="$(extract_var /tmp/main-ci.yml)"
+          if [ -n "$main" ]; then
+            cp /tmp/main-ci.yml /tmp/contract-origin.yml
+            echo "::notice::pattern enforced from origin/main (contract case A — full contract on main)"
+            echo "::warning::pattern enforced from origin/main (contract case A — full contract on main)"
+          else
+            cp .github/workflows/ci.yml /tmp/contract-origin.yml
+            echo "::notice::contract bootstrap from working tree — requires human review before merge (contract case B — origin/main lacks the pattern)"
+            echo "::warning::contract bootstrap from working tree — requires human review before merge (contract case B — origin/main lacks the pattern)"
+          fi
+      - name: Fail on retired shared-pair secret references
+        run: |
+          set -euo pipefail
+          # issue #123: the zone-wide shared origin pair is retired. No tracked
+          # .tf/.sh/.yml may reference its secret prefix — the per-anchor pair
+          # (key generated on the box, cert returned via the cert-only repo
+          # variable) replaced it. Pattern runs from the contract source
+          # (/tmp/contract-origin.yml — see the fetch step); files scanned stay
+          # on HEAD. A line carrying 'ci-allowlist: <reason>' (10+ chars) is
+          # the only escape hatch; the pattern's own defining line uses it.
+          SHARED_ORIGIN_PATTERN='CF_ORIGIN_' # ci-allowlist: defining use — the pattern names the retired shared-pair secret prefix it forbids.
+          PATTERN="$(grep -E "^[[:space:]]*SHARED_ORIGIN_PATTERN=" /tmp/contract-origin.yml | head -n1 | cut -d"'" -f2 || true)"
+          [ -n "$PATTERN" ] || { echo "::error::could not determine SHARED_ORIGIN_PATTERN from the contract source"; exit 1; }
+          all_hits="$(git ls-files '*.tf' '*.sh' '*.yml' | xargs -r grep -nE "$PATTERN" || true)"
+          hits="$(printf '%s' "$all_hits" | grep -v 'ci-allowlist:' || true)"  # marker literal in code, not an exemption grant
+          exempted="$(printf '%s' "$all_hits" | grep 'ci-allowlist:' || true)"  # marker literal in code, not an exemption grant
+          fail=0
+          if [ -n "$exempted" ]; then
+            printf '%s\n' "$exempted" | while IFS= read -r line; do echo "::notice::allowlisted: $line"; done
+            short="$(printf '%s\n' "$exempted" | grep -vE 'ci-allowlist:.{10,}' || true)"  # marker literal in code, not an exemption grant
+            if [ -n "$short" ]; then
+              printf '%s\n' "$short" | while IFS= read -r line; do echo "::error::allowlist reason too short (need 10+ chars after marker): $line"; done
+              fail=1
+            fi
+          fi
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits" | while IFS= read -r line; do echo "::error::$line"; done
+            echo "::error::retired shared-pair secret reference still present (see lines above)"
+            fail=1
+          fi
+          bare="$(git ls-files '*.tf' '*.sh' '*.yml' | xargs -r grep -nE 'ci-allowlist:[[:space:]]*$' || true)"  # marker literal in code, not an exemption grant
+          if [ -n "$bare" ]; then
+            printf '%s\n' "$bare" | while IFS= read -r line; do echo "::error::bare escape marker without a reason: $line"; done
+            fail=1
+          fi
+          [ "$fail" -eq 0 ]
+          echo "no retired shared-pair secret references in tracked .tf/.sh/.yml (OK)"
+
   unit-tests-scripts:
     name: unit-tests (scripts)
     runs-on: ubuntu-latest
@@ -550,7 +627,7 @@ jobs:
             # large list makes grep's early exit SIGPIPE the writer
             # (pipeline rc 141), which silently turns this match into
             # run=no on exactly the big PRs that need the harnesses.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety)/)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety|origin-ca)/)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -573,6 +650,7 @@ jobs:
           bash tests/retention-cap/run-test.sh
           bash tests/policy-naming/run-test.sh
           bash tests/public-log-safety/run-test.sh
+          bash tests/origin-ca/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |

@@ -145,7 +145,8 @@ span() { # $1 file, $2 begin marker, $3 end marker
 }
 artifact_ids='(^|[^A-Za-z0-9_])(SERVER_ID|ANCHOR_HOST|MAC|SCP_USER_ID|ORDER_NAME|API_USER|CUSTOMER_NUMBER)([^A-Za-z0-9_]|$)'
 for pair in "head-sha|Record head SHA for the backend approval pin|Upload head-SHA artifact" \
-  "thumbprint|Write thumbprint captured by the A1 provision step|Upload thumbprint artifact"; do
+  "thumbprint|Write thumbprint captured by the A1 provision step|Upload thumbprint artifact" \
+  "origin-ca-csr|Upload per-anchor CSR artifact|Best-effort root lock"; do
   label="${pair%%|*}"; rest="${pair#*|}"; begin="${rest%%|*}"; end="${rest#*|}"
   body="$(span "$PROV" "$begin" "$end")"
   if [ -z "$body" ]; then
