@@ -17,7 +17,10 @@
 # any use, and the old direct-override / silent-first-index shapes are gone.
 # The wiring checks are structural (non-comment lines; the HOST4 assignment
 # pinned to the exact guarded call), so a partial revert cannot satisfy them
-# by leaving the old code text in a comment.
+# by leaving the old code text in a comment — and a BEHAVIORAL section runs
+# the real resolve-step body against a stubbed netcup API, asserting the
+# emitted ANCHOR_HOST/anchor_ipv4: that binding survives control-flow
+# rewrites the static greps cannot bound (e.g. a `read -r HOST4` bypass).
 #
 # Cred-free, offline: no network, no credentials, real jq.
 set -euo pipefail
@@ -226,6 +229,101 @@ before "explicit normalized before the resolve call" \
   "${host4_line:-}"
 lack "$PROV" 'ipv4Addresses[0]' "no silent first-index pick remains in provision.yml"
 lack "$PROV" 'HOST4="${ANCHOR_IPV4' "no direct HOST4 override from the secret remains"
+
+# ---- behavioral binding: run the REAL resolve-step body against a stubbed
+# netcup API ---------------------------------------------------------------
+# The static assertions stop shape-level reverts, but a control-flow rewrite
+# can keep them all green while the emitted target comes from the secret
+# (e.g. `read -r HOST4 <<<"$EXPLICIT"` on the secret path). This section
+# binds the CONTRACT behaviorally: whatever the step does, the emitted
+# ANCHOR_HOST / anchor_ipv4 must be an address the resolved server itself
+# reports, and a non-matching explicit value must exit non-zero with
+# nothing emitted.
+RESOLVE_BODY="$WORK/resolve-body.sh"
+awk '
+  index($0, "- name: Resolve server + approver guard + zero-IP discovery") { inblock=1; next }
+  inblock && $0 == "        run: |" { inrun=1; next }
+  inrun && /^      - name: / { exit }
+  inrun { line=$0; sub(/^          /, "", line); print line }
+' "$PROV" > "$RESOLVE_BODY"
+[ -s "$RESOLVE_BODY" ] || { printf 'FAIL could not extract the resolve step body from provision.yml\n'; exit 1; }
+grep -qF 'resolve_anchor_ipv4' "$RESOLVE_BODY" || { printf 'FAIL extracted body has no resolve_anchor_ipv4 call\n'; exit 1; }
+
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub netcup SCP API: fixtures via STUB_LIST / STUB_DETAIL / STUB_BY_IP.
+args="$*"
+case "$args" in
+  *protocol/openid-connect/userinfo*) printf '%s' '{"id":"123"}'; exit 0 ;;
+  *"/api/v1/users/123"*) printf '%s' '{"username":"999999"}'; exit 0 ;;
+  *"--data-urlencode ip="*) printf '%s' "${STUB_BY_IP:-[]}"; exit 0 ;;
+esac
+case "$args" in
+  *"/api/v1/servers/42"*) printf '%s' "${STUB_DETAIL:?STUB_DETAIL unset}"; exit 0 ;;
+  *"/api/v1/servers"*) printf '%s' "${STUB_LIST:?STUB_LIST unset}"; exit 0 ;;
+  *) printf 'stub curl: unexpected args: %s\n' "$args" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$WORK/bin/curl"
+
+DETAIL_ONE='{"name":"order","hostname":"anchor-01-test","ipv4Addresses":[{"ip":"203.0.113.10"}]}'
+DETAIL_TWO='{"name":"order","hostname":"anchor-01-test","ipv4Addresses":[{"ip":"203.0.113.10"},{"ip":"198.51.100.7"}]}'
+LIST_ONE='[{"id":"42","hostname":"anchor-01-test"}]'
+LIST_TWO='[{"id":"1","hostname":"other-a"},{"id":"2","hostname":"other-b"}]'
+BY_IP_42='[{"id":"42","hostname":"anchor-01-test"}]'
+
+RESOLVE_RUN() { # $1 tag; remaining: VAR=value pairs -> rc; files in $WORK/res.<tag>.*
+  local tag="$1"; shift
+  local genv="$WORK/res.$tag.genv" gout="$WORK/res.$tag.gout" rc=0
+  : > "$genv"; : > "$gout"
+  env -i PATH="$WORK/bin:$PATH" HOME="$WORK" \
+    GITHUB_ENV="$genv" GITHUB_OUTPUT="$gout" \
+    TENANT_USER=test CUSTOMER_NUMBER=999999 SCP_USER_ID_IN= \
+    NETCUP_SCP_ACCESS_TOKEN=stub-token \
+    "$@" \
+    bash "$RESOLVE_BODY" > "$WORK/res.$tag.out" 2> "$WORK/res.$tag.err" || rc=$?
+  printf '%s' "$rc"
+}
+emitted() { # $1 tag, $2 file suffix (genv|gout) -> matching lines or empty
+  grep -E '^(ANCHOR_HOST|anchor_ipv4)=' "$WORK/res.$1.$2" || true
+}
+
+# b1: F2 poison — server reports 203.0.113.10, the secret says 198.51.100.99.
+rc="$(RESOLVE_RUN b1 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_ONE" ANCHOR_IPV4=198.51.100.99)"
+is "b1 poisoned explicit rc (fail closed)" "1" "$rc"
+is "b1 nothing emitted to GITHUB_ENV" "" "$(emitted b1 genv)"
+is "b1 nothing emitted to GITHUB_OUTPUT" "" "$(emitted b1 gout)"
+contains "b1 fail-closed message" "not one of the resolved server's own addresses" "$(cat "$WORK/res.b1.err")"
+
+# b2: no explicit — target is the server detail's own address.
+rc="$(RESOLVE_RUN b2 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_ONE" ANCHOR_IPV4=)"
+is "b2 discovery rc" "0" "$rc"
+is "b2 ANCHOR_HOST is the API address" "ANCHOR_HOST=203.0.113.10" "$(emitted b2 genv)"
+is "b2 anchor_ipv4 is the API address" "anchor_ipv4=203.0.113.10" "$(emitted b2 gout)"
+
+# b3: explicit matching the server's own address — selected and emitted.
+rc="$(RESOLVE_RUN b3 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_ONE" ANCHOR_IPV4=203.0.113.10)"
+is "b3 matching explicit rc" "0" "$rc"
+is "b3 ANCHOR_HOST is the API address" "ANCHOR_HOST=203.0.113.10" "$(emitted b3 genv)"
+
+# b4/b5: multi-IPv4 — no explicit fails loud; explicit selects a member.
+rc="$(RESOLVE_RUN b4 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_TWO" ANCHOR_IPV4=)"
+is "b4 multi no explicit rc (fail loud)" "1" "$rc"
+is "b4 nothing emitted" "" "$(emitted b4 genv)"
+contains "b4 lists candidate 198.51.100.7" "198.51.100.7" "$(cat "$WORK/res.b4.err")"
+rc="$(RESOLVE_RUN b5 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_TWO" ANCHOR_IPV4=198.51.100.7)"
+is "b5 multi explicit member rc" "0" "$rc"
+is "b5 ANCHOR_HOST is the selected member" "ANCHOR_HOST=198.51.100.7" "$(emitted b5 genv)"
+
+# b6/b7: explicit resolves the server via ?ip= (ambiguous account) — the
+# emitted target is still that server's own address, never the secret.
+rc="$(RESOLVE_RUN b6 STUB_LIST="$LIST_TWO" STUB_BY_IP="$BY_IP_42" STUB_DETAIL="$DETAIL_ONE" ANCHOR_IPV4=198.51.100.7)"
+is "b6 ?ip= resolved + non-member explicit rc" "1" "$rc"
+is "b6 nothing emitted on ?ip= mismatch" "" "$(emitted b6 genv)"
+rc="$(RESOLVE_RUN b7 STUB_LIST="$LIST_TWO" STUB_BY_IP="$BY_IP_42" STUB_DETAIL="$DETAIL_ONE" ANCHOR_IPV4=203.0.113.10)"
+is "b7 ?ip= resolved + member explicit rc" "0" "$rc"
+is "b7 ANCHOR_HOST is the API address" "ANCHOR_HOST=203.0.113.10" "$(emitted b7 genv)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
