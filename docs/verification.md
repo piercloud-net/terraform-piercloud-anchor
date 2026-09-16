@@ -26,7 +26,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist; also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
 | `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, sweep pre/post, naming scheme, retention cap, policy naming, public-log safety, per-anchor origin-ca) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, anchor IP selection, sweep pre/post, naming scheme, retention cap, policy naming, public-log safety, per-anchor origin-ca) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety|origin-ca)/)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety|origin-ca)/)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -67,6 +67,8 @@ Live proof means running the real flow against a real anchor and capturing the a
 ### Provisioning run (`scripts/`, `.tf`, workflows)
 
 - [ ] Dispatch `provision.yml` `mode=apply` from the reviewed branch and approve the device flow (§5).
+- [ ] Anchor target is API-derived: the A-record value and the A1 SSH target equal the `GET /servers/{id}` address (resolve log) — no pasted-IP override exists.
+- [ ] Fail-closed proof: a temporarily set non-matching `ANCHOR_IPV4` fails the run closed at the resolve step (no SSH/DNS action; the secret is removed afterwards). The log names the candidate count, never the address values.
 - [ ] Run log assertions all pass: firewall policy created/attached; A1 window opened then closed (swept pre + post); tang thumbprint printed; Caddy + Gatus deployed; DNS upsert + verify-after-write; device-grant teardown revoked.
 - [ ] `dig +short anchor-01-<tenant>.piercloud.net` returns the anchor IPv4 (DNS-only record — clevis must reach tang directly, no edge in front).
 - [ ] `curl -s -o /dev/null -w '%{http_code}' http://anchor-01-<tenant>.piercloud.net/adv` prints `200` from the main box, and times out from an unlisted address (the firewall actually gates tang).

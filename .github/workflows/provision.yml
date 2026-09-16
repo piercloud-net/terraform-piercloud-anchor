@@ -202,8 +202,10 @@ jobs:
       # No SCP_USER_ID secret by default: resolved from the token via OIDC
       # userinfo in the resolve step (override only if yours differs).
       # ANCHOR_IPV4 / ANCHOR_ROOT_PASSWORD are optional (issue #50): unset
-      # means zero-IP discovery + a caller-set one-time password; set keeps
-      # the legacy pasted-IP / pasted-password path byte-for-byte.
+      # means zero-IP discovery + a caller-set one-time password. When set,
+      # ANCHOR_IPV4 must match one of the resolved server's own IPv4
+      # addresses — it selects, never overrides; a mismatch fails closed.
+      # ANCHOR_ROOT_PASSWORD keeps the legacy pasted-password path as-is.
       CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
       TENANT_USER: ${{ vars.TENANT_USER }}
     steps:
@@ -519,6 +521,19 @@ jobs:
           # on-box Caddy render consumes it as the dashboard FQDN.
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
           . scripts/lib/naming.sh
+          . .github/scripts/lib/anchor-ip.sh
+          # ANCHOR_IPV4 is optional and may carry the server-ready email's
+          # /prefix suffix: default it for `set -u`, strip the suffix ONCE,
+          # and validate before any use below (the ?ip= fallback and the
+          # membership check consume the bare value only). An explicit value
+          # may SELECT among the resolved server's own addresses, never
+          # override them (F2).
+          ANCHOR_IPV4="${ANCHOR_IPV4:-}"
+          EXPLICIT="${ANCHOR_IPV4%%/*}"
+          if [ -n "$ANCHOR_IPV4" ] && ! is_bare_ipv4 "$EXPLICIT"; then
+            echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix. Paste the IP from the server-ready email."
+            exit 1
+          fi
           RAW="$(printf '%s' "$TENANT_USER" | tr '[:upper:]' '[:lower:]')"
           validate_tenant_username "$RAW"
           SAN="$(sanitize_tenant "$RAW")"
@@ -598,10 +613,10 @@ jobs:
               echo "Still empty (attempt $i/6)..."
             done
           fi
-          # Negative COUNT with a pasted IP flows past ranking into the
-          # legacy ?ip= branch below (same API, independent shape); without
-          # an IP there is nothing to fall back to — fail closed.
-          if [ "$COUNT" -lt 0 ] && [ -z "${ANCHOR_IPV4:-}" ]; then
+          # Negative COUNT with an explicit value flows past ranking into
+          # the ?ip= branch below (same API, independent shape); without
+          # one there is nothing to fall back to — fail closed.
+          if [ "$COUNT" -lt 0 ] && [ -z "$EXPLICIT" ]; then
             echo "::error::server list came back in an unexpected shape — escalate, no fallback."
             exit 1
           fi
@@ -619,12 +634,12 @@ jobs:
             fi
           fi
           if [ -z "$RESOLVED_ID" ]; then
-            if [ -n "${ANCHOR_IPV4:-}" ]; then
-              # Legacy fallback, byte-for-byte today's behavior: the pasted
-              # IP resolves via ?ip= (exact-one, fail closed).
-              IP4="${ANCHOR_IPV4%%/*}"
-              case "$IP4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix. Paste the IP from the server-ready email."; exit 1;; esac
-              RESP="$(curl -sS -G "$SCP/api/v1/servers" --data-urlencode "ip=$IP4" \
+            if [ -n "$EXPLICIT" ]; then
+              # Fallback: the explicit value resolves via ?ip= (exact-one,
+              # fail closed). It selects a server here; the final target
+              # still has to be one of that server's own addresses
+              # (resolve_anchor_ipv4 below).
+              RESP="$(curl -sS -G "$SCP/api/v1/servers" --data-urlencode "ip=$EXPLICIT" \
                 -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN")"
               IP_COUNT="$(printf '%s' "$RESP" | jq -r 'if type == "array" then length else -1 end' 2>/dev/null || printf '%s' "-1")"
               RESOLVED_ID="$(printf '%s' "$RESP" | jq -r 'if type == "array" and length == 1 then .[0].id // empty else empty end')"
@@ -633,7 +648,7 @@ jobs:
                 exit 1
               fi
               mask_server_id "$RESOLVED_ID"
-              echo "Discovery fell back to the pasted IP (legacy path): adopting the matched server."
+              echo "Discovery fell back to the explicit ANCHOR_IPV4 value: adopting the matched server."
             else
               echo "::error::expected 1 server, found $COUNT — and none is named $HOSTNAME. Rename the anchor to $HOSTNAME, or set the ANCHOR_IPV4 secret to the anchor IP, then re-dispatch."
               exit 1
@@ -663,21 +678,18 @@ jobs:
             guard_line "OLD_HOSTNAME" "$OLD_HOSTNAME"
             mask_escaped "$OLD_HOSTNAME"
           fi
-          # SSH/DNS target: the pasted IP wins when set (legacy,
-          # byte-for-byte); else the server detail's first IPv4 (IPv6-only
-          # resolves via detail/interfaces, never q — and fails closed here
-          # because runners have no IPv6 path).
-          if [ -n "${ANCHOR_IPV4:-}" ]; then
-            HOST4="${ANCHOR_IPV4%%/*}"
-            case "$HOST4" in ''|*[!0-9.]*) echo "::error::ANCHOR_IPV4 is not a bare IPv4 after stripping any /suffix."; exit 1;; esac
-          else
-            HOST4="$(printf '%s' "$DETAIL" | jq -r '.ipv4Addresses[0].ip // empty')"
-            [ -n "$HOST4" ] || { echo "::error::server reports no IPv4 address (IPv6-only is unsupported — runners have no IPv6). Attach an IPv4, or set ANCHOR_IPV4 and re-dispatch."; exit 1; }
-            echo "Discovery: anchor IPv4 from server detail, no pasted IP needed."
+          # SSH/DNS target is API-derived, ALWAYS (F2): the resolved
+          # server's own addresses (GET /servers/{id} detail) are the only
+          # candidates. ANCHOR_IPV4 may select one of them, never override;
+          # a non-matching value fails closed. Several addresses with no
+          # explicit pick fail loud with the address count (P4); address
+          # values stay out of the public log (exposure audit §4.3).
+          if ! HOST4="$(resolve_anchor_ipv4 "$DETAIL" "$EXPLICIT" "$HOSTNAME")"; then
+            exit 1
           fi
           # Parse-time validation (review security): the SSH/DNS target must
-          # be a bare IPv4 (both the pasted-secret and the API-derived path) —
-          # it is interpolated into runner shell and $GITHUB_OUTPUT. Fail closed.
+          # be a bare IPv4 (the resolve_anchor_ipv4 output) — it is
+          # interpolated into runner shell and $GITHUB_OUTPUT. Fail closed.
           case "$HOST4" in '' | *[!0-9.]*) echo "::error::anchor host is not a bare IPv4 — refusing to use it (injection guard)."; exit 1 ;; esac
           guard_line "ANCHOR_HOST" "$HOST4"
           echo "ANCHOR_HOST=$HOST4" >> "$GITHUB_ENV"
@@ -1228,8 +1240,10 @@ jobs:
     environment: anchor
     env:
       TENANT_USER: ${{ vars.TENANT_USER }}
-      # Resolved-or-pasted target from the device-flow job (discovery-first;
-      # the pasted secret wins when set, so the legacy path is byte-for-byte).
+      # Resolved target — the device-flow job's validated output, never the
+      # raw repo secret: API-derived, and an explicit ANCHOR_IPV4 can only
+      # have selected among the resolved server's own addresses (the
+      # producer, resolve_anchor_ipv4, fails closed on any mismatch).
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
       CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
     steps:
