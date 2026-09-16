@@ -76,6 +76,7 @@ All notable changes to this project will be documented in this file.
 - Allowlist tasks/users SCP endpoints (closes #50)
 - Mock-tang bind-proof e2e through real Caddy render (closes #57)
 - External-watch — GitHub-side cron probes the public dashboard (closes #94)
+- API-derived anchor IP + multi-IPv4 fail-loud (closes #124)
 
 
 ## [Unreleased]
