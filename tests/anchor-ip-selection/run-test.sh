@@ -8,7 +8,8 @@
 #        multi + explicit in list; duplicate candidates deduped.
 #   fail F2 poison — explicit != the resolved server's address (the SSH/DNS
 #        target can never come from the secret alone);
-#        P4 — multi-IPv4 with no explicit fails loud with the candidate list;
+#        P4 — multi-IPv4 with no explicit fails loud with the address count
+#             (values never on stderr);
 #        zero candidates (IPv6-only) fails closed;
 #        malformed detail shapes / malformed explicit values fail closed.
 #
@@ -41,6 +42,9 @@ is()  { # $1 label, $2 expected, $3 actual
 }
 contains() { # $1 label, $2 needle, $3 haystack
   case "$3" in *"$2"*) ok "$1" ;; *) bad "$1 (missing '$2')" ;; esac
+}
+lacks() { # $1 label, $2 needle, $3 haystack -- ok when the needle is ABSENT
+  case "$3" in *"$2"*) bad "$1 (found '$2')" ;; *) ok "$1" ;; esac
 }
 
 [ -f "$LIB" ] || { printf 'FAIL lib not found: %s\n' "$LIB"; exit 1; }
@@ -102,7 +106,8 @@ rc="$(RUN f1 "$ONE" "198.51.100.7" "$LABEL")"
 is "f1 F2 poison rc (fail closed)" "1" "$rc"
 is "f1 F2 poison stdout empty" "" "$(OUT f1)"
 contains "f1 F2 poison names the refusal" "not one of the resolved server's own addresses" "$(ERR f1)"
-contains "f1 F2 poison lists the server's own address" "203.0.113.10" "$(ERR f1)"
+contains "f1 F2 poison names the candidate count" "reports 1 IPv4 address" "$(ERR f1)"
+lacks "f1 F2 poison leaks no address value" "203.0.113.10" "$(ERR f1)"
 
 # The workflow strips /suffix before the lib; a raw suffix at the lib
 # boundary is not a member and must fail closed (single validated entry
@@ -115,14 +120,17 @@ is "f2 raw /suffix stdout empty" "" "$(OUT f2)"
 rc="$(RUN f3 "$TWO" "" "$LABEL")"
 is "f3 multi, no explicit rc (fail loud)" "1" "$rc"
 is "f3 multi, no explicit stdout empty" "" "$(OUT f3)"
-contains "f3 lists candidate 1" "203.0.113.10" "$(ERR f3)"
-contains "f3 lists candidate 2" "198.51.100.7" "$(ERR f3)"
+contains "f3 names the candidate count" "reports 2 IPv4 addresses" "$(ERR f3)"
+lacks "f3 leaks no candidate 1 value" "203.0.113.10" "$(ERR f3)"
+lacks "f3 leaks no candidate 2 value" "198.51.100.7" "$(ERR f3)"
 contains "f3 names the ambiguity" "IPv4 addresses" "$(ERR f3)"
 
 rc="$(RUN f4 "$TWO" "192.0.2.99" "$LABEL")"
 is "f4 multi + explicit not in list rc" "1" "$rc"
 is "f4 multi + explicit not in list stdout empty" "" "$(OUT f4)"
-contains "f4 lists candidates" "198.51.100.7" "$(ERR f4)"
+contains "f4 names the candidate count" "reports 2 IPv4 address" "$(ERR f4)"
+lacks "f4 leaks no non-member value" "198.51.100.7" "$(ERR f4)"
+lacks "f4 leaks no member value" "203.0.113.10" "$(ERR f4)"
 
 # ---- zero candidates: IPv6-only is unsupported ---------------------------
 rc="$(RUN f5 '{"ipv4Addresses":[]}' "" "$LABEL")"
@@ -311,7 +319,9 @@ is "b3 ANCHOR_HOST is the API address" "ANCHOR_HOST=203.0.113.10" "$(emitted b3 
 rc="$(RESOLVE_RUN b4 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_TWO" ANCHOR_IPV4=)"
 is "b4 multi no explicit rc (fail loud)" "1" "$rc"
 is "b4 nothing emitted" "" "$(emitted b4 genv)"
-contains "b4 lists candidate 198.51.100.7" "198.51.100.7" "$(cat "$WORK/res.b4.err")"
+contains "b4 names the candidate count" "reports 2 IPv4 addresses" "$(cat "$WORK/res.b4.err")"
+lacks "b4 leaks no candidate 203.0.113.10" "203.0.113.10" "$(cat "$WORK/res.b4.err")"
+lacks "b4 leaks no candidate 198.51.100.7" "198.51.100.7" "$(cat "$WORK/res.b4.err")"
 rc="$(RESOLVE_RUN b5 STUB_LIST="$LIST_ONE" STUB_DETAIL="$DETAIL_TWO" ANCHOR_IPV4=198.51.100.7)"
 is "b5 multi explicit member rc" "0" "$rc"
 is "b5 ANCHOR_HOST is the selected member" "ANCHOR_HOST=198.51.100.7" "$(emitted b5 genv)"

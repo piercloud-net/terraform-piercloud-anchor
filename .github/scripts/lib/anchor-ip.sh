@@ -10,7 +10,9 @@
 # server itself reports. An explicit value (ANCHOR_IPV4) may SELECT among
 # those addresses, never override them; a mismatch fails closed. A server
 # reporting several IPv4s with no explicit pick fails loud with the
-# candidate list (P4) — never a silent first-index pick.
+# address count and an operator action (P4) — never a silent first-index
+# pick, and never the address values in the public log (2026-09-12
+# exposure audit §4.3/§5).
 #
 # Contract (bash 3.2 compatible; stdout carries data, stderr carries notes):
 #   is_bare_ipv4 <s>                      0 iff s is a canonical dotted-quad
@@ -23,8 +25,10 @@
 #   resolve_anchor_ipv4 <detail-json> <explicit|""> <label>
 #                                         stdout: ONLY the chosen IPv4.
 #                                         stderr: one-line note on success,
-#                                         ::error:: + candidates/fix on
-#                                         failure. Non-zero = fail closed.
+#                                         ::error:: + count/action on
+#                                         failure; candidate values are
+#                                         NEVER written to stderr (public
+#                                         log). Non-zero = fail closed.
 # The lib expects a bare IPv4 (or empty) as <explicit>: /suffix stripping
 # is the caller's single validated entry point, never done here.
 
@@ -100,8 +104,7 @@ resolve_anchor_ipv4() { # $1 = server detail JSON, $2 = explicit bare IPv4 or ""
     fi
     printf "::error::%s: the explicit ANCHOR_IPV4 value is not one of the resolved server's own addresses — refusing it (fail closed).\n" "$label" >&2
     if [ "$count" -gt 0 ]; then
-      printf 'The resolved server reports:\n%s\n' "$candidates" >&2
-      printf 'Set ANCHOR_IPV4 to one of those addresses, delete the secret, or attach the intended IPv4 to the resolved server, then re-dispatch.\n' >&2
+      printf 'The resolved server reports %s IPv4 address(es); the explicit value matches none of them. Read the addresses in the netcup SCP (server detail), set ANCHOR_IPV4 to one of them (or delete the secret), then re-dispatch. Address values are never printed to this public log.\n' "$count" >&2
     else
       printf 'The resolved server reports no IPv4 address at all — attach the intended IPv4 to it, then re-dispatch.\n' >&2
     fi
@@ -117,7 +120,6 @@ resolve_anchor_ipv4() { # $1 = server detail JSON, $2 = explicit bare IPv4 or ""
     return 0
   fi
   printf '::error::%s: the resolved server reports %s IPv4 addresses — refusing to pick one (fail loud).\n' "$label" "$count" >&2
-  printf 'Candidates:\n%s\n' "$candidates" >&2
-  printf 'Set ANCHOR_IPV4 to one of those addresses, or attach exactly one IPv4 to the resolved server, then re-dispatch.\n' >&2
+  printf 'Read the addresses in the netcup SCP (server detail), set ANCHOR_IPV4 to the intended one (or attach exactly one IPv4 to the server), then re-dispatch. Address values are never printed to this public log.\n' >&2
   return 1
 }

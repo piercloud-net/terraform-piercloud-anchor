@@ -682,7 +682,8 @@ jobs:
           # server's own addresses (GET /servers/{id} detail) are the only
           # candidates. ANCHOR_IPV4 may select one of them, never override;
           # a non-matching value fails closed. Several addresses with no
-          # explicit pick fail loud with the candidate list (P4).
+          # explicit pick fail loud with the address count (P4); address
+          # values stay out of the public log (exposure audit §4.3).
           if ! HOST4="$(resolve_anchor_ipv4 "$DETAIL" "$EXPLICIT" "$HOSTNAME")"; then
             exit 1
           fi
