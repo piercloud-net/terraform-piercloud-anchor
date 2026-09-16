@@ -148,6 +148,32 @@ grep -q "client_auth" "${WORK}/Caddyfile.aop" || die "AOP render lacks the clien
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.aop" --adapter caddyfile
 log "AOP render validates (real client_auth stanza compiled)"
 
+# Per-anchor Origin CA render (issue #123, G1 render half): the PRODUCTION
+# shape — ORIGIN_TLS=1 with the origin-ca pair paths + AOP — goes through the
+# real render_caddyfile and caddy must compile it. A path/semantics drift in
+# the pair selection or the stanza builder fails here, not on a live dispatch.
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin-ca.key" -out "${WORK}/origin-ca.crt" \
+  -days 1 -nodes -subj "/CN=harness-origin-ca" >/dev/null 2>&1 || die "openssl could not mint the harness origin-ca pair"
+( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
+  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export ORIGIN_TLS="1" ORIGIN_CA_PAIR="1" AOP_TLS="yes"
+  export CADDY_ORIGIN_CRT="${WORK}/origin-ca.crt" CADDY_ORIGIN_KEY="${WORK}/origin-ca.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
+  # The REAL stanza builder (extracted above) must pick up the per-anchor
+  # paths — never a hand-built copy of the stanza.
+  # shellcheck disable=SC1090
+  source "${WORK}/aop-stanza.src"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.origin-ca" )
+grep -q "tls ${WORK}/origin-ca.crt ${WORK}/origin-ca.key" "${WORK}/Caddyfile.origin-ca" \
+  || die "origin-ca render does not reference the per-anchor pair paths"
+grep -q "client_auth" "${WORK}/Caddyfile.origin-ca" || die "origin-ca render lacks the client_auth block"
+grep -q "trust_pool file ${WORK}/aop-ca.pem" "${WORK}/Caddyfile.origin-ca" || die "origin-ca render lost the AOP trust pool"
+if grep -vE '^[[:space:]]*#' "${WORK}/Caddyfile.origin-ca" | grep -q "on_demand"; then
+  die "origin-ca render uses on_demand TLS — explicit per-site blocks only"
+fi
+HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.origin-ca" --adapter caddyfile
+log "Per-anchor origin-ca render validates (real pair + AOP stanza compiled)"
+
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"
 export TENANT_USER=citest TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"

@@ -951,12 +951,14 @@ jobs:
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-          # Operator-plane dashboard-TLS secrets (set at template time — the
-          # tenant pastes nothing, bootstrap stays 1 secret): Cloudflare
-          # Origin CA pair + optional zone-AOP bundle. Deployed key material
-          # for Caddy's :443, NOT a standing API token.
-          CF_ORIGIN_CERT_PEM: ${{ secrets.CF_ORIGIN_CERT_PEM }}
-          CF_ORIGIN_KEY_PEM: ${{ secrets.CF_ORIGIN_KEY_PEM }}
+          # Operator-plane dashboard-TLS material (set at template time — the
+          # tenant pastes nothing, bootstrap stays 1 secret): the per-anchor
+          # Origin CA certificate arrives via the cert-only repo VARIABLE
+          # (public material — never key material; the key is generated on
+          # the box); CF_AOP_CA_PEM stays the optional zone-AOP client-auth
+          # bundle (repo secret). Deployed material for Caddy's :443, NOT a
+          # standing API token.
+          ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
@@ -969,8 +971,8 @@ jobs:
           # Mask FIRST, before any use (repo secrets are auto-masked; the
           # explicit masks cover every expansion path, multiline PEMs
           # included). Guarded: masking an empty value warns without masking.
-          if [ -n "${{ secrets.CF_ORIGIN_CERT_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_ORIGIN_CERT_PEM }}"; fi
-          if [ -n "${{ secrets.CF_ORIGIN_KEY_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_ORIGIN_KEY_PEM }}"; fi
+          # ORIGIN_CA_CERT_PEM is public cert-only material (repo variable) —
+          # deliberately NOT masked.
           if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
           # the one-run credential (pasted secret, or the caller-set value
@@ -980,6 +982,20 @@ jobs:
           if [ "${{ inputs.rotate_keys }}" = "true" ]; then ARGS="--rotate"; fi
           # shellcheck disable=SC2086: ARGS is empty-or-one-known-flag by construction.
           .github/scripts/020-provision-anchor.sh $ARGS provision
+
+      - name: Upload per-anchor CSR artifact
+        # always(): the CSR is most needed when a LATER step fails (the run
+        # already wrote it before the probes). apply-only, like the A1 window.
+        if: always() && inputs.mode == 'apply'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
+        with:
+          name: origin-ca-csr-${{ vars.TENANT_USER }}
+          path: origin-ca.csr
+          # 90 = the public-repo cap. Public material (a CSR carries no key):
+          # the hand-off for operator-side signing; the signed cert returns
+          # via the cert-only ORIGIN_CA_CERT_PEM variable.
+          retention-days: 90
+          if-no-files-found: warn
 
       - name: Best-effort root lock (passwordless finally-path)
         if: failure() && inputs.mode == 'apply'
