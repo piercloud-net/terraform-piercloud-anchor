@@ -109,9 +109,10 @@ printf '          # retention-days: 400 was the old value\n          retention-d
 check "full-line comment is skipped" 0 "$TMP/comment-line"
 expect_out "full-line comment not counted" "retention-days literals checked: 1"
 
-# 8. The real tree passes and proves both uploads.
+# 8. The real tree passes and proves every upload (head-sha, thumbprint,
+# per-anchor CSR — the third landed with issue #123).
 check "real tree passes" 0 "$REPO_ROOT/.github/workflows"
-expect_out "real tree counts both literals" "retention-days literals checked: 2"
+expect_out "real tree counts all literals" "retention-days literals checked: 3"
 
 echo "harness summary: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
