@@ -15,6 +15,9 @@
 # Plus static wiring assertions over provision.yml: the lib is sourced, the
 # call site uses resolve_anchor_ipv4, the secret is normalized once before
 # any use, and the old direct-override / silent-first-index shapes are gone.
+# The wiring checks are structural (non-comment lines; the HOST4 assignment
+# pinned to the exact guarded call), so a partial revert cannot satisfy them
+# by leaving the old code text in a comment.
 #
 # Cred-free, offline: no network, no credentials, real jq.
 set -euo pipefail
@@ -191,27 +194,38 @@ for bad in 256.1.1.1 01.2.3.4 1.2.3.4. 1.2.3 1.2.3.4/24 not-an-ip 999.1.1.1 1.2.
 done
 
 # ---- static wiring over provision.yml ------------------------------------
-has()  { if grep -qF -- "$2" "$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
-lack() { if grep -qF -- "$2" "$1"; then bad "$3 (found: $2)"; else ok "$3"; fi; }
-first_line() { grep -nF -- "$1" "$2" 2>/dev/null | head -n1 | cut -d: -f1 || true; }
-before() { # $1 label, $2 earlier line, $3 later line
-  if [ -n "$2" ] && [ -n "$3" ] && [ "$2" -lt "$3" ]; then ok "$1"; else bad "$1 (line order: $2 then $3)"; fi
+# Asserted structurally, not by substring alone: every required pattern must
+# sit on a NON-COMMENT line, and the HOST4 assignment must be exactly the
+# guarded resolve_anchor_ipv4 call — a same-line fallback that leaves the
+# call text in a trailing comment (or wraps it in a substitution) fails.
+active_line() { # $1 needle, $2 file -> first non-comment line number containing it
+  awk -v n="$1" 'index($0, n) && $0 !~ /^[[:space:]]*#/ { print NR; exit }' "$2"
 }
-has "$PROV" '. .github/scripts/lib/anchor-ip.sh' "workflow sources .github/scripts/lib/anchor-ip.sh"
-has "$PROV" 'resolve_anchor_ipv4 "$DETAIL" "$EXPLICIT" "$HOSTNAME"' "workflow resolves HOST4 via resolve_anchor_ipv4"
-has "$PROV" 'EXPLICIT="${ANCHOR_IPV4%%/*}"' "workflow strips any /suffix once into EXPLICIT"
-has "$PROV" 'is_bare_ipv4 "$EXPLICIT"' "workflow validates the explicit value with is_bare_ipv4"
+active() { # $1 label, $2 needle, $3 file
+  if [ -n "$(active_line "$2" "$3")" ]; then ok "$1"; else bad "$1 (no non-comment line with: $2)"; fi
+}
+lack() { if grep -qF -- "$2" "$1"; then bad "$3 (found: $2)"; else ok "$3"; fi; }
+before() { # $1 label, $2 earlier line, $3 later line
+  if [ -n "$2" ] && [ -n "$3" ] && [ "$2" -lt "$3" ] 2>/dev/null; then ok "$1"; else bad "$1 (line order: $2 then $3)"; fi
+}
+active "workflow sources .github/scripts/lib/anchor-ip.sh" '. .github/scripts/lib/anchor-ip.sh' "$PROV"
+active "workflow strips any /suffix once into EXPLICIT" 'EXPLICIT="${ANCHOR_IPV4%%/*}"' "$PROV"
+active "workflow validates the explicit value with is_bare_ipv4" 'is_bare_ipv4 "$EXPLICIT"' "$PROV"
+# Exactly one HOST4 assignment anywhere (start of line, after whitespace, or
+# after `!`); the resolved-output write `ANCHOR_HOST=$HOST4` is not one.
+is "exactly one HOST4 assignment (the resolve_anchor_ipv4 call site)" "1" "$(grep -cE '(^|[[:space:]!])HOST4=' "$PROV")"
+host4_line="$(grep -nE '(^|[[:space:]!])HOST4=' "$PROV" | head -n1 | cut -d: -f1)"
+expected4='if ! HOST4="$(resolve_anchor_ipv4 "$DETAIL" "$EXPLICIT" "$HOSTNAME")"; then'
+got4="$(sed -n "${host4_line:-99999}p" "$PROV" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+is "HOST4 assignment is exactly the guarded lib call" "$expected4" "$got4"
 before "lib sourced before the explicit validation" \
-  "$(first_line '. .github/scripts/lib/anchor-ip.sh' "$PROV")" \
-  "$(first_line 'is_bare_ipv4 "$EXPLICIT"' "$PROV")"
+  "$(active_line '. .github/scripts/lib/anchor-ip.sh' "$PROV")" \
+  "$(active_line 'is_bare_ipv4 "$EXPLICIT"' "$PROV")"
 before "explicit normalized before the resolve call" \
-  "$(first_line 'EXPLICIT="${ANCHOR_IPV4%%/*}"' "$PROV")" \
-  "$(first_line 'resolve_anchor_ipv4 "$DETAIL"' "$PROV")"
+  "$(active_line 'EXPLICIT="${ANCHOR_IPV4%%/*}"' "$PROV")" \
+  "${host4_line:-}"
 lack "$PROV" 'ipv4Addresses[0]' "no silent first-index pick remains in provision.yml"
 lack "$PROV" 'HOST4="${ANCHOR_IPV4' "no direct HOST4 override from the secret remains"
-# The count binding: a partial revert that keeps a second HOST4= assignment
-# (e.g. a fallback before the lib call) must fail this harness.
-is "exactly one HOST4 assignment (the resolve_anchor_ipv4 call site)" "1" "$(grep -cF 'HOST4=' "$PROV")"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
