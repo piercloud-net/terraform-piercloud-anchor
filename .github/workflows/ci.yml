@@ -633,7 +633,7 @@ jobs:
             # large list makes grep's early exit SIGPIPE the writer
             # (pipeline rc 141), which silently turns this match into
             # run=no on exactly the big PRs that need the harnesses.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety|origin-ca)/)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|retention-cap|policy-naming|public-log-safety|origin-ca|gatus-render)/)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -658,6 +658,7 @@ jobs:
           bash tests/policy-naming/run-test.sh
           bash tests/public-log-safety/run-test.sh
           bash tests/origin-ca/run-test.sh
+          bash tests/gatus-render/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |
