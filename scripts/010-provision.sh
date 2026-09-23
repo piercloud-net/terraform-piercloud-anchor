@@ -794,7 +794,7 @@ fi
 if [ -n "${NTFY_TOPIC:-}" ]; then
   # Fail fast on YAML injection: topic/token interpolate into config-as-data.
   case "$NTFY_TOPIC" in ''|*[!a-zA-Z0-9_-]*) die "bad NTFY_TOPIC (chars [a-zA-Z0-9_-] only): ${NTFY_TOPIC}";; esac
-  case "$NTFY_TOKEN" in *[[:space:]]*|*[![:print:]]*) die "bad NTFY_TOKEN (no whitespace/control characters)";; esac
+  case "${NTFY_TOKEN:-}" in *[[:space:]]*|*[![:print:]]*) die "bad NTFY_TOKEN (no whitespace/control characters)";; esac
   ALERTING_YAML="  ntfy:
     url: https://ntfy.sh
     topic: ${NTFY_TOPIC}"
