@@ -972,6 +972,8 @@ EOF
 # not active (names only; never the topic).
 if [ "$ALERTS_EXPECTED" -gt 0 ]; then
   log "Gatus alert stanzas: ${ALERTS_EXPECTED} — $(printf '%s' "${ALERTS_EXPECTED_NAMES}" | tr '\n' ',' | sed 's/,$//')"
+elif [ -n "${NTFY_TOPIC:-}" ]; then
+  log "Gatus alert stanzas: 0 (push channel configured; no alerting rows in this shape)"
 else
   log "Gatus alert stanzas: 0 (no push channel configured)"
 fi

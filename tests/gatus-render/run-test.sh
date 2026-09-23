@@ -164,6 +164,14 @@ lacks "no-topic: no custom provider" "$(cat "$CFG")" "custom:"
 has "no-topic: warns instead of pushing" "$(cat "$CFG")" "No push channel"
 has "no-topic: platform row still rendered" "$(block platform "$CFG")" "name: platform"
 
+# ---- (c2) console-fallback shape with a topic: zero alert sites -----------
+fixture_env
+unset TENANT_USER STATUS_HOST
+export NTFY_TOPIC=pc-test-topic
+if render fallback_topic; then ok "console-fallback + topic renders"; else bad "console-fallback + topic renders"; fi
+has "fallback: zero stanzas names the configured channel" "$(cat "$WORK/fallback_topic/stderr.log")" "push channel configured; no alerting rows"
+lacks "fallback: does not claim no channel" "$(cat "$WORK/fallback_topic/stderr.log")" "no push channel configured"
+
 # ---- (d) fail-closed role gate -------------------------------------------
 fixture_env
 export ANCHOR_ROLE=bogus
