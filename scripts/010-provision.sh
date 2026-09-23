@@ -757,6 +757,10 @@ fi
 # Tenant endpoints. Bad pairs fail closed: a typo'd monitor you'd trust is
 # worse than none.
 ENDPOINTS_YAML=""
+# Alert-intent counter (issue #134, call C4): every alert stanza appended
+# below increments it; the render-time assertion after the config write
+# compares it to the rendered count.
+ALERTS_EXPECTED=0
 # Default target: the tenant homepage derives from TENANT_USER — no input
 # needed (pier → https://pier.piercloud.net). Skipped only for hand runs
 # without env (console fallback = self-check only, as documented).
@@ -779,6 +783,7 @@ if [ -n "${TENANT_USER:-}" ]; then
               TRIGGERED: \"5\"
               RESOLVED: \"3\"
 "
+    ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
   fi
 fi
 # Built-in endpoint names actually rendered this run (issue #134, call C6):
@@ -810,6 +815,7 @@ if [ "$PLATFORM_ALERTS" -eq 1 ] && [ -n "${NTFY_TOPIC:-}" ]; then
               TRIGGERED: \"5\"
               RESOLVED: \"3\"
 "
+  ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
 fi
 if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   set -f
@@ -835,6 +841,7 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
         provider-override:
           priority: 4  # alert class 4 (time-sensitive; never a night emergency)
 "
+      ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
     fi
   done
   IFS="$OLD_IFS"
@@ -927,9 +934,16 @@ TMP_CFG="${GATUS_CONFIG}.new"
       printf '%s\n' "        failure-threshold: 3"
       printf '%s\n' "        provider-override:"
       printf '%s\n' "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
+      ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
     fi
   fi
 } >"$TMP_CFG"
+# Render-time assertion (issue #134, call C4): the number of endpoint alert
+# stanzas must equal the intent counted while rendering — the #118 class of
+# gap (condition rendered, stanza forgotten) is otherwise invisible.
+ALERTS_RENDERED="$(grep -c '^    alerts:$' "$TMP_CFG" || true)"
+[ "$ALERTS_RENDERED" -eq "$ALERTS_EXPECTED" ] \
+  || die "Gatus render assertion failed: ${ALERTS_RENDERED} alerts stanza(s) rendered, expected ${ALERTS_EXPECTED} — refusing to install"
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
   log "Gatus config unchanged — no restart"
   rm -f "$TMP_CFG"

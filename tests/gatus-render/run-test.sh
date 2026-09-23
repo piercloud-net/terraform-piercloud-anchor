@@ -67,7 +67,7 @@ EOF
 render() { # $1 = case label; the caller exports the env for the case
   local dir="$WORK/$1"
   mkdir -p "$dir"
-  { cat "${WORK}/stubs.src"; printf 'GATUS_CONFIG=%q\n' "$dir/config.yaml"; cat "${WORK}/span.src"; } >"$dir/run.sh"
+  { cat "${WORK}/stubs.src"; printf 'GATUS_CONFIG=%q\n' "$dir/config.yaml"; cat "${SPAN:-${WORK}/span.src}"; } >"$dir/run.sh"
   ( cd "$dir"; bash run.sh >"$dir/stdout.log" 2>"$dir/stderr.log" )
 }
 
@@ -189,6 +189,19 @@ has "hand-run pair renders as a normal row" "$(block main "$WORK/main_pair_no_te
 fixture_env
 export GATUS_ENDPOINTS="bad.name=https://example.org"
 if render bad_pair; then bad "malformed pair fails closed"; else ok "malformed pair fails closed"; fi
+
+# ---- (g) the render-time assertion has teeth (C4) -------------------------
+# Drop the first intent increment (main's): the rendered count (4) then
+# exceeds the tracked intent (3) and the render must refuse to install.
+fixture_env
+export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
+INCR_LINE="$(grep -nF 'ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+[ -n "$INCR_LINE" ] || { printf 'FAIL harness could not find an intent increment\n'; exit 1; }
+sed "${INCR_LINE}d" "${WORK}/span.src" >"${WORK}/span-teeth.src"
+SPAN="${WORK}/span-teeth.src"
+if render teeth_assertion; then bad "render assertion catches a missing intent"; else ok "render assertion catches a missing intent"; fi
+has "assertion failure names the counts" "$(cat "$WORK/teeth_assertion/stderr.log")" "render assertion failed"
+SPAN="${WORK}/span.src"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
