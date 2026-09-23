@@ -757,10 +757,17 @@ fi
 # Tenant endpoints. Bad pairs fail closed: a typo'd monitor you'd trust is
 # worse than none.
 ENDPOINTS_YAML=""
-# Alert-intent counter (issue #134, call C4): every alert stanza appended
-# below increments it; the render-time assertion after the config write
-# compares it to the rendered count.
+# Alert-intent ledger (issue #134, call C4): every alert stanza appended
+# below records its endpoint name; the render-time assertion after the
+# config write checks each named endpoint's block carries the stanza and
+# that the total matches — a count-only check would pass a stanza moved
+# to the wrong endpoint (#136 review).
 ALERTS_EXPECTED=0
+ALERTS_EXPECTED_NAMES=""
+alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
+  ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+  ALERTS_EXPECTED_NAMES="${ALERTS_EXPECTED_NAMES}${1}"$'\n'
+}
 # Default target: the tenant homepage derives from TENANT_USER — no input
 # needed (pier → https://pier.piercloud.net). Skipped only for hand runs
 # without env (console fallback = self-check only, as documented).
@@ -783,7 +790,7 @@ if [ -n "${TENANT_USER:-}" ]; then
               TRIGGERED: \"5\"
               RESOLVED: \"3\"
 "
-    ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+    alert_intent main
   fi
 fi
 # Built-in endpoint names actually rendered this run (issue #134, call C6):
@@ -815,7 +822,7 @@ if [ "$PLATFORM_ALERTS" -eq 1 ] && [ -n "${NTFY_TOPIC:-}" ]; then
               TRIGGERED: \"5\"
               RESOLVED: \"3\"
 "
-  ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+  alert_intent platform
 fi
 if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   set -f
@@ -841,7 +848,7 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
         provider-override:
           priority: 4  # alert class 4 (time-sensitive; never a night emergency)
 "
-      ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+      alert_intent "$name"
     fi
   done
   IFS="$OLD_IFS"
@@ -934,16 +941,40 @@ TMP_CFG="${GATUS_CONFIG}.new"
       printf '%s\n' "        failure-threshold: 3"
       printf '%s\n' "        provider-override:"
       printf '%s\n' "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
-      ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+      alert_intent "dashboard TLS (via edge)"
     fi
   fi
 } >"$TMP_CFG"
-# Render-time assertion (issue #134, call C4): the number of endpoint alert
-# stanzas must equal the intent counted while rendering — the #118 class of
-# gap (condition rendered, stanza forgotten) is otherwise invisible.
+# Render-time assertion (issue #134, call C4): the rendered alert stanzas
+# must equal the intent ledger recorded while rendering — the #118 class of
+# gap (condition rendered, stanza forgotten) is otherwise invisible. Total
+# equality plus a per-name presence check is exact: every intended name
+# present with equal totals leaves no room for an extra stanza, and a
+# stanza moved to the wrong endpoint keeps the total and still fails
+# (#136 review, finding 2).
 ALERTS_RENDERED="$(grep -c '^    alerts:$' "$TMP_CFG" || true)"
 [ "$ALERTS_RENDERED" -eq "$ALERTS_EXPECTED" ] \
   || die "Gatus render assertion failed: ${ALERTS_RENDERED} alerts stanza(s) rendered, expected ${ALERTS_EXPECTED} — refusing to install"
+while IFS= read -r _alert_ep; do
+  [ -n "$_alert_ep" ] || continue
+  awk -v want="  - name: ${_alert_ep}" '
+    $0 == want { inb = 1; next }
+    inb && /^  - name: / { inb = 0 }
+    inb && $0 == "    alerts:" { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$TMP_CFG" \
+    || die "Gatus render assertion failed: '${_alert_ep}' is missing its alerts stanza — refusing to install"
+done <<EOF
+${ALERTS_EXPECTED_NAMES}
+EOF
+# Silent-downgrade check (issue #134, call C7): the run log names the
+# endpoints that will alert — `platform` missing means the role/topic is
+# not active (names only; never the topic).
+if [ "$ALERTS_EXPECTED" -gt 0 ]; then
+  log "Gatus alert stanzas: ${ALERTS_EXPECTED} — $(printf '%s' "${ALERTS_EXPECTED_NAMES}" | tr '\n' ',' | sed 's/,$//')"
+else
+  log "Gatus alert stanzas: 0 (no push channel configured)"
+fi
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
   log "Gatus config unchanged — no restart"
   rm -f "$TMP_CFG"

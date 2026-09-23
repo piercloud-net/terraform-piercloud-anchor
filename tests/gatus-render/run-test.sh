@@ -87,13 +87,15 @@ block() { # $1 = endpoint name, $2 = config file -> that endpoint's YAML block
   ' "$2"
 }
 
-yaml_ok() { # $1 label, $2 config file (ruby/psych when available)
+yaml_ok() { # $1 label, $2 config file (ruby/psych required — fail loud, never silently skip)
   if command -v ruby >/dev/null 2>&1; then
     if ruby -ryaml -e 'YAML.load_file(ARGV[0], aliases: true)' "$2" >/dev/null 2>&1; then
       ok "$1"
     else
       bad "$1 (YAML does not parse)"
     fi
+  else
+    bad "$1 (ruby unavailable — YAML parse NOT verified)"
   fi
 }
 
@@ -191,16 +193,27 @@ export GATUS_ENDPOINTS="bad.name=https://example.org"
 if render bad_pair; then bad "malformed pair fails closed"; else ok "malformed pair fails closed"; fi
 
 # ---- (g) the render-time assertion has teeth (C4) -------------------------
-# Drop the first intent increment (main's): the rendered count (4) then
+# (g1) drop the first intent call (main's): the rendered count (4) then
 # exceeds the tracked intent (3) and the render must refuse to install.
 fixture_env
 export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
-INCR_LINE="$(grep -nF 'ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))' "${WORK}/span.src" | head -1 | cut -d: -f1)"
-[ -n "$INCR_LINE" ] || { printf 'FAIL harness could not find an intent increment\n'; exit 1; }
-sed "${INCR_LINE}d" "${WORK}/span.src" >"${WORK}/span-teeth.src"
+INTENT_LINE="$(grep -nF 'alert_intent ' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+[ -n "$INTENT_LINE" ] || { printf 'FAIL harness could not find an intent call\n'; exit 1; }
+sed "${INTENT_LINE}d" "${WORK}/span.src" >"${WORK}/span-teeth.src"
 SPAN="${WORK}/span-teeth.src"
 if render teeth_assertion; then bad "render assertion catches a missing intent"; else ok "render assertion catches a missing intent"; fi
 has "assertion failure names the counts" "$(cat "$WORK/teeth_assertion/stderr.log")" "render assertion failed"
+
+# (g2) a ledger name whose block carries no stanza: totals still match
+# (4 == 4), so only the per-name check catches it — the #136 review's
+# swap/move class (an endpoint in the ledger, its block unalerted).
+fixture_env
+export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
+awk '!done && /alert_intent main/ { sub(/alert_intent main/, "alert_intent moved-row"); done = 1 } { print }' \
+  "${WORK}/span.src" >"${WORK}/span-moved.src"
+SPAN="${WORK}/span-moved.src"
+if render moved_assertion; then bad "render assertion catches a ledger name without its stanza"; else ok "render assertion catches a ledger name without its stanza"; fi
+has "moved-row failure names the unalerted endpoint" "$(cat "$WORK/moved_assertion/stderr.log")" "'moved-row' is missing its alerts stanza"
 SPAN="${WORK}/span.src"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -27,6 +27,8 @@ Related: [usage.md](usage.md) (end-to-end flow) · [invariants.md](invariants.md
 
 `platform` is the shared infrastructure your server runs on — monitor-only on tenant pages (diagnosis, not a page). The operator's first check when it is red is the host watchdog state behind the endpoint (`/healthz` 503 = stale checks). While the fleet has one host, the row is that host; the aggregate meaning widens as hosts are added.
 
+**Operator anchors:** the `platform` row alerts (tenant pages stay monitor-only). The role is the `ANCHOR_ROLE` repo variable — `operator` alerts, unset/`tenant` is monitor-only, anything else fails the run closed. After setting it (with a real `NTFY_TOPIC`), re-dispatch `mode=apply` and check the run log's `Gatus alert stanzas:` line names `platform`: an unset role silently downgrades the row to monitor-only. A run that clears the variable for a tenant-shape proof must restore it and re-dispatch to confirm the operator shape.
+
 ## Boot-failure decision tree (main box asks for a passphrase)
 
 Your main box dropped to a passphrase prompt instead of unlocking via the anchor. Four causes, in order:
