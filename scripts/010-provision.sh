@@ -850,7 +850,14 @@ TMP_CFG="${GATUS_CONFIG}.new"
     printf '%s\n' "    interval: 300s"
     printf '%s\n' "    conditions:"
     printf '%s\n' "      - \"[STATUS] == 200\""
-    printf '%s\n' "      - \"[CERTIFICATE_EXPIRATION] > 720h\"  # fail (and ALERT via ntfy) inside the ~30d stale-cert window"
+    printf '%s\n' "      - \"[CERTIFICATE_EXPIRATION] > 720h\"  # fail inside the ~30d stale-cert window (ntfy ALERT when a topic is set)"
+    if [ -n "${NTFY_TOPIC:-}" ]; then
+      printf '%s\n' "    alerts:"
+      printf '%s\n' "      - type: ntfy"
+      printf '%s\n' "        failure-threshold: 3"
+      printf '%s\n' "        provider-override:"
+      printf '%s\n' "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
+    fi
   fi
 } >"$TMP_CFG"
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
