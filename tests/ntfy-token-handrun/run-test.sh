@@ -44,6 +44,9 @@ run_case() { # $1 = unset|empty|valid|ws|ctrl -> prints ok|die (or the error)
       ws)    NTFY_TOKEN="$(printf 'tk\tbad')" ;;
       ctrl)  NTFY_TOKEN="$(printf 'tk\001bad')" ;;
     esac
+    # exported so the variable reads as externally used (the eval'd snippet
+    # consumes it indirectly; shellcheck SC2034). Unset stays unset.
+    export NTFY_TOKEN
     die() { printf 'die\n'; exit 1; }
     eval "$SNIPPET"
     printf 'ok\n'
