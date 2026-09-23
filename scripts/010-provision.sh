@@ -68,8 +68,8 @@ validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail
     return 1
   fi
   case "$1" in
-    anchor* | status* | pcu*)
-      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu are platform labels, not tenants.\n' "$1" >&2
+    anchor* | status* | pcu* | platform*)
+      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
       return 1 ;;
   esac
   return 0
@@ -734,8 +734,18 @@ assert_no_key_leak
 #    repo secret + re-dispatch). Rendered on EVERY run; hand edits die
 #    (one-time backup below). Env in: GATUS_ENDPOINTS (comma-separated
 #    name=url pairs, http(s) only, v1), NTFY_TOPIC / NTFY_TOKEN (empty =
-#    checks without push + warn).
+#    checks without push + warn), ANCHOR_ROLE (empty/tenant = the platform
+#    row is monitor-only; operator = it alerts).
 # ---------------------------------------------------------------------------
+# --- gatus-render:start ---
+# Operator-role gate (issue #134, call C1): unset/tenant = the platform row
+# is monitor-only; operator = the platform row alerts (with a push topic).
+# Fail closed on anything else — an unknown role must not silently alert.
+case "${ANCHOR_ROLE:-}" in
+  ''|tenant) PLATFORM_ALERTS=0 ;;
+  operator)  PLATFORM_ALERTS=1 ;;
+  *) die "bad ANCHOR_ROLE (want empty/tenant/operator): ${ANCHOR_ROLE}" ;;
+esac
 log "Rendering dispatch-managed Gatus config (${GATUS_CONFIG})"
 mkdir -p "$(dirname "${GATUS_CONFIG}")"
 caddy_status_names
@@ -747,6 +757,17 @@ fi
 # Tenant endpoints. Bad pairs fail closed: a typo'd monitor you'd trust is
 # worse than none.
 ENDPOINTS_YAML=""
+# Alert-intent ledger (issue #134, call C4): every alert stanza appended
+# below records its endpoint name; the render-time assertion after the
+# config write checks each named endpoint's block carries the stanza and
+# that the total matches — a count-only check would pass a stanza moved
+# to the wrong endpoint (#136 review).
+ALERTS_EXPECTED=0
+ALERTS_EXPECTED_NAMES=""
+alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
+  ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+  ALERTS_EXPECTED_NAMES="${ALERTS_EXPECTED_NAMES}${1}"$'\n'
+}
 # Default target: the tenant homepage derives from TENANT_USER — no input
 # needed (pier → https://pier.piercloud.net). Skipped only for hand runs
 # without env (console fallback = self-check only, as documented).
@@ -760,10 +781,48 @@ if [ -n "${TENANT_USER:-}" ]; then
 "
   if [ -n "${NTFY_TOPIC:-}" ]; then
     ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
-      - type: ntfy
+      - type: custom
         failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: \"5\"
+              RESOLVED: \"3\"
 "
+    alert_intent main
   fi
+fi
+# Built-in endpoint names actually rendered this run (issue #134, call C6):
+# a GATUS_ENDPOINTS pair may not shadow one — the render has no dedupe, so a
+# collision would silently render two rows under one name. `platform` is
+# unconditional; `main` exists only when TENANT_USER is set (console
+# fallback runs don't render it, so a `main=` pair is accepted there — the
+# next dispatch fails loud, which is when the duplicate would appear).
+BUILTIN_NAMES="platform"
+[ -n "${TENANT_USER:-}" ] && BUILTIN_NAMES="main ${BUILTIN_NAMES}"
+# Platform row (issue #134, calls C2/C3): the shared host's health as a
+# platform-level fact, built into the render (not a per-anchor secret). The
+# durable name is created S1-era on the control plane; tenant pages show it
+# monitor-only (host-down already reds `main`), the operator anchor alerts.
+ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: platform
+    url: https://platform.piercloud.net/healthz
+    interval: 60s
+    conditions:
+      - \"[STATUS] == 200\"
+"
+if [ "$PLATFORM_ALERTS" -eq 1 ] && [ -n "${NTFY_TOPIC:-}" ]; then
+  ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: \"5\"
+              RESOLVED: \"3\"
+"
+  alert_intent platform
 fi
 if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   set -f
@@ -775,6 +834,7 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
     url="$(printf '%s' "$pair" | cut -d= -f2- | tr -d '[:space:]')"
     case "$name" in ''|*[!a-zA-Z0-9_-]*) die "bad GATUS_ENDPOINTS pair (want name=url, name chars [a-zA-Z0-9_-]): $pair";; esac
     case "$url" in http://*|https://*) ;; *) die "bad GATUS_ENDPOINTS pair (v1 supports http(s) URLs only): $pair";; esac
+    case " ${BUILTIN_NAMES} " in *" ${name} "*) die "GATUS_ENDPOINTS pair name '${name}' collides with a built-in endpoint (${BUILTIN_NAMES// /, }) — pick another name";; esac
     ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: ${name}
     url: ${url}
     interval: 60s
@@ -785,7 +845,10 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
       ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
       - type: ntfy
         failure-threshold: 3
+        provider-override:
+          priority: 4  # alert class 4 (time-sensitive; never a night emergency)
 "
+      alert_intent "$name"
     fi
   done
   IFS="$OLD_IFS"
@@ -802,6 +865,27 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
     ALERTING_YAML="${ALERTING_YAML}
     token: ${NTFY_TOKEN}"
   fi
+  # ntfy-JSON bridge (issue #134, call C9): the native ntfy provider repeats
+  # its single priority on resolve, so class-5 rows (main/platform) publish
+  # through ntfy's JSON API instead — [ALERT_TRIGGERED_OR_RESOLVED] maps to
+  # 5 (triggered) / 3 (resolved), and per-alert provider-override.placeholders
+  # carries the class.
+  ALERTING_YAML="${ALERTING_YAML}
+  custom:
+    url: \"https://ntfy.sh/\"
+    method: POST
+    headers:
+      Content-Type: \"application/json\""
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    ALERTING_YAML="${ALERTING_YAML}
+      Authorization: \"Bearer ${NTFY_TOKEN}\""
+  fi
+  ALERTING_YAML="${ALERTING_YAML}
+    body: '{\"topic\":\"${NTFY_TOPIC}\",\"title\":\"Gatus: [ENDPOINT_NAME]\",\"message\":\"[ENDPOINT_NAME]: [RESULT_CONDITIONS][RESULT_ERRORS]\",\"priority\":[ALERT_TRIGGERED_OR_RESOLVED]}'
+    placeholders:
+      ALERT_TRIGGERED_OR_RESOLVED:
+        TRIGGERED: \"5\"
+        RESOLVED: \"3\""
 else
   ALERTING_YAML="  # No push channel: NTFY_TOPIC unset, so failures are checked
   # but never pushed. Set the NTFY_TOPIC secret + re-dispatch for alerts."
@@ -857,9 +941,42 @@ TMP_CFG="${GATUS_CONFIG}.new"
       printf '%s\n' "        failure-threshold: 3"
       printf '%s\n' "        provider-override:"
       printf '%s\n' "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
+      alert_intent "dashboard TLS (via edge)"
     fi
   fi
 } >"$TMP_CFG"
+# Render-time assertion (issue #134, call C4): the rendered alert stanzas
+# must equal the intent ledger recorded while rendering — the #118 class of
+# gap (condition rendered, stanza forgotten) is otherwise invisible. Total
+# equality plus a per-name presence check is exact: every intended name
+# present with equal totals leaves no room for an extra stanza, and a
+# stanza moved to the wrong endpoint keeps the total and still fails
+# (#136 review, finding 2).
+ALERTS_RENDERED="$(grep -c '^    alerts:$' "$TMP_CFG" || true)"
+[ "$ALERTS_RENDERED" -eq "$ALERTS_EXPECTED" ] \
+  || die "Gatus render assertion failed: ${ALERTS_RENDERED} alerts stanza(s) rendered, expected ${ALERTS_EXPECTED} — refusing to install"
+while IFS= read -r _alert_ep; do
+  [ -n "$_alert_ep" ] || continue
+  awk -v want="  - name: ${_alert_ep}" '
+    $0 == want { inb = 1; next }
+    inb && /^  - name: / { inb = 0 }
+    inb && $0 == "    alerts:" { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$TMP_CFG" \
+    || die "Gatus render assertion failed: '${_alert_ep}' is missing its alerts stanza — refusing to install"
+done <<EOF
+${ALERTS_EXPECTED_NAMES}
+EOF
+# Silent-downgrade check (issue #134, call C7): the run log names the
+# endpoints that will alert — `platform` missing means the role/topic is
+# not active (names only; never the topic).
+if [ "$ALERTS_EXPECTED" -gt 0 ]; then
+  log "Gatus alert stanzas: ${ALERTS_EXPECTED} — $(printf '%s' "${ALERTS_EXPECTED_NAMES}" | tr '\n' ',' | sed 's/,$//')"
+elif [ -n "${NTFY_TOPIC:-}" ]; then
+  log "Gatus alert stanzas: 0 (push channel configured; no alerting rows in this shape)"
+else
+  log "Gatus alert stanzas: 0 (no push channel configured)"
+fi
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
   log "Gatus config unchanged — no restart"
   rm -f "$TMP_CFG"
@@ -869,6 +986,7 @@ else
   log "Gatus config installed (rendered from dispatch env)"
   GATUS_RESTART=1
 fi
+# --- gatus-render:end ---
 
 # ---------------------------------------------------------------------------
 # c1) Per-anchor Origin CA key + CSR + cert install (issue #123, M2)

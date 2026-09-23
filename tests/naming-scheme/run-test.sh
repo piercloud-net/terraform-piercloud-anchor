@@ -66,6 +66,8 @@ expect_fail 'pier--carlo'
 expect_fail 'anchorfan'
 expect_fail 'statuspage'
 expect_fail 'pcu123'
+expect_fail 'platform'    # #134: the platform-health hostname is reserved
+expect_fail 'platformer'  # prefix reservation, not just the exact name
 expect_fail 'abcdefghijklmnopqrstu' # 21 chars
 expect_fail ''                      # empty
 expect_pass 'pier'

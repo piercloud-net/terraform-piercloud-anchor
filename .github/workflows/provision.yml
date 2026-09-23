@@ -472,6 +472,7 @@ jobs:
           SCP_USER_ID_IN: ${{ secrets.SCP_USER_ID }}
           CUSTOMER_NUMBER: ${{ secrets.CUSTOMER_NUMBER }}
           TENANT_USER: ${{ vars.TENANT_USER }}
+          ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE }}
         run: |
           set -euo pipefail
           # Handoff-write guard (review security): every API-derived value
@@ -520,6 +521,14 @@ jobs:
           # zone-less names; STATUS_HOST adds the zone here because the
           # on-box Caddy render consumes it as the dashboard FQDN.
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
+          # ANCHOR_ROLE (issue #134): optional operator-plane repo variable.
+          # Empty or `tenant` = the platform row is monitor-only; `operator` =
+          # it alerts (with a push topic). Anything else fails the run before
+          # any netcup use; the on-box render validates again (defense in depth).
+          case "${ANCHOR_ROLE:-}" in
+            ''|tenant|operator) ;;
+            *) echo "::error::ANCHOR_ROLE repo variable must be empty, 'tenant', or 'operator' — refusing to run."; exit 1 ;;
+          esac
           . scripts/lib/naming.sh
           . .github/scripts/lib/anchor-ip.sh
           # ANCHOR_IPV4 is optional and may carry the server-ready email's
@@ -949,6 +958,7 @@ jobs:
           ROOT_PASSWORD: ${{ secrets.ANCHOR_ROOT_PASSWORD }}
           BOOTSTRAP_ROOT_PASSWORD: ${{ env.BOOTSTRAP_ROOT_PASSWORD }}
           TENANT_USER: ${{ vars.TENANT_USER }}
+          ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}

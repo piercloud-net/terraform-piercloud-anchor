@@ -30,8 +30,8 @@ validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail
     return 1
   fi
   case "$1" in
-    anchor* | status* | pcu*)
-      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu are platform labels, not tenants.\n' "$1" >&2
+    anchor* | status* | pcu* | platform*)
+      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
       return 1 ;;
   esac
   return 0
