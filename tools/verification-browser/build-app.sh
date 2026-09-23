@@ -10,14 +10,16 @@
 # CfT ships ad-hoc/linker-signed (no team, no entitlements), so branding is
 # simple: clone, rename Info.plist, re-sign ad-hoc.
 #
-# Storage: `cp -Rc` is an APFS copy-on-write clone — blocks are shared with the
-# source, so the clone costs almost no space. Re-run after CfT updates (or to
-# refresh the brand).
+# Storage: the CfT base install is shared at `~/.cft` (default CFT_DIR) — one
+# download for every project; `cp -Rc` is an APFS copy-on-write clone, so this
+# project's app bundle costs almost no extra space. Re-run after CfT updates
+# (or to refresh the brand).
 #
 # macOS only. On Linux/headless, use the plain-Chromium equivalent documented
 # in tools/verification-browser/README.md.
 #
-# Env knobs: BROWSER_HOME, CFT_DIR, APP_DIR, APP_NAME, BUNDLE_ID. See
+# Env knobs: BROWSER_HOME, CFT_DIR, APP_DIR, APP_NAME, BUNDLE_ID,
+# CFT_SKIP_FETCH (1 = build from the existing CFT_DIR without downloading). See
 # tools/verification-browser/README.md for the full table.
 set -euo pipefail
 
@@ -28,7 +30,8 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 BROWSER_HOME="${BROWSER_HOME:-$HOME/.piercloud/test-browser}"
-CFT_DIR="${CFT_DIR:-$BROWSER_HOME/cft}"
+# Shared base CfT install (one download, COW-cloned into each project's app bundle).
+CFT_DIR="${CFT_DIR:-$HOME/.cft}"
 APP_DIR="${APP_DIR:-$HOME/Applications}"
 APP_NAME="${APP_NAME:-CfT PierCloud}"
 BUNDLE_ID="${BUNDLE_ID:-com.google.chrome.for.testing.piercloud}"
@@ -51,21 +54,28 @@ echo "APP_NAME=$APP_NAME"
 echo "BUNDLE_ID=$BUNDLE_ID"
 echo "CFT_PLATFORM=$CFT_PLATFORM"
 
-latest="$(curl -fsSL --max-time 30 "$API" | python3 -c "import json,sys; d=json.load(sys.stdin)['channels']['Stable']; print(d['version'])")"
-url="$(curl -fsSL --max-time 30 "$API" | python3 -c "
+CFT_SKIP_FETCH="${CFT_SKIP_FETCH:-0}"
+
+if [ "$CFT_SKIP_FETCH" = "1" ]; then
+  [ -x "$CFT_BIN" ] || { echo "CFT_SKIP_FETCH=1 but no CfT binary at $CFT_BIN" >&2; exit 1; }
+  echo "CFT_SKIP_FETCH=1 — using existing CfT: $("$CFT_BIN" --version 2>/dev/null | awk '{print $NF}')"
+else
+  latest="$(curl -fsSL --max-time 30 "$API" | python3 -c "import json,sys; d=json.load(sys.stdin)['channels']['Stable']; print(d['version'])")"
+  url="$(curl -fsSL --max-time 30 "$API" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)['channels']['Stable']
 print([x['url'] for x in d['downloads']['chrome'] if x['platform']=='$CFT_PLATFORM'][0])")"
 
-have=""
-[ -x "$CFT_BIN" ] && have="$("$CFT_BIN" --version 2>/dev/null | awk '{print $NF}')"
+  have=""
+  [ -x "$CFT_BIN" ] && have="$("$CFT_BIN" --version 2>/dev/null | awk '{print $NF}')"
 
-if [ "$have" != "$latest" ]; then
-  echo "fetching CfT $latest (have: ${have:-none})"
-  mkdir -p "$CFT_DIR"; cd "$CFT_DIR"
-  curl -fsSL --max-time 900 -o cft.zip "$url"
-  unzip -q -o cft.zip
-  rm -f cft.zip
+  if [ "$have" != "$latest" ]; then
+    echo "fetching CfT $latest (have: ${have:-none})"
+    mkdir -p "$CFT_DIR"; cd "$CFT_DIR"
+    curl -fsSL --max-time 900 -o cft.zip "$url"
+    unzip -q -o cft.zip
+    rm -f cft.zip
+  fi
 fi
 
 [ -x "$CFT_BIN" ] || { echo "CfT binary missing after fetch: $CFT_BIN" >&2; exit 1; }
@@ -78,5 +88,6 @@ plutil -replace CFBundleIdentifier  -string "$BUNDLE_ID" "$DEST/Contents/Info.pl
 xattr -cr "$DEST"
 codesign --force --sign - "$DEST"
 
-echo "built: $DEST  (CfT $latest)"
+built_ver="$("$CFT_BIN" --version 2>/dev/null | awk '{print $NF}')"
+echo "built: $DEST  (CfT $built_ver)"
 echo "launch with: $SCRIPT_DIR/launch.sh"
