@@ -57,6 +57,7 @@ All notable changes to this project will be documented in this file.
 
 - Public-run exposure sweep — mask netcup ids, fix failure dumps, artifacts, reviewer PII (closes #121)
 - Per-anchor Origin CA certs (M2) — retire the shared wildcard pair (closes #123)
+- Alerts stanza on dashboard TLS + comment/dr.md truth (closes #118)
 
 ### 📚 Documentation
 
