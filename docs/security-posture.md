@@ -4,15 +4,16 @@ This is the anchor repo's RT-1 standing-credential inventory: what long-lived cr
 
 ## Default posture
 
-The module provisions **no SSH access and no write-capable standing credentials** — inbound or outbound. Nobody logs into the anchor: every change arrives through a per-run approved dispatch (the runner is the admin path), and the netcup device-flow token dies with the runner. Re-entry after the root lock is per-event; rescue mode stays the last resort and disables the netcup firewall (any rescue boot → rotate tang keys).
+The module provisions **no SSH access and no write-capable standing credentials for the anchor's infrastructure** — inbound or outbound. The one credential with a write surface is the ntfy publish token used by the alerting plane (row 2): it can publish to the tenant's notification topic, and nothing else. Nobody logs into the anchor: every change arrives through a per-run approved dispatch (the runner is the admin path), and the netcup device-flow token dies with the runner. Re-entry after the root lock is per-event; rescue mode stays the last resort and disables the netcup firewall (any rescue boot → rotate tang keys).
 
 ## Standing-credential inventory
 
 | # | Credential | Where it lives | Capability | Blast radius if the anchor is compromised | Rotate / retire |
 |---|---|---|---|---|---|
 | 1 | `pc-admin-witness` B2 application key | `/etc/piercloud/recording-witness.env` (mode 0600, root-only) **and** the anchor repo's `RECORDING_WITNESS_KEY` / `RECORDING_WITNESS_KEY_ID` GitHub secrets | **`listFiles` only** on the operator's `pc-admin-dr` bucket: `ListObjectsV2` + `ListMultipartUploads`. **No `readFiles`, no `writeFiles`, no `deleteFiles`** — object content, thumbnails and recordings are unreachable, and nothing can be modified or deleted | Metadata disclosure: object names (session IDs, timestamps, event types) and object timestamps. No recording content, no audit-event content, no write/delete/retention-bypass path | B2 console key rotation → update the repo secrets → re-dispatch `mode=apply`; retire by deleting the six `RECORDING_WITNESS_*` secrets and re-dispatching (the run removes the env file and the timer) |
+| 2 | `NTFY_TOKEN` ntfy access token (pre-existing Gatus alerting; reused by the witness when enabled) | `/etc/gatus/config.yaml` (Gatus alerting) and, when the witness is enabled, `/etc/piercloud/recording-witness.env` (mode 0600, root-only), **and** the anchor repo's `NTFY_TOKEN` GitHub secret | **Publish to the tenant's ntfy topic** (the module only needs publish; a read-scoped token can also read the topic) | An attacker on the anchor can push spoofed alerts onto the tenant topic and, with a read-scoped token, read its message backlog — alert fatigue / social engineering / topic-content disclosure. No host, tang, Teleport or B2 access; the token reaches nothing outside ntfy | ntfy console → update the `NTFY_TOKEN` repo secret → re-dispatch `mode=apply` (Gatus and, if enabled, the witness env re-render) |
 
-There are **no other standing credentials** in the module surface: no SSH keys, no Teleport tokens, no API tokens, no sockets. The witness above exists only when the operator enables it (all six `RECORDING_WITNESS_*` secrets set); the default template carries none.
+There are **no other standing credentials** in the module surface: no SSH keys, no Teleport tokens, no sockets. The only standing API credentials are the list-only witness key (row 1, optional, present only when all six `RECORDING_WITNESS_*` secrets are set) and the ntfy publish token (row 2, pre-existing Gatus alerting, reused by the witness when enabled). The default template carries neither.
 
 ## Why the witness key is acceptable
 

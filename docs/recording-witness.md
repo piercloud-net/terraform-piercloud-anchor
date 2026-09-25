@@ -12,7 +12,7 @@ The witness holds a B2 application key with the **`listFiles` capability only** 
 - `ListObjectsV2` (recordings prefix) — completed `<session-id>.tar` objects;
 - `ListMultipartUploads` (recordings prefix) — in-progress uploads (the completer-lag signal).
 
-It never calls `GET`/`HEAD` on an object (HEAD requires `readFiles`) and **never calls `ListParts`** (that requires `writeFiles`). `ListObjectVersions` is deliberately *not* used either: it needs the separate `listFileVersions` capability, which the witness key does not carry. The committed harness (`tests/recording-witness/`) proves the list-only property against a mock endpoint that records and rejects every non-list request.
+It never calls `GET`/`HEAD` on an object (HEAD requires `readFiles`) and **never calls `ListParts`** (that requires `writeFiles`). `ListObjectVersions` is deliberately *not* used either: it needs the separate `listFileVersions` capability, which the witness key does not carry. The committed harness (`tests/recording-witness/`) proves the list-only property against a mock endpoint that records and rejects every non-list request, and SigV4-verifies every request it sees.
 
 ## The shipper key contract it checks
 
@@ -20,29 +20,37 @@ The witness is parameterized by prefixes, but it *correlates* audit events with 
 
 | Object | Key shape |
 |---|---|
-| Audit event (session-scoped) | `<ts>-<event-type>.<session-id>.<seq>.json` (e.g. `20260925T140321Z-session.start.9f8c…a70.0.json`) |
-| Audit event (non-session) | `<ts>-<event-type>.<seq>.json` (not part of the per-session sequence check) |
+| Audit event (session-scoped) | `<ts>-<event-type>.<session-id>.<seq>.json` (e.g. `20260925T140321Z-session.data.9f8c…a70.2.json`) |
+| Audit event (session start/end, D1) | `<ts>-session.start.<session-id>.<seq>.<mode>.json` (same for `session.end`), `mode` ∈ {`shell`,`exec`} — the mode marker is shipped by the `pc-admin` D1 shipper; a start/end **without** the marker is the legacy shape and is treated as `shell` (conservative — a tar is expected) |
+| Audit event (non-session) | `<ts>-<event-type>.<seq>.json` (not part of the per-session sequence check). Sid-less session events documented by the shipper (currently Teleport v18's `session.rejected`) ship this shape and are **not** drift |
 | Shipper heartbeat | `audit/heartbeat/<ts>.json` every 5 min |
 | Session recording | `recordings/<session-id>.tar` (multipart in progress → completed object) |
 
-`<ts>` is a list-parseable UTC timestamp; `<seq>` is a per-session gap-free, duplicate-free counter (the witness reads the clocks from S3 `LastModified`/`Initiated`, not from the key text).
+`<ts>` is the shipper's list-parseable UTC timestamp (`YYYYmmddTHHMMSSZ`); `<seq>` is a per-session gap-free, duplicate-free counter whose first value is **0 or 1** (the shipped pipeline starts at 1; the witness reads the clocks from S3 `LastModified`/`Initiated`, not from the key text).
 
-## Checks (owner-decided 2026-09-25)
+Drift is judged by *shape* (a `session.*` event type, or a UUID-shaped session id anywhere in the key), not by one literal substring, so a rename that drops `session.` but keeps the sid still fails closed. Audit keys that match no documented shape at all raise `contract-mismatch` (it no longer requires the heartbeat tree to be empty — `heartbeat-missing` covers that separately).
+
+## Checks (owner-decided 2026-09-25; review folds 2026-09-25)
 
 - **Cadence:** the timer runs every 5 minutes (`OnBootSec=2min`, `OnUnitInactiveSec=5min`).
 - **Heartbeat freshness:** newest `audit/heartbeat/*` object older than **15 min** (or missing) → `heartbeat-stale` / `heartbeat-missing` (shipper or egress suppression).
-- **Recording gap:** a `session.start` older than the **10 min** grace with neither a `recordings/<session-id>.tar` object nor an in-progress upload → `recording-gap`.
-- **Completer lag:** an in-progress upload under `recordings/` whose session has a `session.end` event older than **15 min** → `completer-lag`. A bare "multipart older than 15 min" is **never** an alert: Teleport opens one multipart upload per session at start and keeps it open for the whole session, so long live sessions are normal.
-- **Sequence continuity:** per session, the `<seq>` values must be gap- and duplicate-free → `sequence-gap` / `sequence-duplicate`.
+- **Recording gap:** a `session.start` older than the **10 min** grace with neither a `recordings/<session-id>.tar` object nor an in-progress upload → `recording-gap`. **`exec`-mode sessions are exempt**: Teleport does not record non-interactive exec sessions (`tsh ssh <host> <cmd>` emits `session.start`/`session.end` but no tar), and the D1 mode marker in the key is how the list-only witness tells them apart. A session with no mode marker, or a legacy end without one, is treated as `shell` and still gap-checked.
+- **Stream closure:** session events that exist for a session id with **no `session.start`** → `session-start-missing` (without a start there is no gap clock at all, so the absence itself must alert); a session whose first `<seq>` is neither 0 nor 1 → `sequence-origin`.
+- **Completer lag:** an in-progress upload under `recordings/` whose session has a `session.end` event older than **15 min** → `completer-lag`.
+- **Open-upload bound:** an in-progress upload under `recordings/` with **no `session.end`** older than the open-upload bound (default **12 h**) → `open-upload-stale`. This is deliberately distinct from `completer-lag` (which needs the end event) and from the old "a bare multipart older than 15 min is never an alert" rule: a live session *within the bound* is normal because Teleport opens one multipart upload per session at start and keeps it open for the session's whole life, but past the bound a wedged upload can no longer stay green indefinitely.
+- **Sequence continuity:** per session, the `<seq>` values must be gap- and duplicate-free with an origin of 0/1 → `sequence-gap` / `sequence-duplicate` / `sequence-origin`. The missing set is rendered boundedly from the observed values (never materializing `range(low, high+1)`), so crafted seq text cannot hang the check.
+- **Clock skew:** any S3 timestamp more than **5 min** in the future (`LastModified`/`Initiated` comes from B2, so a negative age means the anchor clock is behind) → `error`, never a healthy verdict.
 
 ## Verdicts, state and fail-closed behaviour
 
 Verdict states and exit codes: `ok` (0) / `alert` (1) / `error` (2). The systemd service is `Type=oneshot`, so a non-green run leaves the unit failed and visible in the run/provision log.
 
 - `/var/lib/piercloud/recording-witness/state.json` (0600) — the latest verdict (`state`, `detail`, `updated_at`), the last **baseline** (the last runnable verdict), and notification bookkeeping.
-- `/var/lib/piercloud/recording-witness/verdict.log` — append-only, one line per run: `<ts> <state> <detail>`.
+- `/var/lib/piercloud/recording-witness/verdict.log` — append-only, one line per run: `<ts> <state> <detail>`; it rotates once at 1 MiB to `verdict.log.1` (bounded evidence at ~2 MiB).
 
-**Fail-closed:** a witness that cannot run (bad key, B2 error, unreadable config) reports `error` — it never looks green — and **holds the baseline** (a failed run does not advance the last good baseline). Alerts push through ntfy on state transitions, with a recovery push and a 30-minute re-notify while non-green; a failed push is logged and retried on the next run.
+**Fail-closed:** a witness that cannot run (bad key, B2 error, unreadable config, future-dated metadata) reports `error` — it never looks green — and **holds the baseline** (a failed run does not advance the last good baseline). Alerts push through ntfy on state transitions, with a recovery push and a 30-minute re-notify while non-green; a failed push is logged and retried on the next run.
+
+**Run-once acceptance:** the provision run runs one check synchronously and prints the verdict. It fails the run closed if `systemctl start` fails (it never reads a stale `state.json` as a fresh verdict), and it redacts session ids/recording keys from the printed detail (hash + length) so the public run log stays non-identifying.
 
 ## Enablement (operator; repo secrets)
 
@@ -68,6 +76,8 @@ Rotate the key in the B2 console, update the repo secrets, re-dispatch. Retire b
 
 - **Detection, not prevention.** It detects gaps, stale heartbeats and completer lag from metadata. It cannot stop a suppression.
 - **Pre-SNP residual:** a host-root attacker can also forge completion records; the witness raises the cost of undetected suppression, it does not make completeness unconditional. The CC phase moves the recording termination point into the confidential guest.
+- **The mode marker is self-declared by the shipper.** A suppresser who can ship a `session.end` marked `exec` can dodge the tar check for that session. This is a disclosed non-detection, bounded by the same pre-SNP floor (host root can forge anyway) and by the paired-event checks that still apply (start/end presence, sequence continuity, heartbeats). The mode marker is **not** a content claim — the witness never reads the event body.
+- **SSH / Tier-0 sessions only.** The A2 checks correlate `session.*` lifecycle events and `recordings/<sid>.tar`, i.e. the SSH/Tier-0 recording pipeline. Non-SSH protocol recordings (`app.session.*`, `db.*`, `windows.*`) are not matched today; a missing DB/app/Windows recording is a **known non-detection**, re-derived when those pipelines land.
 - **Operator-owned self-accountability:** pre-CC there is no third-party-completeness claim; the witness runs on the operator's own anchor. The Rekor-style external manifest leg is deferred to the CC phase.
 - **Tenant reuse is parameterized, not free.** The check code is prefix/bucket-parameterized, but a tenant anchor must adopt the same shipper naming and provision the witness (repo secrets + key) itself; nothing transfers automatically.
 

@@ -13,18 +13,33 @@
 #       alert heartbeat-stale; session.start older than the grace with no
 #       recording object/upload -> alert recording-gap; an in-progress upload
 #       with an old session.end -> alert completer-lag; the long-live-session
-#       negative (old upload, NO session.end) stays ok (review finding 2);
-#       a missing <seq> -> alert sequence-gap; a repeated (sid, seq) ->
-#       alert sequence-duplicate; unrecognized session keys ->
-#       alert naming-contract;
+#       negative (old upload, NO session.end, within the open-upload bound)
+#       stays ok (review finding 2); a missing <seq> -> alert sequence-gap; a
+#       repeated (sid, seq) -> alert sequence-duplicate; unrecognized session
+#       keys -> alert naming-contract; event keys with no session.start ->
+#       alert session-start-missing; a session whose first seq is neither 0
+#       nor 1 -> alert sequence-origin; a wedged open upload (no session.end)
+#       past the open-upload bound -> alert open-upload-stale; exec-mode
+#       sessions ship no tar and stay ok; shell/legacy sessions with an end
+#       and no tar -> alert recording-gap; a malformed mode marker ->
+#       naming-contract; sid-less session.rejected keys are not drift; a
+#       renamed session prefix (sess.start) is still drift; an audit key that
+#       matches no documented shape -> alert contract-mismatch; future
+#       timestamps -> error (clock skew);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
-#       last baseline in state.json is held;
+#       last baseline in state.json is held; malformed XML, an S3 error
+#       document and a truncated list without a continuation token all error;
 #   (f) strictly list-only: every request the witness makes is a signed GET
 #       list call (ListObjectsV2 / ListMultipartUploads) — no HEAD, no
-#       object GET, no ListParts, no write; pagination is followed;
+#       object GET, no ListParts, no write; pagination is followed for both
+#       list families, and every scenario SigV4-signature-verifies server-side;
 #   (g) the 0600 env file holds the key and the witness never prints it;
 #   (h) install renders all four artifacts (mode 0600 env) and a later
-#       provision without the env removes them (no stale timer).
+#       provision without the env removes them (no stale timer);
+#   (i) run-once acceptance: a failed `systemctl start` dies instead of
+#       reporting a stale state.json verdict, and the printed detail has
+#       session ids redacted (public run-log safety); verdict.log rotates
+#       once it crosses its size bound.
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,6 +148,7 @@ FIXTURE="${WORK}/fixture.json"
 REQUEST_LOG="${WORK}/requests.log"
 : >"${REQUEST_LOG}"
 SID="9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+SID2="1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
 
 start_mock() {
   if [ -n "${MOCK_PID}" ]; then
@@ -152,7 +168,20 @@ start_mock() {
   MOCK_PORT="$(cat "${MOCK_PORT_FILE}")"
 }
 
-fixture() { cat >"${FIXTURE}"; }
+fixture() { # read a fixture JSON on stdin, inject the SigV4 signature, save
+  python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+data.setdefault(
+    "signature",
+    {"key_id": "test-key-id-0001", "key": "test-secret-SENTINEL-0009", "region": "test-region"},
+)
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+' "${FIXTURE}"
+}
 
 state_field() { # $1 = dotted path into state.json
   python3 -c '
@@ -300,6 +329,313 @@ is "unrecognized session key -> exit 1" "1" "${CASE_RC}"
 is "unrecognized session key -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *naming-contract*) ok "naming drift detail names naming-contract" ;; *) bad "naming drift detail: ${CASE_DETAIL}" ;; esac
 
+# ---- red-team finding 1: stream closure, seq origin, open-upload bound ----
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.1.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.2.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "session events without session.start -> exit 1" "1" "${CASE_RC}"
+is "session events without session.start -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *session-start-missing*) ok "stream-closure detail names session-start-missing" ;; *) bad "stream-closure detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.5.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.6.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.7.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "session starting at seq 5 -> exit 1" "1" "${CASE_RC}"
+is "session starting at seq 5 -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *sequence-origin*) ok "seq-origin detail names sequence-origin" ;; *) bad "seq-origin detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T060000Z-session.start.${SID}.0.json","ago":90000},
+  {"key":"audit/20260925T060100Z-session.data.${SID}.1.json","ago":89900}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":86400}]}
+JSON
+start_mock
+run_case
+is "wedged open upload 24h, no session.end -> exit 1" "1" "${CASE_RC}"
+is "wedged open upload 24h, no session.end -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *open-upload-stale*) ok "open-upload detail names open-upload-stale" ;; *) bad "open-upload detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.999999999999.json","ago":299},
+  {"key":"recordings/${SID}.tar","ago":298}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "huge seq gap -> exit 1 (bounded, no hang)" "1" "${CASE_RC}"
+is "huge seq gap -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *sequence-gap*) ok "huge gap detail names sequence-gap" ;; *) bad "huge gap detail: ${CASE_DETAIL}" ;; esac
+if [ "$(printf '%s' "${CASE_DETAIL}" | wc -c | tr -d ' ')" -le 1000 ]; then
+  ok "huge gap detail stays bounded ($(printf '%s' "${CASE_DETAIL}" | wc -c | tr -d ' ') chars)"
+else
+  bad "huge gap detail is not bounded"
+fi
+
+# ---- cross-repo: session mode markers (exec sessions ship no tar) --------
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.exec.json","ago":1200},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1199},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.exec.json","ago":1198}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "exec session (mode exec, no tar) -> exit 0" "0" "${CASE_RC}"
+is "exec session (mode exec, no tar) -> ok verdict" "ok" "${CASE_STATE}"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":1200},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1199},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":1198}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "shell session with end, no tar -> exit 1" "1" "${CASE_RC}"
+is "shell session with end, no tar -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "shell gap detail names recording-gap" ;; *) bad "shell gap detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.json","ago":1200},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1199},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.json","ago":1198}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "legacy shape (no mode marker), no tar -> exit 1" "1" "${CASE_RC}"
+is "legacy shape (no mode marker), no tar -> alert (conservative shell)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "legacy gap detail names recording-gap" ;; *) bad "legacy gap detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.exec.json","ago":1200},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.json","ago":1198}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "exec start + legacy end -> exit 1" "1" "${CASE_RC}"
+is "exec start + legacy end -> alert (legacy end is conservative shell)" "alert" "${CASE_STATE}"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.pty.json","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "malformed mode marker -> exit 1" "1" "${CASE_RC}"
+is "malformed mode marker -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "malformed-mode detail names naming-contract" ;; *) bad "malformed-mode detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.shell.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "mode marker on a non start/end event -> exit 1" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "misplaced-mode detail names naming-contract" ;; *) bad "misplaced-mode detail: ${CASE_DETAIL}" ;; esac
+
+# ---- shipper contract: sid-less session events + shape-based drift -------
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"audit/20260925T135300Z-session.rejected.000001.json","ago":297},
+  {"key":"recordings/${SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "sid-less session.rejected key -> exit 0" "0" "${CASE_RC}"
+is "sid-less session.rejected key -> ok verdict (no naming-contract false positive)" "ok" "${CASE_STATE}"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-sess.start.${SID}.1.json","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "renamed session prefix (sess.start) -> exit 1" "1" "${CASE_RC}"
+is "renamed session prefix (sess.start) -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "renamed-prefix drift detail names naming-contract" ;; *) bad "renamed-prefix drift detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-user.login.json","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "unknown audit key shape -> exit 1" "1" "${CASE_RC}"
+is "unknown audit key shape -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *contract-mismatch*) ok "contract-mismatch is reachable with a heartbeat present" ;; *) bad "contract-mismatch detail: ${CASE_DETAIL}" ;; esac
+
+# ---- clock skew: future timestamps must error, never look healthy --------
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":-3600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "future heartbeat timestamp -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "future heartbeat timestamp -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"clock skew"*) ok "heartbeat skew detail names clock skew" ;; *) bad "heartbeat skew detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.json","ago":-3600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "future session.start timestamp -> exit 2" "2" "${CASE_RC}"
+is "future session.start timestamp -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"clock skew"*) ok "session-start skew detail names clock skew" ;; *) bad "session-start skew detail: ${CASE_DETAIL}" ;; esac
+
+# ---- ListMultipartUploads pagination + malformed/error-document paths ----
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.end.${SID}.2.shell.json","ago":60},
+  {"key":"audit/20260925T135000Z-session.start.${SID2}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.end.${SID2}.2.shell.json","ago":60}],
+ "uploads":[
+  {"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300},
+  {"key":"recordings/${SID2}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "paginated ListMultipartUploads -> exit 0" "0" "${CASE_RC}"
+is "paginated ListMultipartUploads -> ok verdict" "ok" "${CASE_STATE}"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_objects":"malformed","objects":[],"uploads":[]}
+JSON
+start_mock
+run_case
+is "malformed object-list XML -> exit 2" "2" "${CASE_RC}"
+is "malformed object-list XML -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *unparseable*) ok "malformed XML detail is explicit" ;; *) bad "malformed XML detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"error-doc",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
+JSON
+start_mock
+run_case
+is "error-document uploads list -> exit 2" "2" "${CASE_RC}"
+is "error-document uploads list -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *ListMultipartUploads*HTTP*403*) ok "error-document detail names the failing call + status" ;; *) bad "error-document detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_objects":"truncated-no-token",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
+JSON
+start_mock
+run_case
+is "truncated object list without continuation token -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in *"truncated without a continuation token"*) ok "object truncation detail is explicit" ;; *) bad "object truncation detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"truncated-no-token",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "truncated upload list without key marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in *"truncated without a key marker"*) ok "upload truncation detail is explicit" ;; *) bad "upload truncation detail: ${CASE_DETAIL}" ;; esac
+
+# ---- verdict.log rotation bound ------------------------------------------
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+python3 - <<PY
+with open("${WORK}/state/verdict.log", "w", encoding="utf-8") as handle:
+    handle.write("x" * 1200000)
+PY
+run_case
+if [ -f "${WORK}/state/verdict.log.1" ]; then ok "verdict.log rotates at the size bound" ; else bad "verdict.log did not rotate" ; fi
+rotated_bytes="$(wc -c <"${WORK}/state/verdict.log.1" 2>/dev/null | tr -d ' ')"
+fresh_bytes="$(wc -c <"${WORK}/state/verdict.log" 2>/dev/null | tr -d ' ')"
+if [ "${rotated_bytes:-0}" -ge 1048576 ] && [ "${fresh_bytes:-0}" -lt 1048576 ]; then
+  ok "rotation keeps the old generation and starts a fresh bounded log (${rotated_bytes}/${fresh_bytes} bytes)"
+else
+  bad "rotation bounds wrong (${rotated_bytes:-missing}/${fresh_bytes:-missing} bytes)"
+fi
+
 # baseline held across an un-runnable run
 mkdir -p "${WORK}/state"
 printf '%s\n' '{"version":1,"state":"ok","detail":"seeded baseline","updated_at":"2026-09-25T00:00:00Z","last_notify_epoch":0,"baseline":{"state":"ok","detail":"seeded baseline","updated_at":"2026-09-25T00:00:00Z"}}' >"${WORK}/state/state.json"
@@ -327,6 +663,7 @@ import sys
 violations = []
 entries = 0
 pagination = 0
+uploads_pagination = 0
 sig_ok = 0
 signed_shape = False
 for raw in open(sys.argv[1], encoding="utf-8"):
@@ -347,7 +684,7 @@ for raw in open(sys.argv[1], encoding="utf-8"):
         sig_ok += 1
     if entry.get("sig_check", "").startswith("failed"):
         violations.append("SigV4 verification: %s" % entry["sig_check"])
-    if not entry["ok"] and "fixture failure mode" not in entry["note"]:
+    if not entry["ok"] and "fixture" not in entry["note"]:
         violations.append("rejected request: %s" % entry["note"])
     if "list-type=2" not in entry["note"] and "uploads" not in entry["note"] and entry["ok"]:
         violations.append("non-list OK request: %s" % entry["note"])
@@ -356,13 +693,17 @@ for raw in open(sys.argv[1], encoding="utf-8"):
             violations.append("forbidden query %s in %s" % (forbidden, entry["path"]))
     if "continuation-token=" in entry["path"]:
         pagination += 1
+    if "key-marker=" in entry["path"]:
+        uploads_pagination += 1
 
 if entries < 20:
     violations.append("too few requests observed (%d) - scenarios did not run" % entries)
 if pagination < 1:
-    violations.append("no continuation-token request - pagination not followed")
-if sig_ok < 1:
-    violations.append("no request passed full SigV4 signature verification")
+    violations.append("no continuation-token request - object pagination not followed")
+if uploads_pagination < 1:
+    violations.append("no key-marker request - upload pagination not followed")
+if sig_ok != entries:
+    violations.append("SigV4 verified on only %d/%d requests (all must verify)" % (sig_ok, entries))
 if not signed_shape:
     violations.append("no request carried the expected SigV4 SignedHeaders shape")
 
@@ -370,7 +711,8 @@ if violations:
     for violation in violations:
         print("VIOLATION " + violation)
     sys.exit(1)
-print("requests=%d pagination=%d sig_ok=%d" % (entries, pagination, sig_ok))
+print("requests=%d pagination=%d uploads_pagination=%d sig_ok=%d" % (
+    entries, pagination, uploads_pagination, sig_ok))
 PY
 then ok "every witness request was a signed list call (no HEAD/GET-object/ListParts/write)"; else bad "list-only/SigV4 proof failed"; fi
 
@@ -388,6 +730,10 @@ mkdir -p "${FAKEBIN}"
 cat >"${FAKEBIN}/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_SYSTEMCTL_LOG}"
+case "$1" in
+  start) exit "${FAKE_START_RC:-0}" ;;
+  show) printf '%s\n' "${FAKE_EXEC_STATUS:-0}"; exit 0 ;;
+esac
 exit 0
 FAKE
 chmod +x "${FAKEBIN}/systemctl"
@@ -429,6 +775,45 @@ else
   bad "disable did not disable the timer"
 fi
 if recording_witness_disable; then ok "disable is idempotent"; else bad "second disable failed"; fi
+
+# ---- (i) run-once: rc gating + public-log redaction ----------------------
+mkdir -p "${WORK}/state"
+export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
+cat >"${WORK}/state/state.json" <<EOF
+{"version":1,"state":"ok","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/${SID}.tar session ${SID}","updated_at":"2026-09-25T14:00:00Z","last_notify_epoch":0}
+EOF
+export FAKE_START_RC=0
+export FAKE_EXEC_STATUS=0
+runonce_rc=0
+runonce_out="$( (recording_witness_run_once) 2>&1 )" || runonce_rc=$?
+is "run-once: start ok + state ok exits 0" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once surfaces the OK verdict" ;;
+  *) bad "run-once OK output: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"${SID}"*) bad "run-once leaked the raw session id into the run log" ;;
+  *) ok "run-once redacts session ids from the run log" ;;
+esac
+case "${runonce_out}" in
+  *"<redacted:"*) ok "run-once detail carries redaction markers" ;;
+  *) bad "run-once detail lacks redaction markers: ${runonce_out}" ;;
+esac
+
+# stale green: the service start fails but state.json still says ok
+export FAKE_START_RC=1
+runonce_rc=0
+runonce_out="$( (recording_witness_run_once) 2>&1 )" || runonce_rc=$?
+is "run-once: failed start dies (rc=1), never reports the stale verdict" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) bad "run-once reported a stale OK after a failed start" ;;
+  *) ok "run-once refuses a stale verdict after a failed start" ;;
+esac
+case "${runonce_out}" in
+  *"start failed"*) ok "run-once failure names the failed start" ;;
+  *) bad "run-once failure output: ${runonce_out}" ;;
+esac
+export FAKE_START_RC=0
 
 # ---- wiring: the dispatch paths must carry the witness env -------------
 for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX \

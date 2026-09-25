@@ -1438,14 +1438,31 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 STATE_VERSION = 1
+VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
+UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
+# Classification is shape-strict so a malformed session key cannot be re-parsed
+# as a non-session event (or vice versa).
+TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
+# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
+# optional mode marker (.shell/.exec) is contract-defined for session.start
+# and session.end only (pc-admin D1); other session events keep the old shape.
 SESSION_KEY_RE = re.compile(
-    r"^(?P<ts>[^/]+)-(?P<etype>session\.[A-Za-z0-9_]+)\."
-    r"(?P<sid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\."
-    r"(?P<seq>[0-9]+)\.json$"
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
+    r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
+    r"(?:\.(?P<mode>shell|exec))?\.json$"
 )
-RECORDING_KEY_RE = re.compile(
-    r"^(?P<sid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.tar$"
+# Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
+NON_SESSION_KEY_RE = re.compile(
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
 )
+HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json$")
+UUID_RE = re.compile(UUID_PATTERN)
+RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
+# Sid-less session.* event types documented by the shipper contract (Teleport
+# v18 emits session.rejected without a session id): they ship on the
+# non-session shape and are not naming drift.
+SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
 
 
 class WitnessError(Exception):
@@ -1476,6 +1493,17 @@ def clip(text, limit=300):
 
 def utc_stamp(instant):
     return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def age_seconds(now, moment, label, skew_tolerance):
+    """Signed age in seconds; a future timestamp beyond tolerance is an error."""
+    age = int((now - moment).total_seconds())
+    if age < -skew_tolerance:
+        raise WitnessError(
+            "%s timestamp %s is %ds in the future (clock skew beyond %ds)"
+            % (label, utc_stamp(moment), -age, skew_tolerance)
+        )
+    return age
 
 
 def parse_timestamp(text):
@@ -1516,6 +1544,8 @@ class Config(object):
         self.heartbeat_max_age = env_int("RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS", 900)
         self.session_grace = env_int("RECORDING_WITNESS_SESSION_GRACE_SECONDS", 600)
         self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
+        self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
+        self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
         self.renotify = env_int("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.ntfy_topic = env("NTFY_TOPIC")
         self.ntfy_token = env("NTFY_TOKEN")
@@ -1696,15 +1726,22 @@ def run_checks(config, now):
     uploads = list_uploads(config, config.recordings_prefix)
     alerts = []
 
-    heartbeat_times = [
-        last_modified for key, last_modified in audit_objects.items()
-        if key.startswith(config.heartbeat_prefix)
-    ]
+    heartbeat_times = []
+    unrecognized = []
+    for key, last_modified in audit_objects.items():
+        if not key.startswith(config.heartbeat_prefix):
+            continue
+        if HEARTBEAT_KEY_RE.match(key[len(config.heartbeat_prefix):]):
+            heartbeat_times.append(last_modified)
+        else:
+            unrecognized.append(key)
+
     heartbeat_age = None
     if not heartbeat_times:
         alerts.append("heartbeat-missing: no objects under %s" % config.heartbeat_prefix)
     else:
-        heartbeat_age = int((now - max(heartbeat_times)).total_seconds())
+        heartbeat_age = age_seconds(
+            now, max(heartbeat_times), "newest heartbeat", config.clock_skew_tolerance)
         if heartbeat_age > config.heartbeat_max_age:
             alerts.append(
                 "heartbeat-stale: newest heartbeat is %ds old (limit %ds)"
@@ -1718,27 +1755,80 @@ def run_checks(config, now):
             continue
         relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
         match = SESSION_KEY_RE.match(relative)
-        if not match:
-            if "-session." in relative:
+        if match:
+            event_type = match.group("etype")
+            sid = match.group("sid").lower()
+            state = sessions.setdefault(
+                sid, {"seqs": [], "start": None, "end": None, "start_mode": None, "end_mode": None})
+            state["seqs"].append(int(match.group("seq")))
+            mode = match.group("mode")
+            if event_type == "session.start":
+                if state["start"] is None:
+                    state["start"] = last_modified
+                    state["start_mode"] = mode
+            elif event_type == "session.end":
+                if state["end"] is None or last_modified > state["end"]:
+                    state["end"] = last_modified
+                    state["end_mode"] = mode
+            elif mode:
+                # The mode marker is contract-defined on start/end only; a
+                # marker anywhere else is naming drift.
                 contract_bad += 1
             continue
-        sid = match.group("sid").lower()
-        state = sessions.setdefault(sid, {"seqs": [], "start": None, "end": None})
-        state["seqs"].append(int(match.group("seq")))
-        if match.group("etype") == "session.start" and state["start"] is None:
-            state["start"] = last_modified
-        if match.group("etype") == "session.end" and (state["end"] is None or last_modified > state["end"]):
-            state["end"] = last_modified
+        generic = NON_SESSION_KEY_RE.match(relative)
+        if generic:
+            event_type = generic.group("etype")
+            if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
+                continue  # documented non-session (or known sid-less session) event
+        # Drift is judged by shape (a UUID-shaped sid or a session.* event
+        # type), not by one literal substring: a rename that drops
+        # "-session." but keeps the sid still fails closed.
+        if UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
+            contract_bad += 1
+        else:
+            unrecognized.append(key)
 
     if contract_bad:
         alerts.append(
-            "naming-contract: %d audit key(s) carry a session event but do not match the shipper naming contract"
+            "naming-contract: %d audit key(s) look like session events but do not match the shipper naming contract"
             % contract_bad
         )
-    if not heartbeat_times and not sessions and audit_objects:
+    if unrecognized:
         alerts.append(
-            "contract-mismatch: %d audit object(s), none parse as heartbeat or session events"
-            % len(audit_objects)
+            "contract-mismatch: %d audit object(s) match no documented shipper key shape"
+            % len(unrecognized)
+        )
+
+    upload_keys = set(upload["key"] for upload in uploads)
+    for sid in sorted(sessions):
+        state = sessions[sid]
+        if state["start"] is None:
+            # Stream closure: session events with no session.start can never
+            # be gap-checked, so they must alert on their own.
+            alerts.append(
+                "session-start-missing: session %s has %d audit event(s) but no session.start"
+                % (sid, len(state["seqs"]))
+            )
+            continue
+        # An exec session is one whose mode markers all say exec. A start/end
+        # with no marker is the legacy shape and is treated as shell
+        # (conservative: a tar is expected), including a legacy end paired
+        # with an exec start.
+        if state["end"] is not None:
+            session_mode = "exec" if state["start_mode"] == "exec" and state["end_mode"] == "exec" else "shell"
+        else:
+            session_mode = "exec" if state["start_mode"] == "exec" else "shell"
+        if session_mode == "exec":
+            continue  # non-interactive exec sessions ship no recording (documented)
+        age = age_seconds(now, state["start"], "session.start", config.clock_skew_tolerance)
+        if age <= config.session_grace:
+            continue
+        recording_key = config.recordings_prefix + sid + ".tar"
+        if recording_key in recording_objects or recording_key in upload_keys:
+            continue
+        alerts.append(
+            "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
+            % (session_mode, sid, age, recording_key)
         )
 
     for sid in sorted(sessions):
@@ -1751,29 +1841,29 @@ def run_checks(config, now):
                 % (sid, ",".join(str(number) for number in duplicates))
             )
             continue
-        low, high = min(seqs), max(seqs)
-        if high - low + 1 != len(seqs):
-            missing = [number for number in range(low, high + 1) if number not in counts]
+        unique = sorted(counts)
+        if unique[0] > 1:
+            alerts.append(
+                "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
+                % (sid, unique[0])
+            )
+        if unique[-1] - unique[0] + 1 != len(unique):
+            # Bounded missing-set: render gap ranges from the observed values
+            # (never range(low, high+1), which crafted seq values could hang).
+            missing_ranges = [
+                (before + 1, after - 1)
+                for before, after in zip(unique, unique[1:]) if after > before + 1
+            ]
+            rendered = [
+                str(start) if start == stop else "%d-%d" % (start, stop)
+                for start, stop in missing_ranges[:20]
+            ]
+            if len(missing_ranges) > 20:
+                rendered.append("...")
             alerts.append(
                 "sequence-gap: session %s missing <seq> %s"
-                % (sid, ",".join(str(number) for number in missing))
+                % (sid, ",".join(rendered))
             )
-
-    upload_keys = set(upload["key"] for upload in uploads)
-    for sid in sorted(sessions):
-        started = sessions[sid]["start"]
-        if started is None:
-            continue
-        age = int((now - started).total_seconds())
-        if age <= config.session_grace:
-            continue
-        recording_key = config.recordings_prefix + sid + ".tar"
-        if recording_key in recording_objects or recording_key in upload_keys:
-            continue
-        alerts.append(
-            "recording-gap: session %s started %ds ago with no %s object and no in-progress upload"
-            % (sid, age, recording_key)
-        )
 
     for upload in uploads:
         key = upload["key"]
@@ -1783,13 +1873,23 @@ def run_checks(config, now):
         if not match:
             continue
         sid = match.group("sid").lower()
-        if sid not in sessions or sessions[sid]["end"] is None:
-            continue
-        ended_age = int((now - sessions[sid]["end"]).total_seconds())
-        if ended_age > config.completer_lag:
+        initiated_age = age_seconds(
+            now, upload["initiated"], "upload %s initiated" % key, config.clock_skew_tolerance)
+        ended = sessions.get(sid, {}).get("end")
+        if ended is not None:
+            ended_age = age_seconds(now, ended, "session.end for %s" % sid, config.clock_skew_tolerance)
+            if ended_age > config.completer_lag:
+                alerts.append(
+                    "completer-lag: %s still in progress %ds after session.end (started at %s)"
+                    % (key, ended_age, utc_stamp(upload["initiated"]))
+                )
+        elif initiated_age > config.open_upload_max_age:
+            # Distinct from completer-lag (session.end seen) and from the
+            # bare-old-multipart rule: an upload with no session.end has no
+            # end-anchored clock, so it gets its own age bound.
             alerts.append(
-                "completer-lag: %s still in progress %ds after session.end (started at %s)"
-                % (key, ended_age, utc_stamp(upload["initiated"]))
+                "open-upload-stale: %s has been open %ds with no session.end (bound %ds)"
+                % (key, initiated_age, config.open_upload_max_age)
             )
 
     if alerts:
@@ -1823,6 +1923,11 @@ def write_state(path, record):
 
 
 def append_verdict(path, state, detail):
+    try:
+        if os.path.getsize(path) >= VERDICT_LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+    except FileNotFoundError:
+        pass
     with open(path, "a", encoding="utf-8") as handle:
         handle.write("%s %s %s\n" % (utc_stamp(datetime.now(timezone.utc)), state, detail))
 
@@ -2013,12 +2118,36 @@ recording_witness_install() { # render + install the component (idempotent)
   log "recording witness installed (5 min timer; env file 0600, key never printed)"
 }
 
+recording_witness_redact() { # redact session ids / recording keys from a verdict line
+  python3 - "$1" <<'RECORDING_WITNESS_REDACT_PY'
+import hashlib
+import re
+import sys
+
+
+def _scrub(match):
+    token = match.group(0)
+    return "<redacted:%s:%d>" % (hashlib.sha256(token.encode("utf-8")).hexdigest()[:12], len(token))
+
+
+sys.stdout.write(re.sub(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    _scrub,
+    sys.argv[1],
+))
+RECORDING_WITNESS_REDACT_PY
+}
+
 recording_witness_run_once() { # run one check now and surface the verdict
   local rc=0 state exec_status detail
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    die "witness service start failed (systemctl rc=${rc}) — refusing to read a possibly stale verdict"
+  fi
   exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
   state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
+  detail="$(recording_witness_redact "${detail}")"
   case "${state}:${exec_status}" in
     ok:0) log "witness verdict: OK - ${detail}" ;;
     alert:1) warn "witness verdict: ALERT - ${detail} (the witness works; the recording pipeline has an open alert)" ;;

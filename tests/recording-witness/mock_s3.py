@@ -17,6 +17,11 @@ The fixture is JSON:
       "bucket": "pc-admin-dr",
       "page_size": 2,                      # optional, forces pagination
       "fail": null | "list" | "all",       # list calls return HTTP 500
+      "fail_objects": null | "malformed" | "error-doc" | "truncated-no-token",
+      "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
+      "signature": {                       # optional; when present every
+        "key_id": "...", "key": "...", "region": "..."
+      },                                   # request is SigV4-verified
       "objects": [{"key": "...", "ago": 60}],
       "uploads": [{"key": "...", "upload_id": "u1", "ago": 3600}]
     }
@@ -170,9 +175,19 @@ class Handler(BaseHTTPRequestHandler):
             self.record("GET", False, "fixture failure mode")
             self.send_body(500, "<Error><Code>InternalError</Code></Error>")
             return
-        if query.get("list-type") == ["2"]:
+        kind = "objects" if query.get("list-type") == ["2"] else ("uploads" if "uploads" in query else "")
+        failure = FIXTURE.get("fail_%s" % kind, "") if kind else ""
+        if failure == "malformed":
+            self.record("GET", False, "fixture: malformed XML")
+            self.send_body(200, "this is not XML <<<")
+            return
+        if failure == "error-doc":
+            self.record("GET", False, "fixture: error document")
+            self.send_body(403, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
+            return
+        if kind == "objects":
             self.handle_objects(query)
-        elif "uploads" in query:
+        elif kind == "uploads":
             self.handle_uploads(query)
         else:
             self.record("GET", False, "not a list operation")
@@ -186,9 +201,13 @@ class Handler(BaseHTTPRequestHandler):
             (obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)),
             key=lambda obj: obj["key"],
         )
+        suppress_token = FIXTURE.get("fail_objects") == "truncated-no-token"
         page = matching[offset:offset + PAGE_SIZE]
         next_offset = offset + PAGE_SIZE
-        truncated = next_offset < len(matching)
+        truncated = suppress_token or next_offset < len(matching)
+        next_token = ""
+        if truncated and not suppress_token:
+            next_token = "<NextContinuationToken>%d</NextContinuationToken>" % next_offset
         rows = "".join(
             "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
             "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
@@ -207,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
                 len(page),
                 PAGE_SIZE,
                 "true" if truncated else "false",
-                ("<NextContinuationToken>%d</NextContinuationToken>" % next_offset) if truncated else "",
+                next_token,
                 rows,
             )
         )
@@ -216,20 +235,50 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_uploads(self, query):
         prefix = query.get("prefix", [""])[0]
-        uploads = [upload for upload in FIXTURE.get("uploads", []) if upload["key"].startswith(prefix)]
+        key_marker = query.get("key-marker", [""])[0]
+        upload_marker = query.get("upload-id-marker", [""])[0]
+        matching = sorted(
+            (upload for upload in FIXTURE.get("uploads", []) if upload["key"].startswith(prefix)),
+            key=lambda upload: (upload["key"], upload.get("upload_id", "u")),
+        )
+        if FIXTURE.get("fail_uploads") == "truncated-no-token":
+            page = matching[:PAGE_SIZE]
+            truncated = True
+            next_key = ""
+            next_upload = ""
+        else:
+            start = 0
+            if key_marker or upload_marker:
+                marker = (key_marker, upload_marker)
+                start = next(
+                    (index for index, upload in enumerate(matching)
+                     if (upload["key"], upload.get("upload_id", "u")) > marker),
+                    len(matching),
+                )
+            page = matching[start:start + PAGE_SIZE]
+            truncated = start + PAGE_SIZE < len(matching)
+            next_key = page[-1]["key"] if truncated else ""
+            next_upload = page[-1].get("upload_id", "u") if truncated else ""
         rows = "".join(
             "<Upload><Key>%s</Key><UploadId>%s</UploadId><Initiated>%s</Initiated></Upload>"
             % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), iso_from_ago(upload["ago"]))
-            for upload in uploads
+            for upload in page
         )
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
             "<Bucket>%s</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker>"
-            "<NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker>"
-            "<MaxUploads>%d</MaxUploads><IsTruncated>false</IsTruncated>%s"
+            "<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>"
+            "<MaxUploads>%d</MaxUploads><IsTruncated>%s</IsTruncated>%s"
             "</ListMultipartUploadsResult>"
-            % (xml_escape(FIXTURE.get("bucket", "")), PAGE_SIZE, rows)
+            % (
+                xml_escape(FIXTURE.get("bucket", "")),
+                xml_escape(next_key),
+                xml_escape(next_upload),
+                PAGE_SIZE,
+                "true" if truncated else "false",
+                rows,
+            )
         )
         self.record("GET", True, "uploads prefix=%s" % prefix)
         self.send_body(200, body)
