@@ -1842,10 +1842,27 @@ def run_checks(config, now):
             continue
         if age <= config.session_grace:
             continue
-        alerts.append(
-            "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
-            % (session_mode, sid, age, recording_key)
-        )
+        if state["end"] is None:
+            # No end yet: live v18 marks only the end event, so a `.shell`
+            # start cannot be told apart from an in-flight exec session
+            # (which ships no tar and clears this alert when its `.exec` end
+            # lands). Alert anyway - conservative, never silenced - with
+            # wording that names the ambiguity so triage does not read it as
+            # a confirmed loss. An interactive session whose recording never
+            # started has the same shape and is exactly what must not be
+            # suppressed, which is why a longer bound is not used here (it
+            # would only delay both the false positive and the real gap).
+            alerts.append(
+                "recording-gap: shell session %s started %ds ago with no %s object and no in-progress upload "
+                "(no session.end yet - an in-flight exec session also reads `.shell` until its end ships; "
+                "may clear when the end or tar lands)"
+                % (sid, age, recording_key)
+            )
+        else:
+            alerts.append(
+                "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
+                % (session_mode, sid, age, recording_key)
+            )
 
     for sid in sorted(sessions):
         seqs = sessions[sid]["seqs"]
@@ -1973,9 +1990,21 @@ def notify(config, state, detail):
         return False
 
 
-def should_notify(previous_state, last_epoch, state, now_epoch, renotify):
+def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_since_epoch=0):
+    """Notification bookkeeping.
+
+    Non-green states push on transition and re-notify every renotify window.
+    Green pushes on the non-green -> ok recovery; a recovery push that failed
+    is retried while the ok transition is newer than the last successful
+    notify (state_since_epoch), so a green state never re-pushes once its
+    recovery has landed.
+    """
     if state == "ok":
-        return previous_state not in (None, "ok")
+        if previous_state not in (None, "ok"):
+            return True
+        if previous_state == "ok":
+            return int(state_since_epoch) > int(last_epoch)
+        return False  # a first-ever green run has nothing to recover from
     if state != previous_state:
         return True
     return now_epoch - int(last_epoch) >= int(renotify)
@@ -2014,7 +2043,10 @@ def main():
     renotify = config.renotify if config is not None else 1800
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
     last_notify_epoch = previous.get("last_notify_epoch") or 0
-    if should_notify(previous.get("state"), last_notify_epoch, state, now_epoch, renotify):
+    state_since_epoch = previous.get("state_since_epoch") or 0
+    if previous.get("state") != state:
+        state_since_epoch = now_epoch
+    if should_notify(previous.get("state"), last_notify_epoch, state, now_epoch, renotify, state_since_epoch):
         if config is not None and notify(config, state, detail):
             last_notify_epoch = now_epoch
     record = {
@@ -2022,6 +2054,7 @@ def main():
         "state": state,
         "detail": detail,
         "updated_at": utc_stamp(now),
+        "state_since_epoch": state_since_epoch,
         "last_notify_epoch": last_notify_epoch,
     }
     if state == "error":
@@ -2155,9 +2188,19 @@ RECORDING_WITNESS_REDACT_PY
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail updated_at freshness
+  local rc=0 state exec_status detail updated_at before_updated_at before_invocation after_invocation
+  # Anchor freshness to THIS invocation, not to wall-clock recency: a run
+  # that genuinely took longer than the old +/-300 s window must not be
+  # rejected, and a wedged `systemctl start` that never executed ExecStart
+  # (or a failed state write) must not let the previous verdict read as
+  # current. InvocationID changes on every real systemd invocation (skipped
+  # only if the property is unavailable); updated_at must also advance so a
+  # run that could not persist state.json never counts.
+  before_updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  before_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
   exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+  after_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
   # Type=oneshot: the witness alert (exit 1) also makes `systemctl start`
   # non-zero. A witness run is exactly rc=0+ExecMainStatus=0 (ok),
   # rc=1+ExecMainStatus=1 (alert) or rc=1+ExecMainStatus=2 (error); anything
@@ -2170,23 +2213,11 @@ recording_witness_run_once() { # run one check now and surface the verdict
   state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
   updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
-  # Freshness marker: the verdict we read must have been written by this run
-  # (a unit that silently did not execute leaves the previous state.json).
-  freshness="$(python3 - "${updated_at}" <<'RECORDING_WITNESS_FRESHNESS_PY' 2>/dev/null || true
-import datetime
-import sys
-
-try:
-    moment = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-except (IndexError, ValueError):
-    print("missing")
-    raise SystemExit(0)
-age = (datetime.datetime.now(datetime.timezone.utc) - moment).total_seconds()
-print("fresh" if -300 <= age <= 300 else "stale")
-RECORDING_WITNESS_FRESHNESS_PY
-)"
-  if [ "${freshness}" != "fresh" ]; then
-    die "witness state is ${freshness:-missing} (updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a stale verdict"
+  if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
+    die "witness unit did not start a new invocation (InvocationID ${after_invocation} unchanged, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale state.json"
+  fi
+  if [ -z "${updated_at}" ] || [ "${updated_at}" = "${before_updated_at}" ]; then
+    die "witness state did not advance (updated_at=${updated_at:-none}, before=${before_updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
   fi
   detail="$(recording_witness_redact "${detail}")"
   case "${state}:${exec_status}" in

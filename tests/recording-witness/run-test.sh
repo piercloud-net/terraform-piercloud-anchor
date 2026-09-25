@@ -24,13 +24,19 @@
 #       (no session.end) past the open-upload bound -> alert
 #       open-upload-stale; exec-mode sessions ship no tar and stay ok (the
 #       session.end marker is authoritative - live v18 reads `.shell` on
-#       session.start for exec sessions too); shell/legacy sessions with an
-#       end and no tar -> alert recording-gap; a malformed mode marker ->
+#       session.start for exec sessions too); an in-flight live-v18 exec
+#       session (shell start, no end yet, past grace) alerts recording-gap
+#       conservatively with ambiguity wording and clears once the exec end
+#       lands; shell/legacy sessions with an end and no tar -> alert
+#       recording-gap; duplicate session.end objects resolve by the newest
+#       LastModified (both mode directions pinned); a malformed mode marker ->
 #       naming-contract; sid-less session.rejected keys are not drift; a
 #       renamed session prefix (sess.start) is still drift; an audit key that
 #       matches no documented shape -> alert contract-mismatch; future
-#       timestamps -> error (clock skew); mode-marker fixtures are built with
-#       the pc-admin shipper key grammar (shipper_keys.py), never hand-written;
+#       LastModified *and* future Initiated timestamps -> error (clock skew);
+#       mode-marker fixtures are built with the pc-admin shipper key grammar
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 6430b9d, golden strings +
+#       refusal teeth; never hand-written);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; malformed XML, an S3 error
 #       document and a truncated list without a continuation token all error;
@@ -44,13 +50,18 @@
 #   (i) run-once acceptance: a Type=oneshot start rc is non-zero for an
 #       alerting witness too, so the run maps the paired rc/ExecMainStatus
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
-#       did not run (status unset/203, unpaired rc) or state.json is stale
-#       (freshness marker); the printed detail has session ids redacted
-#       (public run-log safety); verdict.log rotates once it crosses its size
-#       bound;
+#       did not run (status unset/203, unpaired rc, or a wedged start whose
+#       InvocationID did not advance) or when state.json's updated_at did not
+#       advance this invocation (a failed state write, or a start that left
+#       the previous verdict); a run longer than any recency window is
+#       accepted because the anchor is advancement, not recency; state and
+#       ExecMainStatus mismatches die; the printed detail has session ids
+#       redacted (public run-log safety); verdict.log rotates once it crosses
+#       its size bound;
 #   (j) ntfy bookkeeping: state transitions push, a repeated non-green state is
-#       suppressed inside the renotify window, renotifies outside it, and a
-#       recovery to ok pushes once (fake notifier, no network).
+#       suppressed inside the renotify window, renotifies outside it, a failed
+#       recovery push is retried on the next green run until it lands, and
+#       steady ok stays silent afterwards (fake notifier, no network).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,11 +96,45 @@ key() { # audit key built by the pc-admin shipper grammar (never hand-written)
 fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
-# Pin the replica to the pc-admin shipper grammar (6-digit seq + mode suffix):
-# a drift here is what silently weakens every mode-marker tooth below.
-is "shipper key replica (golden exec end key)" \
-  "audit/20260925T100008Z-session.end.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000002.exec.json" \
-  "$(key session.end 20260925T100008Z "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70" 2 exec)"
+# Pin the replica to the pc-admin shipper grammar. The golden strings below
+# were generated from the real builder at cad0p/pc-admin @ 6430b9d
+# (scripts/lib/b2_client.py build_audit_key/session_mode, the SHA pinned in
+# shipper_keys.py); a pc-admin grammar change must bump the pin, regenerate
+# these and update the witness contract together. Drift fixtures (non-UUID or
+# sid-less session keys, malformed modes) stay hand-written literals on
+# purpose: the replica now refuses shapes the real shipper never emits, so a
+# fixture request for one is itself a failure (the teeth after the golden).
+REPLICA_SID="9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+is "replica golden session.start shell" \
+  "audit/20260925T100008Z-session.start.${REPLICA_SID}.000001.shell.json" \
+  "$(key session.start 20260925T100008Z "${REPLICA_SID}" 1 shell)"
+is "replica golden session.end exec" \
+  "audit/20260925T100008Z-session.end.${REPLICA_SID}.000002.exec.json" \
+  "$(key session.end 20260925T100008Z "${REPLICA_SID}" 2 exec)"
+is "replica golden session.data (no mode suffix)" \
+  "audit/20260925T100008Z-session.data.${REPLICA_SID}.000007.json" \
+  "$(key session.data 20260925T100008Z "${REPLICA_SID}" 7)"
+is "replica golden session.rejected forced sid-less" \
+  "audit/20260925T100008Z-session.rejected.000005.json" \
+  "$(key session.rejected 20260925T100008Z "${REPLICA_SID}" 5)"
+is "replica golden non-session key sid-less" \
+  "audit/20260925T100008Z-user.login.000006.json" \
+  "$(key user.login 20260925T100008Z "" 6)"
+# The replica must refuse any unexpected shape instead of silently building a
+# key the real shipper cannot emit.
+replica_refuses() { # label + shipper_keys.py args; non-zero = refused
+  if python3 "${HARNESS_DIR}/shipper_keys.py" "$@" >/dev/null 2>&1; then
+    bad "replica accepted an unexpected shape: $*"
+  else
+    ok "replica refuses unexpected shape: $*"
+  fi
+}
+replica_refuses "session.start non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
+replica_refuses "session.start missing sid and mode" session.start 20260925T100008Z "" 1
+replica_refuses "non-session with sid" user.login 20260925T100008Z "${REPLICA_SID}" 1
+replica_refuses "mode on non-lifecycle event" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
+replica_refuses "mode on non-session event" user.login 20260925T100008Z "" 1 shell
+replica_refuses "lifecycle without the mandatory mode" session.start 20260925T100008Z "${REPLICA_SID}" 1
 
 # The extracted span calls these on-box helpers; stub them in the harness.
 log()  { printf 'harness: %s\n' "$*" >&2; }
@@ -498,6 +543,67 @@ run_case
 is "live v18 exec (shell start + exec end, no tar) -> exit 0" "0" "${CASE_RC}"
 is "live v18 exec (shell start + exec end, no tar) -> ok verdict" "ok" "${CASE_STATE}"
 
+# In-flight live v18 exec session: the start reads `.shell` and the `.exec`
+# end only ships when the command finishes, so past the 10-min grace the
+# witness alerts `recording-gap` — it cannot read the event body to know the
+# session is exec. This is the documented residual, pinned here: the alert is
+# conservative (the safe direction) and the wording names the ambiguity. The
+# fixture directly above is the same session once the `.exec` end lands: ok.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "in-flight live v18 exec (shell start, no end, past grace) -> exit 1 (conservative)" "1" "${CASE_RC}"
+is "in-flight live v18 exec -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "in-flight exec detail names recording-gap" ;; *) bad "in-flight exec detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"no session.end yet"*) ok "in-flight exec detail names the end-less ambiguity" ;; *) bad "in-flight exec detail lacks the ambiguity wording: ${CASE_DETAIL}" ;; esac
+
+# Duplicate session.end objects: resolution must use the newest LastModified
+# (and that key's mode), not the first key the list returns. The mock lists
+# objects by key sort, so seq 3 is seen before seq 4 — the mode of seq 4 has
+# to win in both directions.
+K_END_3_SHELL="$(key session.end 20260925T135200Z "$SID" 3 shell)"
+K_END_3_EXEC="$(key session.end 20260925T135200Z "$SID" 3 exec)"
+K_END_4_SHELL="$(key session.end 20260925T135200Z "$SID" 4 shell)"
+K_END_4_EXEC="$(key session.end 20260925T135200Z "$SID" 4 exec)"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_3_SHELL}","ago":600},
+  {"key":"${K_END_4_EXEC}","ago":500}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "duplicate ends, newest is exec -> exit 0 (newest LastModified wins)" "0" "${CASE_RC}"
+is "duplicate ends, newest is exec -> ok verdict" "ok" "${CASE_STATE}"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_EXEC}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_3_EXEC}","ago":600},
+  {"key":"${K_END_4_SHELL}","ago":500}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "duplicate ends, newest is shell -> exit 1 (newest LastModified wins)" "1" "${CASE_RC}"
+is "duplicate ends, newest is shell -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "duplicate-end shell detail names recording-gap" ;; *) bad "duplicate-end shell detail: ${CASE_DETAIL}" ;; esac
+
 # The mirror case: an end that says shell wins over an exec start
 # (conservative - a tar is expected).
 fixture <<JSON
@@ -694,6 +800,19 @@ is "future session.start timestamp -> exit 2" "2" "${CASE_RC}"
 is "future session.start timestamp -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *"clock skew"*) ok "session-start skew detail names clock skew" ;; *) bad "session-start skew detail: ${CASE_DETAIL}" ;; esac
 
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_SHELL}","ago":300}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":-3600}]}
+JSON
+start_mock
+run_case
+is "future upload Initiated timestamp -> exit 2" "2" "${CASE_RC}"
+is "future upload Initiated timestamp -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"clock skew"*) ok "upload-skew detail names clock skew" ;; *) bad "upload-skew detail: ${CASE_DETAIL}" ;; esac
+
 # ---- ListMultipartUploads pagination + malformed/error-document paths ----
 
 fixture <<JSON
@@ -889,16 +1008,47 @@ mkdir -p "${FAKEBIN}"
 cat >"${FAKEBIN}/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_SYSTEMCTL_LOG}"
+prop=""
+prev=""
+for arg in "$@"; do
+  if [ "${prev}" = "-p" ]; then prop="${arg}"; fi
+  prev="${arg}"
+done
 case "$1" in
   start)
     # Type=oneshot realism: start fails whenever the main process exits
-    # non-zero; FAKE_START_RC overrides only for non-main failure paths.
+    # non-zero. FAKE_START_RC models a start that wedges before ExecStart:
+    # no new invocation and no state write. Otherwise the invocation counter
+    # advances and (unless FAKE_NO_STATE_WRITE=1) state.json gets a new
+    # updated_at, exactly like a real witness run.
     if [ -n "${FAKE_START_RC:-}" ]; then exit "${FAKE_START_RC}"; fi
+    if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ]; then
+      printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
+    fi
+    if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
+      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" <<'PYSTATE'
+import datetime
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    data = {}
+data["updated_at"] = sys.argv[2] or (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(data, open(sys.argv[1], "w"))
+PYSTATE
+    fi
     case "${FAKE_EXEC_STATUS:-0}" in
       0) exit 0 ;;
       *) exit 1 ;;
     esac ;;
-  show) printf '%s\n' "${FAKE_EXEC_STATUS:-0}"; exit 0 ;;
+  show)
+    case "${prop}" in
+      InvocationID) cat "${FAKE_INVOCATION_FILE}" 2>/dev/null || true ;;
+      *) printf '%s\n' "${FAKE_EXEC_STATUS:-0}" ;;
+    esac
+    exit 0 ;;
 esac
 exit 0
 FAKE
@@ -955,9 +1105,16 @@ else
 fi
 if recording_witness_disable; then ok "disable is idempotent"; else bad "second disable failed"; fi
 
-# ---- (i) run-once: ExecMainStatus mapping + freshness + redaction --------
+# ---- (i) run-once: ExecMainStatus mapping + invocation freshness + redaction ----
 mkdir -p "${WORK}/state"
 export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
+# The run-once freshness anchor is "THIS invocation advanced state": the fake
+# systemctl models a real run by bumping InvocationID and rewriting
+# updated_at; the wedged/rollback paths switch that off.
+export FAKE_STATE_FILE="${WORK}/state/state.json"
+export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
+printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
 seed_state() { # $1 = state, $2 = updated_at (the freshness marker)
   printf '{"version":1,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","last_notify_epoch":0}\n' \
     "$1" "${SID}" "${SID}" "$2" >"${WORK}/state/state.json"
@@ -1030,15 +1187,70 @@ case "${runonce_out}" in
   *) ok "run-once never reports a stale OK after a failed start" ;;
 esac
 
-# rc=0 but state.json did not advance: the freshness marker must catch it
-seed_state ok "2026-09-25T00:00:00Z"
+# Wedged start that never executed ExecStart while the stale ExecMainStatus
+# still carries the previous alert's 1: the paired rc/EMS gate passes, but
+# InvocationID did not advance — the previous verdict must never read as
+# current (the exact round-3 repro).
+seed_state alert "$(fresh_stamp)"
+export FAKE_START_RC=1
+export FAKE_EXEC_STATUS=1
+run_once_call
+is "run-once: wedged start + fresh-looking prior alert dies" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"new invocation"*) ok "run-once names the unchanged InvocationID" ;;
+  *) bad "run-once wedged-start output: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"witness verdict: ALERT"*) bad "run-once reported the previous ALERT as current after a wedged start" ;;
+  *) ok "run-once never reports the previous verdict after a wedged start" ;;
+esac
+
+# The unit ran (InvocationID advanced) but could not persist state.json:
+# reading the old state would still be stale, so the updated_at check dies.
+seed_state ok "$(fresh_stamp)"
 unset FAKE_START_RC
 export FAKE_EXEC_STATUS=0
+export FAKE_NO_STATE_WRITE=1
 run_once_call
-is "run-once: rc=0 + stale state dies" "1" "${runonce_rc}"
+is "run-once: rc=0 + state not advanced dies" "1" "${runonce_rc}"
 case "${runonce_out}" in
-  *"stale"*) ok "run-once freshness gate names the stale state" ;;
-  *) bad "run-once stale-state output: ${runonce_out}" ;;
+  *"did not advance"*) ok "run-once freshness gate names the unadvanced state" ;;
+  *) bad "run-once unadvanced-state output: ${runonce_out}" ;;
+esac
+unset FAKE_NO_STATE_WRITE
+
+# A genuine run longer than the old +/-300 s recency window: the state it
+# wrote is older than 300 s, but it moved — accepted. Advancement, not
+# recency, is the rule (round-3 F1).
+seed_state ok "2026-09-25T00:00:00Z"
+export FAKE_NEW_UPDATED_AT="2026-09-25T00:00:01Z"
+run_once_call
+is "run-once: >300s run accepted (advancement, not recency)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once accepts a slow run's advanced state" ;;
+  *) bad "run-once slow-run output: ${runonce_out}" ;;
+esac
+unset FAKE_NEW_UPDATED_AT
+
+# state and ExecMainStatus must agree: the paired gate can pass while the
+# recorded state contradicts the status (seeded tests used state==EMS, so a
+# mutation that ignored `state` stayed green — round-3 F3b).
+seed_state ok "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=1
+run_once_call
+is "run-once: state ok + ExecMainStatus=1 dies" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: ALERT"*) bad "run-once mapped EMS=1 to ALERT despite state=ok" ;;
+  *) ok "run-once refuses a state/ExecMainStatus mismatch (ok:1)" ;;
+esac
+
+seed_state alert "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: state alert + ExecMainStatus=0 dies" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) bad "run-once mapped EMS=0 to OK despite state=alert" ;;
+  *) ok "run-once refuses a state/ExecMainStatus mismatch (alert:0)" ;;
 esac
 
 # ---- (j) ntfy transitions / recovery / renotify (fake notifier) ----------
@@ -1069,6 +1281,14 @@ for label, actual, expected in [
     ("recovery pushes", module.should_notify("alert", now - 1, "ok", now, 1800), True),
     ("steady ok never pushes", module.should_notify("ok", now - 1, "ok", now, 1800), False),
     ("first ok never pushes", module.should_notify(None, 0, "ok", now, 1800), False),
+    ("failed recovery retries while transition newer than last notify",
+     module.should_notify("ok", now - 100, "ok", now, 1800, now - 50), True),
+    ("landed recovery does not re-push",
+     module.should_notify("ok", now - 50, "ok", now, 1800, now - 100), False),
+    ("legacy state without state_since does not re-push",
+     module.should_notify("ok", now - 1, "ok", now, 1800, 0), False),
+    ("first ok never pushes even with a fresh transition epoch",
+     module.should_notify(None, 0, "ok", now, 1800, now), False),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
@@ -1125,7 +1345,20 @@ os.environ.update({
     "RECORDING_WITNESS_RENOTIFY_SECONDS": "1800",
     "NTFY_TOPIC": "pc-admin test",
 })
-module.urllib.request.urlopen = fake_urlopen
+# Stateful transition/recovery through main()'s bookkeeping, with a notifier
+# that fails the first recovery attempt (round-3 F4: a failed recovery push
+# must be retried while the ok transition is newer than the last success).
+flaky = {"fail": False}
+
+
+def flaky_urlopen(request, timeout=None):
+    captured.append(request)
+    if flaky["fail"]:
+        raise module.urllib.error.URLError("flaky")
+    return Response()
+
+
+module.urllib.request.urlopen = flaky_urlopen
 captured[:] = []
 verdict = ["alert"]
 module.run_checks = lambda config, now: (verdict[0], "detail")
@@ -1142,19 +1375,36 @@ json.dump(record, open(state_path, "w"))
 codes.append(module.main())
 if len(captured) != 2:
     raise SystemExit("renotify outside the window must push, got %d" % len(captured))
+# Simulate the last successful push landing before the recovery transition
+# (a same-second transition epoch would make the retry condition ambiguous;
+# real runs are minutes apart).
+record = json.load(open(state_path))
+record["last_notify_epoch"] = 1
+json.dump(record, open(state_path, "w"))
 verdict[0] = "ok"
-codes.append(module.main())
+flaky["fail"] = True
+codes.append(module.main())  # recovery transition: push attempted, fails
 if len(captured) != 3:
-    raise SystemExit("recovery to ok must push, got %d" % len(captured))
+    raise SystemExit("failed recovery must attempt exactly one push, got %d" % len(captured))
+record = json.load(open(state_path))
+if record["state"] != "ok" or int(record.get("state_since_epoch", 0)) <= 1 or record.get("last_notify_epoch") != 1:
+    raise SystemExit("failed recovery must record the ok transition without advancing last_notify_epoch: %r" % record)
+flaky["fail"] = False
+codes.append(module.main())  # next green run retries the recovery push
+if len(captured) != 4:
+    raise SystemExit("failed recovery must retry on the next green run, got %d" % len(captured))
 if captured[-1].headers.get("Tags") != "white_check_mark":
-    raise SystemExit("recovery push must carry the ok tag: %r" % captured[-1].headers)
-codes.append(module.main())
-if len(captured) != 3:
-    raise SystemExit("steady ok must not push, got %d" % len(captured))
-if codes != [1, 1, 1, 0, 0]:
+    raise SystemExit("recovery retry must carry the ok tag: %r" % captured[-1].headers)
+record = json.load(open(state_path))
+if int(record["last_notify_epoch"]) <= 1:
+    raise SystemExit("recovery retry must advance last_notify_epoch")
+codes.append(module.main())  # one success covers the transition: steady ok silent
+if len(captured) != 4:
+    raise SystemExit("steady ok after a landed recovery must not push, got %d" % len(captured))
+if codes != [1, 1, 1, 0, 0, 0]:
     raise SystemExit("main exit codes wrong: %r" % codes)
 PY
-then ok "ntfy: transitions push, repeats suppress, 30-min renotify + recovery push (fake notifier)"; else bad "ntfy bookkeeping test failed"; fi
+then ok "ntfy: transitions push, repeats suppress, 30-min renotify + failed-recovery retry (fake notifier)"; else bad "ntfy bookkeeping test failed"; fi
 
 # ---- wiring: the dispatch paths must carry the witness env -------------
 for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX \
