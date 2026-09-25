@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 66bd304 — the **grammar-defining SHA**: the
-builder grammar (`session_mode` + `build_audit_key`) last changed there and is
-unchanged through 5580ac0 (pc-admin PR #7 copy re-verified byte-identical; the
-only later `b2_client.py` changes are the parser/doc grammar block, which does
-not alter emitted keys). The golden strings in
-tests/recording-witness/run-test.sh and the checked-in vector matrix were
-generated from that SHA; a pc-admin grammar change must bump this pin,
-regenerate both and update the witness contract in the same breath.
+PINNED AGAINST: cad0p/pc-admin @ 41735ff77a79d24c75dc2e22bb1c47cbb0582800 — the
+**grammar-defining SHA**: the builder grammar last changed there (the
+over-long event-type cap: truncate to 128 chars, drop a trailing separator and
+append an `_<sha256[:8]>` collision-resistant suffix) and is unchanged since.
+The golden strings in tests/recording-witness/run-test.sh and the checked-in
+vector matrix were generated from that SHA; a pc-admin grammar change must bump
+this pin, regenerate both and update the witness contract in the same breath.
+The previous grammar-defining SHA was 66bd304 (the session.rejected sid-less
+fold); the truncation cap landed at 41735ff, which is why the pin moved there.
 
 The witness correlates audit events with recordings through object key names, so
 harness fixtures MUST be built with the real shipper grammar (6-digit
@@ -43,11 +44,19 @@ real builder DOES emit on its documented path is reproduced faithfully):
   classifier is single-segment, so the raw type would read as drift).
 - Non-session events never carry a sid (the real builder drops it).
 - `session.rejected` is forced to the sid-less non-session shape: the witness
-  allowlists it there and the real builder at the pinned SHA (66bd304) drops
+  allowlists it there and the real builder at the pinned SHA (41735ff) drops
   any sid for this type, shipping it under the global counter. A regression to
   the pre-fold sid-bearing shape would be read by the witness as a session
   with no `session.start` (`session-start-missing`), so the replica never
   builds it and the golden/refusal teeth pin that.
+- An event type longer than 128 chars is truncated to the cap with a trailing
+  separator dropped and `_<sha256[:8]>` appended (an underscore segment inside
+  the witness's `[A-Za-z0-9_]+` type grammar): the cap keeps B2 keys bounded
+  (1024-byte ceiling) and the hash keeps two distinct over-long types from
+  aliasing to one key (a plain truncation could make the shipper's
+  HEAD-before-PUT replay absorb a different event). The truncation applies
+  only to grammar-valid types — an invalid over-long type is sanitized to
+  `unknown` by the real builder and is refused here.
 - `seq` mirrors the real grammar: the builder emits `previous + 1` (floor 1 —
   seq 0 is legacy-only and must be hand-written) formatted `%06d`, so 7+
   digits are legal past 999999; the ceiling is the witness's `[0-9]{1,18}`
@@ -62,10 +71,11 @@ CLI:  shipper_keys.py <event-type> <ts> [sid] [seq] [mode]
       prints the full audit key (single line).
 """
 
+import hashlib
 import re
 import sys
 
-PINNED_PC_ADMIN_SHA = "66bd304"
+PINNED_PC_ADMIN_SHA = "41735ff77a79d24c75dc2e22bb1c47cbb0582800"
 
 TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z$"
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -76,6 +86,14 @@ SESSION_TYPE_RE = re.compile(r"^session\.[A-Za-z0-9_]+$")
 # The real builder emits `%06d` (7+ digits past 999999); the ceiling mirrors
 # the witness's `[0-9]{1,18}` grammar that pc-admin's SEQ_PATTERN mirrors.
 SEQ_MAX = 10 ** 18 - 1
+
+# Over-long event-type cap (b2_client.MAX_EVENT_TYPE_LENGTH +
+# EVENT_TYPE_HASH_LENGTH): truncate below the cap, drop a trailing separator
+# and append `_<sha256[:8]>` of the full type. The suffix is an underscore
+# segment inside the witness's `[A-Za-z0-9_]+` type grammar, and the hash keeps
+# distinct over-long types from aliasing to one key.
+MAX_EVENT_TYPE_LENGTH = 128
+EVENT_TYPE_HASH_LENGTH = 8
 
 # Session lifecycle events get the `interactive`-derived mode suffix; every
 # other event type never carries one (b2_client.SESSION_MODE_EVENTS).
@@ -102,6 +120,15 @@ def audit_key(event_type, ts, sid="", seq=1, mode=""):
         # `unknown` and drops the sid (global shape). Mirror it.
         event_type = "unknown"
         sid = ""
+    if len(event_type) > MAX_EVENT_TYPE_LENGTH:
+        # The real builder caps an over-long type below B2's 1024-byte key
+        # limit: truncate, drop a trailing separator, and append a short hash
+        # of the FULL type so distinct over-long types cannot alias to one key
+        # (pc-admin R5 @ 41735ff). Only grammar-valid types reach this point;
+        # an invalid type was sanitized to `unknown` above. Mirror exactly.
+        digest = hashlib.sha256(event_type.encode("utf-8")).hexdigest()
+        head = event_type[: MAX_EVENT_TYPE_LENGTH - EVENT_TYPE_HASH_LENGTH - 1].rstrip(".")
+        event_type = "%s_%s" % (head, digest[:EVENT_TYPE_HASH_LENGTH])
     if sid and not UUID_RE.fullmatch(sid):
         raise ValueError(
             "non-UUID sid %r: the real shipper ships this on the sid-less global shape" % sid

@@ -1837,7 +1837,30 @@ def run_checks(config, now):
             % len(unrecognized)
         )
 
-    upload_keys = set(upload["key"] for upload in uploads)
+    # Completed recordings and in-progress uploads keyed by lowercased sid:
+    # sessions are grouped case-insensitively, so an uppercase-sid tar or
+    # upload must satisfy the gap check for the lowercased session id instead
+    # of false-alerting (round-6 F5). The newest LastModified wins a case
+    # collision for the tar clock.
+    recordings_by_sid = {}
+    for key, last_modified in recording_objects.items():
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        current = recordings_by_sid.get(sid)
+        if current is None or last_modified > current:
+            recordings_by_sid[sid] = last_modified
+    upload_sids = set()
+    for upload in uploads:
+        key = upload["key"]
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if match:
+            upload_sids.add(match.group("sid").lower())
     for sid in sorted(sessions):
         state = sessions[sid]
         if state["start"] is None:
@@ -1861,7 +1884,7 @@ def run_checks(config, now):
             continue  # non-interactive exec sessions ship no recording (documented)
         age = age_seconds(now, state["start"], "session.start", config.clock_skew_tolerance)
         recording_key = config.recordings_prefix + sid + ".tar"
-        completed_at = recording_objects.get(recording_key)
+        completed_at = recordings_by_sid.get(sid)
         if completed_at is not None:
             # The tar satisfies the gap check by itself, so a completed
             # recording whose session.end never shipped would stay green
@@ -1876,7 +1899,7 @@ def run_checks(config, now):
                         % (recording_key, completed_age, sid, config.completer_lag)
                     )
             continue
-        if recording_key in upload_keys:
+        if sid in upload_sids:
             continue
         if age <= config.session_grace:
             continue
@@ -1998,19 +2021,45 @@ def read_state(path):
             data = json.load(handle)
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError: a pathologically nested JSON document must take the
+        # invalid-state path (preserve + repair), never abort before the
+        # verdict with no files (round-6 F4).
         raise WitnessError("state file unreadable: %s" % exc)
     if not isinstance(data, dict):
         raise WitnessError("state file is not a JSON object")
     return data
 
 
+def _open_state_file(path, mode):
+    """Open a state/verdict file without following or reusing a planted entry.
+
+    A symlink at `state.json.tmp` or `verdict.log` used to redirect the write
+    (truncate + chmod) at whatever it pointed to, before the tmp was renamed
+    into place (round-6 F3). O_NOFOLLOW refuses a symlink at the final
+    component and O_EXCL refuses to reuse an existing tmp; a stale regular tmp
+    is unlinked first (unlinking a name never touches what it points at).
+    """
+    if mode == "w":
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise OSError("cannot clear stale %s: %s" % (path, clip(exc, 120)))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8")
+
+
 def write_state(path, record):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
+    with _open_state_file(tmp, "w") as handle:
         json.dump(record, handle, indent=1, sort_keys=True)
         handle.write("\n")
-    os.chmod(tmp, 0o600)
+        os.fchmod(handle.fileno(), 0o600)
     os.replace(tmp, path)
 
 
@@ -2020,35 +2069,94 @@ def append_verdict(path, state, detail):
             os.replace(path, path + ".1")
     except FileNotFoundError:
         pass
-    with open(path, "a", encoding="utf-8") as handle:
+    with _open_state_file(path, "a") as handle:
         handle.write("%s %s %s\n" % (utc_stamp(datetime.now(timezone.utc)), state, detail))
+
+
+def ntfy_token_problem(token):
+    """Why a publish token cannot be an HTTP header value (empty string = ok).
+
+    Header values are latin-1 bytes: a control character (especially CR/LF)
+    makes http.client.putheader raise ValueError and a non-ASCII token raises
+    UnicodeEncodeError. Both used to escape notify()'s transport except-clause,
+    aborting the run before state/verdict with no files (and the ValueError
+    text echoed the token bytes into the traceback). Validate first so a bad
+    token becomes a skipped push, never a crash. The length cap also keeps a
+    pathological token from building a giant header (round-6 F1).
+    """
+    if len(token) > 4096:
+        return "token is longer than 4096 characters"
+    for char in token:
+        if not ("!" <= char <= "~"):
+            return "token is not printable ASCII without spaces"
+    return ""
+
+
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect for the ntfy POST (round-6 F2).
+
+    urllib's default redirect handler copies the request headers onto the
+    redirect target, so a 301/302/303 to another host or scheme re-sent
+    `Authorization: Bearer <publish token>` cross-origin (mirror of pc-admin's
+    R3 fix). ntfy needs no redirect hop, so a 3xx becomes a failed push
+    (logged, retried) with nothing sent to the redirect target.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "refusing redirect to %r" % (newurl,), headers, fp
+        )
+
+
+# The redirect-refusing opener is the only client notify() may use; the
+# module-level name is patchable for the offline harness.
+_NTFY_OPENER = urllib.request.build_opener(RefuseRedirects())
+
+
+def open_ntfy(request, timeout=15):
+    """Open the ntfy POST through the redirect-refusing opener."""
+    return _NTFY_OPENER.open(request, timeout=timeout)
 
 
 def notify(config, state, detail):
     """Push the verdict through ntfy when a topic is configured. Best-effort."""
     if not config.ntfy_topic:
         return False
+    token = config.ntfy_token
+    problem = ntfy_token_problem(token) if token else ""
+    if problem:
+        # The reason names the class of problem only - never the token bytes;
+        # a bad token must fail the push, not the run (round-6 F1).
+        log("WARNING: ntfy push skipped: %s" % problem)
+        return False
     headers = {
         "Title": "recording witness: %s" % state,
         "Tags": "white_check_mark" if state == "ok" else "warning",
     }
-    if config.ntfy_token:
-        headers["Authorization"] = "Bearer " + config.ntfy_token
-    request = urllib.request.Request(
-        "https://ntfy.sh/" + urllib.parse.quote(config.ntfy_topic, safe=""),
-        data=clip(detail, 800).encode("utf-8"),
-        method="POST",
-    )
-    for name, value in headers.items():
-        request.add_header(name, value)
+    if token:
+        headers["Authorization"] = "Bearer " + token
     try:
-        with urllib.request.urlopen(request, timeout=15):
+        request = urllib.request.Request(
+            "https://ntfy.sh/" + urllib.parse.quote(config.ntfy_topic, safe=""),
+            data=clip(detail, 800).encode("utf-8"),
+            method="POST",
+        )
+        for name, value in headers.items():
+            request.add_header(name, value)
+        with open_ntfy(request, timeout=15):
             return True
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         # HTTPException covers BadStatusLine / IncompleteRead (not OSError
-        # subclasses): a transport failure must be logged and retried, never
-        # abort the run before state/verdict.
+        # subclasses); URLError covers the refused-redirect HTTPError. A
+        # transport failure must be logged and retried, never abort the run
+        # before state/verdict.
         log("WARNING: ntfy push failed: %s" % clip(exc, 200))
+        return False
+    except (ValueError, UnicodeError) as exc:
+        # A late header-validation failure can embed the header value (the
+        # token); log the exception class only, never its message, and keep
+        # the push non-fatal (round-6 F1).
+        log("WARNING: ntfy push failed: %s" % type(exc).__name__)
         return False
 
 
@@ -2117,8 +2225,12 @@ def main():
         try:
             os.replace(state_path, state_path + ".corrupt")
             log("WARNING: unreadable state file preserved as %s.corrupt" % state_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            # A directory at .corrupt (or an unwritable state dir) disables the
+            # preservation; say so instead of silently dropping forensics
+            # (round-6 F8).
+            log("WARNING: cannot preserve unreadable state as %s.corrupt: %s"
+                % (state_path, clip(exc, 200)))
 
     renotify = config.renotify if config is not None else 1800
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None

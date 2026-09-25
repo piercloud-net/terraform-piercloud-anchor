@@ -39,19 +39,26 @@
 #       enforced at collection time for every listed object, incl. exec
 #       sessions and completed tars that never reach a per-session age check);
 #       equal-LastModified contradictory duplicate starts/ends fail closed to
-#       the conservative shell in both listing orders; an orphan completed tar
+#       the conservative shell in both listing orders; an uppercase-sid tar or
+#       in-progress upload still satisfies the lowercased session's gap check
+#       (sid case is normalized consistently for the recordings lookup); an
+#       orphan completed tar
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 66bd304; golden strings,
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 41735ff; golden strings,
 #       refusal teeth, and the checked-in golden+boundary vector matrix
-#       generated from the real builder — never hand-written);
+#       generated from the real builder — never hand-written — incl. the
+#       over-long event-type truncation cap with its `_<sha256[:8]>` suffix);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; a corrupt state.json (bad numeric
 #       field) reports error and repairs instead of crashing, holding the
 #       readable baseline, and an unreadable one is preserved as
-#       state.json.corrupt; malformed XML, an S3 error document and a
-#       truncated list without a continuation token all error;
+#       state.json.corrupt (a pathologically nested document takes the same
+#       repair path instead of an uncaught RecursionError); planted symlinks
+#       at state.json.tmp/verdict.log are never followed or reused into a
+#       victim; malformed XML, an S3 error document and a truncated list
+#       without a continuation token all error;
 #   (f) strictly list-only: every request the witness makes is a signed GET
 #       list call (ListObjectsV2 / ListMultipartUploads) — no HEAD, no
 #       object GET, no ListParts, no write; pagination is followed for both
@@ -79,8 +86,11 @@
 #       transition still retries), a stored last-notify epoch in the future
 #       still renotifies (clock-corrected state cannot silence forever),
 #       BadStatusLine/IncompleteRead push failures are caught and logged (not
-#       fatal), and steady ok stays silent afterwards (fake notifier, no
-#       network).
+#       fatal), a token that cannot be an HTTP header value (control chars /
+#       CR/LF / non-ASCII / oversized) skips the push with a bounded warning
+#       instead of aborting the run or echoing the token, ntfy redirects are
+#       refused (a 3xx never re-sends Authorization to another host/scheme),
+#       and steady ok stays silent afterwards (fake notifier, no network).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -116,9 +126,11 @@ fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 66bd304
-# (scripts/lib/b2_client.py build_audit_key/session_mode, the SHA pinned in
-# shipper_keys.py); a pc-admin grammar change must bump the pin, regenerate
+# were generated from the real builder at cad0p/pc-admin @ 41735ff
+# (scripts/lib/b2_client.py build_audit_key/session_mode, the full-SHA pin in
+# shipper_keys.py; that grammar point added the over-long event-type
+# truncation cap with the `_<sha256[:8]>` suffix, pinned by the vector matrix
+# below); a pc-admin grammar change must bump the pin, regenerate
 # these and update the witness contract together. Drift fixtures (non-UUID or
 # sid-less session keys, malformed modes) stay hand-written literals on
 # purpose: the replica now refuses shapes the real shipper never emits, so a
@@ -156,6 +168,31 @@ is "replica golden multi-segment session.* sanitized to unknown" \
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
+# Round-6 cross-repo sync: the builder caps an over-long event type at 128
+# chars, drops a trailing separator and appends `_<sha256[:8]>` (pc-admin @
+# 41735ff). The expected key here is re-derived independently from the rule so
+# a replica that stops mirroring the cap fails on these literals too (the
+# vector matrix below pins the real-builder output).
+LONG_TYPE="$(python3 -c 'print("z" * 130)')"
+LONG_KEY="$(python3 - "${LONG_TYPE}" <<'PY'
+import hashlib
+import sys
+
+event_type = sys.argv[1]
+head = event_type[:128 - 8 - 1].rstrip(".")
+print("audit/20260925T100008Z-%s_%s.000001.json" % (head, hashlib.sha256(event_type.encode()).hexdigest()[:8]))
+PY
+)"
+is "replica golden over-long type truncated + hash suffix" \
+  "${LONG_KEY}" \
+  "$(key "${LONG_TYPE}" 20260925T100008Z "" 1)"
+ALIAS_A="$(python3 -c 'print("z" * 128 + "alpha")')"
+ALIAS_B="$(python3 -c 'print("z" * 128 + "beta")')"
+if [ "$(key "${ALIAS_A}" 20260925T100008Z "" 1)" != "$(key "${ALIAS_B}" 20260925T100008Z "" 1)" ]; then
+  ok "distinct over-long types with a shared 119-char head keep distinct keys"
+else
+  bad "over-long type truncation aliased two distinct types to one key"
+fi
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
 replica_refuses() { # label + shipper_keys.py args; non-zero = refused
@@ -174,6 +211,8 @@ replica_refuses "lifecycle without the mandatory mode" session.start 20260925T10
 replica_refuses "seq zero (legacy hand-written fixture only)" session.data 20260925T100008Z "${REPLICA_SID}" 0
 replica_refuses "seq beyond the witness 18-digit grammar" session.data 20260925T100008Z "${REPLICA_SID}" 1000000000000000000
 replica_refuses "session.start missing sid with mode" session.start 20260925T100008Z "" 1 shell
+replica_refuses "over-long type outside the grammar (real builder sanitizes to unknown)" \
+  "$(python3 -c 'print("a" * 128 + "-bad")')" 20260925T100008Z "" 1
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
 # generated from the REAL pc-admin builder at the pinned SHA
@@ -183,6 +222,7 @@ if python3 - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import json
 import os
+import re
 import sys
 
 here = sys.argv[1]
@@ -201,14 +241,26 @@ def replay(args):
 if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
     raise SystemExit("vector pin %r != shipper_keys pin %r" % (
         vectors.get("pinned_pc_admin_sha"), replica.PINNED_PC_ADMIN_SHA))
-# Provenance hardening: the file must have been generated from the pinned
-# grammar-defining SHA itself. A file generated with --allow-sha-mismatch
-# (or hand-edited) fails loudly instead of silently re-pinning the replica.
+
+
+def source_sha_ok(value):
+    # Round-6 F6: exact 40-hex equality. `startswith(pin)` accepted the short
+    # prefix, a prefix plus junk, and any longer prefix-sharing hex string.
+    return (isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+            and value == replica.PINNED_PC_ADMIN_SHA)
+
+
 source_sha = vectors.get("source_sha")
-if not isinstance(source_sha, str) or not source_sha.startswith(replica.PINNED_PC_ADMIN_SHA):
+if not source_sha_ok(source_sha):
     raise SystemExit(
-        "vector source_sha %r does not start with the grammar pin %r - a file generated with "
+        "vector source_sha %r is not exactly the 40-hex grammar pin %r - a file generated with "
         "--allow-sha-mismatch must never be committed" % (source_sha, replica.PINNED_PC_ADMIN_SHA))
+for hostile in (replica.PINNED_PC_ADMIN_SHA[:7], replica.PINNED_PC_ADMIN_SHA[:7] + "!!!",
+                replica.PINNED_PC_ADMIN_SHA + "0", replica.PINNED_PC_ADMIN_SHA + "!!!",
+                replica.PINNED_PC_ADMIN_SHA.upper()):
+    if source_sha_ok(hostile):
+        raise SystemExit("source_sha predicate accepted a hostile value: %r" % hostile)
 for vector in vectors["vectors"]:
     got = replay(vector["replica_args"])
     if got != vector["expected"]:
@@ -1273,6 +1325,211 @@ else
   bad "unreadable state.json -> verdict log missing the error line"
 fi
 
+# ---- round-6 F1: a token that cannot be an HTTP header value fails the push,
+# never the run. The emoji token used to raise UnicodeEncodeError and the
+# newline token ValueError OUTSIDE notify's transport handler, aborting before
+# state.json/verdict.log (and the ValueError text echoed the token bytes).
+run_bad_token_case() { # $1 = state dir, $2 = token literal
+  CASE_STATE_DIR="$1"
+  mkdir -p "${CASE_STATE_DIR}"
+  cat >"${WORK}/witness.env" <<EOF
+RECORDING_WITNESS_ENDPOINT=http://127.0.0.1:${MOCK_PORT}
+RECORDING_WITNESS_REGION=test-region
+RECORDING_WITNESS_BUCKET=pc-admin-dr
+RECORDING_WITNESS_AUDIT_PREFIX=audit/
+RECORDING_WITNESS_RECORDINGS_PREFIX=recordings/
+RECORDING_WITNESS_KEY_ID=test-key-id-0001
+RECORDING_WITNESS_KEY=test-secret-SENTINEL-0009
+RECORDING_WITNESS_STATE_DIR=${CASE_STATE_DIR}
+NTFY_TOPIC='pc-admin test'
+EOF
+  python3 - "$2" "${WORK}/witness.env" <<'PY'
+import sys
+
+token, path = sys.argv[1], sys.argv[2]
+quoted = "'" + token.replace("'", "'\\''") + "'"
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write("NTFY_TOKEN=%s\n" % quoted)
+PY
+  export RECORDING_WITNESS_ENV_FILE="${WORK}/witness.env"
+  CASE_RC=0
+  "${WITNESS}" >"${WORK}/witness.out" 2>"${WORK}/witness.err" || CASE_RC=$?
+  CASE_STATE="$(state_field state)"
+}
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+emoji_token="$(python3 -c 'print("abc\U0001f600def", end="")')"
+newline_token="$(python3 -c 'print("abc\ndef", end="")')"
+huge_token="$(python3 -c 'print("A" * 100000, end="")')"
+for token_case in emoji newline huge; do
+  case "${token_case}" in
+    emoji) token="${emoji_token}" ;;
+    newline) token="${newline_token}" ;;
+    huge) token="${huge_token}" ;;
+  esac
+  bad_token_dir="${WORK}/state-bad-token-${token_case}"
+  run_bad_token_case "${bad_token_dir}" "${token}"
+  is "bad token (${token_case}) -> alert verdict, files written" "alert" "${CASE_STATE}"
+  is "bad token (${token_case}) exits 1 (alert, not a crash)" "1" "${CASE_RC}"
+  if [ -f "${bad_token_dir}/state.json" ] && [ -f "${bad_token_dir}/verdict.log" ]; then
+    ok "bad token (${token_case}) writes state.json + verdict.log"
+  else
+    bad "bad token (${token_case}) left no files"
+  fi
+  if grep -q 'Traceback' "${WORK}/witness.err"; then
+    bad "bad token (${token_case}) crashed with a traceback"
+  else
+    ok "bad token (${token_case}) never crashes"
+  fi
+  if grep -q 'ntfy push skipped' "${WORK}/witness.out"; then
+    ok "bad token (${token_case}) logs the skipped push"
+  else
+    bad "bad token (${token_case}) skip not logged"
+  fi
+  if python3 - "${token}" "${WORK}/witness.out" "${WORK}/witness.err" \
+      "${bad_token_dir}/state.json" "${bad_token_dir}/verdict.log" <<'PY'
+import os
+import sys
+
+token = sys.argv[1].encode("utf-8")
+for path in sys.argv[2:]:
+    if os.path.exists(path) and token and token in open(path, "rb").read():
+        raise SystemExit("token bytes found in %s" % path)
+PY
+  then
+    ok "bad token (${token_case}) never echoes into logs/state"
+  else
+    bad "bad token (${token_case}) echoed token bytes somewhere"
+  fi
+done
+unset emoji_token newline_token huge_token
+
+# ---- round-6 F3: planted symlinks never redirect state/verdict writes ----
+SYMLINK_DIR="${WORK}/state-symlink"
+mkdir -p "${SYMLINK_DIR}"
+victim_tmp="${WORK}/victim-tmp.txt"
+victim_log="${WORK}/victim-log.txt"
+printf 'victim-tmp' >"${victim_tmp}"
+printf 'victim-log' >"${victim_log}"
+chmod 644 "${victim_tmp}" "${victim_log}"
+ln -s "${victim_tmp}" "${SYMLINK_DIR}/state.json.tmp"
+ln -s "${victim_log}" "${SYMLINK_DIR}/verdict.log"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.000001.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.000002.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.000003.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${SYMLINK_DIR}"
+is "symlinked tmp/log target -> exit 0" "0" "${CASE_RC}"
+is "symlinked tmp/log target -> ok verdict" "ok" "${CASE_STATE}"
+is "state.json.tmp symlink victim content untouched" "victim-tmp" "$(cat "${victim_tmp}")"
+is "state.json.tmp symlink victim mode untouched" "644" "$(mode_of "${victim_tmp}")"
+is "verdict.log symlink victim content untouched" "victim-log" "$(cat "${victim_log}")"
+if [ -f "${SYMLINK_DIR}/state.json" ] && [ ! -L "${SYMLINK_DIR}/state.json" ]; then
+  ok "state.json written as a regular file (tmp symlink not followed)"
+else
+  bad "state.json missing or still a symlink"
+fi
+if grep -q 'cannot append verdict log' "${WORK}/witness.out"; then
+  ok "symlinked verdict.log refused with a warning (victim untouched)"
+else
+  bad "symlinked verdict.log was not refused"
+fi
+TMP_DIR_BLOCK="${WORK}/state-tmp-directory"
+mkdir -p "${TMP_DIR_BLOCK}/state.json.tmp"
+run_case "${TMP_DIR_BLOCK}"
+is "directory at state.json.tmp -> exit 0 (write refused, run continues)" "0" "${CASE_RC}"
+if [ -d "${TMP_DIR_BLOCK}/state.json.tmp" ] && grep -q 'cannot write state file' "${WORK}/witness.out"; then
+  ok "directory at state.json.tmp refused loudly"
+else
+  bad "directory at state.json.tmp not refused loudly"
+fi
+
+# ---- round-6 F4: deeply nested state.json -> error + repair, never a crash
+DEEP_DIR="${WORK}/state-deep"
+mkdir -p "${DEEP_DIR}"
+python3 -c 'import sys; open(sys.argv[1], "w").write("[" * 200000)' "${DEEP_DIR}/state.json"
+run_case "${DEEP_DIR}"
+is "deeply nested state.json -> exit 2 (error verdict)" "2" "${CASE_RC}"
+is "deeply nested state.json -> error state" "error" "${CASE_STATE}"
+if [ -f "${DEEP_DIR}/state.json.corrupt" ] && [ -f "${DEEP_DIR}/verdict.log" ]; then
+  ok "deeply nested state preserved as .corrupt + verdict written"
+else
+  bad "deeply nested state was not preserved/repaired"
+fi
+if grep -q 'Traceback' "${WORK}/witness.err"; then
+  bad "deeply nested state crashed with a traceback"
+else
+  ok "deeply nested state never crashes (RecursionError bounded)"
+fi
+
+# ---- round-6 F8: a directory at .corrupt disables preservation loudly -----
+CORRUPT_DIR_BLOCK="${WORK}/state-corrupt-blocked"
+mkdir -p "${CORRUPT_DIR_BLOCK}/state.json.corrupt"
+printf 'not json at all\n' >"${CORRUPT_DIR_BLOCK}/state.json"
+run_case "${CORRUPT_DIR_BLOCK}"
+is "unreadable state + .corrupt directory -> exit 2" "2" "${CASE_RC}"
+is "unreadable state + .corrupt directory -> repaired error state" "error" "${CASE_STATE}"
+if grep -q 'cannot preserve unreadable state' "${WORK}/witness.out"; then
+  ok ".corrupt directory preserves loudly (disabled preservation stated)"
+else
+  bad ".corrupt directory silently swallowed preservation"
+fi
+
+# ---- round-6 F5: sid case is normalized for tar/upload lookups ------------
+SID_UPPER="$(printf '%s' "${SID}" | tr '[:lower:]' '[:upper:]')"
+SID2_UPPER="$(printf '%s' "${SID2}" | tr '[:lower:]' '[:upper:]')"
+K_R6_START="$(key session.start 20260925T130000Z "${SID}" 1 shell)"
+K_R6_DATA="$(key session.data 20260925T130100Z "${SID}" 2)"
+K_R6_END="$(key session.end 20260925T130200Z "${SID}" 3 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_R6_START}","ago":1300},
+  {"key":"${K_R6_DATA}","ago":1299},
+  {"key":"${K_R6_END}","ago":1298},
+  {"key":"recordings/${SID_UPPER}.tar","ago":1297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "uppercase-sid tar no longer false-alerts recording-gap" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_R6_START}","ago":1300}],
+ "uploads":[{"key":"recordings/${SID_UPPER}.tar","upload_id":"u-1","ago":1300}]}
+JSON
+start_mock
+run_case
+is "uppercase-sid in-progress upload satisfies the gap check" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_R6_START}","ago":1300},
+  {"key":"recordings/${SID2_UPPER}.tar","ago":1297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+case "${CASE_DETAIL}" in
+  *recording-gap*) ok "uppercase-sid normalization is per-session (an orphan uppercase tar does not cover SID's gap)" ;;
+  *) bad "per-session sid normalization wrong: ${CASE_DETAIL}" ;;
+esac
+
 # ---- (f) strictly list-only + SigV4 proof over every request -------------
 if python3 - "${REQUEST_LOG}" <<'PY'
 import json
@@ -1687,12 +1944,23 @@ class Response:
         return False
 
 
+class FakeOpener:
+    """Stands in for module._NTFY_OPENER; every notify POST goes through it."""
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    def open(self, request, timeout=None):
+        return self.hook(request, timeout)
+
+
 def fake_urlopen(request, timeout=None):
     captured.append(request)
     return Response()
 
 
-module.urllib.request.urlopen = fake_urlopen
+REAL_NTFY_OPENER = module._NTFY_OPENER
+module._NTFY_OPENER = FakeOpener(fake_urlopen)
 config = types.SimpleNamespace(ntfy_topic="pc-admin test", ntfy_token="tok-SENTINEL")
 if module.notify(config, "alert", "detail-body") is not True:
     raise SystemExit("notify did not report success against the fake notifier")
@@ -1709,7 +1977,7 @@ def failing_urlopen(request, timeout=None):
     raise module.urllib.error.URLError("no route")
 
 
-module.urllib.request.urlopen = failing_urlopen
+module._NTFY_OPENER = FakeOpener(failing_urlopen)
 if module.notify(config, "alert", "detail-body") is not False:
     raise SystemExit("notify must return False when the push fails")
 
@@ -1723,7 +1991,7 @@ def bad_status_urlopen(request, timeout=None):
     raise http.client.BadStatusLine("garbage")
 
 
-module.urllib.request.urlopen = bad_status_urlopen
+module._NTFY_OPENER = FakeOpener(bad_status_urlopen)
 if module.notify(config, "alert", "detail-body") is not False:
     raise SystemExit("notify must return False on BadStatusLine, not abort")
 
@@ -1732,9 +2000,112 @@ def incomplete_read_urlopen(request, timeout=None):
     raise http.client.IncompleteRead(b"abc", 10)
 
 
-module.urllib.request.urlopen = incomplete_read_urlopen
+module._NTFY_OPENER = FakeOpener(incomplete_read_urlopen)
 if module.notify(config, "alert", "detail-body") is not False:
     raise SystemExit("notify must return False on IncompleteRead, not abort")
+
+# Round-6 F1: a token that cannot be an HTTP header value is refused before
+# the request opens (the emoji/newline variants used to raise out of notify and
+# abort with no state/verdict; the ValueError text echoed the token bytes).
+module._NTFY_OPENER = FakeOpener(fake_urlopen)
+token_logs = []
+real_log = module.log
+module.log = token_logs.append
+for token_label, bad_token in [
+    ("emoji", "abc\U0001f600def"),
+    ("newline", "abc\ndef"),
+    ("oversized", "A" * 100000),
+]:
+    bad_config = types.SimpleNamespace(ntfy_topic="pc-admin test", ntfy_token=bad_token)
+    before = len(captured)
+    if module.notify(bad_config, "alert", "detail-body") is not False:
+        raise SystemExit("%s token must fail the push" % token_label)
+    if len(captured) != before:
+        raise SystemExit("%s token must be refused before the request opens" % token_label)
+    joined = "\n".join(str(entry) for entry in token_logs)
+    if bad_token in joined:
+        raise SystemExit("%s token echoed into the log" % token_label)
+if not any("ntfy push skipped" in str(entry) for entry in token_logs):
+    raise SystemExit("a refused token must be logged as a skipped push")
+
+# A late header-validation failure (putheader) must stay caught too, and the
+# catch must log only the exception class (the message can embed the header).
+for exc_label, late_exc in [
+    ("ValueError", ValueError("Invalid header value b'Bearer late-SENTINEL'")),
+    ("UnicodeEncodeError", UnicodeEncodeError("latin-1", u"Bearer late-SENTINEL", 0, 1, "boom")),
+]:
+    def raising(request, timeout=None, _exc=late_exc):
+        raise _exc
+
+    module._NTFY_OPENER = FakeOpener(raising)
+    token_logs[:] = []
+    if module.notify(config, "alert", "detail-body") is not False:
+        raise SystemExit("a %s on the request path must fail the push" % exc_label)
+    joined = "\n".join(str(entry) for entry in token_logs)
+    if "late-SENTINEL" in joined or "Invalid header value" in joined:
+        raise SystemExit("a %s message echoed the header value into the log" % exc_label)
+module.log = real_log
+
+# Round-6 F2: every redirect is refused, so a 302 to another host/scheme can
+# never re-send Authorization (the leak pc-admin fixed as R3). The real opener
+# is exercised against a local redirector + hijack listener.
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+hijack_auth = []
+
+
+class HijackHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        hijack_auth.append(self.headers.get("Authorization"))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
+class RedirectHandler(BaseHTTPRequestHandler):
+    code = 302
+    target = ""
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        self.send_response(RedirectHandler.code)
+        self.send_header("Location", RedirectHandler.target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+hijack_server = ThreadingHTTPServer(("127.0.0.1", 0), HijackHandler)
+threading.Thread(target=hijack_server.serve_forever, daemon=True).start()
+redirect_server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+threading.Thread(target=redirect_server.serve_forever, daemon=True).start()
+RedirectHandler.target = "http://127.0.0.1:%d/hijacked" % hijack_server.server_address[1]
+module._NTFY_OPENER = REAL_NTFY_OPENER
+for redirect_code in (301, 302, 303, 307, 308):
+    RedirectHandler.code = redirect_code
+    redirect_request = module.urllib.request.Request(
+        "http://127.0.0.1:%d/start" % redirect_server.server_address[1],
+        data=b"detail-body",
+        method="POST",
+    )
+    redirect_request.add_header("Authorization", "Bearer tok-REDIRECT-SENTINEL")
+    try:
+        module.open_ntfy(redirect_request, timeout=5)
+    except module.urllib.error.HTTPError:
+        pass
+    else:
+        raise SystemExit("the ntfy opener followed a %d redirect" % redirect_code)
+if hijack_auth:
+    raise SystemExit("redirect target received Authorization %r" % hijack_auth)
+hijack_server.shutdown()
+redirect_server.shutdown()
+module._NTFY_OPENER = FakeOpener(fake_urlopen)
 
 # Stateful transition/recovery through main()'s bookkeeping.
 state_dir = os.path.join(work, "ntfy-state")
@@ -1763,7 +2134,7 @@ def flaky_urlopen(request, timeout=None):
     return Response()
 
 
-module.urllib.request.urlopen = flaky_urlopen
+module._NTFY_OPENER = FakeOpener(flaky_urlopen)
 captured[:] = []
 verdict = ["alert"]
 module.run_checks = lambda config, now: (verdict[0], "detail")
@@ -1853,7 +2224,7 @@ with open(os.path.join(corrupt_dir, "state.json"), "w", encoding="utf-8") as han
                "run_seq": "not-a-number", "last_notify_epoch": 0,
                "baseline": {"state": "ok", "detail": "seeded baseline", "updated_at": "2026-09-25T00:00:00Z"}},
               handle)
-module.urllib.request.urlopen = flaky_urlopen
+module._NTFY_OPENER = FakeOpener(flaky_urlopen)
 flaky["fail"] = False
 captured[:] = []
 verdict[0] = "alert"

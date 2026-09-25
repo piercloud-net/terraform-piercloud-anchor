@@ -1,6 +1,6 @@
 {
-  "pinned_pc_admin_sha": "66bd304",
-  "grammar_note": "builder grammar last changed at 66bd304; unchanged through 5580ac0 (pc-admin PR #7 copy re-verified byte-identical)",
+  "pinned_pc_admin_sha": "41735ff77a79d24c75dc2e22bb1c47cbb0582800",
+  "grammar_note": "builder grammar last changed at 41735ff (the over-long event-type truncation cap with the `_<sha256[:8]>` collision-resistant suffix); unchanged since; previous grammar point 66bd304 (session.rejected sid-less)",
   "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
   "vectors": [
     {
@@ -199,6 +199,66 @@
         "999999999999999999"
       ],
       "expected": "audit/20260925T100008Z-session.data.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.999999999999999999.json"
+    },
+    {
+      "name": "over-long event type truncated below the cap + `_<sha256[:8]>` suffix",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_111fcf58.000001.json"
+    },
+    {
+      "name": "over-long type truncation drops a trailing separator before the suffix",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "replica_args": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_5d5181b6.000001.json"
+    },
+    {
+      "name": "over-long type A (shared 119-char head, distinct hash suffix)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzalpha"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzalpha",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_7cd378e4.000001.json"
+    },
+    {
+      "name": "over-long type B (shared 119-char head, distinct hash suffix)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzbeta"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzbeta",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_4f774766.000001.json"
     }
   ],
   "refusals": [
@@ -287,7 +347,17 @@
         ""
       ],
       "why": "the real builder drops the sid for non-session shapes"
+    },
+    {
+      "name": "over-long type outside the grammar",
+      "replica_args": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bad",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "why": "the real builder sanitizes an invalid type to `unknown`; the truncation cap applies only to grammar-valid types, so the replica must refuse the literal shape"
     }
   ],
-  "source_sha": "66bd304dcf43ba19123a4ff74b96db6244967a6d"
+  "source_sha": "41735ff77a79d24c75dc2e22bb1c47cbb0582800"
 }

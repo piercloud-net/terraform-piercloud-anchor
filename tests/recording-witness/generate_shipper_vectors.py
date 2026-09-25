@@ -7,22 +7,24 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 66bd304
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 41735ff
 
-The script refuses to write unless the pc-admin checkout HEAD matches
-`shipper_keys.PINNED_PC_ADMIN_SHA` (`--allow-sha-mismatch` only for a manual
-debug run — never commit output from a mismatched checkout; the harness
-asserts the committed file's `source_sha` starts with the pin, so such a file
-fails CI). It imports the real `scripts/lib/b2_client.py`, builds the golden +
-boundary matrix through `build_audit_key`, and self-checks that the replica in
-this directory reproduces every vector before writing.
+The script refuses to write unless the pc-admin checkout HEAD is exactly
+`shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex; `--allow-sha-mismatch` only
+for a manual debug run — never commit output from a mismatched checkout; the
+harness asserts the committed file's `source_sha` equals the pin exactly, so
+such a file fails CI). It imports the real `scripts/lib/b2_client.py`, builds
+the golden + boundary matrix through `build_audit_key`, and self-checks that
+the replica in this directory reproduces every vector before writing.
 
 The pin is the **grammar-defining SHA**: the builder grammar last changed at
-66bd304 and is unchanged through 5580ac0 (pc-admin PR #7 copy re-verified
-byte-identical), so regeneration from either checkout yields the identical
-`vectors`/`refusals` payload. When pc-admin's grammar changes: bump the pin in
-`shipper_keys.py`, regenerate this file against the new SHA, and update the
-witness contract + goldens in the same breath.
+41735ff (the over-long event-type truncation cap with the `_<sha256[:8]>`
+suffix) and is unchanged since; the previous grammar point was 66bd304 (the
+`session.rejected` sid-less fold). Because the pin must name the grammar point,
+regeneration deliberately requires a checkout at exactly that SHA — no head
+chasing. When pc-admin's grammar changes: bump the pin in `shipper_keys.py`,
+regenerate this file against the new SHA, and update the witness contract +
+goldens in the same breath.
 """
 
 import argparse
@@ -158,6 +160,42 @@ def build_vectors(b2):
         session_seq={LSID: SEQ_MAX - 1},
     )
 
+    # Cross-repo seed (pc-admin @ 41735ff): the builder caps an over-long event
+    # type at 128 chars, drops a trailing separator and appends
+    # `_<sha256[:8]>`. The cap keeps B2 keys bounded; the hash keeps distinct
+    # over-long types from aliasing to one key (the R5 finding).
+    long_type = "z" * 130
+    vector(
+        "over-long event type truncated below the cap + `_<sha256[:8]>` suffix",
+        "boundary",
+        {"time": EVENT_TIME, "event": long_type},
+        [long_type, TS, "", "1"],
+    )
+    separator_type = "a" * 118 + "." + "b" * 30
+    vector(
+        "over-long type truncation drops a trailing separator before the suffix",
+        "boundary",
+        {"time": EVENT_TIME, "event": separator_type},
+        [separator_type, TS, "", "1"],
+    )
+    alias_a = "z" * 128 + "alpha"
+    alias_b = "z" * 128 + "beta"
+    vector(
+        "over-long type A (shared 119-char head, distinct hash suffix)",
+        "boundary",
+        {"time": EVENT_TIME, "event": alias_a},
+        [alias_a, TS, "", "1"],
+    )
+    vector(
+        "over-long type B (shared 119-char head, distinct hash suffix)",
+        "boundary",
+        {"time": EVENT_TIME, "event": alias_b},
+        [alias_b, TS, "", "1"],
+    )
+    assert real_key(b2, {"time": EVENT_TIME, "event": alias_a}, None, 0) != real_key(
+        b2, {"time": EVENT_TIME, "event": alias_b}, None, 0), \
+        "the real builder aliased two distinct over-long event types"
+
     refusals = [
         {"name": "seq 0 (real floor is 1; legacy-only fixture)",
          "replica_args": ["session.data", TS, LSID, "0"],
@@ -183,6 +221,11 @@ def build_vectors(b2):
         {"name": "non-session event with a sid",
          "replica_args": ["user.login", TS, LSID, "1", ""],
          "why": "the real builder drops the sid for non-session shapes"},
+        {"name": "over-long type outside the grammar",
+         "replica_args": ["a" * 128 + "-bad", TS, "", "1"],
+         "why": "the real builder sanitizes an invalid type to `unknown`; the "
+                "truncation cap applies only to grammar-valid types, so the "
+                "replica must refuse the literal shape"},
     ]
     for refusal in refusals:
         try:
@@ -192,8 +235,9 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder grammar last changed at 66bd304; unchanged through 5580ac0 "
-                        "(pc-admin PR #7 copy re-verified byte-identical)",
+        "grammar_note": "builder grammar last changed at 41735ff (the over-long event-type "
+                        "truncation cap with the `_<sha256[:8]>` collision-resistant suffix); "
+                        "unchanged since; previous grammar point 66bd304 (session.rejected sid-less)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "refusals": refusals,
@@ -212,10 +256,10 @@ def main():
     repo = os.path.abspath(args.pc_admin)
     head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True,
                           capture_output=True, text=True).stdout.strip()
-    if not head.startswith(PINNED_PC_ADMIN_SHA) and not args.allow_sha_mismatch:
+    if head != PINNED_PC_ADMIN_SHA and not args.allow_sha_mismatch:
         raise SystemExit(
             "pc-admin checkout %s is at %s, not the pinned %s; bump the pin deliberately first "
-            "(or pass --allow-sha-mismatch for a debug run)" % (repo, head[:12], PINNED_PC_ADMIN_SHA)
+            "(or pass --allow-sha-mismatch for a debug run)" % (repo, head[:12], PINNED_PC_ADMIN_SHA[:12])
         )
     b2 = load_module(os.path.join(repo, "scripts", "lib", "b2_client.py"), "pcadmin_b2_client")
     payload = build_vectors(b2)
