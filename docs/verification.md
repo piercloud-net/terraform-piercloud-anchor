@@ -26,7 +26,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist; also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
 | `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, anchor IP selection, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, per-anchor origin-ca) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, anchor IP selection, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, per-anchor origin-ca, recording-witness) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|origin-ca)/)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|origin-ca|recording-witness)/)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -115,6 +115,15 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] `tofu plan`/outputs show `anchor_hostname = anchor-01-<tenant>.piercloud.net`; `tests/naming-scheme/` is green.
 - [ ] Live: SCP server name, firewall policy name, and the DNS record all carry the canonical `anchor-01-<tenant>` form.
 - [ ] Dashboard host is the ONE flat label `status-<tenant>.piercloud.net` (Universal SSL coverage; two labels would require ACM — issue #107).
+
+### Recording witness (optional component — `scripts/010-provision.sh`, `provision.yml`)
+
+- [ ] CI green; the `recording-witness` harness renders the real witness span, proves the strict-list-only property (signed `ListObjectsV2`/`ListMultipartUploads` only, pagination followed) and the gap/lag/sequence verdicts against the mock endpoint.
+- [ ] Dormant default: a `mode=apply` provision without `RECORDING_WITNESS_*` leaves no timer and removes a previously installed witness (`systemctl list-timers pc-recording-witness` empty; env file gone).
+- [ ] Owner sets the six `RECORDING_WITNESS_*` repo secrets via the documented stdin form (no value ever in argv/logs) and dispatches; the run log shows the install line, the enabled timer and `witness verdict: OK` with the state counts (a witness `error` fails the run closed; `alert` warns).
+- [ ] `systemctl list-timers pc-recording-witness` shows the 5-minute schedule; `/var/lib/piercloud/recording-witness/state.json` reads `state=ok`; the verdict log has one line per run.
+- [ ] Witness negative (run from `pc-admin` `scripts/030-recording-pipeline.sh`): the witness key lists the bucket but `GET`/`HEAD` fail and `ListParts` is denied — the key is `listFiles`-only.
+- [ ] Retire path: delete the six secrets + re-dispatch; the timer and env file are gone, the verdict log is kept.
 
 ### Docs-only
 

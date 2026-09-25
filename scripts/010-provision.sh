@@ -4,7 +4,8 @@
 #
 # WHERE THIS RUNS: ON the anchor box itself, as root, normally via the A1
 # dispatch (the runner SSHes in under a per-run device-flow approval and pipes
-# this script over stdin with GATUS_*/NTFY_* env prefixed). Fallback: paste it
+# this script over stdin with GATUS_*/NTFY_*/RECORDING_WITNESS_* env prefixed).
+# Fallback: paste it
 # into the netcup SCP remote console by hand — env unset means a self-check-only
 # monitor. Either way the tang keypair is generated ON THIS BOX and never leaves.
 #
@@ -1333,5 +1334,737 @@ if [ -n "${STATUS_HOST:-}" ]; then
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
   fi
 fi
+
+# --- BEGIN RECORDING WITNESS (tests/recording-witness extracts this span; keep markers) ---
+# Recording-completeness witness — optional component, dormant without env.
+# Renders /usr/local/sbin/pc-recording-witness.sh + its 0600 env file + a
+# 5-minute systemd timer. The witness is STRICTLY list-only (ListObjectsV2 +
+# ListMultipartUploads with a listFiles-only B2 application key: no readFiles,
+# no HEAD, no ListParts) and fail-closed (an un-runnable witness reports
+# `error`; the last baseline is held). Design, key contract and checks:
+# docs/recording-witness.md.
+#
+# Paths are overridable so the committed test harness can render and install
+# into throwaway paths; the dispatch env never exports these names, so on-box
+# runs always get the canonical defaults.
+RECORDING_WITNESS_SBIN="${RECORDING_WITNESS_SBIN:-/usr/local/sbin/pc-recording-witness.sh}"
+RECORDING_WITNESS_ENV_FILE="${RECORDING_WITNESS_ENV_FILE:-/etc/piercloud/recording-witness.env}"
+RECORDING_WITNESS_STATE_DIR="${RECORDING_WITNESS_STATE_DIR:-/var/lib/piercloud/recording-witness}"
+RECORDING_WITNESS_SERVICE="${RECORDING_WITNESS_SERVICE:-/etc/systemd/system/pc-recording-witness.service}"
+RECORDING_WITNESS_TIMER="${RECORDING_WITNESS_TIMER:-/etc/systemd/system/pc-recording-witness.timer}"
+
+recording_witness_config_problem() { # print the first config problem; empty = ok
+  if [ -z "${RECORDING_WITNESS_ENDPOINT:-}" ]; then printf '%s' 'RECORDING_WITNESS_ENDPOINT is empty'; return 0; fi
+  case "${RECORDING_WITNESS_ENDPOINT}" in
+    http://*|https://*) ;;
+    *) printf '%s' 'RECORDING_WITNESS_ENDPOINT must start with http:// or https://'; return 0 ;;
+  esac
+  case "${RECORDING_WITNESS_ENDPOINT}" in *[[:space:]]*) printf '%s' 'RECORDING_WITNESS_ENDPOINT has whitespace'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_BUCKET:-}" ]; then printf '%s' 'RECORDING_WITNESS_BUCKET is empty'; return 0; fi
+  case "${RECORDING_WITNESS_BUCKET}" in *[!a-z0-9.-]*) printf '%s' 'RECORDING_WITNESS_BUCKET must match [a-z0-9.-]'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_AUDIT_PREFIX:-}" ]; then printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX is empty'; return 0; fi
+  case "${RECORDING_WITNESS_AUDIT_PREFIX}" in */) ;; *) printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX must end with /'; return 0;; esac
+  case "${RECORDING_WITNESS_AUDIT_PREFIX}" in *[!A-Za-z0-9._/-]*) printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX has unsupported characters'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}" ]; then printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX is empty'; return 0; fi
+  case "${RECORDING_WITNESS_RECORDINGS_PREFIX}" in */) ;; *) printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX must end with /'; return 0;; esac
+  case "${RECORDING_WITNESS_RECORDINGS_PREFIX}" in *[!A-Za-z0-9._/-]*) printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX has unsupported characters'; return 0;; esac
+  if [ "${RECORDING_WITNESS_AUDIT_PREFIX}" = "${RECORDING_WITNESS_RECORDINGS_PREFIX}" ]; then printf '%s' 'audit and recordings prefixes must differ'; return 0; fi
+  if [ -z "${RECORDING_WITNESS_KEY_ID:-}" ]; then printf '%s' 'RECORDING_WITNESS_KEY_ID is empty'; return 0; fi
+  case "${RECORDING_WITNESS_KEY_ID}" in *[!A-Za-z0-9_-]*) printf '%s' 'RECORDING_WITNESS_KEY_ID has unsupported characters'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_KEY:-}" ]; then printf '%s' 'RECORDING_WITNESS_KEY is empty'; return 0; fi
+  case "${RECORDING_WITNESS_KEY}" in *[[:space:]]*|*[![:print:]]*) printf '%s' 'RECORDING_WITNESS_KEY has whitespace or control characters'; return 0;; esac
+  return 0
+}
+
+recording_witness_state() { # off | partial | on
+  local present=0 total=0 name
+  for name in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX RECORDING_WITNESS_RECORDINGS_PREFIX RECORDING_WITNESS_KEY_ID RECORDING_WITNESS_KEY; do
+    total=$((total + 1))
+    if [ -n "${!name:-}" ]; then present=$((present + 1)); fi
+  done
+  if [ "$present" -eq 0 ]; then printf 'off'; return 0; fi
+  if [ "$present" -ne "$total" ]; then printf 'partial'; return 0; fi
+  if [ -n "$(recording_witness_config_problem)" ]; then printf 'partial'; return 0; fi
+  printf 'on'
+}
+
+render_recording_witness() { # print the on-box witness script to stdout
+  cat <<'RECORDING_WITNESS_FILE_EOF'
+#!/usr/bin/env bash
+# pc-recording-witness.sh — list-only recording-completeness witness.
+# RENDERED by terraform-piercloud-anchor scripts/010-provision.sh; DO NOT EDIT.
+# Contract + checks: docs/recording-witness.md (repo).
+#
+# Strictly list-only: reads /etc/piercloud/recording-witness.env (0600) and
+# makes only ListObjectsV2 / ListMultipartUploads calls. Never fetches object
+# content (no GET/HEAD) and never calls ListParts (writeFiles).
+set -euo pipefail
+
+ENV_FILE="${RECORDING_WITNESS_ENV_FILE:-/etc/piercloud/recording-witness.env}"
+if [ ! -r "$ENV_FILE" ]; then
+  printf '[witness] FAIL: witness env file not readable: %s\n' "$ENV_FILE" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090,SC1091  # operator-controlled dispatched env file
+. "$ENV_FILE"
+set +a
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '[witness] FAIL: python3 is not installed\n' >&2
+  exit 2
+fi
+
+exec python3 - <<'RECORDING_WITNESS_PY_EOF'
+"""List-only recording-completeness witness (B2 S3 metadata).
+
+Strictly list-only: ListObjectsV2 + ListMultipartUploads with a listFiles-only
+application key. Never reads an object (no GET/HEAD) and never calls the
+writeFiles-gated ListParts. Fail-closed: any failure to run reports state
+`error`, holds the baseline, and exits 2; alerts exit 1; green exits 0.
+"""
+import collections
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+STATE_VERSION = 1
+SESSION_KEY_RE = re.compile(
+    r"^(?P<ts>[^/]+)-(?P<etype>session\.[A-Za-z0-9_]+)\."
+    r"(?P<sid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\."
+    r"(?P<seq>[0-9]+)\.json$"
+)
+RECORDING_KEY_RE = re.compile(
+    r"^(?P<sid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.tar$"
+)
+
+
+class WitnessError(Exception):
+    """Any condition that makes the witness un-runnable (fail-closed)."""
+
+
+def env(name, default=""):
+    value = os.environ.get(name, "")
+    return value if value else default
+
+
+def env_int(name, default):
+    raw = env(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        raise WitnessError("%s must be an integer, got %r" % (name, raw))
+
+
+def log(message):
+    print("[witness] " + message, flush=True)
+
+
+def clip(text, limit=300):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def utc_stamp(instant):
+    return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_timestamp(text):
+    value = (text or "").strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(timezone.utc)
+
+
+def quote(value, keep_slash=False):
+    safe = "-_.~"
+    if keep_slash:
+        safe += "/"
+    return urllib.parse.quote(value, safe=safe)
+
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def sign(key, message):
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+class Config(object):
+    def __init__(self):
+        self.endpoint = env("RECORDING_WITNESS_ENDPOINT").rstrip("/")
+        self.bucket = env("RECORDING_WITNESS_BUCKET")
+        self.audit_prefix = env("RECORDING_WITNESS_AUDIT_PREFIX")
+        self.recordings_prefix = env("RECORDING_WITNESS_RECORDINGS_PREFIX")
+        self.key_id = env("RECORDING_WITNESS_KEY_ID")
+        self.key = env("RECORDING_WITNESS_KEY")
+        self.region = env("RECORDING_WITNESS_REGION")
+        self.state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
+        self.heartbeat_max_age = env_int("RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS", 900)
+        self.session_grace = env_int("RECORDING_WITNESS_SESSION_GRACE_SECONDS", 600)
+        self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
+        self.renotify = env_int("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
+        self.ntfy_topic = env("NTFY_TOPIC")
+        self.ntfy_token = env("NTFY_TOKEN")
+        self.heartbeat_prefix = self.audit_prefix + "heartbeat/"
+        self.validate()
+
+    def validate(self):
+        required = [
+            ("RECORDING_WITNESS_ENDPOINT", self.endpoint),
+            ("RECORDING_WITNESS_BUCKET", self.bucket),
+            ("RECORDING_WITNESS_AUDIT_PREFIX", self.audit_prefix),
+            ("RECORDING_WITNESS_RECORDINGS_PREFIX", self.recordings_prefix),
+            ("RECORDING_WITNESS_KEY_ID", self.key_id),
+            ("RECORDING_WITNESS_KEY", self.key),
+        ]
+        for name, value in required:
+            if not value:
+                raise WitnessError("%s is empty - witness env incomplete" % name)
+        if not self.endpoint.startswith(("http://", "https://")):
+            raise WitnessError("RECORDING_WITNESS_ENDPOINT must be an http(s) URL")
+        if urllib.parse.urlsplit(self.endpoint).path not in ("", "/"):
+            raise WitnessError("RECORDING_WITNESS_ENDPOINT must not carry a path")
+        for name, value in (("AUDIT_PREFIX", self.audit_prefix), ("RECORDINGS_PREFIX", self.recordings_prefix)):
+            if not value.endswith("/"):
+                raise WitnessError("RECORDING_WITNESS_%s must end with /" % name)
+
+    def signing_region(self):
+        if self.region:
+            return self.region
+        match = re.match(r"^https?://s3\.([a-z0-9-]+)\.backblazeb2\.com$", self.endpoint)
+        return match.group(1) if match else "us-east-1"
+
+
+def signed_get(config, params):
+    """SigV4-signed path-style GET against the S3 endpoint (list calls only)."""
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+    host = urllib.parse.urlsplit(config.endpoint).netloc
+    canonical_uri = "/" + quote(config.bucket, keep_slash=True)
+    pairs = sorted((quote(str(name)), quote(str(value))) for name, value in params.items())
+    canonical_query = "&".join("%s=%s" % (name, value) for name, value in pairs)
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join("%s:%s\n" % (name, headers[name]) for name in sorted(headers))
+    canonical_request = "\n".join(
+        ["GET", canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash]
+    )
+    scope = "%s/%s/s3/aws4_request" % (datestamp, config.signing_region())
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope,
+         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()]
+    )
+    signing_key = sign(("AWS4" + config.key).encode("utf-8"), datestamp)
+    signing_key = sign(signing_key, config.signing_region())
+    signing_key = sign(signing_key, "s3")
+    signing_key = sign(signing_key, "aws4_request")
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
+        config.key_id, scope, signed_headers, signature)
+    url = config.endpoint + canonical_uri + (("?" + canonical_query) if canonical_query else "")
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Authorization", authorization)
+    request.add_header("x-amz-content-sha256", payload_hash)
+    request.add_header("x-amz-date", amz_date)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def list_objects(config, prefix):
+    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content."""
+    objects = {}
+    token = ""
+    for _ in range(1000):
+        params = {"list-type": "2", "prefix": prefix}
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        truncated = False
+        next_token = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    try:
+                        objects[key] = parse_timestamp(last_modified)
+                    except ValueError:
+                        raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+        if not truncated:
+            return objects
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise WitnessError("ListObjectsV2 %s exceeded 1000 pages" % prefix)
+
+
+def list_uploads(config, prefix):
+    """ListMultipartUploads -> [{key, upload_id, initiated}]. List-only."""
+    uploads = []
+    key_marker = ""
+    upload_marker = ""
+    for _ in range(1000):
+        params = {"uploads": ""}
+        if prefix:
+            params["prefix"] = prefix
+        if key_marker:
+            params["key-marker"] = key_marker
+        if upload_marker:
+            params["upload-id-marker"] = upload_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListMultipartUploads %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
+        truncated = False
+        next_key = ""
+        next_upload = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Upload":
+                entry = {"key": "", "upload_id": "", "initiated": None}
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        entry["key"] = field.text or ""
+                    elif field_name == "UploadId":
+                        entry["upload_id"] = field.text or ""
+                    elif field_name == "Initiated":
+                        entry["initiated"] = parse_timestamp(field.text or "")
+                if entry["key"]:
+                    uploads.append(entry)
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextUploadIdMarker":
+                next_upload = child.text or ""
+        if not truncated:
+            return uploads
+        if not next_key:
+            raise WitnessError("ListMultipartUploads %s truncated without a key marker" % prefix)
+        key_marker = next_key
+        upload_marker = next_upload
+    raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
+
+
+def run_checks(config, now):
+    audit_objects = list_objects(config, config.audit_prefix)
+    recording_objects = list_objects(config, config.recordings_prefix)
+    uploads = list_uploads(config, config.recordings_prefix)
+    alerts = []
+
+    heartbeat_times = [
+        last_modified for key, last_modified in audit_objects.items()
+        if key.startswith(config.heartbeat_prefix)
+    ]
+    heartbeat_age = None
+    if not heartbeat_times:
+        alerts.append("heartbeat-missing: no objects under %s" % config.heartbeat_prefix)
+    else:
+        heartbeat_age = int((now - max(heartbeat_times)).total_seconds())
+        if heartbeat_age > config.heartbeat_max_age:
+            alerts.append(
+                "heartbeat-stale: newest heartbeat is %ds old (limit %ds)"
+                % (heartbeat_age, config.heartbeat_max_age)
+            )
+
+    sessions = {}
+    contract_bad = 0
+    for key, last_modified in audit_objects.items():
+        if key.startswith(config.heartbeat_prefix):
+            continue
+        relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
+        match = SESSION_KEY_RE.match(relative)
+        if not match:
+            if "-session." in relative:
+                contract_bad += 1
+            continue
+        sid = match.group("sid").lower()
+        state = sessions.setdefault(sid, {"seqs": [], "start": None, "end": None})
+        state["seqs"].append(int(match.group("seq")))
+        if match.group("etype") == "session.start" and state["start"] is None:
+            state["start"] = last_modified
+        if match.group("etype") == "session.end" and (state["end"] is None or last_modified > state["end"]):
+            state["end"] = last_modified
+
+    if contract_bad:
+        alerts.append(
+            "naming-contract: %d audit key(s) carry a session event but do not match the shipper naming contract"
+            % contract_bad
+        )
+    if not heartbeat_times and not sessions and audit_objects:
+        alerts.append(
+            "contract-mismatch: %d audit object(s), none parse as heartbeat or session events"
+            % len(audit_objects)
+        )
+
+    for sid in sorted(sessions):
+        seqs = sessions[sid]["seqs"]
+        counts = collections.Counter(seqs)
+        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
+        if duplicates:
+            alerts.append(
+                "sequence-duplicate: session %s repeats <seq> %s"
+                % (sid, ",".join(str(number) for number in duplicates))
+            )
+            continue
+        low, high = min(seqs), max(seqs)
+        if high - low + 1 != len(seqs):
+            missing = [number for number in range(low, high + 1) if number not in counts]
+            alerts.append(
+                "sequence-gap: session %s missing <seq> %s"
+                % (sid, ",".join(str(number) for number in missing))
+            )
+
+    upload_keys = set(upload["key"] for upload in uploads)
+    for sid in sorted(sessions):
+        started = sessions[sid]["start"]
+        if started is None:
+            continue
+        age = int((now - started).total_seconds())
+        if age <= config.session_grace:
+            continue
+        recording_key = config.recordings_prefix + sid + ".tar"
+        if recording_key in recording_objects or recording_key in upload_keys:
+            continue
+        alerts.append(
+            "recording-gap: session %s started %ds ago with no %s object and no in-progress upload"
+            % (sid, age, recording_key)
+        )
+
+    for upload in uploads:
+        key = upload["key"]
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        if sid not in sessions or sessions[sid]["end"] is None:
+            continue
+        ended_age = int((now - sessions[sid]["end"]).total_seconds())
+        if ended_age > config.completer_lag:
+            alerts.append(
+                "completer-lag: %s still in progress %ds after session.end (started at %s)"
+                % (key, ended_age, utc_stamp(upload["initiated"]))
+            )
+
+    if alerts:
+        return "alert", "; ".join(alerts)
+    detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
+        len(sessions), len(uploads), len(audit_objects), len(recording_objects),
+        ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
+    return "ok", detail
+
+
+def read_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise WitnessError("state file unreadable: %s" % exc)
+    if not isinstance(data, dict):
+        raise WitnessError("state file is not a JSON object")
+    return data
+
+
+def write_state(path, record):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def append_verdict(path, state, detail):
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("%s %s %s\n" % (utc_stamp(datetime.now(timezone.utc)), state, detail))
+
+
+def notify(config, state, detail):
+    """Push the verdict through ntfy when a topic is configured. Best-effort."""
+    if not config.ntfy_topic:
+        return False
+    headers = {
+        "Title": "recording witness: %s" % state,
+        "Tags": "white_check_mark" if state == "ok" else "warning",
+    }
+    if config.ntfy_token:
+        headers["Authorization"] = "Bearer " + config.ntfy_token
+    request = urllib.request.Request(
+        "https://ntfy.sh/" + urllib.parse.quote(config.ntfy_topic, safe=""),
+        data=clip(detail, 800).encode("utf-8"),
+        method="POST",
+    )
+    for name, value in headers.items():
+        request.add_header(name, value)
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            return True
+    except (urllib.error.URLError, OSError) as exc:
+        log("WARNING: ntfy push failed: %s" % clip(exc, 200))
+        return False
+
+
+def should_notify(previous_state, last_epoch, state, now_epoch, renotify):
+    if state == "ok":
+        return previous_state not in (None, "ok")
+    if state != previous_state:
+        return True
+    return now_epoch - int(last_epoch) >= int(renotify)
+
+
+def main():
+    now = datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    config = None
+    try:
+        config = Config()
+        state, detail = run_checks(config, now)
+    except Exception as exc:  # fail-closed by design: any failure => error
+        state = "error"
+        detail = "error: %s: %s" % (type(exc).__name__, exc)
+    detail = clip(detail, 1000)
+
+    state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
+    state_path = os.path.join(state_dir, "state.json")
+    verdict_path = os.path.join(state_dir, "verdict.log")
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        log("FAIL: cannot create state directory: %s" % clip(exc, 200))
+        log("%s: %s" % (state, detail))
+        return 2
+
+    previous = {}
+    try:
+        previous = read_state(state_path)
+    except WitnessError as exc:
+        if state != "error":
+            state, detail = "error", clip("error: %s" % exc, 1000)
+        previous = {}
+
+    renotify = config.renotify if config is not None else 1800
+    baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
+    last_notify_epoch = previous.get("last_notify_epoch") or 0
+    if should_notify(previous.get("state"), last_notify_epoch, state, now_epoch, renotify):
+        if config is not None and notify(config, state, detail):
+            last_notify_epoch = now_epoch
+    record = {
+        "version": STATE_VERSION,
+        "state": state,
+        "detail": detail,
+        "updated_at": utc_stamp(now),
+        "last_notify_epoch": last_notify_epoch,
+    }
+    if state == "error":
+        record["baseline"] = baseline  # held: an un-runnable run never advances it
+    else:
+        record["baseline"] = {"state": state, "detail": detail, "updated_at": utc_stamp(now)}
+    try:
+        write_state(state_path, record)
+    except OSError as exc:
+        log("WARNING: cannot write state file: %s" % clip(exc, 200))
+    try:
+        append_verdict(verdict_path, state, detail)
+    except OSError as exc:
+        log("WARNING: cannot append verdict log: %s" % clip(exc, 200))
+    log("%s: %s" % (state, detail))
+    return {"ok": 0, "alert": 1, "error": 2}[state]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+RECORDING_WITNESS_PY_EOF
+RECORDING_WITNESS_FILE_EOF
+}
+
+render_recording_witness_service() { # print the systemd service unit to stdout
+  cat <<RECORDING_WITNESS_UNIT_EOF
+[Unit]
+Description=pc-admin recording-completeness witness (list-only B2 metadata)
+Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/recording-witness.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${RECORDING_WITNESS_SBIN}
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=${RECORDING_WITNESS_STATE_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RECORDING_WITNESS_UNIT_EOF
+}
+
+render_recording_witness_timer() { # print the systemd timer unit to stdout
+  cat <<'RECORDING_WITNESS_TIMER_EOF'
+[Unit]
+Description=Run the pc-admin recording-completeness witness every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+RECORDING_WITNESS_TIMER_EOF
+}
+
+recording_witness_install() { # render + install the component (idempotent)
+  local tmp
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "Installing python3 (witness runtime)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq python3-minimal >/dev/null
+  fi
+  mkdir -p "$(dirname "$RECORDING_WITNESS_SBIN")" "$(dirname "$RECORDING_WITNESS_ENV_FILE")" "$RECORDING_WITNESS_STATE_DIR" \
+    "$(dirname "$RECORDING_WITNESS_SERVICE")" "$(dirname "$RECORDING_WITNESS_TIMER")"
+  chmod 700 "$RECORDING_WITNESS_STATE_DIR"
+  tmp="$(mktemp)"
+  render_recording_witness >"$tmp"
+  bash -n "$tmp" || die "rendered witness script failed bash -n - refusing to install"
+  chmod 0755 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$RECORDING_WITNESS_SBIN"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
+    printf '%s\n' "# DO NOT EDIT BY HAND - re-rendered on every provision run. Holds the"
+    printf '%s\n' "# list-only witness key: mode 0600, root-only, never printed to logs."
+    printf 'RECORDING_WITNESS_ENDPOINT=%q\n' "$RECORDING_WITNESS_ENDPOINT"
+    printf 'RECORDING_WITNESS_BUCKET=%q\n' "$RECORDING_WITNESS_BUCKET"
+    printf 'RECORDING_WITNESS_AUDIT_PREFIX=%q\n' "$RECORDING_WITNESS_AUDIT_PREFIX"
+    printf 'RECORDING_WITNESS_RECORDINGS_PREFIX=%q\n' "$RECORDING_WITNESS_RECORDINGS_PREFIX"
+    printf 'RECORDING_WITNESS_KEY_ID=%q\n' "$RECORDING_WITNESS_KEY_ID"
+    printf 'RECORDING_WITNESS_KEY=%q\n' "$RECORDING_WITNESS_KEY"
+    printf 'RECORDING_WITNESS_STATE_DIR=%q\n' "$RECORDING_WITNESS_STATE_DIR"
+    if [ -n "${RECORDING_WITNESS_REGION:-}" ]; then printf 'RECORDING_WITNESS_REGION=%q\n' "$RECORDING_WITNESS_REGION"; fi
+    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$RECORDING_WITNESS_ENV_FILE"
+  render_recording_witness_service >"$RECORDING_WITNESS_SERVICE.tmp.$$"
+  chmod 0644 "$RECORDING_WITNESS_SERVICE.tmp.$$"
+  mv "$RECORDING_WITNESS_SERVICE.tmp.$$" "$RECORDING_WITNESS_SERVICE"
+  render_recording_witness_timer >"$RECORDING_WITNESS_TIMER.tmp.$$"
+  chmod 0644 "$RECORDING_WITNESS_TIMER.tmp.$$"
+  mv "$RECORDING_WITNESS_TIMER.tmp.$$" "$RECORDING_WITNESS_TIMER"
+  systemctl daemon-reload
+  systemctl enable --now pc-recording-witness.timer >/dev/null
+  log "recording witness installed (5 min timer; env file 0600, key never printed)"
+}
+
+recording_witness_run_once() { # run one check now and surface the verdict
+  local rc=0 state exec_status detail
+  systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
+  exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+  state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
+  case "${state}:${exec_status}" in
+    ok:0) log "witness verdict: OK - ${detail}" ;;
+    alert:1) warn "witness verdict: ALERT - ${detail} (the witness works; the recording pipeline has an open alert)" ;;
+    error:2) die "witness verdict: ERROR - ${detail} (an un-runnable witness fails the run closed; fix the config and re-dispatch)" ;;
+    *) die "witness produced no trustworthy verdict (state=${state:-missing} ExecMainStatus=${exec_status:-unset} rc=${rc}) - refusing to finish blind" ;;
+  esac
+}
+
+recording_witness_disable() { # remove a previously installed component
+  if [ ! -e "$RECORDING_WITNESS_SERVICE" ] && [ ! -e "$RECORDING_WITNESS_TIMER" ] && [ ! -e "$RECORDING_WITNESS_SBIN" ] && [ ! -e "$RECORDING_WITNESS_ENV_FILE" ]; then
+    return 0
+  fi
+  log "recording witness disabled (no RECORDING_WITNESS_* env) - removing the timer and rendered artifacts"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now pc-recording-witness.timer >/dev/null 2>&1 || true
+    systemctl stop pc-recording-witness.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$RECORDING_WITNESS_SERVICE" "$RECORDING_WITNESS_TIMER" "$RECORDING_WITNESS_SBIN" "$RECORDING_WITNESS_ENV_FILE"
+  log "witness state + verdict log kept at ${RECORDING_WITNESS_STATE_DIR} (evidence; remove by hand to reset)"
+}
+# --- END RECORDING WITNESS ---
+
+# ---------------------------------------------------------------------------
+# g) Recording-completeness witness (list-only; optional)
+#    Renders + enables the 5-minute witness timer when the RECORDING_WITNESS_*
+#    env is fully set. Missing env = the component stays dormant (tenants
+#    unaffected) and a previously installed copy is removed, so a retire never
+#    leaves a stale timer. A partial env is a config error (fail closed).
+#    Env in: RECORDING_WITNESS_ENDPOINT / _BUCKET / _AUDIT_PREFIX /
+#    _RECORDINGS_PREFIX / _KEY_ID / _KEY (list-only), plus the existing
+#    NTFY_TOPIC / NTFY_TOKEN for alert pushes. Docs: docs/recording-witness.md.
+# ---------------------------------------------------------------------------
+case "$(recording_witness_state)" in
+  on)
+    log "Installing the list-only recording-completeness witness (B2 metadata checks)"
+    recording_witness_install
+    recording_witness_run_once
+    ;;
+  partial)
+    witness_problem="$(recording_witness_config_problem)"
+    die "recording-witness env is partial: ${witness_problem:-unknown problem}. Set every RECORDING_WITNESS_* repo secret or none at all (docs/recording-witness.md)."
+    ;;
+  off)
+    recording_witness_disable
+    ;;
+esac
 
 log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."
