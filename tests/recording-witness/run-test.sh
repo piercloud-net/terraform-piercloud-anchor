@@ -35,14 +35,23 @@
 #       session with no session.start -> session-start-missing; a
 #       renamed session prefix (sess.start) is still drift; an audit key that
 #       matches no documented shape -> alert contract-mismatch; future
-#       LastModified *and* future Initiated timestamps -> error (clock skew);
+#       LastModified *and* future Initiated timestamps -> error (clock skew,
+#       enforced at collection time for every listed object, incl. exec
+#       sessions and completed tars that never reach a per-session age check);
+#       equal-LastModified contradictory duplicate starts/ends fail closed to
+#       the conservative shell in both listing orders; an orphan completed tar
+#       whose sid has no audit events at all alerts session-start-missing past
+#       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
 #       (shipper_keys.py, pinned to cad0p/pc-admin @ 66bd304; golden strings,
 #       refusal teeth, and the checked-in golden+boundary vector matrix
 #       generated from the real builder — never hand-written);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
-#       last baseline in state.json is held; malformed XML, an S3 error
-#       document and a truncated list without a continuation token all error;
+#       last baseline in state.json is held; a corrupt state.json (bad numeric
+#       field) reports error and repairs instead of crashing, holding the
+#       readable baseline, and an unreadable one is preserved as
+#       state.json.corrupt; malformed XML, an S3 error document and a
+#       truncated list without a continuation token all error;
 #   (f) strictly list-only: every request the witness makes is a signed GET
 #       list call (ListObjectsV2 / ListMultipartUploads) — no HEAD, no
 #       object GET, no ListParts, no write; pagination is followed for both
@@ -67,8 +76,11 @@
 #       state is suppressed inside the renotify window, renotifies outside it,
 #       a failed recovery push is retried on the next green run until it lands
 #       (the retry boundary is the per-run identity, so a same-second
-#       transition still retries), and steady ok stays silent afterwards
-#       (fake notifier, no network).
+#       transition still retries), a stored last-notify epoch in the future
+#       still renotifies (clock-corrected state cannot silence forever),
+#       BadStatusLine/IncompleteRead push failures are caught and logged (not
+#       fatal), and steady ok stays silent afterwards (fake notifier, no
+#       network).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -189,6 +201,14 @@ def replay(args):
 if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
     raise SystemExit("vector pin %r != shipper_keys pin %r" % (
         vectors.get("pinned_pc_admin_sha"), replica.PINNED_PC_ADMIN_SHA))
+# Provenance hardening: the file must have been generated from the pinned
+# grammar-defining SHA itself. A file generated with --allow-sha-mismatch
+# (or hand-edited) fails loudly instead of silently re-pinning the replica.
+source_sha = vectors.get("source_sha")
+if not isinstance(source_sha, str) or not source_sha.startswith(replica.PINNED_PC_ADMIN_SHA):
+    raise SystemExit(
+        "vector source_sha %r does not start with the grammar pin %r - a file generated with "
+        "--allow-sha-mismatch must never be committed" % (source_sha, replica.PINNED_PC_ADMIN_SHA))
 for vector in vectors["vectors"]:
     got = replay(vector["replica_args"])
     if got != vector["expected"]:
@@ -199,8 +219,8 @@ for refusal in vectors["refusals"]:
     except ValueError:
         continue
     raise SystemExit("refusal accepted: %s" % refusal["name"])
-print("vectors=%d refusals=%d pin=%s" % (
-    len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"]))
+print("vectors=%d refusals=%d pin=%s source=%s" % (
+    len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
 then ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"; else bad "shipper replica diverged from the checked-in real-builder vectors"; fi
 
@@ -318,7 +338,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 ' "${FIXTURE}"
 }
 
-state_field() { # $1 = dotted path into state.json
+state_field() { # $1 = dotted path into the CASE_STATE_DIR state.json
   python3 -c '
 import json, sys
 try:
@@ -328,10 +348,11 @@ except (OSError, ValueError):
 for part in sys.argv[2].split("."):
     node = node.get(part, "") if isinstance(node, dict) else ""
 print(node)
-' "${WORK}/state/state.json" "$1" 2>/dev/null || true
+' "${CASE_STATE_DIR:-${WORK}/state}/state.json" "$1" 2>/dev/null || true
 }
 
-run_case() { # fixture must be at ${FIXTURE}; sets CASE_RC / CASE_STATE / CASE_DETAIL
+run_case() { # fixture at ${FIXTURE} ($1 = optional state dir); sets CASE_RC / CASE_STATE / CASE_DETAIL
+  CASE_STATE_DIR="${1:-${WORK}/state}"
   cat >"${WORK}/witness.env" <<EOF
 RECORDING_WITNESS_ENDPOINT=http://127.0.0.1:${MOCK_PORT}
 RECORDING_WITNESS_REGION=test-region
@@ -340,7 +361,7 @@ RECORDING_WITNESS_AUDIT_PREFIX=audit/
 RECORDING_WITNESS_RECORDINGS_PREFIX=recordings/
 RECORDING_WITNESS_KEY_ID=test-key-id-0001
 RECORDING_WITNESS_KEY=test-secret-SENTINEL-0009
-RECORDING_WITNESS_STATE_DIR=${WORK}/state
+RECORDING_WITNESS_STATE_DIR=${CASE_STATE_DIR}
 EOF
   export RECORDING_WITNESS_ENV_FILE="${WORK}/witness.env"
   CASE_RC=0
@@ -739,6 +760,71 @@ run_case
 is "contradictory starts, newest exec key lists first -> exit 0 (order-independent)" "0" "${CASE_RC}"
 is "contradictory starts, newest exec key lists first -> ok verdict" "ok" "${CASE_STATE}"
 
+# Round-5: a genuine equal-LastModified tie with conflicting declared modes
+# has no "newest" marker to pick. First-key-wins was order-dependent (an
+# `.exec` tie sorting first silently exempted the session); a conflicting tie
+# fails closed to the conservative `.shell` in BOTH listing orders.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_EXEC}","ago":1200},
+  {"key":"${K_START_2_SHELL}","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "equal-LM contradictory starts, exec key first -> exit 1 (tie fails closed)" "1" "${CASE_RC}"
+is "equal-LM contradictory starts, exec key first -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "equal-LM start tie detail names recording-gap (conservative shell)" ;; *) bad "equal-LM start tie detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":1200},
+  {"key":"${K_START_2_EXEC}","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "equal-LM contradictory starts, shell key first -> exit 1 (both orders)" "1" "${CASE_RC}"
+is "equal-LM contradictory starts, shell key first -> alert verdict" "alert" "${CASE_STATE}"
+
+# The same tie on the authoritative end marker: an `.exec` end sorting first
+# used to win and silently exempt; the conflicting tie is conservative shell
+# (seq-clean via the data seq 2, so only the tie drives the verdict).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_3_EXEC}","ago":600},
+  {"key":"${K_END_4_SHELL}","ago":600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "equal-LM contradictory ends, exec key first -> exit 1 (tie fails closed)" "1" "${CASE_RC}"
+is "equal-LM contradictory ends, exec key first -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "equal-LM end tie detail names recording-gap (conservative shell)" ;; *) bad "equal-LM end tie detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_3_SHELL}","ago":600},
+  {"key":"${K_END_4_EXEC}","ago":600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "equal-LM contradictory ends, shell key first -> exit 1 (both orders)" "1" "${CASE_RC}"
+is "equal-LM contradictory ends, shell key first -> alert verdict" "alert" "${CASE_STATE}"
+
 # The mirror case: an end that says shell wins over an exec start
 # (conservative - a tar is expected).
 fixture <<JSON
@@ -864,6 +950,36 @@ is "completed tar + no session.end (within grace) -> ok verdict" "ok" "${CASE_ST
 
 # tar + session.end (the healthy fixture above) stays ok: no end false positive.
 
+# Round-5: an orphan completed tar whose sid has no audit events at all is the
+# extreme tail of stream closure. The session loop only visits observed
+# sessions, so the recordings listing itself must be checked past the grace.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"recordings/${SID}.tar","ago":3600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "orphan completed tar, no audit events (past grace) -> exit 1" "1" "${CASE_RC}"
+is "orphan completed tar, no audit events -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *session-start-missing*) ok "orphan-tar detail names session-start-missing (stream closure)" ;; *) bad "orphan-tar detail: ${CASE_DETAIL}" ;; esac
+
+# Within the completer-lag grace the tar may just have landed before its audit
+# tail: stay quiet (no over-eager alert).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"recordings/${SID}.tar","ago":60}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "orphan completed tar within grace -> exit 0 (no premature alert)" "0" "${CASE_RC}"
+is "orphan completed tar within grace -> ok verdict" "ok" "${CASE_STATE}"
+
 # ---- shipper contract: sid-less session events + shape-based drift -------
 
 fixture <<JSON
@@ -965,6 +1081,42 @@ is "future upload Initiated timestamp -> exit 2" "2" "${CASE_RC}"
 is "future upload Initiated timestamp -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *"clock skew"*) ok "upload-skew detail names clock skew" ;; *) bad "upload-skew detail: ${CASE_DETAIL}" ;; esac
 
+# Round-5: the skew contract is enforced at collection time for EVERY listed
+# timestamp, including paths that never reach a per-session age check: an
+# exec session (the exec branch continues before any age check) and a
+# completed tar whose session.end is present (the tar branch skips its own
+# age check).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_EXEC}","ago":-600},
+  {"key":"${K_DATA_2}","ago":-600},
+  {"key":"${K_END_EXEC}","ago":-600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "future exec start/data/end -> exit 2 (collection-time skew)" "2" "${CASE_RC}"
+is "future exec start/data/end -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"clock skew"*) ok "future-exec skew detail names clock skew" ;; *) bad "future-exec skew detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_SHELL}","ago":1198},
+  {"key":"recordings/${SID}.tar","ago":-600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "future completed-tar LastModified (end present) -> exit 2" "2" "${CASE_RC}"
+is "future completed-tar LastModified (end present) -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"clock skew"*) ok "future-tar skew detail names clock skew" ;; *) bad "future-tar skew detail: ${CASE_DETAIL}" ;; esac
+
 # ---- ListMultipartUploads pagination + malformed/error-document paths ----
 
 fixture <<JSON
@@ -1065,6 +1217,61 @@ case "${CASE_DETAIL}" in *"error:"*) ok "error detail is explicit" ;; *) bad "er
 missing_rc=0
 RECORDING_WITNESS_ENV_FILE="${WORK}/does-not-exist.env" "${WITNESS}" >"${WORK}/missing.out" 2>"${WORK}/missing.err" || missing_rc=$?
 is "missing env file -> exit 2" "2" "${missing_rc}"
+
+# ---- round-5: corrupt state.json repairs, never a silent crash -----------
+# R1: a type-valid state.json with a non-numeric counter used to raise an
+# uncaught ValueError before notify/write_state (no verdict line, no push,
+# forever). It must report an error verdict, write state + verdict log, and
+# hold the readable baseline.
+CORRUPT_DIR="${WORK}/state-corrupt-numeric"
+mkdir -p "${CORRUPT_DIR}"
+printf '%s\n' '{"version":1,"state":"ok","detail":"seeded","updated_at":"2026-09-25T00:00:00Z","run_seq":"not-a-number","last_notify_epoch":0,"baseline":{"state":"ok","detail":"seeded baseline","updated_at":"2026-09-25T00:00:00Z"}}' >"${CORRUPT_DIR}/state.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":300},
+  {"key":"${K_DATA_2}","ago":299},
+  {"key":"${K_END_SHELL}","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${CORRUPT_DIR}"
+is "garbled run_seq -> exit 2 (error verdict, not a crash)" "2" "${CASE_RC}"
+is "garbled run_seq -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"state field run_seq is invalid"*) ok "garbled run_seq detail names the invalid field" ;; *) bad "garbled run_seq detail: ${CASE_DETAIL}" ;; esac
+is "garbled run_seq -> readable baseline held" "seeded baseline" "$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("baseline") or {}).get("detail",""))' "${CORRUPT_DIR}/state.json")"
+if [ -f "${CORRUPT_DIR}/verdict.log" ] && grep -q ' error ' "${CORRUPT_DIR}/verdict.log"; then
+  ok "garbled run_seq -> verdict line written (no silent crash)"
+else
+  bad "garbled run_seq -> verdict log missing the error line"
+fi
+if grep -q 'Traceback' "${WORK}/witness.err"; then bad "garbled run_seq -> uncaught traceback"; else ok "garbled run_seq -> no uncaught traceback"; fi
+
+# R6: an unreadable state.json used to overwrite the stored baseline with
+# null silently. It is now preserved as state.json.corrupt (forensics +
+# recoverable baseline) and the repaired record reports baseline: null
+# (never fabricated).
+BROKEN_DIR="${WORK}/state-unreadable"
+mkdir -p "${BROKEN_DIR}"
+printf 'not json at all\n' >"${BROKEN_DIR}/state.json"
+run_case "${BROKEN_DIR}"
+is "unreadable state.json -> exit 2 (fail closed)" "2" "${CASE_RC}"
+is "unreadable state.json -> error verdict" "error" "${CASE_STATE}"
+is "unreadable state.json -> repaired baseline is null (never fabricated)" "null" "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("baseline")))' "${BROKEN_DIR}/state.json")"
+if [ -f "${BROKEN_DIR}/state.json.corrupt" ] && grep -q 'seeded baseline' "${BROKEN_DIR}/state.json.corrupt" 2>/dev/null; then
+  ok "unreadable state.json preserved as state.json.corrupt"
+elif [ -f "${BROKEN_DIR}/state.json.corrupt" ]; then
+  ok "unreadable state.json preserved as state.json.corrupt (raw content kept)"
+else
+  bad "unreadable state.json was overwritten without a .corrupt copy"
+fi
+if [ -f "${BROKEN_DIR}/verdict.log" ] && grep -q ' error ' "${BROKEN_DIR}/verdict.log"; then
+  ok "unreadable state.json -> verdict line written"
+else
+  bad "unreadable state.json -> verdict log missing the error line"
+fi
 
 # ---- (f) strictly list-only + SigV4 proof over every request -------------
 if python3 - "${REQUEST_LOG}" <<'PY'
@@ -1461,6 +1668,8 @@ for label, actual, expected in [
      module.should_notify("ok", now - 1, "ok", now, 1800, 0, 0), False),
     ("first ok never pushes even with a fresh transition run",
      module.should_notify(None, 0, "ok", now, 1800, 99, 0), False),
+    ("future last_notify_epoch (clock stepped ahead) still renotifies",
+     module.should_notify("alert", now + 86400, "alert", now, 1800), True),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
@@ -1503,6 +1712,29 @@ def failing_urlopen(request, timeout=None):
 module.urllib.request.urlopen = failing_urlopen
 if module.notify(config, "alert", "detail-body") is not False:
     raise SystemExit("notify must return False when the push fails")
+
+# Round-5 R4: http.client.HTTPException subclasses (BadStatusLine,
+# IncompleteRead) are transport failures too - they must be logged and
+# returned as a failed push, not abort the run before state/verdict.
+import http.client
+
+
+def bad_status_urlopen(request, timeout=None):
+    raise http.client.BadStatusLine("garbage")
+
+
+module.urllib.request.urlopen = bad_status_urlopen
+if module.notify(config, "alert", "detail-body") is not False:
+    raise SystemExit("notify must return False on BadStatusLine, not abort")
+
+
+def incomplete_read_urlopen(request, timeout=None):
+    raise http.client.IncompleteRead(b"abc", 10)
+
+
+module.urllib.request.urlopen = incomplete_read_urlopen
+if module.notify(config, "alert", "detail-body") is not False:
+    raise SystemExit("notify must return False on IncompleteRead, not abort")
 
 # Stateful transition/recovery through main()'s bookkeeping.
 state_dir = os.path.join(work, "ntfy-state")
@@ -1609,6 +1841,34 @@ if len(captured) != 4:
     raise SystemExit("steady ok after a landed recovery must not push, got %d" % len(captured))
 if codes != [1, 1, 1, 0, 0, 0]:
     raise SystemExit("main exit codes wrong: %r" % codes)
+
+# Round-5 R1: a corrupted numeric field in a type-valid state.json used to
+# crash main() before notify/write_state (no push, no verdict, forever). It
+# must repair, report error, and push the error verdict (fake notifier).
+corrupt_dir = os.path.join(work, "ntfy-corrupt-state")
+os.makedirs(corrupt_dir, exist_ok=True)
+os.environ["RECORDING_WITNESS_STATE_DIR"] = corrupt_dir
+with open(os.path.join(corrupt_dir, "state.json"), "w", encoding="utf-8") as handle:
+    json.dump({"version": 2, "state": "ok", "detail": "seeded", "updated_at": "2026-09-25T00:00:00Z",
+               "run_seq": "not-a-number", "last_notify_epoch": 0,
+               "baseline": {"state": "ok", "detail": "seeded baseline", "updated_at": "2026-09-25T00:00:00Z"}},
+              handle)
+module.urllib.request.urlopen = flaky_urlopen
+flaky["fail"] = False
+captured[:] = []
+verdict[0] = "alert"
+corrupt_code = module.main()
+if corrupt_code != 2:
+    raise SystemExit("corrupt run_seq must exit 2 (error), got %r" % corrupt_code)
+if len(captured) != 1:
+    raise SystemExit("corrupt run_seq must push the error verdict, got %d pushes" % len(captured))
+if captured[-1].headers.get("Title") != "recording witness: error":
+    raise SystemExit("corrupt run_seq push must carry the error title: %r" % captured[-1].headers)
+repaired = json.load(open(os.path.join(corrupt_dir, "state.json")))
+if repaired.get("state") != "error" or not isinstance(repaired.get("run_seq"), int):
+    raise SystemExit("corrupt state must be repaired with an error verdict: %r" % repaired)
+if (repaired.get("baseline") or {}).get("detail") != "seeded baseline":
+    raise SystemExit("corrupt-numeric repair must hold the readable baseline: %r" % repaired.get("baseline"))
 PY
 then ok "ntfy: transitions push, repeats suppress, 30-min renotify + failed-recovery retry (fake notifier)"; else bad "ntfy bookkeeping test failed"; fi
 

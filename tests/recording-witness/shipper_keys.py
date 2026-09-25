@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 66bd304 (scripts/lib/b2_client.py,
-`session_mode` + `build_audit_key`). The golden strings in
-tests/recording-witness/run-test.sh were generated from that SHA; a pc-admin
-grammar change must bump this pin, regenerate the golden and update the
-witness contract in the same breath.
+PINNED AGAINST: cad0p/pc-admin @ 66bd304 — the **grammar-defining SHA**: the
+builder grammar (`session_mode` + `build_audit_key`) last changed there and is
+unchanged through 5580ac0 (pc-admin PR #7 copy re-verified byte-identical; the
+only later `b2_client.py` changes are the parser/doc grammar block, which does
+not alter emitted keys). The golden strings in
+tests/recording-witness/run-test.sh and the checked-in vector matrix were
+generated from that SHA; a pc-admin grammar change must bump this pin,
+regenerate both and update the witness contract in the same breath.
 
 The witness correlates audit events with recordings through object key names, so
 harness fixtures MUST be built with the real shipper grammar (6-digit

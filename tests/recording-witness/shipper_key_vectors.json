@@ -1,5 +1,6 @@
 {
   "pinned_pc_admin_sha": "66bd304",
+  "grammar_note": "builder grammar last changed at 66bd304; unchanged through 5580ac0 (pc-admin PR #7 copy re-verified byte-identical)",
   "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
   "vectors": [
     {

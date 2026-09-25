@@ -1421,11 +1421,15 @@ exec python3 - <<'RECORDING_WITNESS_PY_EOF'
 Strictly list-only: ListObjectsV2 + ListMultipartUploads with a listFiles-only
 application key. Never reads an object (no GET/HEAD) and never calls the
 writeFiles-gated ListParts. Fail-closed: any failure to run reports state
-`error`, holds the baseline, and exits 2; alerts exit 1; green exits 0.
+`error`, exits 2, and never advances the last good baseline (an unreadable
+state file is preserved as `state.json.corrupt` and the repaired record
+reports `baseline: null` - it could not be read and is never fabricated);
+alerts exit 1; green exits 0.
 """
 import collections
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -1720,11 +1724,41 @@ def list_uploads(config, prefix):
     raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
 
 
+def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candidate_mode):
+    """Resolve duplicate session.start/session.end markers.
+
+    The strictly-newest LastModified wins with its mode. An exact tie is
+    ambiguous (nothing is "newest"): when the declared modes conflict, fail
+    closed to the conservative `shell` marker (a tar is expected), so neither
+    listing order can silently exempt the session; an identical-mode tie
+    keeps the marker as-is.
+    """
+    if current_time is None or candidate_time > current_time:
+        return candidate_time, candidate_mode
+    if candidate_time < current_time:
+        return current_time, current_mode
+    if (candidate_mode == "exec") != (current_mode == "exec"):
+        return current_time, "shell"
+    return current_time, current_mode
+
+
 def run_checks(config, now):
     audit_objects = list_objects(config, config.audit_prefix)
     recording_objects = list_objects(config, config.recordings_prefix)
     uploads = list_uploads(config, config.recordings_prefix)
     alerts = []
+    # Enforce the clock-skew contract at collection time: every S3 timestamp
+    # the checks can read (object LastModified, multipart Initiated) is
+    # validated once here, so "any S3 timestamp more than 5 min in the future
+    # -> error" holds for every key - including exec sessions that are later
+    # exempt from the gap clock and completed tars whose session.end is
+    # present, which never reach a per-session age check otherwise.
+    for key, last_modified in audit_objects.items():
+        age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+    for key, last_modified in recording_objects.items():
+        age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    for upload in uploads:
+        age_seconds(now, upload["initiated"], "upload %s initiated" % upload["key"], config.clock_skew_tolerance)
 
     heartbeat_times = []
     unrecognized = []
@@ -1762,18 +1796,18 @@ def run_checks(config, now):
                 sid, {"seqs": [], "start": None, "end": None, "start_mode": None, "end_mode": None})
             state["seqs"].append(int(match.group("seq")))
             mode = match.group("mode")
+            # Duplicate starts and ends resolve by the newest LastModified,
+            # exactly like each other: a re-PUT / replayed marker must not win
+            # just because its key sorts first, or a stale `.exec` start could
+            # silently exempt a session whose newest marker says shell. An
+            # exact tie with conflicting declared modes fails closed to the
+            # conservative `shell` (see resolve_lifecycle_marker).
             if event_type == "session.start":
-                # Duplicate starts resolve by the newest LastModified, exactly
-                # like ends below: a re-PUT / replayed start must not win just
-                # because its key sorts first, or a stale `.exec` start could
-                # silently exempt a session whose newest marker says shell.
-                if state["start"] is None or last_modified > state["start"]:
-                    state["start"] = last_modified
-                    state["start_mode"] = mode
+                state["start"], state["start_mode"] = resolve_lifecycle_marker(
+                    state["start"], state["start_mode"], last_modified, mode)
             elif event_type == "session.end":
-                if state["end"] is None or last_modified > state["end"]:
-                    state["end"] = last_modified
-                    state["end_mode"] = mode
+                state["end"], state["end_mode"] = resolve_lifecycle_marker(
+                    state["end"], state["end_mode"], last_modified, mode)
             elif mode:
                 # The mode marker is contract-defined on start/end only; a
                 # marker anywhere else is naming drift.
@@ -1866,6 +1900,27 @@ def run_checks(config, now):
             alerts.append(
                 "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
                 % (session_mode, sid, age, recording_key)
+            )
+
+    # Orphan completed recordings: a tar whose sid has no audit events at all
+    # is the extreme tail of stream closure (no start -> no gap clock at all).
+    # The session loop above cannot see it because it only visits observed
+    # sessions, so it is checked here against the same completer-lag grace.
+    for key, completed in recording_objects.items():
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        if sid in sessions:
+            continue
+        completed_age = age_seconds(
+            now, completed, "recording %s" % key, config.clock_skew_tolerance)
+        if completed_age > config.completer_lag:
+            alerts.append(
+                "session-start-missing: %s completed %ds ago but session %s has no audit events at all "
+                "(no session.start; grace %ds)" % (key, completed_age, sid, config.completer_lag)
             )
 
     for sid in sorted(sessions):
@@ -1989,7 +2044,10 @@ def notify(config, state, detail):
     try:
         with urllib.request.urlopen(request, timeout=15):
             return True
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # HTTPException covers BadStatusLine / IncompleteRead (not OSError
+        # subclasses): a transport failure must be logged and retried, never
+        # abort the run before state/verdict.
         log("WARNING: ntfy push failed: %s" % clip(exc, 200))
         return False
 
@@ -2014,7 +2072,14 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_
         return False  # a first-ever green run has nothing to recover from
     if state != previous_state:
         return True
-    return now_epoch - int(last_epoch) >= int(renotify)
+    last_epoch = int(last_epoch)
+    if last_epoch > now_epoch:
+        # A stored last-push epoch in the future (the anchor clock stepped
+        # ahead, then was corrected) would otherwise suppress renotify until
+        # wall clock catches up; an impossible value is not a reason to stay
+        # silent.
+        return True
+    return now_epoch - last_epoch >= int(renotify)
 
 
 def main():
@@ -2040,23 +2105,54 @@ def main():
         return 2
 
     previous = {}
+    state_bad_reason = ""
     try:
         previous = read_state(state_path)
     except WitnessError as exc:
-        if state != "error":
-            state, detail = "error", clip("error: %s" % exc, 1000)
+        state_bad_reason = str(exc)
         previous = {}
+        # Keep the unreadable record for forensics instead of overwriting it
+        # outright; the repaired record cannot carry a baseline it could not
+        # read.
+        try:
+            os.replace(state_path, state_path + ".corrupt")
+            log("WARNING: unreadable state file preserved as %s.corrupt" % state_path)
+        except OSError:
+            pass
 
     renotify = config.renotify if config is not None else 1800
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
-    last_notify_epoch = int(previous.get("last_notify_epoch") or 0)
-    last_notify_run = int(previous.get("last_notify_run") or 0)
+    # Defensive numeric parsing: a type-valid state.json with a corrupted
+    # counter (e.g. "run_seq": "not-a-number") must never crash the run
+    # before the verdict/push. A bad value is treated like any other invalid
+    # state: error verdict + repair, while the readable baseline is held.
+    numerics = {}
+    for name in ("last_notify_epoch", "last_notify_run", "run_seq", "state_since_run", "state_since_epoch"):
+        value = previous.get(name)
+        if value is None:
+            numerics[name] = 0
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            state_bad_reason = state_bad_reason or "state field %s is invalid: %r" % (name, value)
+            numerics[name] = 0
+        else:
+            numerics[name] = value
+    if state_bad_reason:
+        if state != "error":
+            state = "error"
+            detail = clip("error: %s" % state_bad_reason, 1000)
+        else:
+            detail = clip("%s (state record also invalid: %s)" % (detail, state_bad_reason), 1000)
+        # An invalid record is not a trustworthy previous state: the error
+        # verdict must push instead of comparing against it.
+        previous = {}
+    last_notify_epoch = numerics["last_notify_epoch"]
+    last_notify_run = numerics["last_notify_run"]
     # Per-run identity: a monotonic counter written into state.json, never a
     # second-resolution timestamp, so a genuine same-second run still advances
     # it while a run that failed to persist state still repeats it.
-    run_seq = int(previous.get("run_seq") or 0) + 1
-    state_since_run = int(previous.get("state_since_run") or 0)
-    state_since_epoch = int(previous.get("state_since_epoch") or 0)
+    run_seq = numerics["run_seq"] + 1
+    state_since_run = numerics["state_since_run"]
+    state_since_epoch = numerics["state_since_epoch"]
     previous_state = previous.get("state")
     # Arm the transition marker only when a PERSISTED previous state changed:
     # a first-ever run (previous_state None) must not arm it, or the next
@@ -2080,7 +2176,11 @@ def main():
         "last_notify_epoch": last_notify_epoch,
     }
     if state == "error":
-        record["baseline"] = baseline  # held: an un-runnable run never advances it
+        # Held when it could be read: an un-runnable run never advances the
+        # last good baseline. An unreadable state file has no readable
+        # baseline (the file is kept as state.json.corrupt); the repaired
+        # record says null rather than fabricating one.
+        record["baseline"] = baseline
     else:
         record["baseline"] = {"state": state, "detail": detail, "updated_at": utc_stamp(now)}
     try:

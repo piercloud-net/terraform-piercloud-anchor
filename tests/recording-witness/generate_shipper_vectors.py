@@ -11,14 +11,18 @@ provenance:
 
 The script refuses to write unless the pc-admin checkout HEAD matches
 `shipper_keys.PINNED_PC_ADMIN_SHA` (`--allow-sha-mismatch` only for a manual
-debug run — never commit output from a mismatched checkout). It imports the
-real `scripts/lib/b2_client.py`, builds the golden + boundary matrix through
-`build_audit_key`, and self-checks that the replica in this directory
-reproduces every vector before writing.
+debug run — never commit output from a mismatched checkout; the harness
+asserts the committed file's `source_sha` starts with the pin, so such a file
+fails CI). It imports the real `scripts/lib/b2_client.py`, builds the golden +
+boundary matrix through `build_audit_key`, and self-checks that the replica in
+this directory reproduces every vector before writing.
 
-When pc-admin's grammar changes: bump the pin in `shipper_keys.py`, regenerate
-this file against the new SHA, and update the witness contract + goldens in
-the same breath.
+The pin is the **grammar-defining SHA**: the builder grammar last changed at
+66bd304 and is unchanged through 5580ac0 (pc-admin PR #7 copy re-verified
+byte-identical), so regeneration from either checkout yields the identical
+`vectors`/`refusals` payload. When pc-admin's grammar changes: bump the pin in
+`shipper_keys.py`, regenerate this file against the new SHA, and update the
+witness contract + goldens in the same breath.
 """
 
 import argparse
@@ -188,6 +192,8 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
+        "grammar_note": "builder grammar last changed at 66bd304; unchanged through 5580ac0 "
+                        "(pc-admin PR #7 copy re-verified byte-identical)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "refusals": refusals,
