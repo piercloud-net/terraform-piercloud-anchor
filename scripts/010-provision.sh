@@ -1421,8 +1421,9 @@ exec python3 - <<'RECORDING_WITNESS_PY_EOF'
 Strictly list-only: ListObjectsV2 + ListMultipartUploads with a listFiles-only
 application key. Never reads an object (no GET/HEAD) and never calls the
 writeFiles-gated ListParts. Fail-closed: any failure to run reports state
-`error`, exits 2, and never advances the last good baseline (an unreadable
-state file is preserved as `state.json.corrupt` and the repaired record
+`error`, exits 2, and never advances the last good baseline (an unreadable or
+oversized state file is preserved as `state.json.corrupt` - or a timestamped
+`.corrupt.<stamp>` sibling when that name is taken - and the repaired record
 reports `baseline: null` - it could not be read and is never fabricated);
 alerts exit 1; green exits 0.
 """
@@ -1442,6 +1443,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 STATE_VERSION = 2
+# A state record is a few KB; an oversized file is invalid input, never a reason
+# to allocate it. The bounded read keeps a planted huge state.json from raising
+# an uncaught MemoryError before any verdict (round-7 R2).
+STATE_MAX_BYTES = 1 << 20
 VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
@@ -1621,7 +1626,7 @@ def signed_get(config, params):
     request.add_header("x-amz-content-sha256", payload_hash)
     request.add_header("x-amz-date", amz_date)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with open_signed(request, timeout=30) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
@@ -2015,13 +2020,41 @@ def run_checks(config, now):
     return "ok", detail
 
 
+def corrupt_state_destination(path, now):
+    """Pick a never-overwriting destination for an unreadable state file.
+
+    `<state>.corrupt` when free; when that name is already taken (an earlier
+    preservation, or a planted entry such as a directory) a timestamped
+    `<state>.corrupt.<UTCstamp>` name is used, so earlier forensics are never
+    overwritten (round-7 R3).
+    """
+    base = path + ".corrupt"
+    if not os.path.lexists(base):
+        return base
+    stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = "%s.%s" % (base, stamp)
+    suffix = 0
+    while os.path.lexists(candidate):
+        suffix += 1
+        candidate = "%s.%s-%d" % (base, stamp, suffix)
+    return candidate
+
+
 def read_state(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            raw = handle.read(STATE_MAX_BYTES + 1)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError, RecursionError) as exc:
+        raise WitnessError("state file unreadable: %s" % exc)
+    if len(raw) > STATE_MAX_BYTES:
+        # An oversized state is invalid input, not a reason to read it whole
+        # (round-7 R2: the unbounded read raised an uncaught MemoryError).
+        raise WitnessError("state file exceeds %d bytes" % STATE_MAX_BYTES)
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
         # RecursionError: a pathologically nested JSON document must take the
         # invalid-state path (preserve + repair), never abort before the
         # verdict with no files (round-6 F4).
@@ -2093,13 +2126,15 @@ def ntfy_token_problem(token):
 
 
 class RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    """Refuse every redirect for the ntfy POST (round-6 F2).
+    """Refuse every redirect (ntfy POST and signed S3 list GETs).
 
     urllib's default redirect handler copies the request headers onto the
-    redirect target, so a 301/302/303 to another host or scheme re-sent
-    `Authorization: Bearer <publish token>` cross-origin (mirror of pc-admin's
-    R3 fix). ntfy needs no redirect hop, so a 3xx becomes a failed push
-    (logged, retried) with nothing sent to the redirect target.
+    redirect target, so a 301/302/303 to another host or scheme re-sent the
+    `Authorization` header cross-origin: `Bearer <publish token>` for the ntfy
+    POST (round-6 F2, mirror of pc-admin's R3 fix) and the SigV4
+    `AWS4-HMAC-SHA256 Credential=...` header for the witness S3 client
+    (round-7 R1). Neither call needs a redirect hop, so a 3xx becomes a failed
+    call (logged, retried) with nothing sent to the redirect target.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -2108,14 +2143,21 @@ class RefuseRedirects(urllib.request.HTTPRedirectHandler):
         )
 
 
-# The redirect-refusing opener is the only client notify() may use; the
-# module-level name is patchable for the offline harness.
-_NTFY_OPENER = urllib.request.build_opener(RefuseRedirects())
+# One redirect-refusing opener serves every client call. The module-level
+# _NTFY_OPENER name is patchable for the offline harness; the signed S3 list
+# client always uses the real opener (round-7 R1).
+_REDIRECT_REFUSING_OPENER = urllib.request.build_opener(RefuseRedirects())
+_NTFY_OPENER = _REDIRECT_REFUSING_OPENER
 
 
 def open_ntfy(request, timeout=15):
     """Open the ntfy POST through the redirect-refusing opener."""
     return _NTFY_OPENER.open(request, timeout=timeout)
+
+
+def open_signed(request, timeout=30):
+    """Open a SigV4-signed S3 list GET through the redirect-refusing opener."""
+    return _REDIRECT_REFUSING_OPENER.open(request, timeout=timeout)
 
 
 def notify(config, state, detail):
@@ -2223,12 +2265,13 @@ def main():
         # outright; the repaired record cannot carry a baseline it could not
         # read.
         try:
-            os.replace(state_path, state_path + ".corrupt")
-            log("WARNING: unreadable state file preserved as %s.corrupt" % state_path)
+            corrupt_path = corrupt_state_destination(state_path, now)
+            os.replace(state_path, corrupt_path)
+            log("WARNING: unreadable state file preserved as %s" % corrupt_path)
         except OSError as exc:
-            # A directory at .corrupt (or an unwritable state dir) disables the
-            # preservation; say so instead of silently dropping forensics
-            # (round-6 F8).
+            # An unwritable state dir disables the preservation; say so
+            # instead of silently dropping forensics (round-6 F8). A name
+            # collision is not a failure: the destination is unique (R3).
             log("WARNING: cannot preserve unreadable state as %s.corrupt: %s"
                 % (state_path, clip(exc, 200)))
 

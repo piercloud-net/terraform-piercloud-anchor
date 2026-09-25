@@ -53,9 +53,11 @@
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; a corrupt state.json (bad numeric
 #       field) reports error and repairs instead of crashing, holding the
-#       readable baseline, and an unreadable one is preserved as
-#       state.json.corrupt (a pathologically nested document takes the same
-#       repair path instead of an uncaught RecursionError); planted symlinks
+#       readable baseline, and an unreadable, oversized (bounded read) or
+#       pathologically nested document is preserved as state.json.corrupt (or
+#       a timestamped .corrupt.<stamp> sibling, never overwriting an existing
+#       one) and repaired instead of an uncaught RecursionError/MemoryError;
+#       planted symlinks
 #       at state.json.tmp/verdict.log are never followed or reused into a
 #       victim; malformed XML, an S3 error document and a truncated list
 #       without a continuation token all error;
@@ -89,7 +91,8 @@
 #       fatal), a token that cannot be an HTTP header value (control chars /
 #       CR/LF / non-ASCII / oversized) skips the push with a bounded warning
 #       instead of aborting the run or echoing the token, ntfy redirects are
-#       refused (a 3xx never re-sends Authorization to another host/scheme),
+#       refused and the signed S3 list GETs refuse redirects too (a 3xx never
+#       re-sends an Authorization header to another host/scheme),
 #       and steady ok stays silent afterwards (fake notifier, no network).
 set -euo pipefail
 
@@ -1473,17 +1476,78 @@ else
   ok "deeply nested state never crashes (RecursionError bounded)"
 fi
 
-# ---- round-6 F8: a directory at .corrupt disables preservation loudly -----
+# ---- round-7 R2: an oversized state.json is invalid input, never an OOM ---
+# The read is bounded (1 MiB): a planted 2 MiB state used to be read whole
+# before parsing (a 200 MB file under a memory cap raised an uncaught
+# MemoryError before any verdict). It must take the preserve+repair path.
+OVERSIZE_DIR="${WORK}/state-oversize"
+mkdir -p "${OVERSIZE_DIR}"
+python3 - "${OVERSIZE_DIR}/state.json" <<'PY'
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write('{"version":2,"state":"ok","detail":"' + "A" * (2 * 1024 * 1024)
+                 + '","run_seq":41,"baseline":{"state":"ok","detail":"oversized baseline","updated_at":"2026-09-25T00:00:00Z"}}')
+PY
+run_case "${OVERSIZE_DIR}"
+is "oversized state.json -> exit 2 (error verdict, not a crash)" "2" "${CASE_RC}"
+is "oversized state.json -> error state" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"state file exceeds"*) ok "oversized state detail names the size bound" ;;
+  *) bad "oversized state detail: ${CASE_DETAIL}" ;;
+esac
+if [ -f "${OVERSIZE_DIR}/state.json.corrupt" ] && [ -f "${OVERSIZE_DIR}/verdict.log" ]; then
+  ok "oversized state preserved as .corrupt + verdict written"
+else
+  bad "oversized state was not preserved/repaired"
+fi
+if grep -q 'Traceback' "${WORK}/witness.err"; then bad "oversized state crashed with a traceback"; else ok "oversized state never crashes (read bounded)"; fi
+
+# ---- round-7 R3: an existing .corrupt is never overwritten ---------------
+# Earlier forensics live at state.json.corrupt; the new corruption must land
+# under a unique timestamped sibling.
+KEEP_DIR="${WORK}/state-corrupt-keep"
+mkdir -p "${KEEP_DIR}"
+printf 'earlier forensics SENTINEL-R7-R3\n' >"${KEEP_DIR}/state.json.corrupt"
+printf 'not json at all\n' >"${KEEP_DIR}/state.json"
+run_case "${KEEP_DIR}"
+is "existing .corrupt + unreadable state -> exit 2" "2" "${CASE_RC}"
+is "existing .corrupt + unreadable state -> repaired error state" "error" "${CASE_STATE}"
+if grep -q 'SENTINEL-R7-R3' "${KEEP_DIR}/state.json.corrupt"; then
+  ok "existing .corrupt keeps the earlier forensics"
+else
+  bad "existing .corrupt was overwritten"
+fi
+replacement=""
+for candidate in "${KEEP_DIR}"/state.json.corrupt.*; do
+  [ -e "${candidate}" ] || continue
+  replacement="${candidate}"
+  break
+done
+if [ -n "${replacement}" ] && grep -q 'not json at all' "${replacement}"; then
+  ok "new corruption preserved under a unique .corrupt.<stamp> name"
+else
+  bad "new corruption not preserved under a unique name"
+fi
+
+# ---- round-6 F8 + round-7 R3: a directory at .corrupt no longer disables ---
+# preservation - the unique-name fallback lands the record anyway. -----------
 CORRUPT_DIR_BLOCK="${WORK}/state-corrupt-blocked"
 mkdir -p "${CORRUPT_DIR_BLOCK}/state.json.corrupt"
 printf 'not json at all\n' >"${CORRUPT_DIR_BLOCK}/state.json"
 run_case "${CORRUPT_DIR_BLOCK}"
 is "unreadable state + .corrupt directory -> exit 2" "2" "${CASE_RC}"
 is "unreadable state + .corrupt directory -> repaired error state" "error" "${CASE_STATE}"
-if grep -q 'cannot preserve unreadable state' "${WORK}/witness.out"; then
-  ok ".corrupt directory preserves loudly (disabled preservation stated)"
+replacement_dir=""
+for candidate in "${CORRUPT_DIR_BLOCK}"/state.json.corrupt.*; do
+  [ -e "${candidate}" ] || continue
+  replacement_dir="${candidate}"
+  break
+done
+if [ -d "${CORRUPT_DIR_BLOCK}/state.json.corrupt" ] && [ -n "${replacement_dir}" ]; then
+  ok ".corrupt directory kept + new corruption preserved under a unique name"
 else
-  bad ".corrupt directory silently swallowed preservation"
+  bad ".corrupt directory disabled preservation"
 fi
 
 # ---- round-6 F5: sid case is normalized for tar/upload lookups ------------
@@ -2242,6 +2306,85 @@ if (repaired.get("baseline") or {}).get("detail") != "seeded baseline":
     raise SystemExit("corrupt-numeric repair must hold the readable baseline: %r" % repaired.get("baseline"))
 PY
 then ok "ntfy: transitions push, repeats suppress, 30-min renotify + failed-recovery retry (fake notifier)"; else bad "ntfy bookkeeping test failed"; fi
+
+# ---- round-7 R1: signed S3 list GETs refuse redirects too -----------------
+# The witness S3 client used stock urlopen, so a 3xx from the endpoint
+# forwarded the SigV4 Authorization header cross-origin. signed_get() must
+# surface the redirect as a failed call and send nothing to the target; the
+# redirect origin itself must still have received the signed request.
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+import threading
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+work = sys.argv[1]
+spec = importlib.util.spec_from_file_location("witness_module", os.path.join(work, "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+hijack_auth = []
+redirect_auth = []
+
+
+class HijackHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        hijack_auth.append(self.headers.get("Authorization"))
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class RedirectHandler(BaseHTTPRequestHandler):
+    code = 302
+    target = ""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        redirect_auth.append(self.headers.get("Authorization"))
+        self.send_response(RedirectHandler.code)
+        self.send_header("Location", RedirectHandler.target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+hijack_server = ThreadingHTTPServer(("127.0.0.1", 0), HijackHandler)
+threading.Thread(target=hijack_server.serve_forever, daemon=True).start()
+redirect_server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+threading.Thread(target=redirect_server.serve_forever, daemon=True).start()
+RedirectHandler.target = "http://127.0.0.1:%d/hijacked" % hijack_server.server_address[1]
+
+s3_config = types.SimpleNamespace(
+    endpoint="http://127.0.0.1:%d" % redirect_server.server_address[1],
+    bucket="pc-admin-dr",
+    key_id="test-key-id-0001",
+    key="test-secret-SENTINEL-0009",
+    signing_region=lambda: "test-region",
+)
+for redirect_code in (301, 302, 303, 307, 308):
+    RedirectHandler.code = redirect_code
+    status, _body = module.signed_get(s3_config, {"list-type": "2", "prefix": "audit/"})
+    if status != redirect_code:
+        raise SystemExit("signed_get followed/ignored a %d redirect (status %r)" % (redirect_code, status))
+if not any(auth and auth.startswith("AWS4-HMAC-SHA256 Credential=") for auth in redirect_auth):
+    raise SystemExit("the redirect origin never saw a signed request - the test did not exercise SigV4")
+if hijack_auth:
+    raise SystemExit("signed S3 redirect target received Authorization %r" % hijack_auth)
+hijack_server.shutdown()
+redirect_server.shutdown()
+print("signed_get refused 5 redirect codes; signed requests at the redirect origin=%d; hijack headers=%d"
+      % (len(redirect_auth), len(hijack_auth)))
+PY
+then ok "signed S3 list GETs refuse redirects (no SigV4 Authorization forwarding)"; else bad "signed S3 redirect refusal failed"; fi
 
 # ---- wiring: the dispatch paths must carry the witness env -------------
 for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX \
