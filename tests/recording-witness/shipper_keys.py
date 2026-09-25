@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 6430b9d (scripts/lib/b2_client.py,
+PINNED AGAINST: cad0p/pc-admin @ 66bd304 (scripts/lib/b2_client.py,
 `session_mode` + `build_audit_key`). The golden strings in
 tests/recording-witness/run-test.sh were generated from that SHA; a pc-admin
 grammar change must bump this pin, regenerate the golden and update the
@@ -33,10 +33,11 @@ silently building a shape the real shipper never emits):
   — hand-write those drift fixtures.
 - Non-session events never carry a sid (the real builder drops it).
 - `session.rejected` is forced to the sid-less non-session shape: the witness
-  allowlists it there. The real builder at the pinned SHA still emits a session
-  key when a sid is present, but live Teleport v18 emits `session.rejected`
-  without a sid, so that divergence is latent; the pc-admin special-case that
-  makes this unconditional is PENDING. Keep this forcing in step with it.
+  allowlists it there and the real builder at the pinned SHA (66bd304) drops
+  any sid for this type, shipping it under the global counter. A regression to
+  the pre-fold sid-bearing shape would be read by the witness as a session
+  with no `session.start` (`session-start-missing`), so the replica never
+  builds it and the golden/refusal teeth pin that.
 
 CLI:  shipper_keys.py <event-type> <ts> [sid] [seq] [mode]
       prints the full audit key (single line).
@@ -45,7 +46,7 @@ CLI:  shipper_keys.py <event-type> <ts> [sid] [seq] [mode]
 import re
 import sys
 
-PINNED_PC_ADMIN_SHA = "6430b9d"
+PINNED_PC_ADMIN_SHA = "66bd304"
 
 TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z$"
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -81,7 +82,9 @@ def audit_key(event_type, ts, sid="", seq=1, mode=""):
             "%r requires the mandatory shell|exec mode suffix the real shipper always emits" % event_type
         )
     if event_type in SID_LESS_SESSION_EVENTS:
-        # Forced sid-less (module docstring: pending pc-admin special-case).
+        # Forced sid-less (module docstring): the real builder at the pinned
+        # SHA drops any sid for session.rejected; a sid-bearing key would alert
+        # the witness session-start-missing.
         return "audit/%s-%s.%06d.json" % (ts, event_type, seq)
     if SESSION_TYPE_RE.match(event_type):
         if not sid:

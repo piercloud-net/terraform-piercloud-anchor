@@ -30,12 +30,14 @@
 #       lands; shell/legacy sessions with an end and no tar -> alert
 #       recording-gap; duplicate session.end objects resolve by the newest
 #       LastModified (both mode directions pinned); a malformed mode marker ->
-#       naming-contract; sid-less session.rejected keys are not drift; a
+#       naming-contract; sid-less session.rejected keys are not drift, while a
+#       sid-bearing rejected key (the pre-fold pc-admin shape) is read as a
+#       session with no session.start -> session-start-missing; a
 #       renamed session prefix (sess.start) is still drift; an audit key that
 #       matches no documented shape -> alert contract-mismatch; future
 #       LastModified *and* future Initiated timestamps -> error (clock skew);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 6430b9d, golden strings +
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 66bd304, golden strings +
 #       refusal teeth; never hand-written);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; malformed XML, an S3 error
@@ -97,7 +99,7 @@ fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 6430b9d
+# were generated from the real builder at cad0p/pc-admin @ 66bd304
 # (scripts/lib/b2_client.py build_audit_key/session_mode, the SHA pinned in
 # shipper_keys.py); a pc-admin grammar change must bump the pin, regenerate
 # these and update the witness contract together. Drift fixtures (non-UUID or
@@ -117,6 +119,11 @@ is "replica golden session.data (no mode suffix)" \
 is "replica golden session.rejected forced sid-less" \
   "audit/20260925T100008Z-session.rejected.000005.json" \
   "$(key session.rejected 20260925T100008Z "${REPLICA_SID}" 5)"
+# Regression tooth: the sid-less input must produce the identical key, so a
+# replica change back to the pre-fold sid-bearing shape fails here.
+is "replica golden session.rejected sid-less (sid dropped, not consumed)" \
+  "audit/20260925T100008Z-session.rejected.000005.json" \
+  "$(key session.rejected 20260925T100008Z "" 5)"
 is "replica golden non-session key sid-less" \
   "audit/20260925T100008Z-user.login.000006.json" \
   "$(key user.login 20260925T100008Z "" 6)"
@@ -746,6 +753,23 @@ start_mock
 run_case
 is "sid-less session.rejected key -> exit 0" "0" "${CASE_RC}"
 is "sid-less session.rejected key -> ok verdict (no naming-contract false positive)" "ok" "${CASE_STATE}"
+
+# Regression punch-through tooth: the pre-fold pc-admin shape (a sid-bearing
+# session.rejected key) must be caught by the witness as a session with no
+# session.start — this is exactly the alert the forced-sid-less shipper rule
+# prevents.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135300Z-session.rejected.${SID}.1.json","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "sid-bearing session.rejected key (pre-fold shape) -> exit 1" "1" "${CASE_RC}"
+is "sid-bearing session.rejected key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *session-start-missing*) ok "sid-bearing rejected detail names session-start-missing (the regression the sid-less rule prevents)" ;; *) bad "sid-bearing rejected detail: ${CASE_DETAIL}" ;; esac
 
 fixture <<JSON
 {"bucket":"pc-admin-dr",

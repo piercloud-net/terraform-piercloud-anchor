@@ -22,7 +22,7 @@ The witness is parameterized by prefixes, but it *correlates* audit events with 
 |---|---|
 | Audit event (session-scoped) | `<ts>-<event-type>.<session-id>.<seq>.json` (e.g. `20260925T140321Z-session.data.9f8c…a70.2.json`) |
 | Audit event (session start/end, D1) | `<ts>-session.start.<session-id>.<seq>.<mode>.json` (same for `session.end`), `mode` ∈ {`shell`,`exec`} — the mode marker is shipped by the `pc-admin` D1 shipper. Live Teleport v18 emits `interactive` on the **end** event only, so `session.end` is authoritative when present; a start/end **without** the marker is the legacy shape and is treated as `shell` (conservative — a tar is expected) |
-| Audit event (non-session) | `<ts>-<event-type>.<seq>.json` (not part of the per-session sequence check). Sid-less session events documented by the shipper (currently Teleport v18's `session.rejected`) ship this shape and are **not** drift |
+| Audit event (non-session) | `<ts>-<event-type>.<seq>.json` (not part of the per-session sequence check). Sid-less session events documented by the shipper (currently Teleport v18's `session.rejected`) ship this shape and are **not** drift. The shipper always emits `session.rejected` sid-less (any sid is dropped, pc-admin @ `66bd304`); a sid-bearing `session.rejected` key is classified as a session event instead (no `naming-contract`) and alerts `session-start-missing` — the regression the sid-less rule prevents |
 | Shipper heartbeat | `audit/heartbeat/<ts>.json` every 5 min |
 | Session recording | `recordings/<session-id>.tar` (multipart in progress → completed object) |
 
