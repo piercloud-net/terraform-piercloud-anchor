@@ -1810,21 +1810,37 @@ def run_checks(config, now):
                 % (sid, len(state["seqs"]))
             )
             continue
-        # An exec session is one whose mode markers all say exec. A start/end
-        # with no marker is the legacy shape and is treated as shell
-        # (conservative: a tar is expected), including a legacy end paired
-        # with an exec start.
+        # session.end is authoritative for the exec/shell split: live Teleport
+        # v18 emits `interactive` on the end event only (the start key reads
+        # `.shell` for exec sessions too). With no end yet, the start marker
+        # governs; a missing/legacy marker is shell (conservative: a tar is
+        # expected).
         if state["end"] is not None:
-            session_mode = "exec" if state["start_mode"] == "exec" and state["end_mode"] == "exec" else "shell"
+            session_mode = "exec" if state["end_mode"] == "exec" else "shell"
         else:
             session_mode = "exec" if state["start_mode"] == "exec" else "shell"
         if session_mode == "exec":
             continue  # non-interactive exec sessions ship no recording (documented)
         age = age_seconds(now, state["start"], "session.start", config.clock_skew_tolerance)
-        if age <= config.session_grace:
-            continue
         recording_key = config.recordings_prefix + sid + ".tar"
-        if recording_key in recording_objects or recording_key in upload_keys:
+        completed_at = recording_objects.get(recording_key)
+        if completed_at is not None:
+            # The tar satisfies the gap check by itself, so a completed
+            # recording whose session.end never shipped would stay green
+            # forever; anchor the end grace on the tar's own LastModified
+            # (the completer-lag window: > shipper backoff, 15 min default).
+            if state["end"] is None:
+                completed_age = age_seconds(
+                    now, completed_at, "recording %s" % recording_key, config.clock_skew_tolerance)
+                if completed_age > config.completer_lag:
+                    alerts.append(
+                        "session-end-missing: %s completed %ds ago but session %s has no session.end (grace %ds)"
+                        % (recording_key, completed_age, sid, config.completer_lag)
+                    )
+            continue
+        if recording_key in upload_keys:
+            continue
+        if age <= config.session_grace:
             continue
         alerts.append(
             "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
@@ -2139,20 +2155,45 @@ RECORDING_WITNESS_REDACT_PY
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail
+  local rc=0 state exec_status detail updated_at freshness
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
-  if [ "${rc}" -ne 0 ]; then
-    die "witness service start failed (systemctl rc=${rc}) — refusing to read a possibly stale verdict"
-  fi
   exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+  # Type=oneshot: the witness alert (exit 1) also makes `systemctl start`
+  # non-zero. A witness run is exactly rc=0+ExecMainStatus=0 (ok),
+  # rc=1+ExecMainStatus=1 (alert) or rc=1+ExecMainStatus=2 (error); anything
+  # else (unset status, exec error 203, a failed start that never executed the
+  # main process) is not a verdict.
+  case "${rc}:${exec_status}" in
+    0:0|1:1|1:2) ;;
+    *) die "witness produced no trustworthy verdict (systemctl rc=${rc} ExecMainStatus=${exec_status:-unset}) — the unit demonstrably did not run; refusing to read a possibly stale state.json" ;;
+  esac
   state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
+  updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  # Freshness marker: the verdict we read must have been written by this run
+  # (a unit that silently did not execute leaves the previous state.json).
+  freshness="$(python3 - "${updated_at}" <<'RECORDING_WITNESS_FRESHNESS_PY' 2>/dev/null || true
+import datetime
+import sys
+
+try:
+    moment = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+except (IndexError, ValueError):
+    print("missing")
+    raise SystemExit(0)
+age = (datetime.datetime.now(datetime.timezone.utc) - moment).total_seconds()
+print("fresh" if -300 <= age <= 300 else "stale")
+RECORDING_WITNESS_FRESHNESS_PY
+)"
+  if [ "${freshness}" != "fresh" ]; then
+    die "witness state is ${freshness:-missing} (updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a stale verdict"
+  fi
   detail="$(recording_witness_redact "${detail}")"
   case "${state}:${exec_status}" in
     ok:0) log "witness verdict: OK - ${detail}" ;;
     alert:1) warn "witness verdict: ALERT - ${detail} (the witness works; the recording pipeline has an open alert)" ;;
     error:2) die "witness verdict: ERROR - ${detail} (an un-runnable witness fails the run closed; fix the config and re-dispatch)" ;;
-    *) die "witness produced no trustworthy verdict (state=${state:-missing} ExecMainStatus=${exec_status:-unset} rc=${rc}) - refusing to finish blind" ;;
+    *) die "witness produced no trustworthy verdict (state=${state:-missing} ExecMainStatus=${exec_status} rc=${rc}) - refusing to finish blind" ;;
   esac
 }
 

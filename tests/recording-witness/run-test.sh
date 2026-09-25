@@ -9,23 +9,28 @@
 #   (b) the rendered systemd units carry the canonical paths and the decided
 #       5-minute cadence (OnUnitInactiveSec=5min);
 #   (c) env parsing: none = off, all-valid = on, partial/invalid = partial;
-#   (d) verdicts on mocked S3 metadata: healthy -> ok; stale heartbeat ->
-#       alert heartbeat-stale; session.start older than the grace with no
-#       recording object/upload -> alert recording-gap; an in-progress upload
-#       with an old session.end -> alert completer-lag; the long-live-session
-#       negative (old upload, NO session.end, within the open-upload bound)
-#       stays ok (review finding 2); a missing <seq> -> alert sequence-gap; a
-#       repeated (sid, seq) -> alert sequence-duplicate; unrecognized session
-#       keys -> alert naming-contract; event keys with no session.start ->
-#       alert session-start-missing; a session whose first seq is neither 0
-#       nor 1 -> alert sequence-origin; a wedged open upload (no session.end)
-#       past the open-upload bound -> alert open-upload-stale; exec-mode
-#       sessions ship no tar and stay ok; shell/legacy sessions with an end
-#       and no tar -> alert recording-gap; a malformed mode marker ->
+#   (d) verdicts on mocked S3 metadata: healthy -> ok; missing/stale heartbeat ->
+#       alert heartbeat-missing / heartbeat-stale; session.start older than the
+#       grace with no recording object/upload -> alert recording-gap; a
+#       completed tar with no session.end past the grace -> alert
+#       session-end-missing (the tar alone must not keep it green forever); an
+#       in-progress upload with an old session.end -> alert completer-lag; the
+#       long-live-session negative (old upload, NO session.end, within the
+#       open-upload bound) stays ok (review finding 2); a missing <seq> ->
+#       alert sequence-gap; a repeated (sid, seq) -> alert sequence-duplicate;
+#       unrecognized session keys -> alert naming-contract; event keys with no
+#       session.start -> alert session-start-missing; a session whose first
+#       seq is neither 0 nor 1 -> alert sequence-origin; a wedged open upload
+#       (no session.end) past the open-upload bound -> alert
+#       open-upload-stale; exec-mode sessions ship no tar and stay ok (the
+#       session.end marker is authoritative - live v18 reads `.shell` on
+#       session.start for exec sessions too); shell/legacy sessions with an
+#       end and no tar -> alert recording-gap; a malformed mode marker ->
 #       naming-contract; sid-less session.rejected keys are not drift; a
 #       renamed session prefix (sess.start) is still drift; an audit key that
 #       matches no documented shape -> alert contract-mismatch; future
-#       timestamps -> error (clock skew);
+#       timestamps -> error (clock skew); mode-marker fixtures are built with
+#       the pc-admin shipper key grammar (shipper_keys.py), never hand-written;
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; malformed XML, an S3 error
 #       document and a truncated list without a continuation token all error;
@@ -36,10 +41,16 @@
 #   (g) the 0600 env file holds the key and the witness never prints it;
 #   (h) install renders all four artifacts (mode 0600 env) and a later
 #       provision without the env removes them (no stale timer);
-#   (i) run-once acceptance: a failed `systemctl start` dies instead of
-#       reporting a stale state.json verdict, and the printed detail has
-#       session ids redacted (public run-log safety); verdict.log rotates
-#       once it crosses its size bound.
+#   (i) run-once acceptance: a Type=oneshot start rc is non-zero for an
+#       alerting witness too, so the run maps the paired rc/ExecMainStatus
+#       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
+#       did not run (status unset/203, unpaired rc) or state.json is stale
+#       (freshness marker); the printed detail has session ids redacted
+#       (public run-log safety); verdict.log rotates once it crosses its size
+#       bound;
+#   (j) ntfy bookkeeping: state transitions push, a repeated non-green state is
+#       suppressed inside the renotify window, renotifies outside it, and a
+#       recovery to ok pushes once (fake notifier, no network).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,6 +79,17 @@ is()  { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
 mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || echo "?"; }
+key() { # audit key built by the pc-admin shipper grammar (never hand-written)
+  python3 "${HARNESS_DIR}/shipper_keys.py" "$@"
+}
+fresh_stamp() { # current UTC in the witness's state.json format
+  python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
+}
+# Pin the replica to the pc-admin shipper grammar (6-digit seq + mode suffix):
+# a drift here is what silently weakens every mode-marker tooth below.
+is "shipper key replica (golden exec end key)" \
+  "audit/20260925T100008Z-session.end.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000002.exec.json" \
+  "$(key session.end 20260925T100008Z "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70" 2 exec)"
 
 # The extracted span calls these on-box helpers; stub them in the harness.
 log()  { printf 'harness: %s\n' "$*" >&2; }
@@ -246,6 +268,17 @@ case "${CASE_DETAIL}" in *heartbeat-stale*) ok "stale heartbeat detail names hea
 
 fixture <<JSON
 {"bucket":"pc-admin-dr",
+ "objects":[],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "no heartbeat object -> exit 1" "1" "${CASE_RC}"
+is "no heartbeat object -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *heartbeat-missing*) ok "heartbeat-missing detail names heartbeat-missing" ;; *) bad "heartbeat-missing detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
  "objects":[
   {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
   {"key":"audit/20260925T130000Z-session.start.${SID}.0.json","ago":1200},
@@ -376,49 +409,119 @@ is "wedged open upload 24h, no session.end -> exit 1" "1" "${CASE_RC}"
 is "wedged open upload 24h, no session.end -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *open-upload-stale*) ok "open-upload detail names open-upload-stale" ;; *) bad "open-upload detail: ${CASE_DETAIL}" ;; esac
 
-fixture <<JSON
-{"bucket":"pc-admin-dr",
- "objects":[
-  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
-  {"key":"audit/20260925T135000Z-session.start.${SID}.0.json","ago":300},
-  {"key":"audit/20260925T135100Z-session.data.${SID}.999999999999.json","ago":299},
-  {"key":"recordings/${SID}.tar","ago":298}],
- "uploads":[]}
-JSON
+# 30 single-value gaps (seqs 0,2,4,...,60 + end 61): the renderer must cap at
+# 20 ranges + ellipsis and complete fast. The round-1 length assertion was
+# tautological because state.json is clipped server-side; this checks the
+# bounded renderer itself. Keys come from the shipper grammar.
+python3 - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from shipper_keys import audit_key
+
+sid = sys.argv[2]
+objects = [
+    {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+    {"key": audit_key("session.start", "20260925T135000Z", sid, 0, "shell"), "ago": 300},
+]
+for seq in range(2, 61, 2):
+    objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq), "ago": 299})
+objects.append({"key": audit_key("session.end", "20260925T135200Z", sid, 61, "shell"), "ago": 298})
+objects.append({"key": "recordings/%s.tar" % sid, "ago": 297})
+print(json.dumps({"bucket": "pc-admin-dr", "objects": objects, "uploads": []}))
+PY
 start_mock
+gap_start="$(date +%s)"
 run_case
-is "huge seq gap -> exit 1 (bounded, no hang)" "1" "${CASE_RC}"
-is "huge seq gap -> alert" "alert" "${CASE_STATE}"
-case "${CASE_DETAIL}" in *sequence-gap*) ok "huge gap detail names sequence-gap" ;; *) bad "huge gap detail: ${CASE_DETAIL}" ;; esac
-if [ "$(printf '%s' "${CASE_DETAIL}" | wc -c | tr -d ' ')" -le 1000 ]; then
-  ok "huge gap detail stays bounded ($(printf '%s' "${CASE_DETAIL}" | wc -c | tr -d ' ') chars)"
+gap_elapsed=$(( $(date +%s) - gap_start ))
+is "30 seq gaps -> exit 1 (bounded, no hang)" "1" "${CASE_RC}"
+is "30 seq gaps -> alert" "alert" "${CASE_STATE}"
+if python3 - "${CASE_DETAIL}" <<'PY'
+import sys
+
+text = sys.argv[1]
+marker = "missing <seq> "
+if marker not in text:
+    raise SystemExit("no sequence-gap missing list in: %s" % text[:200])
+rendered = text.split(marker, 1)[1].strip().split(",")
+if len(rendered) > 21:
+    raise SystemExit("renderer materialised %d ranges" % len(rendered))
+if rendered[-1] != "...":
+    raise SystemExit("bounded renderer must end with ... (got %r)" % rendered[-1])
+PY
+then ok "30 seq gaps render as at most 20 ranges + ellipsis (real renderer bound)"; else bad "30 seq gaps: renderer bound assertion failed"; fi
+if [ "${gap_elapsed}" -le 15 ]; then
+  ok "30 seq gaps complete without materialising the range (${gap_elapsed}s)"
 else
-  bad "huge gap detail is not bounded"
+  bad "30 seq gaps took ${gap_elapsed}s (renderer may be materialising)"
 fi
 
 # ---- cross-repo: session mode markers (exec sessions ship no tar) --------
+# These fixtures are built with the pc-admin shipper key grammar
+# (shipper_keys.py replicates scripts/lib/b2_client.py build_audit_key): the
+# round-1 hand-written keys are what let the live-v18 contract slip
+# (session.start omits `interactive` and reads `.shell` even for exec).
+K_START_SHELL="$(key session.start 20260925T135000Z "$SID" 1 shell)"
+K_DATA_2="$(key session.data 20260925T135100Z "$SID" 2)"
+K_END_SHELL="$(key session.end 20260925T135200Z "$SID" 3 shell)"
+K_START_EXEC="$(key session.start 20260925T135000Z "$SID" 1 exec)"
+K_END_EXEC="$(key session.end 20260925T135200Z "$SID" 3 exec)"
 
 fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
   {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
-  {"key":"audit/20260925T135000Z-session.start.${SID}.1.exec.json","ago":1200},
-  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1199},
-  {"key":"audit/20260925T135200Z-session.end.${SID}.3.exec.json","ago":1198}],
+  {"key":"${K_START_EXEC}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_EXEC}","ago":1198}],
  "uploads":[]}
 JSON
 start_mock
 run_case
-is "exec session (mode exec, no tar) -> exit 0" "0" "${CASE_RC}"
-is "exec session (mode exec, no tar) -> ok verdict" "ok" "${CASE_STATE}"
+is "exec session (exec markers, no tar) -> exit 0" "0" "${CASE_RC}"
+is "exec session (exec markers, no tar) -> ok verdict" "ok" "${CASE_STATE}"
+
+# Live Teleport v18 exec: session.start reads `.shell` (no `interactive` on the
+# start event); only session.end can say exec. The end marker is authoritative.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_EXEC}","ago":1198}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "live v18 exec (shell start + exec end, no tar) -> exit 0" "0" "${CASE_RC}"
+is "live v18 exec (shell start + exec end, no tar) -> ok verdict" "ok" "${CASE_STATE}"
+
+# The mirror case: an end that says shell wins over an exec start
+# (conservative - a tar is expected).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_EXEC}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_SHELL}","ago":1198}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "exec start + shell end -> exit 1 (end is authoritative)" "1" "${CASE_RC}"
+is "exec start + shell end -> alert (conservative shell)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "exec-start/shell-end detail names recording-gap" ;; *) bad "exec-start/shell-end detail: ${CASE_DETAIL}" ;; esac
 
 fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
   {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
-  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":1200},
-  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1199},
-  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":1198}],
+  {"key":"${K_START_SHELL}","ago":1200},
+  {"key":"${K_DATA_2}","ago":1199},
+  {"key":"${K_END_SHELL}","ago":1198}],
  "uploads":[]}
 JSON
 start_mock
@@ -446,7 +549,7 @@ fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
   {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
-  {"key":"audit/20260925T135000Z-session.start.${SID}.1.exec.json","ago":1200},
+  {"key":"${K_START_EXEC}","ago":1200},
   {"key":"audit/20260925T135200Z-session.end.${SID}.3.json","ago":1198}],
  "uploads":[]}
 JSON
@@ -472,9 +575,9 @@ fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
   {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
-  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"${K_START_SHELL}","ago":300},
   {"key":"audit/20260925T135100Z-session.data.${SID}.2.shell.json","ago":299},
-  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"${K_END_SHELL}","ago":298},
   {"key":"recordings/${SID}.tar","ago":297}],
  "uploads":[]}
 JSON
@@ -482,6 +585,43 @@ start_mock
 run_case
 is "mode marker on a non start/end event -> exit 1" "1" "${CASE_RC}"
 case "${CASE_DETAIL}" in *naming-contract*) ok "misplaced-mode detail names naming-contract" ;; *) bad "misplaced-mode detail: ${CASE_DETAIL}" ;; esac
+
+# ---- completed tar + lost session.end (the tar must not stay green alone) --
+K_TAR_START="$(key session.start 20260925T120000Z "$SID" 1 shell)"
+K_TAR_DATA="$(key session.data 20260925T120100Z "$SID" 2)"
+K_FRESH_START="$(key session.start 20260925T135000Z "$SID" 1 shell)"
+K_FRESH_DATA="$(key session.data 20260925T135100Z "$SID" 2)"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_TAR_START}","ago":3600},
+  {"key":"${K_TAR_DATA}","ago":3599},
+  {"key":"recordings/${SID}.tar","ago":3600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "completed tar + no session.end (past grace) -> exit 1" "1" "${CASE_RC}"
+is "completed tar + no session.end (past grace) -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *session-end-missing*) ok "lost-end detail names session-end-missing" ;; *) bad "lost-end detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_FRESH_START}","ago":1200},
+  {"key":"${K_FRESH_DATA}","ago":1199},
+  {"key":"recordings/${SID}.tar","ago":60}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "completed tar + no session.end (within grace) -> exit 0" "0" "${CASE_RC}"
+is "completed tar + no session.end (within grace) -> ok verdict" "ok" "${CASE_STATE}"
+
+# tar + session.end (the healthy fixture above) stays ok: no end false positive.
 
 # ---- shipper contract: sid-less session events + shape-based drift -------
 
@@ -722,7 +862,26 @@ if grep -q 'SENTINEL' "${WORK}/witness.out" "${WORK}/witness.err" "${WORK}/state
 else
   ok "the witness never prints the key (stdout/stderr/verdict/state clean)"
 fi
-grep -q 'SENTINEL' "${WORK}/witness.env" && ok "the env file holds the key (0600)" || bad "env fixture missing the key"
+grep -q 'SENTINEL' "${WORK}/witness.env" && ok "the env fixture carries the sentinel key" || bad "env fixture missing the key"
+
+# The run-case env file's key is the one the witness signs with: a fixture
+# that verifies a different secret makes the mock reject every request, so the
+# witness must fail closed. (This replaces a fixture self-grep that proved
+# nothing.)
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-wrong-key.log"
+: >"${REQUEST_LOG}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "signature":{"key_id":"test-key-id-0001","key":"a-different-secret","region":"test-region"},
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "wrong env-file key -> exit 2 (the env key is really used)" "2" "${CASE_RC}"
+is "wrong env-file key -> error verdict (fail-closed)" "error" "${CASE_STATE}"
 
 # ---- (h) install + disable path (fake systemctl, throwaway paths) --------
 FAKEBIN="${WORK}/bin"
@@ -731,7 +890,14 @@ cat >"${FAKEBIN}/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_SYSTEMCTL_LOG}"
 case "$1" in
-  start) exit "${FAKE_START_RC:-0}" ;;
+  start)
+    # Type=oneshot realism: start fails whenever the main process exits
+    # non-zero; FAKE_START_RC overrides only for non-main failure paths.
+    if [ -n "${FAKE_START_RC:-}" ]; then exit "${FAKE_START_RC}"; fi
+    case "${FAKE_EXEC_STATUS:-0}" in
+      0) exit 0 ;;
+      *) exit 1 ;;
+    esac ;;
   show) printf '%s\n' "${FAKE_EXEC_STATUS:-0}"; exit 0 ;;
 esac
 exit 0
@@ -757,17 +923,30 @@ recording_witness_install
 [ -s "${RECORDING_WITNESS_SERVICE}" ] && ok "install renders the service unit" || bad "install left no service unit"
 [ -s "${RECORDING_WITNESS_TIMER}" ] && ok "install renders the timer unit" || bad "install left no timer unit"
 is "installed env file mode is 0600" "600" "$(mode_of "${RECORDING_WITNESS_ENV_FILE}")"
+if grep -q 'install-key-value-SENTINEL-0010' "${RECORDING_WITNESS_ENV_FILE}"; then
+  ok "installed env file holds the rendered witness key"
+else
+  bad "installed env file lost the rendered witness key"
+fi
 if grep -q 'enable --now pc-recording-witness.timer' "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null; then
   ok "install enables the timer"
 else
   bad "install did not enable the timer: $(cat "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null)"
 fi
 
+# Seed a verdict log: the disable path must keep it as evidence (docs claim).
+mkdir -p "${RECORDING_WITNESS_STATE_DIR}"
+printf '%s\n' 'kept-evidence-line' >"${RECORDING_WITNESS_STATE_DIR}/verdict.log"
 recording_witness_disable
 if [ ! -e "${RECORDING_WITNESS_SBIN}" ] && [ ! -e "${RECORDING_WITNESS_ENV_FILE}" ] && [ ! -e "${RECORDING_WITNESS_SERVICE}" ] && [ ! -e "${RECORDING_WITNESS_TIMER}" ]; then
   ok "disable removes script + env + units (no stale timer)"
 else
   bad "disable left artifacts behind"
+fi
+if [ -f "${RECORDING_WITNESS_STATE_DIR}/verdict.log" ] && grep -q 'kept-evidence-line' "${RECORDING_WITNESS_STATE_DIR}/verdict.log"; then
+  ok "disable keeps the verdict log as evidence"
+else
+  bad "disable removed the verdict log"
 fi
 if grep -q 'disable --now pc-recording-witness.timer' "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null; then
   ok "disable stops and disables the timer"
@@ -776,17 +955,23 @@ else
 fi
 if recording_witness_disable; then ok "disable is idempotent"; else bad "second disable failed"; fi
 
-# ---- (i) run-once: rc gating + public-log redaction ----------------------
+# ---- (i) run-once: ExecMainStatus mapping + freshness + redaction --------
 mkdir -p "${WORK}/state"
 export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
-cat >"${WORK}/state/state.json" <<EOF
-{"version":1,"state":"ok","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/${SID}.tar session ${SID}","updated_at":"2026-09-25T14:00:00Z","last_notify_epoch":0}
-EOF
-export FAKE_START_RC=0
+seed_state() { # $1 = state, $2 = updated_at (the freshness marker)
+  printf '{"version":1,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","last_notify_epoch":0}\n' \
+    "$1" "${SID}" "${SID}" "$2" >"${WORK}/state/state.json"
+}
+run_once_call() { # sets runonce_rc / runonce_out
+  runonce_rc=0
+  runonce_out="$( (recording_witness_run_once) 2>&1 )" || runonce_rc=$?
+}
+
+seed_state ok "$(fresh_stamp)"
+unset FAKE_START_RC
 export FAKE_EXEC_STATUS=0
-runonce_rc=0
-runonce_out="$( (recording_witness_run_once) 2>&1 )" || runonce_rc=$?
-is "run-once: start ok + state ok exits 0" "0" "${runonce_rc}"
+run_once_call
+is "run-once: ok + ExecMainStatus=0 exits 0" "0" "${runonce_rc}"
 case "${runonce_out}" in
   *"witness verdict: OK"*) ok "run-once surfaces the OK verdict" ;;
   *) bad "run-once OK output: ${runonce_out}" ;;
@@ -800,20 +985,176 @@ case "${runonce_out}" in
   *) bad "run-once detail lacks redaction markers: ${runonce_out}" ;;
 esac
 
-# stale green: the service start fails but state.json still says ok
+# alert (exit 1) makes systemctl start return non-zero; that must warn, not die
+seed_state alert "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=1
+run_once_call
+is "run-once: rc=1 + ExecMainStatus=1 + alert warns (exit 0)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: ALERT"*) ok "run-once maps ExecMainStatus=1 to the ALERT warn path" ;;
+  *) bad "run-once alert output: ${runonce_out}" ;;
+esac
+
+# error (exit 2) fails the run closed with the ERROR verdict
+seed_state error "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=2
+run_once_call
+is "run-once: rc=1 + ExecMainStatus=2 + error fails closed" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: ERROR"*) ok "run-once maps ExecMainStatus=2 to the ERROR die path" ;;
+  *) bad "run-once error output: ${runonce_out}" ;;
+esac
+
+# unit demonstrably did not run: ExecMainStatus 203 (exec error) -> die
+seed_state ok "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=203
+run_once_call
+is "run-once: exec error 203 dies" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"demonstrably did not run"*) ok "run-once names the exec-error path" ;;
+  *) bad "run-once exec-error output: ${runonce_out}" ;;
+esac
+
+# failed start + ExecMainStatus=0 is not a witness verdict -> die, no stale OK
+seed_state ok "$(fresh_stamp)"
 export FAKE_START_RC=1
-runonce_rc=0
-runonce_out="$( (recording_witness_run_once) 2>&1 )" || runonce_rc=$?
-is "run-once: failed start dies (rc=1), never reports the stale verdict" "1" "${runonce_rc}"
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: failed start + ExecMainStatus=0 dies" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"demonstrably did not run"*) ok "run-once refuses a start that did not run the witness" ;;
+  *) bad "run-once failed-start output: ${runonce_out}" ;;
+esac
 case "${runonce_out}" in
   *"witness verdict: OK"*) bad "run-once reported a stale OK after a failed start" ;;
-  *) ok "run-once refuses a stale verdict after a failed start" ;;
+  *) ok "run-once never reports a stale OK after a failed start" ;;
 esac
+
+# rc=0 but state.json did not advance: the freshness marker must catch it
+seed_state ok "2026-09-25T00:00:00Z"
+unset FAKE_START_RC
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: rc=0 + stale state dies" "1" "${runonce_rc}"
 case "${runonce_out}" in
-  *"start failed"*) ok "run-once failure names the failed start" ;;
-  *) bad "run-once failure output: ${runonce_out}" ;;
+  *"stale"*) ok "run-once freshness gate names the stale state" ;;
+  *) bad "run-once stale-state output: ${runonce_out}" ;;
 esac
-export FAKE_START_RC=0
+
+# ---- (j) ntfy transitions / recovery / renotify (fake notifier) ----------
+py_begin="$(grep -n "exec python3 - <<'RECORDING_WITNESS_PY_EOF'" "${PROVISION}" | cut -d: -f1)"
+py_end="$(grep -n '^RECORDING_WITNESS_PY_EOF$' "${PROVISION}" | cut -d: -f1)"
+if [ -n "${py_begin}" ] && [ -n "${py_end}" ] && [ "${py_begin}" -lt "${py_end}" ]; then
+  sed -n "$((py_begin + 1)),$((py_end - 1))p" "${PROVISION}" >"${WORK}/witness_module.py"
+fi
+if [ -s "${WORK}/witness_module.py" ] && python3 - "${WORK}" <<'PY'
+import datetime
+import importlib.util
+import json
+import os
+import sys
+import types
+
+work = sys.argv[1]
+spec = importlib.util.spec_from_file_location("witness_module", os.path.join(work, "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+now = 1_800_000_000
+for label, actual, expected in [
+    ("first non-green pushes", module.should_notify(None, 0, "alert", now, 1800), True),
+    ("repeat inside window suppresses", module.should_notify("alert", now - 100, "alert", now, 1800), False),
+    ("1799s suppressed", module.should_notify("alert", now - 1799, "alert", now, 1800), False),
+    ("1800s renotifies", module.should_notify("alert", now - 1800, "alert", now, 1800), True),
+    ("recovery pushes", module.should_notify("alert", now - 1, "ok", now, 1800), True),
+    ("steady ok never pushes", module.should_notify("ok", now - 1, "ok", now, 1800), False),
+    ("first ok never pushes", module.should_notify(None, 0, "ok", now, 1800), False),
+]:
+    if actual is not expected:
+        raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
+
+captured = []
+
+
+class Response:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def fake_urlopen(request, timeout=None):
+    captured.append(request)
+    return Response()
+
+
+module.urllib.request.urlopen = fake_urlopen
+config = types.SimpleNamespace(ntfy_topic="pc-admin test", ntfy_token="tok-SENTINEL")
+if module.notify(config, "alert", "detail-body") is not True:
+    raise SystemExit("notify did not report success against the fake notifier")
+request = captured[-1]
+if request.full_url != "https://ntfy.sh/pc-admin%20test":
+    raise SystemExit("notify URL wrong: %s" % request.full_url)
+if request.headers.get("Authorization") != "Bearer tok-SENTINEL":
+    raise SystemExit("notify auth header wrong: %r" % request.headers)
+if request.data != b"detail-body":
+    raise SystemExit("notify body wrong: %r" % request.data)
+
+
+def failing_urlopen(request, timeout=None):
+    raise module.urllib.error.URLError("no route")
+
+
+module.urllib.request.urlopen = failing_urlopen
+if module.notify(config, "alert", "detail-body") is not False:
+    raise SystemExit("notify must return False when the push fails")
+
+# Stateful transition/recovery through main()'s bookkeeping.
+state_dir = os.path.join(work, "ntfy-state")
+os.environ.update({
+    "RECORDING_WITNESS_STATE_DIR": state_dir,
+    "RECORDING_WITNESS_ENDPOINT": "http://127.0.0.1:9",
+    "RECORDING_WITNESS_BUCKET": "pc-admin-dr",
+    "RECORDING_WITNESS_AUDIT_PREFIX": "audit/",
+    "RECORDING_WITNESS_RECORDINGS_PREFIX": "recordings/",
+    "RECORDING_WITNESS_KEY_ID": "k",
+    "RECORDING_WITNESS_KEY": "s",
+    "RECORDING_WITNESS_RENOTIFY_SECONDS": "1800",
+    "NTFY_TOPIC": "pc-admin test",
+})
+module.urllib.request.urlopen = fake_urlopen
+captured[:] = []
+verdict = ["alert"]
+module.run_checks = lambda config, now: (verdict[0], "detail")
+codes = [module.main()]
+if len(captured) != 1:
+    raise SystemExit("first alert must push once, got %d" % len(captured))
+codes.append(module.main())
+if len(captured) != 1:
+    raise SystemExit("repeat alert inside the window must not push, got %d" % len(captured))
+state_path = os.path.join(state_dir, "state.json")
+record = json.load(open(state_path))
+record["last_notify_epoch"] = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 1801
+json.dump(record, open(state_path, "w"))
+codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("renotify outside the window must push, got %d" % len(captured))
+verdict[0] = "ok"
+codes.append(module.main())
+if len(captured) != 3:
+    raise SystemExit("recovery to ok must push, got %d" % len(captured))
+if captured[-1].headers.get("Tags") != "white_check_mark":
+    raise SystemExit("recovery push must carry the ok tag: %r" % captured[-1].headers)
+codes.append(module.main())
+if len(captured) != 3:
+    raise SystemExit("steady ok must not push, got %d" % len(captured))
+if codes != [1, 1, 1, 0, 0]:
+    raise SystemExit("main exit codes wrong: %r" % codes)
+PY
+then ok "ntfy: transitions push, repeats suppress, 30-min renotify + recovery push (fake notifier)"; else bad "ntfy bookkeeping test failed"; fi
 
 # ---- wiring: the dispatch paths must carry the witness env -------------
 for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX \
