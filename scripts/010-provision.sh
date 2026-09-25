@@ -1437,7 +1437,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
@@ -1763,7 +1763,11 @@ def run_checks(config, now):
             state["seqs"].append(int(match.group("seq")))
             mode = match.group("mode")
             if event_type == "session.start":
-                if state["start"] is None:
+                # Duplicate starts resolve by the newest LastModified, exactly
+                # like ends below: a re-PUT / replayed start must not win just
+                # because its key sorts first, or a stale `.exec` start could
+                # silently exempt a session whose newest marker says shell.
+                if state["start"] is None or last_modified > state["start"]:
                     state["start"] = last_modified
                     state["start_mode"] = mode
             elif event_type == "session.end":
@@ -1990,20 +1994,23 @@ def notify(config, state, detail):
         return False
 
 
-def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_since_epoch=0):
+def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_since_run=0, last_notify_run=0):
     """Notification bookkeeping.
 
     Non-green states push on transition and re-notify every renotify window.
     Green pushes on the non-green -> ok recovery; a recovery push that failed
-    is retried while the ok transition is newer than the last successful
-    notify (state_since_epoch), so a green state never re-pushes once its
-    recovery has landed.
+    is retried while the current ok state began after the last successful
+    notify (state_since_run > last_notify_run), so a green state never
+    re-pushes once its recovery has landed. The retry boundary is the per-run
+    identity, not the second-resolution epoch: a recovery transition in the
+    same second as the last non-green push still retries, and a landing in
+    that same second still stops (run ids are unique per run).
     """
     if state == "ok":
         if previous_state not in (None, "ok"):
             return True
         if previous_state == "ok":
-            return int(state_since_epoch) > int(last_epoch)
+            return int(state_since_run) > int(last_notify_run)
         return False  # a first-ever green run has nothing to recover from
     if state != previous_state:
         return True
@@ -2042,19 +2049,34 @@ def main():
 
     renotify = config.renotify if config is not None else 1800
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
-    last_notify_epoch = previous.get("last_notify_epoch") or 0
-    state_since_epoch = previous.get("state_since_epoch") or 0
-    if previous.get("state") != state:
+    last_notify_epoch = int(previous.get("last_notify_epoch") or 0)
+    last_notify_run = int(previous.get("last_notify_run") or 0)
+    # Per-run identity: a monotonic counter written into state.json, never a
+    # second-resolution timestamp, so a genuine same-second run still advances
+    # it while a run that failed to persist state still repeats it.
+    run_seq = int(previous.get("run_seq") or 0) + 1
+    state_since_run = int(previous.get("state_since_run") or 0)
+    state_since_epoch = int(previous.get("state_since_epoch") or 0)
+    previous_state = previous.get("state")
+    # Arm the transition marker only when a PERSISTED previous state changed:
+    # a first-ever run (previous_state None) must not arm it, or the next
+    # green run looks like an un-landed recovery and pushes a spurious ok.
+    if previous_state is not None and previous_state != state:
+        state_since_run = run_seq
         state_since_epoch = now_epoch
-    if should_notify(previous.get("state"), last_notify_epoch, state, now_epoch, renotify, state_since_epoch):
+    if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify, state_since_run, last_notify_run):
         if config is not None and notify(config, state, detail):
             last_notify_epoch = now_epoch
+            last_notify_run = run_seq
     record = {
         "version": STATE_VERSION,
         "state": state,
         "detail": detail,
         "updated_at": utc_stamp(now),
+        "run_seq": run_seq,
+        "state_since_run": state_since_run,
         "state_since_epoch": state_since_epoch,
+        "last_notify_run": last_notify_run,
         "last_notify_epoch": last_notify_epoch,
     }
     if state == "error":
@@ -2188,15 +2210,17 @@ RECORDING_WITNESS_REDACT_PY
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail updated_at before_updated_at before_invocation after_invocation
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation
   # Anchor freshness to THIS invocation, not to wall-clock recency: a run
   # that genuinely took longer than the old +/-300 s window must not be
   # rejected, and a wedged `systemctl start` that never executed ExecStart
   # (or a failed state write) must not let the previous verdict read as
   # current. InvocationID changes on every real systemd invocation (skipped
-  # only if the property is unavailable); updated_at must also advance so a
-  # run that could not persist state.json never counts.
-  before_updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  # only if the property is unavailable); state.json's per-run identity
+  # (run_seq) must also advance so a run that could not persist state.json
+  # never counts, while two runs in the same wall-clock second still count
+  # (updated_at is second-resolution and may legitimately repeat).
+  before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   before_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
   exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
@@ -2213,11 +2237,12 @@ recording_witness_run_once() { # run one check now and surface the verdict
   state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
   updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
     die "witness unit did not start a new invocation (InvocationID ${after_invocation} unchanged, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale state.json"
   fi
-  if [ -z "${updated_at}" ] || [ "${updated_at}" = "${before_updated_at}" ]; then
-    die "witness state did not advance (updated_at=${updated_at:-none}, before=${before_updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
+  if [ -z "${run_seq}" ] || [ "${run_seq}" = "${before_run_seq}" ]; then
+    die "witness state did not advance (run_seq=${run_seq:-none}, before=${before_run_seq:-none}, updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
   fi
   detail="$(recording_witness_redact "${detail}")"
   case "${state}:${exec_status}" in

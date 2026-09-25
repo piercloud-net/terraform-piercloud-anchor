@@ -21,16 +21,23 @@ is a deliberate replica; when pc-admin's grammar changes, change this file in
 the same breath.
 
 Replica rules (deliberately strict — the harness fails loudly instead of
-silently building a shape the real shipper never emits):
+silently building a shape the real shipper never emits, but every shape the
+real builder DOES emit on its documented path is reproduced faithfully):
 
 - Only a `session.*` event with a **strict-UUID** sid becomes a session key; a
   non-UUID sid is refused here. (The real builder at the pinned SHA would ship
   it on the sid-less global shape — refuse so a fixture can never pin a shape
   the shipper cannot produce.)
+- The sid is **lowercased** exactly like the real builder (`build_audit_key`
+  lowercases a strict-UUID sid); the witness groups sessions
+  case-insensitively, so an uppercase fixture pins the lowercased key.
 - The `shell|exec` mode suffix is lifecycle-only and **mandatory** on
   `session.start`/`session.end` (the real builder always emits `.shell` or
   `.exec`); legacy pre-marker lifecycle keys are not buildable here by design
   — hand-write those drift fixtures.
+- A multi-segment `session.*` type is sanitized to `unknown` on the sid-less
+  global shape, exactly like the real builder (the witness's session
+  classifier is single-segment, so the raw type would read as drift).
 - Non-session events never carry a sid (the real builder drops it).
 - `session.rejected` is forced to the sid-less non-session shape: the witness
   allowlists it there and the real builder at the pinned SHA (66bd304) drops
@@ -38,6 +45,15 @@ silently building a shape the real shipper never emits):
   the pre-fold sid-bearing shape would be read by the witness as a session
   with no `session.start` (`session-start-missing`), so the replica never
   builds it and the golden/refusal teeth pin that.
+- `seq` mirrors the real grammar: the builder emits `previous + 1` (floor 1 —
+  seq 0 is legacy-only and must be hand-written) formatted `%06d`, so 7+
+  digits are legal past 999999; the ceiling is the witness's `[0-9]{1,18}`
+  grammar pc-admin's `SEQ_PATTERN` mirrors.
+
+Golden + boundary vectors are generated from the pinned real builder and
+checked in (`shipper_key_vectors.json`, regenerated with
+`generate_shipper_vectors.py` against the pc-admin checkout); the harness
+replays every vector against this replica, so silent drift fails there.
 
 CLI:  shipper_keys.py <event-type> <ts> [sid] [seq] [mode]
       prints the full audit key (single line).
@@ -54,6 +70,9 @@ TS_RE = re.compile(TS_PATTERN)
 UUID_RE = re.compile(UUID_PATTERN)
 EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$")
 SESSION_TYPE_RE = re.compile(r"^session\.[A-Za-z0-9_]+$")
+# The real builder emits `%06d` (7+ digits past 999999); the ceiling mirrors
+# the witness's `[0-9]{1,18}` grammar that pc-admin's SEQ_PATTERN mirrors.
+SEQ_MAX = 10 ** 18 - 1
 
 # Session lifecycle events get the `interactive`-derived mode suffix; every
 # other event type never carries one (b2_client.SESSION_MODE_EVENTS).
@@ -67,14 +86,27 @@ def audit_key(event_type, ts, sid="", seq=1, mode=""):
     """Build one audit object key exactly as pc-admin's shipper does."""
     if not TS_RE.match(ts):
         raise ValueError("timestamp must be YYYYmmddTHHMMSSZ, got %r" % ts)
-    if not isinstance(seq, int) or isinstance(seq, bool) or not 0 <= seq <= 999999:
-        raise ValueError("seq must fit the shipper's six-digit counter, got %r" % (seq,))
+    if not isinstance(seq, int) or isinstance(seq, bool) or not 1 <= seq <= SEQ_MAX:
+        raise ValueError(
+            "seq must be >= 1 (the real builder emits previous+1; seq 0 is a "
+            "hand-written legacy fixture) and fit the witness's 18-digit grammar, got %r" % (seq,)
+        )
     if not EVENT_TYPE_RE.match(event_type):
         raise ValueError("event type outside the shipper grammar: %r" % event_type)
+    if event_type.startswith("session.") and not SESSION_TYPE_RE.match(event_type):
+        # Multi-segment session.*: the witness's session classifier is
+        # single-segment, so the real builder sanitizes the whole type to
+        # `unknown` and drops the sid (global shape). Mirror it.
+        event_type = "unknown"
+        sid = ""
     if sid and not UUID_RE.fullmatch(sid):
         raise ValueError(
             "non-UUID sid %r: the real shipper ships this on the sid-less global shape" % sid
         )
+    if sid:
+        # The real builder lowercases; the witness groups sessions
+        # case-insensitively, so an uppercase fixture pins the lowercased key.
+        sid = sid.lower()
     if mode and (mode not in ("shell", "exec") or event_type not in SESSION_MODE_EVENTS):
         raise ValueError("mode %r is only valid on session.start/session.end" % mode)
     if event_type in SESSION_MODE_EVENTS and mode not in ("shell", "exec"):

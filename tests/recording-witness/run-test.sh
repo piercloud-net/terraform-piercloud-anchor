@@ -37,8 +37,9 @@
 #       matches no documented shape -> alert contract-mismatch; future
 #       LastModified *and* future Initiated timestamps -> error (clock skew);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 66bd304, golden strings +
-#       refusal teeth; never hand-written);
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 66bd304; golden strings,
+#       refusal teeth, and the checked-in golden+boundary vector matrix
+#       generated from the real builder — never hand-written);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; malformed XML, an S3 error
 #       document and a truncated list without a continuation token all error;
@@ -53,17 +54,21 @@
 #       alerting witness too, so the run maps the paired rc/ExecMainStatus
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
-#       InvocationID did not advance) or when state.json's updated_at did not
-#       advance this invocation (a failed state write, or a start that left
-#       the previous verdict); a run longer than any recency window is
-#       accepted because the anchor is advancement, not recency; state and
-#       ExecMainStatus mismatches die; the printed detail has session ids
-#       redacted (public run-log safety); verdict.log rotates once it crosses
-#       its size bound;
-#   (j) ntfy bookkeeping: state transitions push, a repeated non-green state is
-#       suppressed inside the renotify window, renotifies outside it, a failed
-#       recovery push is retried on the next green run until it lands, and
-#       steady ok stays silent afterwards (fake notifier, no network).
+#       InvocationID did not advance) or when state.json's per-run identity
+#       (run_seq) did not advance this invocation (a failed state write, or a
+#       start that left the previous verdict) — run identity, not the
+#       second-resolution updated_at, so a genuine same-second run counts; a
+#       run longer than any recency window is accepted because the anchor is
+#       advancement, not recency; state and ExecMainStatus mismatches die; the
+#       printed detail has session ids redacted (public run-log safety);
+#       verdict.log rotates once it crosses its size bound;
+#   (j) ntfy bookkeeping: state transitions push, a first-ever green never
+#       pushes (and does not arm the recovery retry), a repeated non-green
+#       state is suppressed inside the renotify window, renotifies outside it,
+#       a failed recovery push is retried on the next green run until it lands
+#       (the retry boundary is the per-run identity, so a same-second
+#       transition still retries), and steady ok stays silent afterwards
+#       (fake notifier, no network).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,6 +132,18 @@ is "replica golden session.rejected sid-less (sid dropped, not consumed)" \
 is "replica golden non-session key sid-less" \
   "audit/20260925T100008Z-user.login.000006.json" \
   "$(key user.login 20260925T100008Z "" 6)"
+# Round-4 LOW 3 fixed divergences, pinned as literal goldens as well as in
+# the checked-in real-builder vector matrix below: uppercase sid lowercased,
+# multi-segment session.* sanitized to `unknown`, 7-digit seq past 999999.
+is "replica golden uppercase sid lowercased" \
+  "audit/20260925T100008Z-session.start.${REPLICA_SID}.000001.shell.json" \
+  "$(key session.start 20260925T100008Z "9F8C4B1E-0D2A-4F7E-9C11-2B3D4E5F6A70" 1 shell)"
+is "replica golden multi-segment session.* sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000001.json" \
+  "$(key session.foo.bar 20260925T100008Z "" 1)"
+is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
+  "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
+  "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
 replica_refuses() { # label + shipper_keys.py args; non-zero = refused
@@ -142,6 +159,50 @@ replica_refuses "non-session with sid" user.login 20260925T100008Z "${REPLICA_SI
 replica_refuses "mode on non-lifecycle event" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
 replica_refuses "mode on non-session event" user.login 20260925T100008Z "" 1 shell
 replica_refuses "lifecycle without the mandatory mode" session.start 20260925T100008Z "${REPLICA_SID}" 1
+replica_refuses "seq zero (legacy hand-written fixture only)" session.data 20260925T100008Z "${REPLICA_SID}" 0
+replica_refuses "seq beyond the witness 18-digit grammar" session.data 20260925T100008Z "${REPLICA_SID}" 1000000000000000000
+replica_refuses "session.start missing sid with mode" session.start 20260925T100008Z "" 1 shell
+
+# Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
+# generated from the REAL pc-admin builder at the pinned SHA
+# (generate_shipper_vectors.py); every vector must replay exactly and every
+# refusal must stay refused, or silent replica drift passes the harness.
+if python3 - "${HARNESS_DIR}" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+
+here = sys.argv[1]
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+vectors = json.load(open(os.path.join(here, "shipper_key_vectors.json"), encoding="utf-8"))
+
+
+def replay(args):
+    args = list(args)
+    args[3] = int(args[3])
+    return replica.audit_key(*args)
+
+
+if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
+    raise SystemExit("vector pin %r != shipper_keys pin %r" % (
+        vectors.get("pinned_pc_admin_sha"), replica.PINNED_PC_ADMIN_SHA))
+for vector in vectors["vectors"]:
+    got = replay(vector["replica_args"])
+    if got != vector["expected"]:
+        raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
+for refusal in vectors["refusals"]:
+    try:
+        replay(refusal["replica_args"])
+    except ValueError:
+        continue
+    raise SystemExit("refusal accepted: %s" % refusal["name"])
+print("vectors=%d refusals=%d pin=%s" % (
+    len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"]))
+PY
+then ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"; else bad "shipper replica diverged from the checked-in real-builder vectors"; fi
 
 # The extracted span calls these on-box helpers; stub them in the harness.
 log()  { printf 'harness: %s\n' "$*" >&2; }
@@ -475,7 +536,9 @@ from shipper_keys import audit_key
 sid = sys.argv[2]
 objects = [
     {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
-    {"key": audit_key("session.start", "20260925T135000Z", sid, 0, "shell"), "ago": 300},
+    # Legacy seq-0 origin, hand-written on purpose: the real builder floors at
+    # 1 (previous+1) and the replica refuses to build seq 0.
+    {"key": "audit/20260925T135000Z-session.start.%s.0.shell.json" % sid, "ago": 300},
 ]
 for seq in range(2, 61, 2):
     objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq), "ago": 299})
@@ -610,6 +673,71 @@ run_case
 is "duplicate ends, newest is shell -> exit 1 (newest LastModified wins)" "1" "${CASE_RC}"
 is "duplicate ends, newest is shell -> alert verdict" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *recording-gap*) ok "duplicate-end shell detail names recording-gap" ;; *) bad "duplicate-end shell detail: ${CASE_DETAIL}" ;; esac
+
+# Duplicate session.start objects (round-4 LOW 4): resolution must use the
+# newest LastModified + its mode, exactly like ends. The mock lists objects by
+# key sort, so swapping the key timestamps swaps the listing order while the
+# LastModified assignment stays: the newest marker (shell, past the grace)
+# must win in both orders — a first-key-wins reader would silently exempt the
+# session when the stale `.exec` start sorts first.
+K_START_1_EXEC="$(key session.start 20260925T134000Z "$SID" 1 exec)"
+K_START_1_SHELL="$(key session.start 20260925T134000Z "$SID" 1 shell)"
+K_START_2_EXEC="$(key session.start 20260925T135000Z "$SID" 2 exec)"
+K_START_2_SHELL="$(key session.start 20260925T135000Z "$SID" 2 shell)"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_EXEC}","ago":1200},
+  {"key":"${K_START_2_SHELL}","ago":700}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "contradictory starts, stale exec key lists first -> exit 1 (newest shell wins)" "1" "${CASE_RC}"
+is "contradictory starts, stale exec key lists first -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "duplicate-start exec-first detail names recording-gap" ;; *) bad "duplicate-start exec-first detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":700},
+  {"key":"${K_START_2_EXEC}","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "contradictory starts, newest shell key lists first -> exit 1 (order-independent)" "1" "${CASE_RC}"
+is "contradictory starts, newest shell key lists first -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "duplicate-start shell-first detail names recording-gap" ;; *) bad "duplicate-start shell-first detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_SHELL}","ago":1200},
+  {"key":"${K_START_2_EXEC}","ago":700}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "contradictory starts, newest exec key lists second -> exit 0 (newest exempts)" "0" "${CASE_RC}"
+is "contradictory starts, newest exec key lists second -> ok verdict" "ok" "${CASE_STATE}"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_1_EXEC}","ago":700},
+  {"key":"${K_START_2_SHELL}","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "contradictory starts, newest exec key lists first -> exit 0 (order-independent)" "0" "${CASE_RC}"
+is "contradictory starts, newest exec key lists first -> ok verdict" "ok" "${CASE_STATE}"
 
 # The mirror case: an end that says shell wins over an exec start
 # (conservative - a tar is expected).
@@ -1044,7 +1172,8 @@ case "$1" in
     # non-zero. FAKE_START_RC models a start that wedges before ExecStart:
     # no new invocation and no state write. Otherwise the invocation counter
     # advances and (unless FAKE_NO_STATE_WRITE=1) state.json gets a new
-    # updated_at, exactly like a real witness run.
+    # per-run identity (run_seq) plus a fresh updated_at, exactly like a real
+    # witness run.
     if [ -n "${FAKE_START_RC:-}" ]; then exit "${FAKE_START_RC}"; fi
     if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ]; then
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
@@ -1059,6 +1188,7 @@ try:
     data = json.load(open(sys.argv[1]))
 except (OSError, ValueError):
     data = {}
+data["run_seq"] = int(data.get("run_seq") or 0) + 1
 data["updated_at"] = sys.argv[2] or (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 json.dump(data, open(sys.argv[1], "w"))
 PYSTATE
@@ -1133,15 +1263,16 @@ if recording_witness_disable; then ok "disable is idempotent"; else bad "second 
 mkdir -p "${WORK}/state"
 export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
 # The run-once freshness anchor is "THIS invocation advanced state": the fake
-# systemctl models a real run by bumping InvocationID and rewriting
-# updated_at; the wedged/rollback paths switch that off.
+# systemctl models a real run by bumping InvocationID and writing a new
+# per-run identity (run_seq; updated_at is second-resolution and may repeat);
+# the wedged/rollback paths switch that off.
 export FAKE_STATE_FILE="${WORK}/state/state.json"
 export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
 printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
 unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
-seed_state() { # $1 = state, $2 = updated_at (the freshness marker)
-  printf '{"version":1,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","last_notify_epoch":0}\n' \
-    "$1" "${SID}" "${SID}" "$2" >"${WORK}/state/state.json"
+seed_state() { # $1 = state, $2 = updated_at (wall clock), $3 = run_seq (default 41)
+  printf '{"version":2,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","run_seq":%s,"last_notify_epoch":0}\n' \
+    "$1" "${SID}" "${SID}" "$2" "${3:-41}" >"${WORK}/state/state.json"
 }
 run_once_call() { # sets runonce_rc / runonce_out
   runonce_rc=0
@@ -1244,8 +1375,8 @@ esac
 unset FAKE_NO_STATE_WRITE
 
 # A genuine run longer than the old +/-300 s recency window: the state it
-# wrote is older than 300 s, but it moved — accepted. Advancement, not
-# recency, is the rule (round-3 F1).
+# wrote is older than 300 s, but its per-run identity moved — accepted.
+# Advancement, not recency, is the rule (round-3 F1).
 seed_state ok "2026-09-25T00:00:00Z"
 export FAKE_NEW_UPDATED_AT="2026-09-25T00:00:01Z"
 run_once_call
@@ -1253,6 +1384,19 @@ is "run-once: >300s run accepted (advancement, not recency)" "0" "${runonce_rc}"
 case "${runonce_out}" in
   *"witness verdict: OK"*) ok "run-once accepts a slow run's advanced state" ;;
   *) bad "run-once slow-run output: ${runonce_out}" ;;
+esac
+unset FAKE_NEW_UPDATED_AT
+
+# Same-second double run (round-4 LOW 2): updated_at is second-resolution, so
+# the second run can stamp the identical value; the freshness gate must key on
+# run_seq, not the timestamp, or a genuine run dies as "state did not advance".
+seed_state ok "2026-09-25T00:00:00Z" 41
+export FAKE_NEW_UPDATED_AT="2026-09-25T00:00:00Z"
+run_once_call
+is "run-once: same-second run accepted (run_seq advanced, updated_at identical)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once accepts the same-second run whose only advancement is run_seq" ;;
+  *) bad "run-once same-second output: ${runonce_out}" ;;
 esac
 unset FAKE_NEW_UPDATED_AT
 
@@ -1305,14 +1449,18 @@ for label, actual, expected in [
     ("recovery pushes", module.should_notify("alert", now - 1, "ok", now, 1800), True),
     ("steady ok never pushes", module.should_notify("ok", now - 1, "ok", now, 1800), False),
     ("first ok never pushes", module.should_notify(None, 0, "ok", now, 1800), False),
-    ("failed recovery retries while transition newer than last notify",
-     module.should_notify("ok", now - 100, "ok", now, 1800, now - 50), True),
+    ("failed recovery retries while the recovery run is newer than the last notified run",
+     module.should_notify("ok", now - 100, "ok", now, 1800, 41, 40), True),
     ("landed recovery does not re-push",
-     module.should_notify("ok", now - 50, "ok", now, 1800, now - 100), False),
-    ("legacy state without state_since does not re-push",
-     module.should_notify("ok", now - 1, "ok", now, 1800, 0), False),
-    ("first ok never pushes even with a fresh transition epoch",
-     module.should_notify(None, 0, "ok", now, 1800, now), False),
+     module.should_notify("ok", now - 50, "ok", now, 1800, 41, 41), False),
+    ("same-second recovery transition (notify + transition in one second) still retries",
+     module.should_notify("ok", now, "ok", now, 1800, 41, 40), True),
+    ("same-second landed recovery does not re-push",
+     module.should_notify("ok", now, "ok", now, 1800, 41, 41), False),
+    ("legacy state without run identity does not re-push",
+     module.should_notify("ok", now - 1, "ok", now, 1800, 0, 0), False),
+    ("first ok never pushes even with a fresh transition run",
+     module.should_notify(None, 0, "ok", now, 1800, 99, 0), False),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
@@ -1371,7 +1519,8 @@ os.environ.update({
 })
 # Stateful transition/recovery through main()'s bookkeeping, with a notifier
 # that fails the first recovery attempt (round-3 F4: a failed recovery push
-# must be retried while the ok transition is newer than the last success).
+# must be retried while the recovery run identity is newer than the last
+# success).
 flaky = {"fail": False}
 
 
@@ -1386,6 +1535,37 @@ module.urllib.request.urlopen = flaky_urlopen
 captured[:] = []
 verdict = ["alert"]
 module.run_checks = lambda config, now: (verdict[0], "detail")
+
+# First-ever green baseline (round-4 LOW 1): two consecutive green runs must
+# not push, and the first-ever run must not arm the recovery retry. Then a
+# real non-green -> ok recovery still pushes exactly once.
+fresh_state_dir = os.path.join(work, "ntfy-fresh-state")
+os.environ["RECORDING_WITNESS_STATE_DIR"] = fresh_state_dir
+captured[:] = []
+verdict[0] = "ok"
+fresh_codes = [module.main(), module.main()]
+if len(captured) != 0:
+    raise SystemExit("first-ever green (and the next green) must not push, got %d" % len(captured))
+fresh_record = json.load(open(os.path.join(fresh_state_dir, "state.json")))
+if int(fresh_record.get("state_since_run") or 0) != 0 or int(fresh_record.get("last_notify_run") or 0) != 0:
+    raise SystemExit("first-ever green armed the recovery retry: %r" % fresh_record)
+verdict[0] = "alert"
+fresh_codes.append(module.main())
+if len(captured) != 1:
+    raise SystemExit("post-baseline alert must push once, got %d" % len(captured))
+verdict[0] = "ok"
+fresh_codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("post-baseline recovery must push once, got %d" % len(captured))
+fresh_codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("landed recovery must not re-push, got %d" % len(captured))
+if fresh_codes != [0, 0, 1, 0, 0]:
+    raise SystemExit("fresh first-green sequence exit codes wrong: %r" % fresh_codes)
+
+os.environ["RECORDING_WITNESS_STATE_DIR"] = state_dir
+captured[:] = []
+verdict[0] = "alert"
 codes = [module.main()]
 if len(captured) != 1:
     raise SystemExit("first alert must push once, got %d" % len(captured))
@@ -1411,8 +1591,10 @@ codes.append(module.main())  # recovery transition: push attempted, fails
 if len(captured) != 3:
     raise SystemExit("failed recovery must attempt exactly one push, got %d" % len(captured))
 record = json.load(open(state_path))
-if record["state"] != "ok" or int(record.get("state_since_epoch", 0)) <= 1 or record.get("last_notify_epoch") != 1:
-    raise SystemExit("failed recovery must record the ok transition without advancing last_notify_epoch: %r" % record)
+if (record["state"] != "ok"
+        or int(record.get("state_since_run") or 0) <= int(record.get("last_notify_run") or 0)
+        or record.get("last_notify_epoch") != 1):
+    raise SystemExit("failed recovery must record the ok transition (state_since_run > last_notify_run) without advancing last_notify_epoch: %r" % record)
 flaky["fail"] = False
 codes.append(module.main())  # next green run retries the recovery push
 if len(captured) != 4:
