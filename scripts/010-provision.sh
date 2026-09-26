@@ -2559,11 +2559,11 @@ recording_witness_run_once() { # run one check now and surface the verdict
   # Issue #143: on a long-up box the timer's OnBootSec=2min has already
   # elapsed, so the timer fires the service as soon as it is enabled (fresh
   # install) and a reinstall can find a timer-triggered invocation already
-  # in flight. Snapshotting the unit while that invocation runs lets this
+  # in flight. Reading the unit while that invocation runs lets this
   # function's `systemctl start` merge with its job: the merged start
   # returns the in-flight run's result while InvocationID stays put, and the
   # fail-closed gate below then refuses a perfectly valid verdict. Drain
-  # first (bounded) so the snapshot has a stable baseline; the bounded retry
+  # first (bounded) so the captured baseline is stable; the bounded retry
   # after the start covers a fire that still lands between the drain and the
   # start. If the unit will not drain, fail closed rather than guess.
   recording_witness_wait_idle

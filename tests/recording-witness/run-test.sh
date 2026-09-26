@@ -91,7 +91,7 @@
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
 #       InvocationID did not advance); the timer's immediate first fire on a
-#       long-up box (issue #143) is drained (bounded) before the snapshot and
+#       long-up box (issue #143) is drained (bounded) before the capture and
 #       retried once if a start still merged with it, so a merged
 #       timer-triggered invocation is never mis-filed as a stale start; the
 #       run also dies when state.json's per-run identity
@@ -2336,7 +2336,7 @@ esac
 # Issue #143: on a long-up box the witness timer fires its service as soon as
 # the timer is enabled, so a fresh install (or a reinstall whose timer is
 # already running) can find that timer-triggered invocation in flight when
-# run-once snapshots the unit. Its own `systemctl start` then merges with the
+# run-once reads the unit. Its own `systemctl start` then merges with the
 # in-flight job: the merged start returns the in-flight run's result and
 # InvocationID does NOT advance, even though that run wrote a perfectly valid
 # state.json. The acceptance must drain the unit, retry exactly once (the
@@ -2371,7 +2371,7 @@ unset FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE
 
 # Issue #143 (drain leg): a reinstall can catch a timer-triggered invocation
 # already running. run-once must wait (bounded) for the unit to go inactive
-# BEFORE it snapshots InvocationID, so its own start cannot merge with the
+# BEFORE it reads InvocationID, so its own start cannot merge with the
 # in-flight job at all. The fake reports the unit active for one poll and
 # drained from the second poll on; the fix must poll it out before starting.
 seed_state ok "$(fresh_stamp)" 51
