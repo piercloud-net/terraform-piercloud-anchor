@@ -4,7 +4,8 @@
 #
 # WHERE THIS RUNS: ON the anchor box itself, as root, normally via the A1
 # dispatch (the runner SSHes in under a per-run device-flow approval and pipes
-# this script over stdin with GATUS_*/NTFY_* env prefixed). Fallback: paste it
+# this script over stdin with GATUS_*/NTFY_*/RECORDING_WITNESS_* env prefixed).
+# Fallback: paste it
 # into the netcup SCP remote console by hand — env unset means a self-check-only
 # monitor. Either way the tang keypair is generated ON THIS BOX and never leaves.
 #
@@ -1333,5 +1334,1314 @@ if [ -n "${STATUS_HOST:-}" ]; then
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
   fi
 fi
+
+# --- BEGIN RECORDING WITNESS (tests/recording-witness extracts this span; keep markers) ---
+# Recording-completeness witness — optional component, dormant without env.
+# Renders /usr/local/sbin/pc-recording-witness.sh + its 0600 env file + a
+# 5-minute systemd timer. The witness is STRICTLY list-only (ListObjectsV2 +
+# ListMultipartUploads with a listFiles-only B2 application key: no readFiles,
+# no HEAD, no ListParts) and fail-closed (an un-runnable witness reports
+# `error`; the last baseline is held). Design, key contract and checks:
+# docs/recording-witness.md.
+#
+# Paths are overridable so the committed test harness can render and install
+# into throwaway paths; the dispatch env never exports these names, so on-box
+# runs always get the canonical defaults.
+RECORDING_WITNESS_SBIN="${RECORDING_WITNESS_SBIN:-/usr/local/sbin/pc-recording-witness.sh}"
+RECORDING_WITNESS_ENV_FILE="${RECORDING_WITNESS_ENV_FILE:-/etc/piercloud/recording-witness.env}"
+RECORDING_WITNESS_STATE_DIR="${RECORDING_WITNESS_STATE_DIR:-/var/lib/piercloud/recording-witness}"
+RECORDING_WITNESS_SERVICE="${RECORDING_WITNESS_SERVICE:-/etc/systemd/system/pc-recording-witness.service}"
+RECORDING_WITNESS_TIMER="${RECORDING_WITNESS_TIMER:-/etc/systemd/system/pc-recording-witness.timer}"
+
+recording_witness_config_problem() { # print the first config problem; empty = ok
+  if [ -z "${RECORDING_WITNESS_ENDPOINT:-}" ]; then printf '%s' 'RECORDING_WITNESS_ENDPOINT is empty'; return 0; fi
+  case "${RECORDING_WITNESS_ENDPOINT}" in
+    http://*|https://*) ;;
+    *) printf '%s' 'RECORDING_WITNESS_ENDPOINT must start with http:// or https://'; return 0 ;;
+  esac
+  case "${RECORDING_WITNESS_ENDPOINT}" in *[[:space:]]*) printf '%s' 'RECORDING_WITNESS_ENDPOINT has whitespace'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_BUCKET:-}" ]; then printf '%s' 'RECORDING_WITNESS_BUCKET is empty'; return 0; fi
+  case "${RECORDING_WITNESS_BUCKET}" in *[!a-z0-9.-]*) printf '%s' 'RECORDING_WITNESS_BUCKET must match [a-z0-9.-]'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_AUDIT_PREFIX:-}" ]; then printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX is empty'; return 0; fi
+  case "${RECORDING_WITNESS_AUDIT_PREFIX}" in */) ;; *) printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX must end with /'; return 0;; esac
+  case "${RECORDING_WITNESS_AUDIT_PREFIX}" in *[!A-Za-z0-9._/-]*) printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX has unsupported characters'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}" ]; then printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX is empty'; return 0; fi
+  case "${RECORDING_WITNESS_RECORDINGS_PREFIX}" in */) ;; *) printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX must end with /'; return 0;; esac
+  case "${RECORDING_WITNESS_RECORDINGS_PREFIX}" in *[!A-Za-z0-9._/-]*) printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX has unsupported characters'; return 0;; esac
+  if [ "${RECORDING_WITNESS_AUDIT_PREFIX}" = "${RECORDING_WITNESS_RECORDINGS_PREFIX}" ]; then printf '%s' 'audit and recordings prefixes must differ'; return 0; fi
+  if [ -z "${RECORDING_WITNESS_KEY_ID:-}" ]; then printf '%s' 'RECORDING_WITNESS_KEY_ID is empty'; return 0; fi
+  case "${RECORDING_WITNESS_KEY_ID}" in *[!A-Za-z0-9_-]*) printf '%s' 'RECORDING_WITNESS_KEY_ID has unsupported characters'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_KEY:-}" ]; then printf '%s' 'RECORDING_WITNESS_KEY is empty'; return 0; fi
+  case "${RECORDING_WITNESS_KEY}" in *[[:space:]]*|*[![:print:]]*) printf '%s' 'RECORDING_WITNESS_KEY has whitespace or control characters'; return 0;; esac
+  return 0
+}
+
+recording_witness_state() { # off | partial | on
+  local present=0 total=0 name
+  for name in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX RECORDING_WITNESS_RECORDINGS_PREFIX RECORDING_WITNESS_KEY_ID RECORDING_WITNESS_KEY; do
+    total=$((total + 1))
+    if [ -n "${!name:-}" ]; then present=$((present + 1)); fi
+  done
+  if [ "$present" -eq 0 ]; then printf 'off'; return 0; fi
+  if [ "$present" -ne "$total" ]; then printf 'partial'; return 0; fi
+  if [ -n "$(recording_witness_config_problem)" ]; then printf 'partial'; return 0; fi
+  printf 'on'
+}
+
+render_recording_witness() { # print the on-box witness script to stdout
+  cat <<'RECORDING_WITNESS_FILE_EOF'
+#!/usr/bin/env bash
+# pc-recording-witness.sh — list-only recording-completeness witness.
+# RENDERED by terraform-piercloud-anchor scripts/010-provision.sh; DO NOT EDIT.
+# Contract + checks: docs/recording-witness.md (repo).
+#
+# Strictly list-only: reads /etc/piercloud/recording-witness.env (0600) and
+# makes only ListObjectsV2 / ListMultipartUploads calls. Never fetches object
+# content (no GET/HEAD) and never calls ListParts (writeFiles).
+set -euo pipefail
+
+ENV_FILE="${RECORDING_WITNESS_ENV_FILE:-/etc/piercloud/recording-witness.env}"
+if [ ! -r "$ENV_FILE" ]; then
+  printf '[witness] FAIL: witness env file not readable: %s\n' "$ENV_FILE" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090,SC1091  # operator-controlled dispatched env file
+. "$ENV_FILE"
+set +a
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '[witness] FAIL: python3 is not installed\n' >&2
+  exit 2
+fi
+
+exec python3 - <<'RECORDING_WITNESS_PY_EOF'
+"""List-only recording-completeness witness (B2 S3 metadata).
+
+Strictly list-only: ListObjectsV2 + ListMultipartUploads with a listFiles-only
+application key. Never reads an object (no GET/HEAD) and never calls the
+writeFiles-gated ListParts. Fail-closed: any failure to run reports state
+`error`, exits 2, and never advances the last good baseline (an unreadable or
+oversized state file is preserved as `state.json.corrupt` - or a timestamped
+`.corrupt.<stamp>` sibling when that name is taken - and the repaired record
+reports `baseline: null` - it could not be read and is never fabricated);
+alerts exit 1; green exits 0.
+"""
+import collections
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+STATE_VERSION = 2
+# A state record is a few KB; an oversized file is invalid input, never a reason
+# to allocate it. The bounded read keeps a planted huge state.json from raising
+# an uncaught MemoryError before any verdict (round-7 R2).
+STATE_MAX_BYTES = 1 << 20
+VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
+UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
+# Classification is shape-strict so a malformed session key cannot be re-parsed
+# as a non-session event (or vice versa).
+TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
+# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
+# optional mode marker (.shell/.exec) is contract-defined for session.start
+# and session.end only (pc-admin D1); other session events keep the old shape.
+SESSION_KEY_RE = re.compile(
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
+    r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
+    r"(?:\.(?P<mode>shell|exec))?\.json$"
+)
+# Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
+NON_SESSION_KEY_RE = re.compile(
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
+)
+HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json$")
+UUID_RE = re.compile(UUID_PATTERN)
+RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
+# Sid-less session.* event types documented by the shipper contract (Teleport
+# v18 emits session.rejected without a session id): they ship on the
+# non-session shape and are not naming drift.
+SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
+# Replay-conflict variants (pc-admin `disambiguate_audit_key`): when a rebuilt
+# audit file replays an event under a key that already exists with DIFFERENT
+# bytes, the shipper appends `_<sha256[:16]>` to the event type (a session
+# lifecycle variant drops its mode marker) instead of silently skipping the
+# line. The witness is list-only and cannot see bytes, so a variant is the
+# SAME event identity as its base key, re-shipped under a disambiguated name:
+# canonicalize the type and count the (ts, type, seq) identity once per session.
+CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}$")
+
+
+def canonical_conflict_type(event_type):
+    """Strip a replay-conflict `_<hash16>` suffix; return (base, is_variant)."""
+    match = CONFLICT_SUFFIX_RE.search(event_type)
+    if not match:
+        return event_type, False
+    return event_type[: match.start()], True
+
+
+class WitnessError(Exception):
+    """Any condition that makes the witness un-runnable (fail-closed)."""
+
+
+def env(name, default=""):
+    value = os.environ.get(name, "")
+    return value if value else default
+
+
+def env_int(name, default):
+    raw = env(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        raise WitnessError("%s must be an integer, got %r" % (name, raw))
+
+
+def log(message):
+    print("[witness] " + message, flush=True)
+
+
+def clip(text, limit=300):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def utc_stamp(instant):
+    return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def age_seconds(now, moment, label, skew_tolerance):
+    """Signed age in seconds; a future timestamp beyond tolerance is an error."""
+    age = int((now - moment).total_seconds())
+    if age < -skew_tolerance:
+        raise WitnessError(
+            "%s timestamp %s is %ds in the future (clock skew beyond %ds)"
+            % (label, utc_stamp(moment), -age, skew_tolerance)
+        )
+    return age
+
+
+def parse_timestamp(text):
+    value = (text or "").strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(timezone.utc)
+
+
+def quote(value, keep_slash=False):
+    safe = "-_.~"
+    if keep_slash:
+        safe += "/"
+    return urllib.parse.quote(value, safe=safe)
+
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def sign(key, message):
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+class Config(object):
+    def __init__(self):
+        self.endpoint = env("RECORDING_WITNESS_ENDPOINT").rstrip("/")
+        self.bucket = env("RECORDING_WITNESS_BUCKET")
+        self.audit_prefix = env("RECORDING_WITNESS_AUDIT_PREFIX")
+        self.recordings_prefix = env("RECORDING_WITNESS_RECORDINGS_PREFIX")
+        self.key_id = env("RECORDING_WITNESS_KEY_ID")
+        self.key = env("RECORDING_WITNESS_KEY")
+        self.region = env("RECORDING_WITNESS_REGION")
+        self.state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
+        self.heartbeat_max_age = env_int("RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS", 900)
+        self.session_grace = env_int("RECORDING_WITNESS_SESSION_GRACE_SECONDS", 600)
+        self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
+        self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
+        self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
+        self.renotify = env_int("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
+        self.ntfy_topic = env("NTFY_TOPIC")
+        self.ntfy_token = env("NTFY_TOKEN")
+        self.heartbeat_prefix = self.audit_prefix + "heartbeat/"
+        self.validate()
+
+    def validate(self):
+        required = [
+            ("RECORDING_WITNESS_ENDPOINT", self.endpoint),
+            ("RECORDING_WITNESS_BUCKET", self.bucket),
+            ("RECORDING_WITNESS_AUDIT_PREFIX", self.audit_prefix),
+            ("RECORDING_WITNESS_RECORDINGS_PREFIX", self.recordings_prefix),
+            ("RECORDING_WITNESS_KEY_ID", self.key_id),
+            ("RECORDING_WITNESS_KEY", self.key),
+        ]
+        for name, value in required:
+            if not value:
+                raise WitnessError("%s is empty - witness env incomplete" % name)
+        if not self.endpoint.startswith(("http://", "https://")):
+            raise WitnessError("RECORDING_WITNESS_ENDPOINT must be an http(s) URL")
+        if urllib.parse.urlsplit(self.endpoint).path not in ("", "/"):
+            raise WitnessError("RECORDING_WITNESS_ENDPOINT must not carry a path")
+        for name, value in (("AUDIT_PREFIX", self.audit_prefix), ("RECORDINGS_PREFIX", self.recordings_prefix)):
+            if not value.endswith("/"):
+                raise WitnessError("RECORDING_WITNESS_%s must end with /" % name)
+
+    def signing_region(self):
+        if self.region:
+            return self.region
+        match = re.match(r"^https?://s3\.([a-z0-9-]+)\.backblazeb2\.com$", self.endpoint)
+        return match.group(1) if match else "us-east-1"
+
+
+def signed_get(config, params):
+    """SigV4-signed path-style GET against the S3 endpoint (list calls only)."""
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+    host = urllib.parse.urlsplit(config.endpoint).netloc
+    canonical_uri = "/" + quote(config.bucket, keep_slash=True)
+    pairs = sorted((quote(str(name)), quote(str(value))) for name, value in params.items())
+    canonical_query = "&".join("%s=%s" % (name, value) for name, value in pairs)
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join("%s:%s\n" % (name, headers[name]) for name in sorted(headers))
+    canonical_request = "\n".join(
+        ["GET", canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash]
+    )
+    scope = "%s/%s/s3/aws4_request" % (datestamp, config.signing_region())
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope,
+         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()]
+    )
+    signing_key = sign(("AWS4" + config.key).encode("utf-8"), datestamp)
+    signing_key = sign(signing_key, config.signing_region())
+    signing_key = sign(signing_key, "s3")
+    signing_key = sign(signing_key, "aws4_request")
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
+        config.key_id, scope, signed_headers, signature)
+    url = config.endpoint + canonical_uri + (("?" + canonical_query) if canonical_query else "")
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Authorization", authorization)
+    request.add_header("x-amz-content-sha256", payload_hash)
+    request.add_header("x-amz-date", amz_date)
+    try:
+        with open_signed(request, timeout=30) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def list_objects(config, prefix):
+    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content."""
+    objects = {}
+    token = ""
+    for _ in range(1000):
+        params = {"list-type": "2", "prefix": prefix}
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        truncated = False
+        next_token = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    try:
+                        objects[key] = parse_timestamp(last_modified)
+                    except ValueError:
+                        raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+        if not truncated:
+            return objects
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise WitnessError("ListObjectsV2 %s exceeded 1000 pages" % prefix)
+
+
+def list_uploads(config, prefix):
+    """ListMultipartUploads -> [{key, upload_id, initiated}]. List-only."""
+    uploads = []
+    key_marker = ""
+    upload_marker = ""
+    for _ in range(1000):
+        params = {"uploads": ""}
+        if prefix:
+            params["prefix"] = prefix
+        if key_marker:
+            params["key-marker"] = key_marker
+        if upload_marker:
+            params["upload-id-marker"] = upload_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListMultipartUploads %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
+        truncated = False
+        next_key = ""
+        next_upload = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Upload":
+                entry = {"key": "", "upload_id": "", "initiated": None}
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        entry["key"] = field.text or ""
+                    elif field_name == "UploadId":
+                        entry["upload_id"] = field.text or ""
+                    elif field_name == "Initiated":
+                        entry["initiated"] = parse_timestamp(field.text or "")
+                if entry["key"]:
+                    uploads.append(entry)
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextUploadIdMarker":
+                next_upload = child.text or ""
+        if not truncated:
+            return uploads
+        if not next_key:
+            raise WitnessError("ListMultipartUploads %s truncated without a key marker" % prefix)
+        key_marker = next_key
+        upload_marker = next_upload
+    raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
+
+
+def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candidate_mode):
+    """Resolve duplicate session.start/session.end markers.
+
+    The strictly-newest LastModified wins with its mode. An exact tie is
+    ambiguous (nothing is "newest"): when the declared modes conflict, fail
+    closed to the conservative `shell` marker (a tar is expected), so neither
+    listing order can silently exempt the session; an identical-mode tie
+    keeps the marker as-is.
+    """
+    if current_time is None or candidate_time > current_time:
+        return candidate_time, candidate_mode
+    if candidate_time < current_time:
+        return current_time, current_mode
+    if (candidate_mode == "exec") != (current_mode == "exec"):
+        return current_time, "shell"
+    return current_time, current_mode
+
+
+def run_checks(config, now):
+    audit_objects = list_objects(config, config.audit_prefix)
+    recording_objects = list_objects(config, config.recordings_prefix)
+    uploads = list_uploads(config, config.recordings_prefix)
+    alerts = []
+    # Enforce the clock-skew contract at collection time: every S3 timestamp
+    # the checks can read (object LastModified, multipart Initiated) is
+    # validated once here, so "any S3 timestamp more than 5 min in the future
+    # -> error" holds for every key - including exec sessions that are later
+    # exempt from the gap clock and completed tars whose session.end is
+    # present, which never reach a per-session age check otherwise.
+    for key, last_modified in audit_objects.items():
+        age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+    for key, last_modified in recording_objects.items():
+        age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    for upload in uploads:
+        age_seconds(now, upload["initiated"], "upload %s initiated" % upload["key"], config.clock_skew_tolerance)
+
+    heartbeat_times = []
+    unrecognized = []
+    for key, last_modified in audit_objects.items():
+        if not key.startswith(config.heartbeat_prefix):
+            continue
+        if HEARTBEAT_KEY_RE.match(key[len(config.heartbeat_prefix):]):
+            heartbeat_times.append(last_modified)
+        else:
+            unrecognized.append(key)
+
+    heartbeat_age = None
+    if not heartbeat_times:
+        alerts.append("heartbeat-missing: no objects under %s" % config.heartbeat_prefix)
+    else:
+        heartbeat_age = age_seconds(
+            now, max(heartbeat_times), "newest heartbeat", config.clock_skew_tolerance)
+        if heartbeat_age > config.heartbeat_max_age:
+            alerts.append(
+                "heartbeat-stale: newest heartbeat is %ds old (limit %ds)"
+                % (heartbeat_age, config.heartbeat_max_age)
+            )
+
+    sessions = {}
+    contract_bad = 0
+    for key, last_modified in audit_objects.items():
+        if key.startswith(config.heartbeat_prefix):
+            continue
+        relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
+        match = SESSION_KEY_RE.match(relative)
+        if match:
+            event_type, is_variant = canonical_conflict_type(match.group("etype"))
+            sid = match.group("sid").lower()
+            state = sessions.setdefault(
+                sid, {"seqs": [], "start": None, "end": None, "start_mode": None,
+                      "end_mode": None, "identities": set()})
+            seq = int(match.group("seq"))
+            # A base key and its replay-conflict variant share one identity
+            # (ts, canonical type, seq): count the seq once so a legitimate
+            # variant cannot read as a `sequence-duplicate`, while a genuine
+            # duplicate from a different timestamp still does. The identity is
+            # for sequence counting ONLY - it must not skip lifecycle
+            # resolution: a same-ts `.exec`/`.shell` marker pair also shares
+            # the identity (the mode is not part of it), so forcing the second
+            # key to skip would let whichever key the listing returns first
+            # win regardless of LastModified (a stale/equal-LM `.exec` silently
+            # exempting a shell session). Only a key whose type
+            # `canonical_conflict_type` actually flags as a replay-conflict
+            # variant skips resolution; every canonical key reaches
+            # `resolve_lifecycle_marker` and the newest marker (or the
+            # conservative conflicting tie) wins in either listing order.
+            identity = (match.group("ts"), event_type, seq)
+            if identity not in state["identities"]:
+                state["identities"].add(identity)
+                state["seqs"].append(seq)
+            mode = match.group("mode")
+            if is_variant:
+                # Variants drop the mode marker by contract and must not
+                # re-resolve the lifecycle marker: the base key (which the
+                # producer only variants because it exists) is authoritative.
+                # A mode marker on a variant is naming drift exactly like a
+                # mode marker on any non-lifecycle base shape.
+                if mode:
+                    contract_bad += 1
+                continue
+            # Duplicate starts and ends resolve by the newest LastModified,
+            # exactly like each other: a re-PUT / replayed marker must not win
+            # just because its key sorts first, or a stale `.exec` start could
+            # silently exempt a session whose newest marker says shell. An
+            # exact tie with conflicting declared modes fails closed to the
+            # conservative `shell` (see resolve_lifecycle_marker).
+            if event_type == "session.start":
+                state["start"], state["start_mode"] = resolve_lifecycle_marker(
+                    state["start"], state["start_mode"], last_modified, mode)
+            elif event_type == "session.end":
+                state["end"], state["end_mode"] = resolve_lifecycle_marker(
+                    state["end"], state["end_mode"], last_modified, mode)
+            elif mode:
+                # The mode marker is contract-defined on start/end only; a
+                # marker anywhere else is naming drift.
+                contract_bad += 1
+            continue
+        generic = NON_SESSION_KEY_RE.match(relative)
+        if generic:
+            # A replay-conflict variant (`session.rejected_<hash16>`) is the
+            # same documented event as its base type, never naming drift.
+            event_type, _ = canonical_conflict_type(generic.group("etype"))
+            if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
+                continue  # documented non-session (or known sid-less session) event
+        # Drift is judged by shape (a UUID-shaped sid or a session.* event
+        # type), not by one literal substring: a rename that drops
+        # "-session." but keeps the sid still fails closed.
+        if UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
+            contract_bad += 1
+        else:
+            unrecognized.append(key)
+
+    if contract_bad:
+        alerts.append(
+            "naming-contract: %d audit key(s) look like session events but do not match the shipper naming contract"
+            % contract_bad
+        )
+    if unrecognized:
+        alerts.append(
+            "contract-mismatch: %d audit object(s) match no documented shipper key shape"
+            % len(unrecognized)
+        )
+
+    # Completed recordings and in-progress uploads keyed by lowercased sid:
+    # sessions are grouped case-insensitively, so an uppercase-sid tar or
+    # upload must satisfy the gap check for the lowercased session id instead
+    # of false-alerting (round-6 F5). The newest LastModified wins a case
+    # collision for the tar clock.
+    recordings_by_sid = {}
+    for key, last_modified in recording_objects.items():
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        current = recordings_by_sid.get(sid)
+        if current is None or last_modified > current:
+            recordings_by_sid[sid] = last_modified
+    upload_sids = set()
+    for upload in uploads:
+        key = upload["key"]
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if match:
+            upload_sids.add(match.group("sid").lower())
+    for sid in sorted(sessions):
+        state = sessions[sid]
+        if state["start"] is None:
+            # Stream closure: session events with no session.start can never
+            # be gap-checked, so they must alert on their own.
+            alerts.append(
+                "session-start-missing: session %s has %d audit event(s) but no session.start"
+                % (sid, len(state["seqs"]))
+            )
+            continue
+        # session.end is authoritative for the exec/shell split: live Teleport
+        # v18 emits `interactive` on the end event only (the start key reads
+        # `.shell` for exec sessions too). With no end yet, the start marker
+        # governs; a missing/legacy marker is shell (conservative: a tar is
+        # expected).
+        if state["end"] is not None:
+            session_mode = "exec" if state["end_mode"] == "exec" else "shell"
+        else:
+            session_mode = "exec" if state["start_mode"] == "exec" else "shell"
+        if session_mode == "exec":
+            continue  # non-interactive exec sessions ship no recording (documented)
+        age = age_seconds(now, state["start"], "session.start", config.clock_skew_tolerance)
+        recording_key = config.recordings_prefix + sid + ".tar"
+        completed_at = recordings_by_sid.get(sid)
+        if completed_at is not None:
+            # The tar satisfies the gap check by itself, so a completed
+            # recording whose session.end never shipped would stay green
+            # forever; anchor the end grace on the tar's own LastModified
+            # (the completer-lag window: > shipper backoff, 15 min default).
+            if state["end"] is None:
+                completed_age = age_seconds(
+                    now, completed_at, "recording %s" % recording_key, config.clock_skew_tolerance)
+                if completed_age > config.completer_lag:
+                    alerts.append(
+                        "session-end-missing: %s completed %ds ago but session %s has no session.end (grace %ds)"
+                        % (recording_key, completed_age, sid, config.completer_lag)
+                    )
+            continue
+        if sid in upload_sids:
+            continue
+        if age <= config.session_grace:
+            continue
+        if state["end"] is None:
+            # No end yet: live v18 marks only the end event, so a `.shell`
+            # start cannot be told apart from an in-flight exec session
+            # (which ships no tar and clears this alert when its `.exec` end
+            # lands). Alert anyway - conservative, never silenced - with
+            # wording that names the ambiguity so triage does not read it as
+            # a confirmed loss. An interactive session whose recording never
+            # started has the same shape and is exactly what must not be
+            # suppressed, which is why a longer bound is not used here (it
+            # would only delay both the false positive and the real gap).
+            alerts.append(
+                "recording-gap: shell session %s started %ds ago with no %s object and no in-progress upload "
+                "(no session.end yet - an in-flight exec session also reads `.shell` until its end ships; "
+                "may clear when the end or tar lands)"
+                % (sid, age, recording_key)
+            )
+        else:
+            alerts.append(
+                "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
+                % (session_mode, sid, age, recording_key)
+            )
+
+    # Orphan completed recordings: a tar whose sid has no audit events at all
+    # is the extreme tail of stream closure (no start -> no gap clock at all).
+    # The session loop above cannot see it because it only visits observed
+    # sessions, so it is checked here against the same completer-lag grace.
+    for key, completed in recording_objects.items():
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        if sid in sessions:
+            continue
+        completed_age = age_seconds(
+            now, completed, "recording %s" % key, config.clock_skew_tolerance)
+        if completed_age > config.completer_lag:
+            alerts.append(
+                "session-start-missing: %s completed %ds ago but session %s has no audit events at all "
+                "(no session.start; grace %ds)" % (key, completed_age, sid, config.completer_lag)
+            )
+
+    for sid in sorted(sessions):
+        seqs = sessions[sid]["seqs"]
+        counts = collections.Counter(seqs)
+        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
+        if duplicates:
+            alerts.append(
+                "sequence-duplicate: session %s repeats <seq> %s"
+                % (sid, ",".join(str(number) for number in duplicates))
+            )
+            continue
+        unique = sorted(counts)
+        if unique[0] > 1:
+            alerts.append(
+                "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
+                % (sid, unique[0])
+            )
+        if unique[-1] - unique[0] + 1 != len(unique):
+            # Bounded missing-set: render gap ranges from the observed values
+            # (never range(low, high+1), which crafted seq values could hang).
+            missing_ranges = [
+                (before + 1, after - 1)
+                for before, after in zip(unique, unique[1:]) if after > before + 1
+            ]
+            rendered = [
+                str(start) if start == stop else "%d-%d" % (start, stop)
+                for start, stop in missing_ranges[:20]
+            ]
+            if len(missing_ranges) > 20:
+                rendered.append("...")
+            alerts.append(
+                "sequence-gap: session %s missing <seq> %s"
+                % (sid, ",".join(rendered))
+            )
+
+    for upload in uploads:
+        key = upload["key"]
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        initiated_age = age_seconds(
+            now, upload["initiated"], "upload %s initiated" % key, config.clock_skew_tolerance)
+        ended = sessions.get(sid, {}).get("end")
+        if ended is not None:
+            ended_age = age_seconds(now, ended, "session.end for %s" % sid, config.clock_skew_tolerance)
+            if ended_age > config.completer_lag:
+                alerts.append(
+                    "completer-lag: %s still in progress %ds after session.end (started at %s)"
+                    % (key, ended_age, utc_stamp(upload["initiated"]))
+                )
+        elif initiated_age > config.open_upload_max_age:
+            # Distinct from completer-lag (session.end seen) and from the
+            # bare-old-multipart rule: an upload with no session.end has no
+            # end-anchored clock, so it gets its own age bound.
+            alerts.append(
+                "open-upload-stale: %s has been open %ds with no session.end (bound %ds)"
+                % (key, initiated_age, config.open_upload_max_age)
+            )
+
+    if alerts:
+        return "alert", "; ".join(alerts)
+    detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
+        len(sessions), len(uploads), len(audit_objects), len(recording_objects),
+        ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
+    return "ok", detail
+
+
+def corrupt_state_destination(path, now):
+    """Pick a never-overwriting destination for an unreadable state file.
+
+    `<state>.corrupt` when free; when that name is already taken (an earlier
+    preservation, or a planted entry such as a directory) a timestamped
+    `<state>.corrupt.<UTCstamp>` name is used, so earlier forensics are never
+    overwritten (round-7 R3).
+    """
+    base = path + ".corrupt"
+    if not os.path.lexists(base):
+        return base
+    stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = "%s.%s" % (base, stamp)
+    suffix = 0
+    while os.path.lexists(candidate):
+        suffix += 1
+        candidate = "%s.%s-%d" % (base, stamp, suffix)
+    return candidate
+
+
+def read_state(path):
+    try:
+        # Read raw BYTES: the cap below is a byte bound (a worst-case
+        # 4-byte-per-char UTF-8 file must not slip past a character count).
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read(STATE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError) as exc:
+        raise WitnessError("state file unreadable: %s" % exc)
+    if len(raw_bytes) > STATE_MAX_BYTES:
+        # An oversized state is invalid input, not a reason to read it whole
+        # (round-7 R2: the unbounded read raised an uncaught MemoryError).
+        raise WitnessError("state file exceeds %d bytes" % STATE_MAX_BYTES)
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WitnessError("state file is not valid UTF-8: %s" % exc)
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        # RecursionError: a pathologically nested JSON document must take the
+        # invalid-state path (preserve + repair), never abort before the
+        # verdict with no files (round-6 F4).
+        raise WitnessError("state file unreadable: %s" % exc)
+    if not isinstance(data, dict):
+        raise WitnessError("state file is not a JSON object")
+    return data
+
+
+def _open_state_file(path, mode):
+    """Open a state/verdict file without following or reusing a planted entry.
+
+    A symlink at `state.json.tmp` or `verdict.log` used to redirect the write
+    (truncate + chmod) at whatever it pointed to, before the tmp was renamed
+    into place (round-6 F3). O_NOFOLLOW refuses a symlink at the final
+    component and O_EXCL refuses to reuse an existing tmp; a stale regular tmp
+    is unlinked first (unlinking a name never touches what it points at).
+    """
+    if mode == "w":
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise OSError("cannot clear stale %s: %s" % (path, clip(exc, 120)))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8")
+
+
+def write_state(path, record):
+    tmp = path + ".tmp"
+    with _open_state_file(tmp, "w") as handle:
+        json.dump(record, handle, indent=1, sort_keys=True)
+        handle.write("\n")
+        os.fchmod(handle.fileno(), 0o600)
+    os.replace(tmp, path)
+
+
+def append_verdict(path, state, detail):
+    try:
+        if os.path.getsize(path) >= VERDICT_LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+    except FileNotFoundError:
+        pass
+    with _open_state_file(path, "a") as handle:
+        handle.write("%s %s %s\n" % (utc_stamp(datetime.now(timezone.utc)), state, detail))
+
+
+def ntfy_token_problem(token):
+    """Why a publish token cannot be an HTTP header value (empty string = ok).
+
+    Header values are latin-1 bytes: a control character (especially CR/LF)
+    makes http.client.putheader raise ValueError and a non-ASCII token raises
+    UnicodeEncodeError. Both used to escape notify()'s transport except-clause,
+    aborting the run before state/verdict with no files (and the ValueError
+    text echoed the token bytes into the traceback). Validate first so a bad
+    token becomes a skipped push, never a crash. The length cap also keeps a
+    pathological token from building a giant header (round-6 F1).
+    """
+    if len(token) > 4096:
+        return "token is longer than 4096 characters"
+    for char in token:
+        if not ("!" <= char <= "~"):
+            return "token is not printable ASCII without spaces"
+    return ""
+
+
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect (ntfy POST and signed S3 list GETs).
+
+    urllib's default redirect handler copies the request headers onto the
+    redirect target, so a 301/302/303 to another host or scheme re-sent the
+    `Authorization` header cross-origin: `Bearer <publish token>` for the ntfy
+    POST (round-6 F2, mirror of pc-admin's R3 fix) and the SigV4
+    `AWS4-HMAC-SHA256 Credential=...` header for the witness S3 client
+    (round-7 R1). Neither call needs a redirect hop, so a 3xx becomes a failed
+    call (logged, retried) with nothing sent to the redirect target.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "refusing redirect to %r" % (newurl,), headers, fp
+        )
+
+
+# One redirect-refusing opener serves every client call. The module-level
+# _NTFY_OPENER name is patchable for the offline harness; the signed S3 list
+# client always uses the real opener (round-7 R1).
+_REDIRECT_REFUSING_OPENER = urllib.request.build_opener(RefuseRedirects())
+_NTFY_OPENER = _REDIRECT_REFUSING_OPENER
+
+
+def open_ntfy(request, timeout=15):
+    """Open the ntfy POST through the redirect-refusing opener."""
+    return _NTFY_OPENER.open(request, timeout=timeout)
+
+
+def open_signed(request, timeout=30):
+    """Open a SigV4-signed S3 list GET through the redirect-refusing opener."""
+    return _REDIRECT_REFUSING_OPENER.open(request, timeout=timeout)
+
+
+def notify(config, state, detail):
+    """Push the verdict through ntfy when a topic is configured. Best-effort."""
+    if not config.ntfy_topic:
+        return False
+    token = config.ntfy_token
+    problem = ntfy_token_problem(token) if token else ""
+    if problem:
+        # The reason names the class of problem only - never the token bytes;
+        # a bad token must fail the push, not the run (round-6 F1).
+        log("WARNING: ntfy push skipped: %s" % problem)
+        return False
+    headers = {
+        "Title": "recording witness: %s" % state,
+        "Tags": "white_check_mark" if state == "ok" else "warning",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        request = urllib.request.Request(
+            "https://ntfy.sh/" + urllib.parse.quote(config.ntfy_topic, safe=""),
+            data=clip(detail, 800).encode("utf-8"),
+            method="POST",
+        )
+        for name, value in headers.items():
+            request.add_header(name, value)
+        with open_ntfy(request, timeout=15):
+            return True
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # HTTPException covers BadStatusLine / IncompleteRead (not OSError
+        # subclasses); URLError covers the refused-redirect HTTPError. A
+        # transport failure must be logged and retried, never abort the run
+        # before state/verdict.
+        log("WARNING: ntfy push failed: %s" % clip(exc, 200))
+        return False
+    except (ValueError, UnicodeError) as exc:
+        # A late header-validation failure can embed the header value (the
+        # token); log the exception class only, never its message, and keep
+        # the push non-fatal (round-6 F1).
+        log("WARNING: ntfy push failed: %s" % type(exc).__name__)
+        return False
+
+
+def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_since_run=0, last_notify_run=0):
+    """Notification bookkeeping.
+
+    Non-green states push on transition and re-notify every renotify window.
+    Green pushes on the non-green -> ok recovery; a recovery push that failed
+    is retried while the current ok state began after the last successful
+    notify (state_since_run > last_notify_run), so a green state never
+    re-pushes once its recovery has landed. The retry boundary is the per-run
+    identity, not the second-resolution epoch: a recovery transition in the
+    same second as the last non-green push still retries, and a landing in
+    that same second still stops (run ids are unique per run).
+    """
+    if state == "ok":
+        if previous_state not in (None, "ok"):
+            return True
+        if previous_state == "ok":
+            return int(state_since_run) > int(last_notify_run)
+        return False  # a first-ever green run has nothing to recover from
+    if state != previous_state:
+        return True
+    last_epoch = int(last_epoch)
+    if last_epoch > now_epoch:
+        # A stored last-push epoch in the future (the anchor clock stepped
+        # ahead, then was corrected) would otherwise suppress renotify until
+        # wall clock catches up; an impossible value is not a reason to stay
+        # silent.
+        return True
+    return now_epoch - last_epoch >= int(renotify)
+
+
+def main():
+    now = datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    config = None
+    try:
+        config = Config()
+        state, detail = run_checks(config, now)
+    except Exception as exc:  # fail-closed by design: any failure => error
+        state = "error"
+        detail = "error: %s: %s" % (type(exc).__name__, exc)
+    detail = clip(detail, 1000)
+
+    state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
+    state_path = os.path.join(state_dir, "state.json")
+    verdict_path = os.path.join(state_dir, "verdict.log")
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        log("FAIL: cannot create state directory: %s" % clip(exc, 200))
+        log("%s: %s" % (state, detail))
+        return 2
+
+    previous = {}
+    state_bad_reason = ""
+    try:
+        previous = read_state(state_path)
+    except WitnessError as exc:
+        state_bad_reason = str(exc)
+        previous = {}
+        # Keep the unreadable record for forensics instead of overwriting it
+        # outright; the repaired record cannot carry a baseline it could not
+        # read.
+        corrupt_path = None
+        try:
+            corrupt_path = corrupt_state_destination(state_path, now)
+            os.replace(state_path, corrupt_path)
+            log("WARNING: unreadable state file preserved as %s" % corrupt_path)
+        except OSError as exc:
+            # An unwritable state dir disables the preservation; say so
+            # instead of silently dropping forensics (round-6 F8). A name
+            # collision is not a failure: the destination is unique (R3).
+            log("WARNING: cannot preserve unreadable state as %s: %s"
+                % (corrupt_path or (state_path + ".corrupt"), clip(exc, 200)))
+
+    renotify = config.renotify if config is not None else 1800
+    baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
+    # Defensive numeric parsing: a type-valid state.json with a corrupted
+    # counter (e.g. "run_seq": "not-a-number") must never crash the run
+    # before the verdict/push. A bad value is treated like any other invalid
+    # state: error verdict + repair, while the readable baseline is held.
+    numerics = {}
+    for name in ("last_notify_epoch", "last_notify_run", "run_seq", "state_since_run", "state_since_epoch"):
+        value = previous.get(name)
+        if value is None:
+            numerics[name] = 0
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            state_bad_reason = state_bad_reason or "state field %s is invalid: %r" % (name, value)
+            numerics[name] = 0
+        else:
+            numerics[name] = value
+    if state_bad_reason:
+        if state != "error":
+            state = "error"
+            detail = clip("error: %s" % state_bad_reason, 1000)
+        else:
+            detail = clip("%s (state record also invalid: %s)" % (detail, state_bad_reason), 1000)
+        # An invalid record is not a trustworthy previous state: the error
+        # verdict must push instead of comparing against it.
+        previous = {}
+    last_notify_epoch = numerics["last_notify_epoch"]
+    last_notify_run = numerics["last_notify_run"]
+    # Per-run identity: a monotonic counter written into state.json, never a
+    # second-resolution timestamp, so a genuine same-second run still advances
+    # it while a run that failed to persist state still repeats it.
+    run_seq = numerics["run_seq"] + 1
+    state_since_run = numerics["state_since_run"]
+    state_since_epoch = numerics["state_since_epoch"]
+    previous_state = previous.get("state")
+    # Arm the transition marker only when a PERSISTED previous state changed:
+    # a first-ever run (previous_state None) must not arm it, or the next
+    # green run looks like an un-landed recovery and pushes a spurious ok.
+    if previous_state is not None and previous_state != state:
+        state_since_run = run_seq
+        state_since_epoch = now_epoch
+    if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify, state_since_run, last_notify_run):
+        if config is not None and notify(config, state, detail):
+            last_notify_epoch = now_epoch
+            last_notify_run = run_seq
+    record = {
+        "version": STATE_VERSION,
+        "state": state,
+        "detail": detail,
+        "updated_at": utc_stamp(now),
+        "run_seq": run_seq,
+        "state_since_run": state_since_run,
+        "state_since_epoch": state_since_epoch,
+        "last_notify_run": last_notify_run,
+        "last_notify_epoch": last_notify_epoch,
+    }
+    if state_bad_reason:
+        # Explicit repair evidence: an unreadable/invalid record has no
+        # readable baseline, so the counter restarts at 1 above. The run-once
+        # acceptance cannot tell that reset from a stale record by `run_seq`
+        # alone, so mark the repair here and name the systemd invocation that
+        # wrote it below; the acceptance only counts a repair written by the
+        # invocation that just ran.
+        record["repaired"] = True
+    invocation = env("INVOCATION_ID", "")
+    if invocation:
+        # systemd's per-runtime-cycle ID (unique 32-hex, the same value
+        # `systemctl show -p InvocationID` reports). A failed state write
+        # leaves the previous record - and its previous invocation - in
+        # place, so this is what lets the acceptance tell "this invocation
+        # repaired the record" from "this invocation never persisted state".
+        record["invocation"] = invocation
+    if state == "error":
+        # Held when it could be read: an un-runnable run never advances the
+        # last good baseline. An unreadable state file has no readable
+        # baseline (the file is kept as state.json.corrupt); the repaired
+        # record says null rather than fabricating one.
+        record["baseline"] = baseline
+    else:
+        record["baseline"] = {"state": state, "detail": detail, "updated_at": utc_stamp(now)}
+    try:
+        write_state(state_path, record)
+    except OSError as exc:
+        log("WARNING: cannot write state file: %s" % clip(exc, 200))
+    try:
+        append_verdict(verdict_path, state, detail)
+    except OSError as exc:
+        log("WARNING: cannot append verdict log: %s" % clip(exc, 200))
+    log("%s: %s" % (state, detail))
+    return {"ok": 0, "alert": 1, "error": 2}[state]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+RECORDING_WITNESS_PY_EOF
+RECORDING_WITNESS_FILE_EOF
+}
+
+render_recording_witness_service() { # print the systemd service unit to stdout
+  cat <<RECORDING_WITNESS_UNIT_EOF
+[Unit]
+Description=pc-admin recording-completeness witness (list-only B2 metadata)
+Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/recording-witness.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${RECORDING_WITNESS_SBIN}
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=${RECORDING_WITNESS_STATE_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RECORDING_WITNESS_UNIT_EOF
+}
+
+render_recording_witness_timer() { # print the systemd timer unit to stdout
+  cat <<'RECORDING_WITNESS_TIMER_EOF'
+[Unit]
+Description=Run the pc-admin recording-completeness witness every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+RECORDING_WITNESS_TIMER_EOF
+}
+
+recording_witness_install() { # render + install the component (idempotent)
+  local tmp
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "Installing python3 (witness runtime)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq python3-minimal >/dev/null
+  fi
+  mkdir -p "$(dirname "$RECORDING_WITNESS_SBIN")" "$(dirname "$RECORDING_WITNESS_ENV_FILE")" "$RECORDING_WITNESS_STATE_DIR" \
+    "$(dirname "$RECORDING_WITNESS_SERVICE")" "$(dirname "$RECORDING_WITNESS_TIMER")"
+  chmod 700 "$RECORDING_WITNESS_STATE_DIR"
+  tmp="$(mktemp)"
+  render_recording_witness >"$tmp"
+  bash -n "$tmp" || die "rendered witness script failed bash -n - refusing to install"
+  chmod 0755 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$RECORDING_WITNESS_SBIN"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
+    printf '%s\n' "# DO NOT EDIT BY HAND - re-rendered on every provision run. Holds the"
+    printf '%s\n' "# list-only witness key: mode 0600, root-only, never printed to logs."
+    printf 'RECORDING_WITNESS_ENDPOINT=%q\n' "$RECORDING_WITNESS_ENDPOINT"
+    printf 'RECORDING_WITNESS_BUCKET=%q\n' "$RECORDING_WITNESS_BUCKET"
+    printf 'RECORDING_WITNESS_AUDIT_PREFIX=%q\n' "$RECORDING_WITNESS_AUDIT_PREFIX"
+    printf 'RECORDING_WITNESS_RECORDINGS_PREFIX=%q\n' "$RECORDING_WITNESS_RECORDINGS_PREFIX"
+    printf 'RECORDING_WITNESS_KEY_ID=%q\n' "$RECORDING_WITNESS_KEY_ID"
+    printf 'RECORDING_WITNESS_KEY=%q\n' "$RECORDING_WITNESS_KEY"
+    printf 'RECORDING_WITNESS_STATE_DIR=%q\n' "$RECORDING_WITNESS_STATE_DIR"
+    if [ -n "${RECORDING_WITNESS_REGION:-}" ]; then printf 'RECORDING_WITNESS_REGION=%q\n' "$RECORDING_WITNESS_REGION"; fi
+    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$RECORDING_WITNESS_ENV_FILE"
+  render_recording_witness_service >"$RECORDING_WITNESS_SERVICE.tmp.$$"
+  chmod 0644 "$RECORDING_WITNESS_SERVICE.tmp.$$"
+  mv "$RECORDING_WITNESS_SERVICE.tmp.$$" "$RECORDING_WITNESS_SERVICE"
+  render_recording_witness_timer >"$RECORDING_WITNESS_TIMER.tmp.$$"
+  chmod 0644 "$RECORDING_WITNESS_TIMER.tmp.$$"
+  mv "$RECORDING_WITNESS_TIMER.tmp.$$" "$RECORDING_WITNESS_TIMER"
+  systemctl daemon-reload
+  systemctl enable --now pc-recording-witness.timer >/dev/null
+  log "recording witness installed (5 min timer; env file 0600, key never printed)"
+}
+
+recording_witness_redact() { # redact session ids / recording keys from a verdict line
+  python3 - "$1" <<'RECORDING_WITNESS_REDACT_PY'
+import hashlib
+import re
+import sys
+
+
+def _scrub(match):
+    token = match.group(0)
+    return "<redacted:%s:%d>" % (hashlib.sha256(token.encode("utf-8")).hexdigest()[:12], len(token))
+
+
+sys.stdout.write(re.sub(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    _scrub,
+    sys.argv[1],
+))
+RECORDING_WITNESS_REDACT_PY
+}
+
+recording_witness_run_once() { # run one check now and surface the verdict
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced
+  # Anchor freshness to THIS invocation, not to wall-clock recency: a run
+  # that genuinely took longer than the old +/-300 s window must not be
+  # rejected, and a wedged `systemctl start` that never executed ExecStart
+  # (or a failed state write) must not let the previous verdict read as
+  # current. InvocationID changes on every real systemd invocation (skipped
+  # only if the property is unavailable); state.json's per-run identity
+  # (run_seq) must also advance so a run that could not persist state.json
+  # never counts, while two runs in the same wall-clock second still count
+  # (updated_at is second-resolution and may legitimately repeat). The one
+  # exception is an explicit repair written by THIS invocation (`repaired`,
+  # a matching `invocation`, and the `error` verdict a repair always
+  # carries): only an unreadable `run_seq` restarts the counter at 1 (a
+  # valid `run_seq` with another invalid field is kept and still advances),
+  # and that `error` verdict still fails the acceptance closed below.
+  before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  before_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
+  exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+  after_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  # Type=oneshot: the witness alert (exit 1) also makes `systemctl start`
+  # non-zero. A witness run is exactly rc=0+ExecMainStatus=0 (ok),
+  # rc=1+ExecMainStatus=1 (alert) or rc=1+ExecMainStatus=2 (error); anything
+  # else (unset status, exec error 203, a failed start that never executed the
+  # main process) is not a verdict.
+  case "${rc}:${exec_status}" in
+    0:0|1:1|1:2) ;;
+    *) die "witness produced no trustworthy verdict (systemctl rc=${rc} ExecMainStatus=${exec_status:-unset}) — the unit demonstrably did not run; refusing to read a possibly stale state.json" ;;
+  esac
+  state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
+  updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  repaired="$(jq -r '.repaired // false' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  state_invocation="$(jq -r '.invocation // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
+    die "witness unit did not start a new invocation (InvocationID ${after_invocation} unchanged, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale state.json"
+  fi
+  state_advanced=yes
+  if [ -z "${run_seq}" ] || [ "${run_seq}" = "${before_run_seq}" ]; then
+    state_advanced=no
+    if [ -n "${run_seq}" ] && [ "${repaired}" = "true" ] && [ "${state}" = "error" ] && [ -n "${state_invocation}" ] && [ "${state_invocation}" = "${after_invocation}" ]; then
+      state_advanced=yes
+      log "witness state was repaired by this invocation (run_seq reset to ${run_seq}); reading the explicit repair verdict"
+    fi
+  fi
+  if [ "${state_advanced}" != "yes" ]; then
+    die "witness state did not advance (run_seq=${run_seq:-none}, before=${before_run_seq:-none}, updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
+  fi
+  # A `repaired` record is only trustworthy as the `error` verdict the shipped
+  # writer always forces. Enforce that AFTER advancement is granted, not only
+  # in the collision branch above: when the prior run_seq does not render as
+  # the same non-empty string (unreadable state -> ""; a missing run_seq;
+  # "01"; 1.0; -1; true) or is simply advanced (5 -> 6), the outer check
+  # passes. The invocation field is only evidence for the collision-branch
+  # exception (run_seq did not move); a fresh run_seq already authenticates
+  # the record as THIS run's write, so every repaired non-error record dies
+  # here however it names its invocation.
+  if [ "${repaired}" = "true" ] && [ "${state}" != "error" ]; then
+    die "witness state carries repaired=true but state=${state} (a repaired record must be error) — no trustworthy verdict; refusing to finish blind"
+  fi
+  detail="$(recording_witness_redact "${detail}")"
+  case "${state}:${exec_status}" in
+    ok:0) log "witness verdict: OK - ${detail}" ;;
+    alert:1) warn "witness verdict: ALERT - ${detail} (the witness works; the recording pipeline has an open alert)" ;;
+    error:2) die "witness verdict: ERROR - ${detail} (an un-runnable witness fails the run closed; fix the config and re-dispatch)" ;;
+    *) die "witness produced no trustworthy verdict (state=${state:-missing} ExecMainStatus=${exec_status} rc=${rc}) - refusing to finish blind" ;;
+  esac
+}
+
+recording_witness_disable() { # remove a previously installed component
+  if [ ! -e "$RECORDING_WITNESS_SERVICE" ] && [ ! -e "$RECORDING_WITNESS_TIMER" ] && [ ! -e "$RECORDING_WITNESS_SBIN" ] && [ ! -e "$RECORDING_WITNESS_ENV_FILE" ]; then
+    return 0
+  fi
+  log "recording witness disabled (no RECORDING_WITNESS_* env) - removing the timer and rendered artifacts"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now pc-recording-witness.timer >/dev/null 2>&1 || true
+    systemctl stop pc-recording-witness.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$RECORDING_WITNESS_SERVICE" "$RECORDING_WITNESS_TIMER" "$RECORDING_WITNESS_SBIN" "$RECORDING_WITNESS_ENV_FILE"
+  log "witness state + verdict log kept at ${RECORDING_WITNESS_STATE_DIR} (evidence; remove by hand to reset)"
+}
+# --- END RECORDING WITNESS ---
+
+# ---------------------------------------------------------------------------
+# g) Recording-completeness witness (list-only; optional)
+#    Renders + enables the 5-minute witness timer when the RECORDING_WITNESS_*
+#    env is fully set. Missing env = the component stays dormant (tenants
+#    unaffected) and a previously installed copy is removed, so a retire never
+#    leaves a stale timer. A partial env is a config error (fail closed).
+#    Env in: RECORDING_WITNESS_ENDPOINT / _BUCKET / _AUDIT_PREFIX /
+#    _RECORDINGS_PREFIX / _KEY_ID / _KEY (list-only), plus the existing
+#    NTFY_TOPIC / NTFY_TOKEN for alert pushes. Docs: docs/recording-witness.md.
+# ---------------------------------------------------------------------------
+case "$(recording_witness_state)" in
+  on)
+    log "Installing the list-only recording-completeness witness (B2 metadata checks)"
+    recording_witness_install
+    recording_witness_run_once
+    ;;
+  partial)
+    witness_problem="$(recording_witness_config_problem)"
+    die "recording-witness env is partial: ${witness_problem:-unknown problem}. Set every RECORDING_WITNESS_* repo secret or none at all (docs/recording-witness.md)."
+    ;;
+  off)
+    recording_witness_disable
+    ;;
+esac
 
 log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

@@ -110,6 +110,16 @@
 #                            dispatch-managed monitor config (repo secret — tenant
 #                            service map stays write-only). NTFY_TOPIC/NTFY_TOKEN
 #                            arrive the same way (empty = checks without push).
+#   RECORDING_WITNESS_*      optional recording-completeness witness (repo
+#                            secrets: ENDPOINT/BUCKET/AUDIT_PREFIX/
+#                            RECORDINGS_PREFIX/KEY_ID/KEY). KEY is a B2
+#                            listFiles-only application key — the witness
+#                            never reads object content. All six set = the
+#                            on-box script installs the witness; none set =
+#                            dormant and any previous install is removed.
+#                            Values are single-quote escaped into the piped
+#                            env prefix below — never argv, never logged.
+#                            Docs: docs/recording-witness.md.
 #   ORIGIN_CA_CERT_PEM      operator-planted per-anchor Cloudflare Origin CA
 #                            certificate (repo VARIABLE, cert-only public
 #                            material — NO key material ever travels; the key
@@ -868,7 +878,7 @@ cmd_provision() {
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
-  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")';"
+  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")' RECORDING_WITNESS_ENDPOINT='$(q "${RECORDING_WITNESS_ENDPOINT:-}")' RECORDING_WITNESS_BUCKET='$(q "${RECORDING_WITNESS_BUCKET:-}")' RECORDING_WITNESS_AUDIT_PREFIX='$(q "${RECORDING_WITNESS_AUDIT_PREFIX:-}")' RECORDING_WITNESS_RECORDINGS_PREFIX='$(q "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}")' RECORDING_WITNESS_KEY_ID='$(q "${RECORDING_WITNESS_KEY_ID:-}")' RECORDING_WITNESS_KEY='$(q "${RECORDING_WITNESS_KEY:-}")';";
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi

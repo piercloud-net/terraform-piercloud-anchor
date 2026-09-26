@@ -961,6 +961,17 @@ jobs:
           # standing API token.
           ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
+          # Optional recording-completeness witness (docs/recording-witness.md):
+          # KEY is a B2 listFiles-only application key — the witness lists
+          # metadata and never reads object content. All six set = the witness
+          # installs; empty = the component stays dormant (tenant anchors are
+          # unaffected; a previous install is removed).
+          RECORDING_WITNESS_ENDPOINT: ${{ secrets.RECORDING_WITNESS_ENDPOINT }}
+          RECORDING_WITNESS_BUCKET: ${{ secrets.RECORDING_WITNESS_BUCKET }}
+          RECORDING_WITNESS_AUDIT_PREFIX: ${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX }}
+          RECORDING_WITNESS_RECORDINGS_PREFIX: ${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}
+          RECORDING_WITNESS_KEY_ID: ${{ secrets.RECORDING_WITNESS_KEY_ID }}
+          RECORDING_WITNESS_KEY: ${{ secrets.RECORDING_WITNESS_KEY }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail
@@ -975,6 +986,18 @@ jobs:
           # ORIGIN_CA_CERT_PEM is public cert-only material (repo variable) —
           # deliberately NOT masked.
           if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
+          # Recording-witness values: masked at first receipt before any use
+          # (repo secrets are auto-masked; the explicit masks cover every
+          # expansion path). Never echoed, never logged, never in argv.
+          for witness_value in \
+            "${{ secrets.RECORDING_WITNESS_ENDPOINT }}" \
+            "${{ secrets.RECORDING_WITNESS_BUCKET }}" \
+            "${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX }}" \
+            "${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}" \
+            "${{ secrets.RECORDING_WITNESS_KEY_ID }}" \
+            "${{ secrets.RECORDING_WITNESS_KEY }}"; do
+            if [ -n "$witness_value" ]; then echo "::add-mask::$witness_value"; fi
+          done
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
           # the one-run credential (pasted secret, or the caller-set value
           # minted by bootstrap-password) arrives masked and is never

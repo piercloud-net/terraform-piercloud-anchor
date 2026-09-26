@@ -1,0 +1,450 @@
+{
+  "pinned_pc_admin_sha": "a7035a9701517c7d9edfc5baa7cc04cc0ca72189",
+  "grammar_note": "builder grammar last changed at a7035a9 (the replay-conflict `_<sha256[:16]>` variant keys from disambiguate_audit_key); unchanged since; previous grammar points 66bd304 (session.rejected sid-less), 929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>` suffix on the truncated type) and 342a37c (the 10^18-1 seq-ceiling clamp in build_audit_key)",
+  "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
+  "vectors": [
+    {
+      "name": "session.start shell (live v18 start omits interactive)",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.start",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        "shell"
+      ],
+      "expected": "audit/20260925T100008Z-session.start.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000001.shell.json"
+    },
+    {
+      "name": "session.start exec (interactive false)",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.start",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "interactive": false
+      },
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        "exec"
+      ],
+      "expected": "audit/20260925T100008Z-session.start.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000001.exec.json"
+    },
+    {
+      "name": "session.end shell",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.end",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.end",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "2",
+        "shell"
+      ],
+      "expected": "audit/20260925T100008Z-session.end.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000002.shell.json"
+    },
+    {
+      "name": "session.data (no mode suffix)",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.data",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "7"
+      ],
+      "expected": "audit/20260925T100008Z-session.data.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000007.json"
+    },
+    {
+      "name": "session.rejected sid dropped (forced sid-less, global counter)",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.rejected",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.rejected",
+        "20260925T100008Z",
+        "9F8C4B1E-0D2A-4F7E-9C11-2B3D4E5F6A70",
+        "5"
+      ],
+      "expected": "audit/20260925T100008Z-session.rejected.000005.json"
+    },
+    {
+      "name": "uppercase sid lowercased",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.start",
+        "sid": "9F8C4B1E-0D2A-4F7E-9C11-2B3D4E5F6A70"
+      },
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "9F8C4B1E-0D2A-4F7E-9C11-2B3D4E5F6A70",
+        "1",
+        "shell"
+      ],
+      "expected": "audit/20260925T100008Z-session.start.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000001.shell.json"
+    },
+    {
+      "name": "multi-segment session.* sanitized to unknown, sid dropped",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.foo.bar",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.foo.bar",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-unknown.000001.json"
+    },
+    {
+      "name": "non-session event with a sid drops the sid",
+      "kind": "golden",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "user.login",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "user.login",
+        "20260925T100008Z",
+        "",
+        "6"
+      ],
+      "expected": "audit/20260925T100008Z-user.login.000006.json"
+    },
+    {
+      "name": "seq lower boundary 1",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.data",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-session.data.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000001.json"
+    },
+    {
+      "name": "seq 999999 (six digits)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.data",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "999999"
+      ],
+      "expected": "audit/20260925T100008Z-session.data.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.999999.json"
+    },
+    {
+      "name": "seq 10^6 (seven digits, past the old replica ceiling)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.data",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1000000"
+      ],
+      "expected": "audit/20260925T100008Z-session.data.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.1000000.json"
+    },
+    {
+      "name": "seq 10^18-1 (witness 18-digit ceiling)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.data",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "999999999999999999"
+      ],
+      "expected": "audit/20260925T100008Z-session.data.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.999999999999999999.json"
+    },
+    {
+      "name": "over-long event type truncated below the cap + `_<sha256[:8]>` suffix",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_111fcf58.000001.json"
+    },
+    {
+      "name": "over-long type truncation drops a trailing separator before the suffix",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "replica_args": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_5d5181b6.000001.json"
+    },
+    {
+      "name": "over-long type A (shared 119-char head, distinct hash suffix)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzalpha"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzalpha",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_7cd378e4.000001.json"
+    },
+    {
+      "name": "over-long type B (shared 119-char head, distinct hash suffix)",
+      "kind": "boundary",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzbeta"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzbeta",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_4f774766.000001.json"
+    },
+    {
+      "name": "session.start exec replay-conflict variant (mode marker dropped)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.start",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "interactive": false
+      },
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        "exec"
+      ],
+      "body": "{\"event\":\"session.start\",\"seq\":1,\"v\":\"replay-start\"}",
+      "expected": "audit/20260925T100008Z-session.start_1c2b4eeca8ee196a.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000001.json"
+    },
+    {
+      "name": "session.end shell replay-conflict variant (mode marker dropped)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.end",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.end",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "2",
+        "shell"
+      ],
+      "body": "{\"event\":\"session.end\",\"seq\":2,\"v\":\"replay-end\"}",
+      "expected": "audit/20260925T100008Z-session.end_a20241ba2ca38cc0.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000002.json"
+    },
+    {
+      "name": "session.rejected sid-less replay-conflict variant (hash joins last segment)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.rejected",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.rejected",
+        "20260925T100008Z",
+        "9F8C4B1E-0D2A-4F7E-9C11-2B3D4E5F6A70",
+        "5"
+      ],
+      "body": "{\"event\":\"session.rejected\",\"seq\":5,\"v\":\"replay-rejected\"}",
+      "expected": "audit/20260925T100008Z-session.rejected_6af87bd56cab0a6f.000005.json"
+    },
+    {
+      "name": "user.login replay-conflict variant (hash joins last segment)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "user.login",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "user.login",
+        "20260925T100008Z",
+        "",
+        "6"
+      ],
+      "body": "{\"event\":\"user.login\",\"seq\":6,\"v\":\"replay-login\"}",
+      "expected": "audit/20260925T100008Z-user.login_3899cbea8b5b8a4e.000006.json"
+    },
+    {
+      "name": "over-long type truncation variant (truncation suffix kept, conflict suffix appended)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "body": "{\"event\":\"over-long\",\"seq\":1,\"v\":\"replay-truncated\"}",
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_111fcf58_36f265eaa52c806b.000001.json"
+    }
+  ],
+  "refusals": [
+    {
+      "name": "seq 0 (real floor is 1; legacy-only fixture)",
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "0"
+      ],
+      "why": "build_audit_key emits previous+1, so the shipper cannot produce seq 0"
+    },
+    {
+      "name": "seq 10^18 (19 digits, witness naming drift)",
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1000000000000000000"
+      ],
+      "why": "the witness accepts [0-9]{1,18}; a 19-digit seq is drift"
+    },
+    {
+      "name": "non-UUID sid on session.*",
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "not-a-uuid",
+        "1",
+        ""
+      ],
+      "why": "the real builder ships a non-UUID sid on the sid-less drift shape"
+    },
+    {
+      "name": "session.start without a sid",
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "",
+        "1",
+        "shell"
+      ],
+      "why": "a session key needs a strict-UUID sid"
+    },
+    {
+      "name": "lifecycle without the mandatory mode",
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        ""
+      ],
+      "why": "the real builder always emits .shell or .exec on lifecycle keys"
+    },
+    {
+      "name": "mode on a non-lifecycle session event",
+      "replica_args": [
+        "session.data",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        "shell"
+      ],
+      "why": "the mode suffix is contract-defined on session.start/session.end only"
+    },
+    {
+      "name": "mode on a non-session event",
+      "replica_args": [
+        "user.login",
+        "20260925T100008Z",
+        "",
+        "1",
+        "shell"
+      ],
+      "why": "non-session events never carry a mode"
+    },
+    {
+      "name": "non-session event with a sid",
+      "replica_args": [
+        "user.login",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        ""
+      ],
+      "why": "the real builder drops the sid for non-session shapes"
+    },
+    {
+      "name": "over-long type outside the grammar",
+      "replica_args": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bad",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "why": "the real builder sanitizes an invalid type to `unknown`; the truncation cap applies only to grammar-valid types, so the replica must refuse the literal shape"
+    }
+  ],
+  "source_sha": "a7035a9701517c7d9edfc5baa7cc04cc0ca72189"
+}
