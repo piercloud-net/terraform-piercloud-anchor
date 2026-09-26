@@ -2583,6 +2583,16 @@ recording_witness_run_once() { # run one check now and surface the verdict
   if [ "${state_advanced}" != "yes" ]; then
     die "witness state did not advance (run_seq=${run_seq:-none}, before=${before_run_seq:-none}, updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
   fi
+  # A `repaired` record is only trustworthy as the `error` verdict the shipped
+  # writer always forces. Enforce that AFTER advancement is granted, not only
+  # in the collision branch above: when the prior run_seq does not render as
+  # the same non-empty string (unreadable state -> ""; a missing run_seq;
+  # "01"; 1.0; -1; true) or is simply advanced (5 -> 6), the outer check
+  # passes and a fault-injected repaired ok/alert bound to THIS invocation
+  # would otherwise read as a verdict.
+  if [ "${repaired}" = "true" ] && [ -n "${state_invocation}" ] && [ "${state_invocation}" = "${after_invocation}" ] && [ "${state}" != "error" ]; then
+    die "witness state claims a repair by THIS invocation but carries state=${state} (a repaired record must be error) — no trustworthy verdict; refusing to finish blind"
+  fi
   detail="$(recording_witness_redact "${detail}")"
   case "${state}:${exec_status}" in
     ok:0) log "witness verdict: OK - ${detail}" ;;

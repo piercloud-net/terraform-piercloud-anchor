@@ -96,9 +96,11 @@
 #       second-resolution updated_at, so a genuine same-second run counts; an
 #       explicit `repaired` record OF THIS invocation is accepted even though
 #       an unreadable `run_seq` restarts the counter at 1 (a repaired record
-#       must carry the error verdict — the gate enforces it, so a repaired
-#       ok/alert record is refused and the run still fails closed), while a
-#       stale repair marker from a previous invocation still dies; a
+#       must carry the error verdict — the gate enforces that after
+#       advancement on every path, not only when the prior run_seq collides,
+#       so a repaired ok/alert record is refused however the prior run_seq
+#       rendered and the run still fails closed), while a stale repair marker
+#       from a previous invocation still dies; a
 #       run longer than any recency window is accepted because the anchor is
 #       advancement, not recency; state and ExecMainStatus mismatches die; the
 #       printed detail has session ids redacted (public run-log safety);
@@ -2085,7 +2087,7 @@ case "$1" in
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
     fi
     if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
-      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" "${FAKE_REPAIR_VERDICT:-error}" <<'PYSTATE'
+      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" "${FAKE_REPAIR_VERDICT:-error}" "${FAKE_REPAIR_RUN_SEQ:-}" <<'PYSTATE'
 import datetime
 import json
 import sys
@@ -2102,7 +2104,10 @@ if sys.argv[4] == "1":
     # hostile writer that claims a non-error repair instead), and the record
     # carries `repaired` plus the INVOCATION_ID of the run that wrote it.
     data["repaired"] = True
-    data["run_seq"] = 1
+    # FAKE_REPAIR_RUN_SEQ models a hostile writer that advances the counter
+    # instead of resetting it to 1 (round-13 D6); empty keeps the real
+    # unreadable-run_seq repair shape (reset to 1).
+    data["run_seq"] = int(sys.argv[6] or 1)
     data["state"] = sys.argv[5]
 else:
     data.pop("repaired", None)
@@ -2353,6 +2358,44 @@ case "${runonce_out}" in
   *) bad "run-once non-error repair output: ${runonce_out}" ;;
 esac
 unset FAKE_REPAIR_STATE FAKE_REPAIR_VERDICT
+
+# Round-13 F1: the round-12 gate sat only inside the run_seq-equality branch,
+# so when the PRIOR run_seq did not render as the same non-empty string — an
+# unreadable state.json (""), a missing run_seq, "01", 1.0, -1, true — the
+# outer advancement check passed and a fault-injected `repaired` + ok/alert
+# record bound to THIS invocation was accepted; a hostile writer can also
+# simply advance the counter (5 -> 6). The repair-error invariant is enforced
+# after advancement now, so every shape must die with no OK/ALERT verdict.
+repaired_bypass_case() { # $1 label, $2 before state.json body, $3 repair verdict, $4 repair run_seq, $5 EMS
+  printf '%s\n' "$2" >"${WORK}/state/state.json"
+  before_render="$(jq -r '.run_seq // ""' "${WORK}/state/state.json" 2>/dev/null || true)"
+  unset FAKE_START_RC FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+  export FAKE_EXEC_STATUS="$5" FAKE_REPAIR_STATE=1 FAKE_REPAIR_VERDICT="$3" FAKE_REPAIR_RUN_SEQ="$4"
+  run_once_call
+  is "run-once: ${1} dies (a repair can only carry error)" "1" "${runonce_rc}"
+  case "${runonce_out}" in
+    *"witness verdict: OK"*|*"witness verdict: ALERT"*) bad "run-once accepted ${1}" ;;
+    *) ok "run-once refuses ${1} (no OK/ALERT verdict)" ;;
+  esac
+  # On the non-collision path (the bypass class) the dedicated enforcement
+  # message must fire; a jq that renders the prior value equal to the repair
+  # counter instead dies at the older freshness gate, which the rc/no-verdict
+  # teeth above still cover.
+  if [ "$4" != "${before_render}" ]; then
+    case "${runonce_out}" in
+      *"no trustworthy verdict"*) ok "run-once names the forged repair (${1})" ;;
+      *) bad "run-once forged-repair output (${1}): ${runonce_out}" ;;
+    esac
+  fi
+}
+repaired_bypass_case "prior state unreadable (empty run_seq) + repaired ok" 'not json at all' ok 1 0
+repaired_bypass_case "prior run_seq missing + repaired alert" '{"state":"ok","detail":"x","updated_at":"t"}' alert 1 1
+repaired_bypass_case 'prior run_seq "01" + repaired ok' '{"state":"error","detail":"x","updated_at":"t","run_seq":"01"}' ok 1 0
+repaired_bypass_case "prior run_seq 1.0 + repaired ok" '{"state":"error","detail":"x","updated_at":"t","run_seq":1.0}' ok 1 0
+repaired_bypass_case "prior run_seq -1 + repaired ok" '{"state":"error","detail":"x","updated_at":"t","run_seq":-1}' ok 1 0
+repaired_bypass_case "prior run_seq true + repaired ok" '{"state":"error","detail":"x","updated_at":"t","run_seq":true}' ok 1 0
+repaired_bypass_case "hostile advance 5 -> 6 + repaired ok" '{"state":"error","detail":"x","updated_at":"t","run_seq":5}' ok 6 0
+unset FAKE_REPAIR_STATE FAKE_REPAIR_VERDICT FAKE_REPAIR_RUN_SEQ
 
 # ...but the stale-gate protection stays intact: a repair marker left by a
 # PREVIOUS invocation must not cover a run that never persisted state.json.
