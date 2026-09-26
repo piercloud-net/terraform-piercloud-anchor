@@ -95,9 +95,10 @@
 #       start that left the previous verdict) — run identity, not the
 #       second-resolution updated_at, so a genuine same-second run counts; an
 #       explicit `repaired` record OF THIS invocation is accepted even though
-#       the repair resets run_seq to 1 (its verdict is always error, so it
-#       still fails closed), while a stale repair marker from a previous
-#       invocation still dies; a
+#       an unreadable `run_seq` restarts the counter at 1 (a repaired record
+#       must carry the error verdict — the gate enforces it, so a repaired
+#       ok/alert record is refused and the run still fails closed), while a
+#       stale repair marker from a previous invocation still dies; a
 #       run longer than any recency window is accepted because the anchor is
 #       advancement, not recency; state and ExecMainStatus mismatches die; the
 #       printed detail has session ids redacted (public run-log safety);
@@ -2084,7 +2085,7 @@ case "$1" in
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
     fi
     if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
-      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" <<'PYSTATE'
+      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" "${FAKE_REPAIR_VERDICT:-error}" <<'PYSTATE'
 import datetime
 import json
 import sys
@@ -2096,12 +2097,13 @@ except (OSError, ValueError):
 if sys.argv[4] == "1":
     # Round-10 NIT: model the witness preserve+repair write. The old record
     # was unreadable/invalid, so the run identity resets to 1 (which can equal
-    # the value jq read before the run), the verdict is forced to error, and
-    # the record carries `repaired` plus the INVOCATION_ID of the run that
-    # wrote it.
+    # the value jq read before the run), the verdict is forced to error (the
+    # shipped writer's repair verdict; FAKE_REPAIR_VERDICT models a faulty or
+    # hostile writer that claims a non-error repair instead), and the record
+    # carries `repaired` plus the INVOCATION_ID of the run that wrote it.
     data["repaired"] = True
     data["run_seq"] = 1
-    data["state"] = "error"
+    data["state"] = sys.argv[5]
 else:
     data.pop("repaired", None)
     data["run_seq"] = int(data.get("run_seq") or 0) + 1
@@ -2329,6 +2331,28 @@ case "${runonce_out}" in
   *) ok "run-once does not mis-file a genuine repair as a stale state" ;;
 esac
 unset FAKE_REPAIR_STATE
+
+# Round-12 F1: a repair verdict is always `error`; the gate enforces that
+# instead of trusting the writer, so a fault-injected record that combines
+# `repaired` + this run's invocation + a non-error verdict (run_seq held at 1,
+# exactly like a repair) must die at the freshness gate — never print OK.
+seed_state error "$(fresh_stamp)" 1
+unset FAKE_START_RC
+unset FAKE_NO_STATE_WRITE
+export FAKE_EXEC_STATUS=0
+export FAKE_REPAIR_STATE=1
+export FAKE_REPAIR_VERDICT=ok
+run_once_call
+is "run-once: repaired non-error record dies (repair must surface an error verdict)" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) bad "run-once accepted a repaired non-error record as OK" ;;
+  *) ok "run-once refuses a repaired non-error record (no OK)" ;;
+esac
+case "${runonce_out}" in
+  *"did not advance"*) ok "run-once names the unadvanced non-error repair" ;;
+  *) bad "run-once non-error repair output: ${runonce_out}" ;;
+esac
+unset FAKE_REPAIR_STATE FAKE_REPAIR_VERDICT
 
 # ...but the stale-gate protection stays intact: a repair marker left by a
 # PREVIOUS invocation must not cover a run that never persisted state.json.

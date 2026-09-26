@@ -2544,9 +2544,11 @@ recording_witness_run_once() { # run one check now and surface the verdict
   # (run_seq) must also advance so a run that could not persist state.json
   # never counts, while two runs in the same wall-clock second still count
   # (updated_at is second-resolution and may legitimately repeat). The one
-  # exception is an explicit repair written by THIS invocation (`repaired`
-  # plus a matching `invocation`): it resets `run_seq` to 1, but its verdict
-  # is always `error`, so it still fails the acceptance closed below.
+  # exception is an explicit repair written by THIS invocation (`repaired`,
+  # a matching `invocation`, and the `error` verdict a repair always
+  # carries): only an unreadable `run_seq` restarts the counter at 1 (a
+  # valid `run_seq` with another invalid field is kept and still advances),
+  # and that `error` verdict still fails the acceptance closed below.
   before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   before_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
@@ -2573,7 +2575,7 @@ recording_witness_run_once() { # run one check now and surface the verdict
   state_advanced=yes
   if [ -z "${run_seq}" ] || [ "${run_seq}" = "${before_run_seq}" ]; then
     state_advanced=no
-    if [ -n "${run_seq}" ] && [ "${repaired}" = "true" ] && [ -n "${state_invocation}" ] && [ "${state_invocation}" = "${after_invocation}" ]; then
+    if [ -n "${run_seq}" ] && [ "${repaired}" = "true" ] && [ "${state}" = "error" ] && [ -n "${state_invocation}" ] && [ "${state_invocation}" = "${after_invocation}" ]; then
       state_advanced=yes
       log "witness state was repaired by this invocation (run_seq reset to ${run_seq}); reading the explicit repair verdict"
     fi
