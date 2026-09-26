@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 41735ff77a79d24c75dc2e22bb1c47cbb0582800 — the
+PINNED AGAINST: cad0p/pc-admin @ a7035a9701517c7d9edfc5baa7cc04cc0ca72189 — the
 **grammar-defining SHA**: the builder grammar last changed there (the
-over-long event-type cap: truncate to 128 chars, drop a trailing separator and
-append an `_<sha256[:8]>` collision-resistant suffix) and is unchanged since.
+replay-conflict variant: `disambiguate_audit_key` appends `_<sha256[:16]>` to
+the event type when a rebuilt file replays a taken key with different bytes)
+and is unchanged since (pc-admin round-9 @ `e41fac8` added ETag normalization
+and persisted-float validation only — no key-grammar change).
+The previous grammar points were 41735ff (the over-long event-type cap:
+truncate to 128 chars, drop a trailing separator and append an
+`_<sha256[:8]>` suffix) and 66bd304 (the session.rejected sid-less fold).
 The golden strings in tests/recording-witness/run-test.sh and the checked-in
-vector matrix were generated from that SHA; a pc-admin grammar change must bump
-this pin, regenerate both and update the witness contract in the same breath.
-The previous grammar-defining SHA was 66bd304 (the session.rejected sid-less
-fold); the truncation cap landed at 41735ff, which is why the pin moved there.
+vector matrix were generated from the pinned SHA; a pc-admin grammar change
+must bump this pin, regenerate both and update the witness contract in the
+same breath.
 
 The witness correlates audit events with recordings through object key names, so
 harness fixtures MUST be built with the real shipper grammar (6-digit
@@ -44,8 +48,9 @@ real builder DOES emit on its documented path is reproduced faithfully):
   classifier is single-segment, so the raw type would read as drift).
 - Non-session events never carry a sid (the real builder drops it).
 - `session.rejected` is forced to the sid-less non-session shape: the witness
-  allowlists it there and the real builder at the pinned SHA (41735ff) drops
-  any sid for this type, shipping it under the global counter. A regression to
+  allowlists it there and the real builder at the pinned SHA (`a7035a9`;
+  unchanged since `66bd304`) drops any sid for this type, shipping it under
+  the global counter. A regression to
   the pre-fold sid-bearing shape would be read by the witness as a session
   with no `session.start` (`session-start-missing`), so the replica never
   builds it and the golden/refusal teeth pin that.
@@ -68,14 +73,16 @@ checked in (`shipper_key_vectors.json`, regenerated with
 replays every vector against this replica, so silent drift fails there.
 
 CLI:  shipper_keys.py <event-type> <ts> [sid] [seq] [mode]
-      prints the full audit key (single line).
+      shipper_keys.py --variant <body> <event-type> <ts> [sid] [seq] [mode]
+      prints the audit key (single line); the `--variant` form prints the
+      replay-conflict variant key for <body>.
 """
 
 import hashlib
 import re
 import sys
 
-PINNED_PC_ADMIN_SHA = "41735ff77a79d24c75dc2e22bb1c47cbb0582800"
+PINNED_PC_ADMIN_SHA = "a7035a9701517c7d9edfc5baa7cc04cc0ca72189"
 
 TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z$"
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -94,6 +101,23 @@ SEQ_MAX = 10 ** 18 - 1
 # distinct over-long types from aliasing to one key.
 MAX_EVENT_TYPE_LENGTH = 128
 EVENT_TYPE_HASH_LENGTH = 8
+
+# Replay-conflict variant (b2_client.CONFLICT_HASH_LENGTH +
+# disambiguate_audit_key): a rebuilt file that replays a taken key with
+# different bytes ships a variant whose event type carries `_<sha256[:16]>` of
+# the local content. A session lifecycle variant drops its mode marker; on the
+# sid-less shape the hash joins the last type segment (segment count
+# unchanged). The witness canonicalizes the suffix back to the base type and
+# treats the variant as the same event identity.
+CONFLICT_HASH_LENGTH = 16
+SESSION_KEY_PARSE_RE = re.compile(
+    r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>session\.[A-Za-z0-9_]+)\.(?P<sid>"
+    + UUID_PATTERN
+    + r")\.(?P<seq>[0-9]{1,18})(?:\.(?P<mode>shell|exec))?\.json$"
+)
+OTHER_KEY_PARSE_RE = re.compile(
+    r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
+)
 
 # Session lifecycle events get the `interactive`-derived mode suffix; every
 # other event type never carries one (b2_client.SESSION_MODE_EVENTS).
@@ -161,14 +185,64 @@ def audit_key(event_type, ts, sid="", seq=1, mode=""):
     return "audit/%s-%s.%06d.json" % (ts, event_type, seq)
 
 
+def disambiguate_key(key, body):
+    """Mirror pc-admin's `disambiguate_audit_key` (replay-conflict variant).
+
+    Appends `_<sha256[:16]>` of the local content to the event type: a session
+    variant drops its mode marker; on the sid-less shape the hash joins the
+    last type segment. Returns the key unchanged outside the shipper grammar,
+    exactly like the producer (the caller never invents a shape the witness
+    cannot classify).
+    """
+    payload = body if isinstance(body, bytes) else str(body).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:CONFLICT_HASH_LENGTH]
+    prefix, _, basename = key.rpartition("/")
+    match = SESSION_KEY_PARSE_RE.match(basename)
+    if match:
+        parts = match.groupdict()
+        variant = "%s-%s_%s.%s.%s.json" % (
+            parts["ts"], parts["type"], digest, parts["sid"], parts["seq"])
+    else:
+        match = OTHER_KEY_PARSE_RE.match(basename)
+        if not match:
+            return key
+        parts = match.groupdict()
+        head, _, last = parts["type"].rpartition(".")
+        hashed = "%s.%s_%s" % (head, last, digest) if head else "%s_%s" % (last, digest)
+        variant = "%s-%s.%s.json" % (parts["ts"], hashed, parts["seq"])
+    return "%s/%s" % (prefix, variant) if prefix else variant
+
+
 if __name__ == "__main__":
-    event_type = sys.argv[1]
-    ts = sys.argv[2]
-    sid = sys.argv[3] if len(sys.argv) > 3 else ""
-    seq = int(sys.argv[4]) if len(sys.argv) > 4 else 1
-    mode = sys.argv[5] if len(sys.argv) > 5 else ""
+    argv = sys.argv[1:]
+    variant_body = None
+    if argv and argv[0] == "--variant":
+        if len(argv) < 2:
+            print("shipper_keys: --variant needs a body string", file=sys.stderr)
+            sys.exit(2)
+        variant_body = argv[1]
+        argv = argv[2:]
+    if len(argv) < 2:
+        print(
+            "usage: shipper_keys.py <event-type> <ts> [sid] [seq] [mode] "
+            "| shipper_keys.py --variant <body> <event-type> <ts> [sid] [seq] [mode]",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    event_type = argv[0]
+    ts = argv[1]
+    sid = argv[2] if len(argv) > 2 else ""
     try:
-        print(audit_key(event_type, ts, sid, seq, mode))
+        seq = int(argv[3]) if len(argv) > 3 else 1
+    except ValueError:
+        print("shipper_keys: seq must be an integer, got %r" % (argv[3],), file=sys.stderr)
+        sys.exit(2)
+    mode = argv[4] if len(argv) > 4 else ""
+    try:
+        key = audit_key(event_type, ts, sid, seq, mode)
+        if variant_body is not None:
+            key = disambiguate_key(key, variant_body)
+        print(key)
     except ValueError as exc:
         print("shipper_keys: %s" % exc, file=sys.stderr)
         sys.exit(2)

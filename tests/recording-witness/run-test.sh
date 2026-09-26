@@ -33,6 +33,12 @@
 #       naming-contract; sid-less session.rejected keys are not drift, while a
 #       sid-bearing rejected key (the pre-fold pc-admin shape) is read as a
 #       session with no session.start -> session-start-missing; a
+#       replay-conflict variant key (base + `_<sha256[:16]>`) is absorbed as
+#       the SAME event identity as its base (no sequence-duplicate, no naming
+#       drift) with the base key authoritative for the lifecycle mode, while a
+#       genuine same-seq duplicate at a different ts still alerts
+#       sequence-duplicate and a variant-only session start stays
+#       conservatively session-start-missing; a
 #       renamed session prefix (sess.start) is still drift; an audit key that
 #       matches no documented shape -> alert contract-mismatch; future
 #       LastModified *and* future Initiated timestamps -> error (clock skew,
@@ -46,17 +52,21 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 41735ff; golden strings,
-#       refusal teeth, and the checked-in golden+boundary vector matrix
-#       generated from the real builder — never hand-written — incl. the
-#       over-long event-type truncation cap with its `_<sha256[:8]>` suffix);
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ a7035a9; golden strings,
+#       refusal teeth, and the checked-in golden+boundary+variant vector
+#       matrix generated from the real builder — never hand-written — incl.
+#       the over-long event-type truncation cap with its `_<sha256[:8]>`
+#       suffix and the replay-conflict `_<sha256[:16]>` variant keys);
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; a corrupt state.json (bad numeric
 #       field) reports error and repairs instead of crashing, holding the
-#       readable baseline, and an unreadable, oversized (bounded read) or
+#       readable baseline, and an unreadable, oversized (a bounded BYTE read:
+#       a multi-byte state over 1 MiB bytes is invalid input) or
 #       pathologically nested document is preserved as state.json.corrupt (or
 #       a timestamped .corrupt.<stamp> sibling, never overwriting an existing
 #       one) and repaired instead of an uncaught RecursionError/MemoryError;
+#       a preservation failure (unwritable state dir) warns with the actual
+#       destination it tried;
 #       planted symlinks
 #       at state.json.tmp/verdict.log are never followed or reused into a
 #       victim; malformed XML, an S3 error document and a truncated list
@@ -125,16 +135,21 @@ mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || echo 
 key() { # audit key built by the pc-admin shipper grammar (never hand-written)
   python3 "${HARNESS_DIR}/shipper_keys.py" "$@"
 }
+variant_key() { # replay-conflict variant: --variant <body> <event-type> <ts> [sid] [seq] [mode]
+  python3 "${HARNESS_DIR}/shipper_keys.py" --variant "$@"
+}
 fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 41735ff
-# (scripts/lib/b2_client.py build_audit_key/session_mode, the full-SHA pin in
-# shipper_keys.py; that grammar point added the over-long event-type
-# truncation cap with the `_<sha256[:8]>` suffix, pinned by the vector matrix
-# below); a pc-admin grammar change must bump the pin, regenerate
-# these and update the witness contract together. Drift fixtures (non-UUID or
+# were generated from the real builder at cad0p/pc-admin @ a7035a9
+# (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key,
+# the full-SHA pin in shipper_keys.py; the grammar-defining point added the
+# replay-conflict `_<sha256[:16]>` variant keys, and the earlier point 41735ff
+# added the over-long event-type truncation cap with the `_<sha256[:8]>`
+# suffix — both are pinned by the vector matrix below); a pc-admin grammar
+# change must bump the pin, regenerate these and update the witness contract
+# together. Drift fixtures (non-UUID or
 # sid-less session keys, malformed modes) stay hand-written literals on
 # purpose: the replica now refuses shapes the real shipper never emits, so a
 # fixture request for one is itself a failure (the teeth after the golden).
@@ -196,6 +211,30 @@ if [ "$(key "${ALIAS_A}" 20260925T100008Z "" 1)" != "$(key "${ALIAS_B}" 20260925
 else
   bad "over-long type truncation aliased two distinct types to one key"
 fi
+# Round-8 cross-repo sync: a replay-conflict variant key (pc-admin @ a7035a9)
+# appends `_<sha256[:16]>` of the body bytes to the event type; a session
+# lifecycle variant drops its mode marker and the sid-less shape joins the
+# hash to the last type segment. The expected suffix is re-derived here from
+# the body, so a replica that stops mirroring the variant shape fails these
+# literals too (the vector matrix below pins the real-builder output).
+VARIANT_BODY='{"event":"session.start","v":"harness-golden"}'
+VARIANT_HASH="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])' "${VARIANT_BODY}")"
+is "replica golden session.start variant (mode dropped)" \
+  "audit/20260925T100008Z-session.start_${VARIANT_HASH}.${REPLICA_SID}.000001.json" \
+  "$(variant_key "${VARIANT_BODY}" session.start 20260925T100008Z "${REPLICA_SID}" 1 exec)"
+is "replica golden session.rejected variant (hash joins last segment)" \
+  "audit/20260925T100008Z-session.rejected_${VARIANT_HASH}.000005.json" \
+  "$(variant_key "${VARIANT_BODY}" session.rejected 20260925T100008Z "${REPLICA_SID}" 5)"
+is "replica golden user.login variant (hash joins last segment)" \
+  "audit/20260925T100008Z-user.login_${VARIANT_HASH}.000006.json" \
+  "$(variant_key "${VARIANT_BODY}" user.login 20260925T100008Z "" 6)"
+VARIANT_BODY_OTHER='{"event":"session.start","v":"harness-other"}'
+if [ "$(variant_key "${VARIANT_BODY}" session.start 20260925T100008Z "${REPLICA_SID}" 1 exec)" \
+     != "$(variant_key "${VARIANT_BODY_OTHER}" session.start 20260925T100008Z "${REPLICA_SID}" 1 exec)" ]; then
+  ok "distinct replay-variant body bytes build distinct variant keys"
+else
+  bad "replay-conflict variant key ignored the body bytes"
+fi
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
 replica_refuses() { # label + shipper_keys.py args; non-zero = refused
@@ -235,10 +274,15 @@ spec.loader.exec_module(replica)
 vectors = json.load(open(os.path.join(here, "shipper_key_vectors.json"), encoding="utf-8"))
 
 
-def replay(args):
+def replay(args, body=None):
     args = list(args)
     args[3] = int(args[3])
-    return replica.audit_key(*args)
+    key = replica.audit_key(*args)
+    if body is not None:
+        # `kind: "variant"` vectors carry the real builder's
+        # `disambiguate_audit_key` output for this body.
+        key = replica.disambiguate_key(key, body)
+    return key
 
 
 if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
@@ -265,7 +309,7 @@ for hostile in (replica.PINNED_PC_ADMIN_SHA[:7], replica.PINNED_PC_ADMIN_SHA[:7]
     if source_sha_ok(hostile):
         raise SystemExit("source_sha predicate accepted a hostile value: %r" % hostile)
 for vector in vectors["vectors"]:
-    got = replay(vector["replica_args"])
+    got = replay(vector["replica_args"], vector.get("body"))
     if got != vector["expected"]:
         raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
 for refusal in vectors["refusals"]:
@@ -1070,6 +1114,116 @@ is "sid-bearing session.rejected key (pre-fold shape) -> exit 1" "1" "${CASE_RC}
 is "sid-bearing session.rejected key -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *session-start-missing*) ok "sid-bearing rejected detail names session-start-missing (the regression the sid-less rule prevents)" ;; *) bad "sid-bearing rejected detail: ${CASE_DETAIL}" ;; esac
 
+# ---- round-8: replay-conflict variants (`_<sha256[:16]>`) --------------
+# A rebuilt audit file that replays a taken key with different bytes ships
+# under a deterministic variant key (pc-admin `disambiguate_audit_key` @
+# a7035a9): the event type gains `_<sha256[:16]>`, a session lifecycle variant
+# drops its mode marker, and the sid-less shape joins the hash to the last
+# type segment. List-only, the witness sees only the NAME: base and variant
+# share the (ts, canonical type, seq) identity, so the variant must be
+# absorbed (no sequence-duplicate) and must not read as naming drift, while
+# the base key stays authoritative for the lifecycle mode. B2 lists ascending
+# keys and `.` < `_`, so a base always precedes its variant.
+START_BODY='{"event":"session.start","v":"harness-variant"}'
+DATA_BODY='{"event":"session.data","v":"harness-variant"}'
+END_BODY='{"event":"session.end","v":"harness-variant"}'
+START_BASE="$(key session.start 20260925T135000Z "${SID}" 1 shell)"
+START_VARIANT="$(variant_key "${START_BODY}" session.start 20260925T135000Z "${SID}" 1 shell)"
+if [ "$(printf '%s\n' "${START_BASE}" "${START_VARIANT}" | LC_ALL=C sort | head -n 1)" = "${START_BASE}" ]; then
+  ok "base key sorts before its replay variant (ascending listing: base wins)"
+else
+  bad "variant key sorts before its base (${START_VARIANT} < ${START_BASE})"
+fi
+
+# (a) a completed session with a base + variant on start/data/end: every
+# variant is the same identity, the lifecycle resolves from the base keys and
+# the tar closes the gap -> ok.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${START_BASE}","ago":300},
+  {"key":"$(variant_key "${START_BODY}" session.start 20260925T135000Z "${SID}" 1 shell)","ago":299},
+  {"key":"$(key session.data 20260925T135100Z "${SID}" 2)","ago":299},
+  {"key":"$(variant_key "${DATA_BODY}" session.data 20260925T135100Z "${SID}" 2)","ago":298},
+  {"key":"$(key session.end 20260925T135200Z "${SID}" 3 shell)","ago":298},
+  {"key":"$(variant_key "${END_BODY}" session.end 20260925T135200Z "${SID}" 3 shell)","ago":297},
+  {"key":"recordings/${SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "base + replay-conflict variant (start/data/end) -> exit 0" "0" "${CASE_RC}"
+is "base + replay-conflict variant absorbed -> ok (no sequence-duplicate, no naming drift)" "ok" "${CASE_STATE}"
+
+# (a2) the base lifecycle marker stays authoritative: an exec start plus a
+# NEWER variant (mode dropped) must not clobber the exec exemption; a live
+# exec session (no tar, no end, past the grace) stays ok.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":900},
+  {"key":"$(variant_key "${START_BODY}" session.start 20260925T134000Z "${SID}" 1 exec)","ago":300},
+  {"key":"$(key session.data 20260925T134100Z "${SID}" 2)","ago":299}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "exec start + newer replay variant (mode dropped) -> exit 0" "0" "${CASE_RC}"
+is "base key authoritative for the lifecycle mode -> ok (variant does not clobber exec)" "ok" "${CASE_STATE}"
+
+# (b) a session.rejected replay variant is the same documented sid-less event
+# after canonicalization - never naming drift.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.rejected 20260925T135300Z "" 5)","ago":297},
+  {"key":"$(variant_key "${START_BODY}" session.rejected 20260925T135300Z "" 5)","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "session.rejected replay-conflict variant -> exit 0" "0" "${CASE_RC}"
+is "session.rejected variant is not naming drift -> ok" "ok" "${CASE_STATE}"
+
+# (c) regression tooth: the identity dedupe keys on (ts, canonical type, seq),
+# so a GENUINE same-seq duplicate under a different ts still alerts
+# sequence-duplicate (a (sid, seq)-only dedupe would silently absorb it).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T135000Z "${SID}" 1 shell)","ago":300},
+  {"key":"$(key session.data 20260925T135100Z "${SID}" 2)","ago":299},
+  {"key":"$(key session.data 20260925T135200Z "${SID}" 2)","ago":298},
+  {"key":"$(key session.end 20260925T135300Z "${SID}" 3 shell)","ago":297},
+  {"key":"recordings/${SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "genuine same-seq duplicate at a different ts -> exit 1" "1" "${CASE_RC}"
+is "genuine same-seq duplicate at a different ts -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *sequence-duplicate*) ok "genuine duplicate still names sequence-duplicate" ;; *) bad "genuine duplicate detail: ${CASE_DETAIL}" ;; esac
+
+# (d) a variant with no base key never fabricates a lifecycle marker: it stays
+# a conservative session-start-missing (the shipper only variants a key that
+# already exists; this pins the defense-in-depth rule).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(variant_key "${START_BODY}" session.start 20260925T135000Z "${SID}" 1 exec)","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "variant-only session start -> exit 1" "1" "${CASE_RC}"
+is "variant-only session start -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *session-start-missing*) ok "variant-only start stays conservative: session-start-missing" ;; *) bad "variant-only start detail: ${CASE_DETAIL}" ;; esac
+
 fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
@@ -1502,6 +1656,52 @@ else
   bad "oversized state was not preserved/repaired"
 fi
 if grep -q 'Traceback' "${WORK}/witness.err"; then bad "oversized state crashed with a traceback"; else ok "oversized state never crashes (read bounded)"; fi
+
+# ---- round-8: the state bound is BYTES, not characters -------------------
+# The old text-mode read counted characters, so a valid JSON state under the
+# 1 MiB character cap but over 1 MiB UTF-8 bytes slipped past the bound. The
+# binary read must treat it as oversized (preserve + repaired error verdict).
+OVERSIZE_UTF8_DIR="${WORK}/state-oversize-utf8"
+mkdir -p "${OVERSIZE_UTF8_DIR}"
+python3 - "${OVERSIZE_UTF8_DIR}/state.json" <<'PY'
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    # ~717k chars (< 1 MiB) but ~1.4 MB as UTF-8 (over the byte bound).
+    handle.write('{"version":2,"state":"ok","detail":"' + "\u00e9" * (700 * 1024)
+                 + '","run_seq":41,"baseline":{"state":"ok","detail":"utf8 baseline","updated_at":"2026-09-25T00:00:00Z"}}')
+PY
+run_case "${OVERSIZE_UTF8_DIR}"
+is "multi-byte state.json under the char cap but over the byte bound -> exit 2" "2" "${CASE_RC}"
+is "multi-byte oversized state.json -> error state" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"state file exceeds"*) ok "byte-bound oversized detail names the size bound" ;;
+  *) bad "byte-bound oversized detail: ${CASE_DETAIL}" ;;
+esac
+if [ -f "${OVERSIZE_UTF8_DIR}/state.json.corrupt" ] && [ -f "${OVERSIZE_UTF8_DIR}/verdict.log" ]; then
+  ok "byte-oversized state preserved as .corrupt + verdict written"
+else
+  bad "byte-oversized state was not preserved/repaired"
+fi
+
+# ---- round-8: a failed preservation warning names the ACTUAL destination ---
+# With an unwritable state dir the preserve/rename cannot land; the warning
+# must name the destination the run tried (here a timestamped sibling, because
+# state.json.corrupt is taken), not a hardcoded plain `.corrupt` name that
+# would send triage to the wrong file.
+UNWRITABLE_DIR="${WORK}/state-unwritable"
+mkdir -p "${UNWRITABLE_DIR}"
+printf 'not json at all\n' >"${UNWRITABLE_DIR}/state.json"
+printf 'earlier forensics\n' >"${UNWRITABLE_DIR}/state.json.corrupt"
+chmod 0500 "${UNWRITABLE_DIR}"
+run_case "${UNWRITABLE_DIR}"
+is "unwritable state dir -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+if grep -E 'cannot preserve unreadable state as .*/state\.json\.corrupt\.[0-9]{8}T[0-9]{6}Z:' "${WORK}/witness.out" >/dev/null; then
+  ok "preservation-failure warning names the timestamped destination it tried"
+else
+  bad "preservation-failure warning named the wrong destination: $(grep 'cannot preserve' "${WORK}/witness.out" || echo none)"
+fi
+chmod 0700 "${UNWRITABLE_DIR}" || true
 
 # ---- round-7 R3: an existing .corrupt is never overwritten ---------------
 # Earlier forensics live at state.json.corrupt; the new corruption must land

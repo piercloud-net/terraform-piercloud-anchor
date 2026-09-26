@@ -7,24 +7,27 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 41735ff
+        --pc-admin ../pc-admin          # a checkout whose HEAD is a7035a9
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex; `--allow-sha-mismatch` only
 for a manual debug run — never commit output from a mismatched checkout; the
 harness asserts the committed file's `source_sha` equals the pin exactly, so
 such a file fails CI). It imports the real `scripts/lib/b2_client.py`, builds
-the golden + boundary matrix through `build_audit_key`, and self-checks that
-the replica in this directory reproduces every vector before writing.
+the golden + boundary matrix through `build_audit_key` and the replay-conflict
+variant matrix through `disambiguate_audit_key`, and self-checks that the
+replica in this directory reproduces every vector before writing.
 
 The pin is the **grammar-defining SHA**: the builder grammar last changed at
+a7035a9 (the replay-conflict variant — `disambiguate_audit_key` appends
+`_<sha256[:16]>` to the event type when a rebuilt file replays a taken key
+with different bytes) and is unchanged since; the previous grammar points were
 41735ff (the over-long event-type truncation cap with the `_<sha256[:8]>`
-suffix) and is unchanged since; the previous grammar point was 66bd304 (the
-`session.rejected` sid-less fold). Because the pin must name the grammar point,
-regeneration deliberately requires a checkout at exactly that SHA — no head
-chasing. When pc-admin's grammar changes: bump the pin in `shipper_keys.py`,
-regenerate this file against the new SHA, and update the witness contract +
-goldens in the same breath.
+suffix) and 66bd304 (the `session.rejected` sid-less fold). Because the pin
+must name the grammar point, regeneration deliberately requires a checkout at
+exactly that SHA — no head chasing. When pc-admin's grammar changes: bump the
+pin in `shipper_keys.py`, regenerate this file against the new SHA, and update
+the witness contract + goldens in the same breath.
 """
 
 import argparse
@@ -36,7 +39,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from shipper_keys import PINNED_PC_ADMIN_SHA, audit_key  # noqa: E402
+from shipper_keys import PINNED_PC_ADMIN_SHA, audit_key, disambiguate_key  # noqa: E402
 
 TS = "20260925T100008Z"
 EVENT_TIME = "2026-09-25T10:00:08Z"
@@ -75,6 +78,24 @@ def build_vectors(b2):
             "kind": kind,
             "event": event,
             "replica_args": replica_args,
+            "expected": expected,
+        })
+
+    def variant_vector(name, event, replica_args, body, session_seq=None, global_seq=0):
+        # The real replay-conflict builder hashes the local BYTES; the replica
+        # hashes the UTF-8 encoding of the same string, so both must agree.
+        base = real_key(b2, event, session_seq, global_seq)
+        expected = b2.disambiguate_audit_key(base, body.encode("utf-8"))
+        assert expected != base, "the real builder did not build a variant for %s" % name
+        replica_base = replicate(replica_args)
+        assert replica_base == base, "replica drift at generation time: %s" % name
+        assert disambiguate_key(replica_base, body) == expected, "replica variant drift: %s" % name
+        vectors.append({
+            "name": name,
+            "kind": "variant",
+            "event": event,
+            "replica_args": replica_args,
+            "body": body,
             "expected": expected,
         })
 
@@ -196,6 +217,47 @@ def build_vectors(b2):
         b2, {"time": EVENT_TIME, "event": alias_b}, None, 0), \
         "the real builder aliased two distinct over-long event types"
 
+    # Cross-repo seed (pc-admin @ a7035a9): a rebuilt audit file that replays a
+    # taken key with DIFFERENT bytes ships under `disambiguate_audit_key` — the
+    # event type gains `_<sha256[:16]>`; a session lifecycle variant drops its
+    # mode marker and the sid-less shape keeps the segment count (the hash
+    # joins the last type segment). The witness absorbs a variant as the same
+    # event identity as its base key; these vectors pin the real builder's
+    # variant shape against the replica.
+    variant_vector(
+        "session.start exec replay-conflict variant (mode marker dropped)",
+        {"time": EVENT_TIME, "event": "session.start", "sid": LSID, "interactive": False},
+        ["session.start", TS, LSID, "1", "exec"],
+        "{\"event\":\"session.start\",\"seq\":1,\"v\":\"replay-start\"}",
+    )
+    variant_vector(
+        "session.end shell replay-conflict variant (mode marker dropped)",
+        {"time": EVENT_TIME, "event": "session.end", "sid": LSID},
+        ["session.end", TS, LSID, "2", "shell"],
+        "{\"event\":\"session.end\",\"seq\":2,\"v\":\"replay-end\"}",
+        session_seq={LSID: 1},
+    )
+    variant_vector(
+        "session.rejected sid-less replay-conflict variant (hash joins last segment)",
+        {"time": EVENT_TIME, "event": "session.rejected", "sid": LSID},
+        ["session.rejected", TS, USID, "5"],
+        "{\"event\":\"session.rejected\",\"seq\":5,\"v\":\"replay-rejected\"}",
+        global_seq=4,
+    )
+    variant_vector(
+        "user.login replay-conflict variant (hash joins last segment)",
+        {"time": EVENT_TIME, "event": "user.login", "sid": LSID},
+        ["user.login", TS, "", "6"],
+        "{\"event\":\"user.login\",\"seq\":6,\"v\":\"replay-login\"}",
+        global_seq=5,
+    )
+    variant_vector(
+        "over-long type truncation variant (truncation suffix kept, conflict suffix appended)",
+        {"time": EVENT_TIME, "event": long_type},
+        [long_type, TS, "", "1"],
+        "{\"event\":\"over-long\",\"seq\":1,\"v\":\"replay-truncated\"}",
+    )
+
     refusals = [
         {"name": "seq 0 (real floor is 1; legacy-only fixture)",
          "replica_args": ["session.data", TS, LSID, "0"],
@@ -235,9 +297,11 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder grammar last changed at 41735ff (the over-long event-type "
-                        "truncation cap with the `_<sha256[:8]>` collision-resistant suffix); "
-                        "unchanged since; previous grammar point 66bd304 (session.rejected sid-less)",
+        "grammar_note": "builder grammar last changed at a7035a9 (the replay-conflict "
+                        "`_<sha256[:16]>` variant keys from disambiguate_audit_key); "
+                        "unchanged since; previous grammar points 41735ff (over-long event-type "
+                        "truncation cap with the `_<sha256[:8]>` suffix) and 66bd304 "
+                        "(session.rejected sid-less)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "refusals": refusals,

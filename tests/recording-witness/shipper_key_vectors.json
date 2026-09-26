@@ -1,6 +1,6 @@
 {
-  "pinned_pc_admin_sha": "41735ff77a79d24c75dc2e22bb1c47cbb0582800",
-  "grammar_note": "builder grammar last changed at 41735ff (the over-long event-type truncation cap with the `_<sha256[:8]>` collision-resistant suffix); unchanged since; previous grammar point 66bd304 (session.rejected sid-less)",
+  "pinned_pc_admin_sha": "a7035a9701517c7d9edfc5baa7cc04cc0ca72189",
+  "grammar_note": "builder grammar last changed at a7035a9 (the replay-conflict `_<sha256[:16]>` variant keys from disambiguate_audit_key); unchanged since; previous grammar points 41735ff (over-long event-type truncation cap with the `_<sha256[:8]>` suffix) and 66bd304 (session.rejected sid-less)",
   "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
   "vectors": [
     {
@@ -259,6 +259,93 @@
         "1"
       ],
       "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_4f774766.000001.json"
+    },
+    {
+      "name": "session.start exec replay-conflict variant (mode marker dropped)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.start",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "interactive": false
+      },
+      "replica_args": [
+        "session.start",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "1",
+        "exec"
+      ],
+      "body": "{\"event\":\"session.start\",\"seq\":1,\"v\":\"replay-start\"}",
+      "expected": "audit/20260925T100008Z-session.start_1c2b4eeca8ee196a.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000001.json"
+    },
+    {
+      "name": "session.end shell replay-conflict variant (mode marker dropped)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.end",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.end",
+        "20260925T100008Z",
+        "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70",
+        "2",
+        "shell"
+      ],
+      "body": "{\"event\":\"session.end\",\"seq\":2,\"v\":\"replay-end\"}",
+      "expected": "audit/20260925T100008Z-session.end_a20241ba2ca38cc0.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.000002.json"
+    },
+    {
+      "name": "session.rejected sid-less replay-conflict variant (hash joins last segment)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "session.rejected",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "session.rejected",
+        "20260925T100008Z",
+        "9F8C4B1E-0D2A-4F7E-9C11-2B3D4E5F6A70",
+        "5"
+      ],
+      "body": "{\"event\":\"session.rejected\",\"seq\":5,\"v\":\"replay-rejected\"}",
+      "expected": "audit/20260925T100008Z-session.rejected_6af87bd56cab0a6f.000005.json"
+    },
+    {
+      "name": "user.login replay-conflict variant (hash joins last segment)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "user.login",
+        "sid": "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+      },
+      "replica_args": [
+        "user.login",
+        "20260925T100008Z",
+        "",
+        "6"
+      ],
+      "body": "{\"event\":\"user.login\",\"seq\":6,\"v\":\"replay-login\"}",
+      "expected": "audit/20260925T100008Z-user.login_3899cbea8b5b8a4e.000006.json"
+    },
+    {
+      "name": "over-long type truncation variant (truncation suffix kept, conflict suffix appended)",
+      "kind": "variant",
+      "event": {
+        "time": "2026-09-25T10:00:08Z",
+        "event": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      },
+      "replica_args": [
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "20260925T100008Z",
+        "",
+        "1"
+      ],
+      "body": "{\"event\":\"over-long\",\"seq\":1,\"v\":\"replay-truncated\"}",
+      "expected": "audit/20260925T100008Z-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_111fcf58_36f265eaa52c806b.000001.json"
     }
   ],
   "refusals": [
@@ -359,5 +446,5 @@
       "why": "the real builder sanitizes an invalid type to `unknown`; the truncation cap applies only to grammar-valid types, so the replica must refuse the literal shape"
     }
   ],
-  "source_sha": "41735ff77a79d24c75dc2e22bb1c47cbb0582800"
+  "source_sha": "a7035a9701517c7d9edfc5baa7cc04cc0ca72189"
 }

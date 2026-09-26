@@ -1472,6 +1472,22 @@ RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
 SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
+# Replay-conflict variants (pc-admin `disambiguate_audit_key`): when a rebuilt
+# audit file replays an event under a key that already exists with DIFFERENT
+# bytes, the shipper appends `_<sha256[:16]>` to the event type (a session
+# lifecycle variant drops its mode marker) instead of silently skipping the
+# line. The witness is list-only and cannot see bytes, so a variant is the
+# SAME event identity as its base key, re-shipped under a disambiguated name:
+# canonicalize the type and count the (ts, type, seq) identity once per session.
+CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}$")
+
+
+def canonical_conflict_type(event_type):
+    """Strip a replay-conflict `_<hash16>` suffix; return (base, is_variant)."""
+    match = CONFLICT_SUFFIX_RE.search(event_type)
+    if not match:
+        return event_type, False
+    return event_type[: match.start()], True
 
 
 class WitnessError(Exception):
@@ -1795,12 +1811,28 @@ def run_checks(config, now):
         relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
         match = SESSION_KEY_RE.match(relative)
         if match:
-            event_type = match.group("etype")
+            event_type, is_variant = canonical_conflict_type(match.group("etype"))
             sid = match.group("sid").lower()
             state = sessions.setdefault(
-                sid, {"seqs": [], "start": None, "end": None, "start_mode": None, "end_mode": None})
-            state["seqs"].append(int(match.group("seq")))
+                sid, {"seqs": [], "start": None, "end": None, "start_mode": None,
+                      "end_mode": None, "identities": set()})
+            seq = int(match.group("seq"))
+            # A base key and its replay-conflict variant share one identity
+            # (ts, canonical type, seq): count the seq once so a legitimate
+            # variant cannot read as a `sequence-duplicate`, while a genuine
+            # duplicate from a different timestamp still does.
+            identity = (match.group("ts"), event_type, seq)
+            if identity in state["identities"]:
+                is_variant = True
+            else:
+                state["identities"].add(identity)
+                state["seqs"].append(seq)
             mode = match.group("mode")
+            if is_variant:
+                # Variants drop the mode marker by contract and must not
+                # re-resolve the lifecycle marker: the base key (which the
+                # producer only variants because it exists) is authoritative.
+                continue
             # Duplicate starts and ends resolve by the newest LastModified,
             # exactly like each other: a re-PUT / replayed marker must not win
             # just because its key sorts first, or a stale `.exec` start could
@@ -1820,7 +1852,9 @@ def run_checks(config, now):
             continue
         generic = NON_SESSION_KEY_RE.match(relative)
         if generic:
-            event_type = generic.group("etype")
+            # A replay-conflict variant (`session.rejected_<hash16>`) is the
+            # same documented event as its base type, never naming drift.
+            event_type, _ = canonical_conflict_type(generic.group("etype"))
             if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
                 continue  # documented non-session (or known sid-less session) event
         # Drift is judged by shape (a UUID-shaped sid or a session.* event
@@ -2042,16 +2076,22 @@ def corrupt_state_destination(path, now):
 
 def read_state(path):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            raw = handle.read(STATE_MAX_BYTES + 1)
+        # Read raw BYTES: the cap below is a byte bound (a worst-case
+        # 4-byte-per-char UTF-8 file must not slip past a character count).
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read(STATE_MAX_BYTES + 1)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError, RecursionError) as exc:
         raise WitnessError("state file unreadable: %s" % exc)
-    if len(raw) > STATE_MAX_BYTES:
+    if len(raw_bytes) > STATE_MAX_BYTES:
         # An oversized state is invalid input, not a reason to read it whole
         # (round-7 R2: the unbounded read raised an uncaught MemoryError).
         raise WitnessError("state file exceeds %d bytes" % STATE_MAX_BYTES)
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WitnessError("state file is not valid UTF-8: %s" % exc)
     try:
         data = json.loads(raw)
     except (ValueError, RecursionError) as exc:
@@ -2264,6 +2304,7 @@ def main():
         # Keep the unreadable record for forensics instead of overwriting it
         # outright; the repaired record cannot carry a baseline it could not
         # read.
+        corrupt_path = None
         try:
             corrupt_path = corrupt_state_destination(state_path, now)
             os.replace(state_path, corrupt_path)
@@ -2272,8 +2313,8 @@ def main():
             # An unwritable state dir disables the preservation; say so
             # instead of silently dropping forensics (round-6 F8). A name
             # collision is not a failure: the destination is unique (R3).
-            log("WARNING: cannot preserve unreadable state as %s.corrupt: %s"
-                % (state_path, clip(exc, 200)))
+            log("WARNING: cannot preserve unreadable state as %s: %s"
+                % (corrupt_path or (state_path + ".corrupt"), clip(exc, 200)))
 
     renotify = config.renotify if config is not None else 1800
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
