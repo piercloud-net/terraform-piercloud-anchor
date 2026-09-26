@@ -91,9 +91,12 @@
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
 #       InvocationID did not advance); the timer's immediate first fire on a
-#       long-up box (issue #143) is drained (bounded) before the capture and
-#       retried once if a start still merged with it, so a merged
-#       timer-triggered invocation is never mis-filed as a stale start; the
+#       long-up box (issue #143) is drained (bounded, 100 polls) before the
+#       capture and retried exactly once if a start still merged with it, so a
+#       merged timer-triggered invocation is never mis-filed as a stale start
+#       (a merged write followed by a failed retry write dies on the
+#       re-anchored run_seq baseline, and a unit that never drains dies at the
+#       bound with zero starts); the
 #       run also dies when state.json's per-run identity
 #       (run_seq) did not advance this invocation (a failed state write, or a
 #       start that left the previous verdict) — run identity, not the
@@ -2101,7 +2104,12 @@ case "$1" in
     if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ] && [ "${merged}" != "1" ]; then
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
     fi
-    if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
+    # FAKE_RETRY_NO_STATE_WRITE=1 models a retry whose own state write fails:
+    # the merged first start writes its record, the second (retry) start does not.
+    write_state=1
+    if [ "${FAKE_NO_STATE_WRITE:-0}" = "1" ]; then write_state=0; fi
+    if [ "${FAKE_RETRY_NO_STATE_WRITE:-0}" = "1" ] && [ "${start_count}" -ge 2 ]; then write_state=0; fi
+    if [ "${write_state}" = "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
       python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" "${FAKE_REPAIR_VERDICT:-error}" "${FAKE_REPAIR_RUN_SEQ:-}" <<'PYSTATE'
 import datetime
 import json
@@ -2163,6 +2171,15 @@ esac
 exit 0
 FAKE
 chmod +x "${FAKEBIN}/systemctl"
+# The drain-bound tooth drives all 100 wait-idle polls; FAKE_SLEEP_NOWAIT
+# removes the wall-clock cost while keeping the iteration count (and with it
+# the bound) exercised. Every other test sleeps for real.
+cat >"${FAKEBIN}/sleep" <<'FAKESLEEP'
+#!/usr/bin/env bash
+if [ "${FAKE_SLEEP_NOWAIT:-0}" = "1" ]; then exit 0; fi
+exec /bin/sleep "$@"
+FAKESLEEP
+chmod +x "${FAKEBIN}/sleep"
 export FAKE_SYSTEMCTL_LOG="${WORK}/systemctl.log"
 export PATH="${FAKEBIN}:${PATH}"
 
@@ -2228,7 +2245,8 @@ export FAKE_STATE_FILE="${WORK}/state/state.json"
 export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
 printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
 unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT \
-      FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE FAKE_SERVICE_ACTIVE_POLLS FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_STATE
+      FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE FAKE_START_COUNT_FILE FAKE_SERVICE_ACTIVE_POLLS \
+      FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_STATE FAKE_SLEEP_NOWAIT
 seed_state() { # $1 = state, $2 = updated_at (wall clock), $3 = run_seq (default 41)
   printf '{"version":2,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","run_seq":%s,"last_notify_epoch":0}\n' \
     "$1" "${SID}" "${SID}" "$2" "${3:-41}" >"${WORK}/state/state.json"
@@ -2369,6 +2387,31 @@ else
 fi
 unset FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE
 
+# Harness tooth for the retry re-anchor (red-team LOW / functional NIT-1):
+# the merged first start writes a valid record (run_seq 41 -> 42) but the
+# retry's OWN write fails. With the re-anchor, the merged record is the new
+# baseline and the missing retry write must die on it (42 == 42). Without the
+# re-anchor the stale baseline (41) makes the merged record look advanced, so
+# the acceptance reads the merged invocation's verdict as this run's (rc=0,
+# invocation=inv-inflight-143). Deleting the re-anchor line must fail this.
+seed_state ok "$(fresh_stamp)" 41
+printf 'inv-inflight-143\n' >"${FAKE_INVOCATION_FILE}"
+printf '0\n' >"${WORK}/retry-fail-count"
+export FAKE_MERGE_FIRST_START=1 FAKE_START_COUNT_FILE="${WORK}/retry-fail-count" FAKE_RETRY_NO_STATE_WRITE=1
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT FAKE_SERVICE_ACTIVE_POLLS FAKE_ACTIVE_POLL_FILE
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: merged write + failed retry write dies on the re-anchored baseline" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"did not advance (run_seq=42, before=42"*) ok "run-once re-anchored the retry baseline to the merged run's write" ;;
+  *) bad "run-once did not re-anchor the retry baseline: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"witness verdict: OK"*) bad "run-once accepted the merged record after the retry's write failed" ;;
+  *) ok "run-once never reports the merged record as the retry's verdict" ;;
+esac
+unset FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE FAKE_START_COUNT_FILE
+
 # Issue #143 (drain leg): a reinstall can catch a timer-triggered invocation
 # already running. run-once must wait (bounded) for the unit to go inactive
 # BEFORE it reads InvocationID, so its own start cannot merge with the
@@ -2388,6 +2431,27 @@ case "${runonce_out}" in
 esac
 is "run-once: drained the unit (active poll then inactive) before starting" "2" "$(cat "${WORK}/active-polls")"
 unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
+
+# Retry/drain bound (red-team INFO-2): a unit that never reports drained must
+# die fail-closed at the bounded 100-poll wait BEFORE any `systemctl start` —
+# zero starts, never a start-then-retry loop. FAKE_SLEEP_NOWAIT keeps the 100
+# iterations but removes their wall-clock cost; FAKE_ACTIVE_STATE=active
+# reports active on every poll. A regression that starts before the drain, or
+# retries beyond the bound, moves the start counter off 0; one that loops
+# without the bound hangs this check instead of failing it.
+seed_state ok "$(fresh_stamp)" 61
+printf '0\n' >"${WORK}/no-drain-start-count"
+export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_SLEEP_NOWAIT=1
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: a unit that never drains dies fail-closed (issue #143)" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"did not drain within 100s"*) ok "run-once names the bounded drain failure" ;;
+  *) bad "run-once non-drain output: ${runonce_out}" ;;
+esac
+is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
+unset FAKE_ACTIVE_STATE FAKE_SLEEP_NOWAIT
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.
