@@ -90,7 +90,11 @@
 #       alerting witness too, so the run maps the paired rc/ExecMainStatus
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
-#       InvocationID did not advance) or when state.json's per-run identity
+#       InvocationID did not advance); the timer's immediate first fire on a
+#       long-up box (issue #143) is drained (bounded) before the snapshot and
+#       retried once if a start still merged with it, so a merged
+#       timer-triggered invocation is never mis-filed as a stale start; the
+#       run also dies when state.json's per-run identity
 #       (run_seq) did not advance this invocation (a failed state write, or a
 #       start that left the previous verdict) — run identity, not the
 #       second-resolution updated_at, so a genuine same-second run counts; an
@@ -2078,12 +2082,23 @@ case "$1" in
   start)
     # Type=oneshot realism: start fails whenever the main process exits
     # non-zero. FAKE_START_RC models a start that wedges before ExecStart:
-    # no new invocation and no state write. Otherwise the invocation counter
-    # advances and (unless FAKE_NO_STATE_WRITE=1) state.json gets a new
-    # per-run identity (run_seq) plus a fresh updated_at, exactly like a real
-    # witness run.
+    # no new invocation and no state write. FAKE_MERGE_FIRST_START models the
+    # issue #143 race: the first start merges with a timer-triggered
+    # invocation that was already running — that in-flight (real) run writes
+    # state.json, but InvocationID does not advance; the retry start does.
+    # Otherwise the invocation counter advances and (unless
+    # FAKE_NO_STATE_WRITE=1) state.json gets a new per-run identity (run_seq)
+    # plus a fresh updated_at, exactly like a real witness run.
+    start_count=0
+    if [ -n "${FAKE_START_COUNT_FILE:-}" ]; then
+      start_count="$(cat "${FAKE_START_COUNT_FILE}" 2>/dev/null || echo 0)"
+      start_count=$((start_count + 1))
+      printf '%s\n' "${start_count}" >"${FAKE_START_COUNT_FILE}"
+    fi
     if [ -n "${FAKE_START_RC:-}" ]; then exit "${FAKE_START_RC}"; fi
-    if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ]; then
+    merged=0
+    if [ "${FAKE_MERGE_FIRST_START:-0}" = "1" ] && [ "${start_count}" = "1" ]; then merged=1; fi
+    if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ] && [ "${merged}" != "1" ]; then
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
     fi
     if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
@@ -2125,6 +2140,22 @@ PYSTATE
   show)
     case "${prop}" in
       InvocationID) cat "${FAKE_INVOCATION_FILE}" 2>/dev/null || true ;;
+      ActiveState)
+        # FAKE_SERVICE_ACTIVE_POLLS=N models a unit that is still running for
+        # the first N-1 ActiveState polls and drained from poll N on (the
+        # issue #143 in-flight timer invocation); the default is drained.
+        polls="${FAKE_SERVICE_ACTIVE_POLLS:-0}"
+        if [ "${polls}" -gt 0 ] 2>/dev/null; then
+          seen="$(cat "${FAKE_ACTIVE_POLL_FILE:-/dev/null}" 2>/dev/null || echo 0)"
+          seen=$((seen + 1))
+          printf '%s\n' "${seen}" >"${FAKE_ACTIVE_POLL_FILE}"
+          if [ "${seen}" -lt "${polls}" ]; then
+            printf 'active\n'
+            exit 0
+          fi
+        fi
+        printf '%s\n' "${FAKE_ACTIVE_STATE:-inactive}"
+        ;;
       *) printf '%s\n' "${FAKE_EXEC_STATUS:-0}" ;;
     esac
     exit 0 ;;
@@ -2196,7 +2227,8 @@ export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
 export FAKE_STATE_FILE="${WORK}/state/state.json"
 export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
 printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
-unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT \
+      FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE FAKE_SERVICE_ACTIVE_POLLS FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_STATE
 seed_state() { # $1 = state, $2 = updated_at (wall clock), $3 = run_seq (default 41)
   printf '{"version":2,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","run_seq":%s,"last_notify_epoch":0}\n' \
     "$1" "${SID}" "${SID}" "$2" "${3:-41}" >"${WORK}/state/state.json"
@@ -2300,6 +2332,62 @@ case "${runonce_out}" in
   *"witness verdict: ALERT"*) bad "run-once reported the previous ALERT as current after a wedged start" ;;
   *) ok "run-once never reports the previous verdict after a wedged start" ;;
 esac
+
+# Issue #143: on a long-up box the witness timer fires its service as soon as
+# the timer is enabled, so a fresh install (or a reinstall whose timer is
+# already running) can find that timer-triggered invocation in flight when
+# run-once snapshots the unit. Its own `systemctl start` then merges with the
+# in-flight job: the merged start returns the in-flight run's result and
+# InvocationID does NOT advance, even though that run wrote a perfectly valid
+# state.json. The acceptance must drain the unit, retry exactly once (the
+# merged run's write becoming the new run_seq baseline), and read the retry
+# invocation's verdict — not refuse the valid record and not read the merged
+# run's record as this run's.
+seed_state ok "$(fresh_stamp)" 41
+printf 'inv-inflight-143\n' >"${FAKE_INVOCATION_FILE}"
+printf '0\n' >"${WORK}/start-count"
+export FAKE_MERGE_FIRST_START=1 FAKE_START_COUNT_FILE="${WORK}/start-count"
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+export FAKE_EXEC_STATUS=0
+unset FAKE_SERVICE_ACTIVE_POLLS FAKE_ACTIVE_POLL_FILE
+run_once_call
+is "run-once: merged timer invocation + bounded retry reaches a verdict (issue #143)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once retries the merged start and reads a trustworthy verdict" ;;
+  *) bad "run-once merged-start output: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"new invocation"*) bad "run-once refused the merged timer invocation as a wedged start" ;;
+  *) ok "run-once does not mis-file the merged timer invocation as a wedged start" ;;
+esac
+is "run-once: merged start was followed by exactly one retry" "2" "$(cat "${WORK}/start-count")"
+merged_invocation="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("invocation", ""))' "${WORK}/state/state.json")"
+if [ -n "${merged_invocation}" ] && [ "${merged_invocation}" != "inv-inflight-143" ]; then
+  ok "run-once verdict belongs to the retry invocation, not the merged in-flight run"
+else
+  bad "run-once read the merged in-flight run's record (invocation=${merged_invocation:-none})"
+fi
+unset FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE
+
+# Issue #143 (drain leg): a reinstall can catch a timer-triggered invocation
+# already running. run-once must wait (bounded) for the unit to go inactive
+# BEFORE it snapshots InvocationID, so its own start cannot merge with the
+# in-flight job at all. The fake reports the unit active for one poll and
+# drained from the second poll on; the fix must poll it out before starting.
+seed_state ok "$(fresh_stamp)" 51
+printf '0\n' >"${WORK}/active-polls"
+export FAKE_ACTIVE_POLL_FILE="${WORK}/active-polls" FAKE_SERVICE_ACTIVE_POLLS=2
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+export FAKE_EXEC_STATUS=0
+unset FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE
+run_once_call
+is "run-once: in-flight invocation is drained before the start (issue #143)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once waits out the in-flight timer invocation, then reads the verdict" ;;
+  *) bad "run-once drain output: ${runonce_out}" ;;
+esac
+is "run-once: drained the unit (active poll then inactive) before starting" "2" "$(cat "${WORK}/active-polls")"
+unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.
