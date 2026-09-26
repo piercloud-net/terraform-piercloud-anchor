@@ -7,9 +7,10 @@ replay-conflict variant: `disambiguate_audit_key` appends `_<sha256[:16]>` to
 the event type when a rebuilt file replays a taken key with different bytes)
 and is unchanged since (pc-admin round-9 @ `e41fac8` added ETag normalization
 and persisted-float validation only — no key-grammar change).
-The previous grammar points were 41735ff (the over-long event-type cap:
-truncate to 128 chars, drop a trailing separator and append an
-`_<sha256[:8]>` suffix) and 66bd304 (the session.rejected sid-less fold).
+The previous grammar points were 66bd304 (the session.rejected sid-less fold),
+929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the
+`_<sha256[:8]>` collision-resistant suffix on the truncated type) and 342a37c
+(the `10^18-1` seq-ceiling clamp in `build_audit_key`).
 The golden strings in tests/recording-witness/run-test.sh and the checked-in
 vector matrix were generated from the pinned SHA; a pc-admin grammar change
 must bump this pin, regenerate both and update the witness contract in the

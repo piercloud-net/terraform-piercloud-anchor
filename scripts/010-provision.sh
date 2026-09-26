@@ -1820,11 +1820,19 @@ def run_checks(config, now):
             # A base key and its replay-conflict variant share one identity
             # (ts, canonical type, seq): count the seq once so a legitimate
             # variant cannot read as a `sequence-duplicate`, while a genuine
-            # duplicate from a different timestamp still does.
+            # duplicate from a different timestamp still does. The identity is
+            # for sequence counting ONLY - it must not skip lifecycle
+            # resolution: a same-ts `.exec`/`.shell` marker pair also shares
+            # the identity (the mode is not part of it), so forcing the second
+            # key to skip would let whichever key the listing returns first
+            # win regardless of LastModified (a stale/equal-LM `.exec` silently
+            # exempting a shell session). Only a key whose type
+            # `canonical_conflict_type` actually flags as a replay-conflict
+            # variant skips resolution; every canonical key reaches
+            # `resolve_lifecycle_marker` and the newest marker (or the
+            # conservative conflicting tie) wins in either listing order.
             identity = (match.group("ts"), event_type, seq)
-            if identity in state["identities"]:
-                is_variant = True
-            else:
+            if identity not in state["identities"]:
                 state["identities"].add(identity)
                 state["seqs"].append(seq)
             mode = match.group("mode")
@@ -1832,6 +1840,10 @@ def run_checks(config, now):
                 # Variants drop the mode marker by contract and must not
                 # re-resolve the lifecycle marker: the base key (which the
                 # producer only variants because it exists) is authoritative.
+                # A mode marker on a variant is naming drift exactly like a
+                # mode marker on any non-lifecycle base shape.
+                if mode:
+                    contract_bad += 1
                 continue
             # Duplicate starts and ends resolve by the newest LastModified,
             # exactly like each other: a re-PUT / replayed marker must not win

@@ -38,7 +38,12 @@
 #       drift) with the base key authoritative for the lifecycle mode, while a
 #       genuine same-seq duplicate at a different ts still alerts
 #       sequence-duplicate and a variant-only session start stays
-#       conservatively session-start-missing; a
+#       conservatively session-start-missing; the identity tuple excludes the
+#       mode marker and drives sequence counting only, so a same-(ts, type,
+#       seq) `.exec`/`.shell` marker pair still resolves by the newest
+#       LastModified (conflicting equal-LM tie -> conservative shell) and a
+#       variant-first listing order cannot force-skip the canonical base;
+#       a
 #       renamed session prefix (sess.start) is still drift; an audit key that
 #       matches no documented shape -> alert contract-mismatch; future
 #       LastModified *and* future Initiated timestamps -> error (clock skew,
@@ -56,7 +61,8 @@
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
 #       the over-long event-type truncation cap with its `_<sha256[:8]>`
-#       suffix and the replay-conflict `_<sha256[:16]>` variant keys);
+#       suffix and the replay-conflict `_<sha256[:16]>` variant keys; a
+#       fixture can pin non-conformant listing orders;
 #   (e) fail-closed: a failing listing run reports error (exit 2) while the
 #       last baseline in state.json is held; a corrupt state.json (bad numeric
 #       field) reports error and repairs instead of crashing, holding the
@@ -65,6 +71,8 @@
 #       pathologically nested document is preserved as state.json.corrupt (or
 #       a timestamped .corrupt.<stamp> sibling, never overwriting an existing
 #       one) and repaired instead of an uncaught RecursionError/MemoryError;
+#       an invalid-UTF-8 state takes the same preserve-and-repair path with
+#       the encoding failure named;
 #       a preservation failure (unwritable state dir) warns with the actual
 #       destination it tried;
 #       planted symlinks
@@ -1012,6 +1020,27 @@ run_case
 is "mode marker on a non start/end event -> exit 1" "1" "${CASE_RC}"
 case "${CASE_DETAIL}" in *naming-contract*) ok "misplaced-mode detail names naming-contract" ;; *) bad "misplaced-mode detail: ${CASE_DETAIL}" ;; esac
 
+# Round-9 NIT: the same mode-drift rule must hold for a replay-conflict
+# variant shape. The identity-based `continue` ran before the naming check,
+# so this key stayed silent while the plain shape above alerts. A variant
+# drops its mode marker by contract, and the mode is lifecycle-only on every
+# shape, so a mode here is drift. Hand-written on purpose: the shipper replica
+# refuses to build a shape the real builder never emits.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"${K_START_SHELL}","ago":300},
+  {"key":"audit/20260925T135100Z-session.data_0123456789abcdef.${SID}.2.exec.json","ago":299},
+  {"key":"${K_END_SHELL}","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "mode marker on a variant-shaped non start/end event -> exit 1" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "variant-shaped misplaced-mode detail names naming-contract" ;; *) bad "variant-shaped misplaced-mode detail: ${CASE_DETAIL}" ;; esac
+
 # ---- completed tar + lost session.end (the tar must not stay green alone) --
 K_TAR_START="$(key session.start 20260925T120000Z "$SID" 1 shell)"
 K_TAR_DATA="$(key session.data 20260925T120100Z "$SID" 2)"
@@ -1158,20 +1187,128 @@ is "base + replay-conflict variant absorbed -> ok (no sequence-duplicate, no nam
 
 # (a2) the base lifecycle marker stays authoritative: an exec start plus a
 # NEWER variant (mode dropped) must not clobber the exec exemption; a live
-# exec session (no tar, no end, past the grace) stays ok.
+# exec session (no tar, no end, past the grace) stays ok. Re-aged (round 9):
+# base 1200 s / variant 700 s. Both markers are past the 600 s grace, so a
+# clobbering variant would resolve `shell` at its own (newer) 700 s clock and
+# alert `recording-gap` - the earlier 900/300 ages kept the clobber inside
+# the grace and the tooth passed even with the variant guard deleted.
 fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
   {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
-  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":900},
-  {"key":"$(variant_key "${START_BODY}" session.start 20260925T134000Z "${SID}" 1 exec)","ago":300},
-  {"key":"$(key session.data 20260925T134100Z "${SID}" 2)","ago":299}],
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":1200},
+  {"key":"$(variant_key "${START_BODY}" session.start 20260925T134000Z "${SID}" 1 exec)","ago":700},
+  {"key":"$(key session.data 20260925T134100Z "${SID}" 2)","ago":699}],
  "uploads":[]}
 JSON
 start_mock
 run_case
 is "exec start + newer replay variant (mode dropped) -> exit 0" "0" "${CASE_RC}"
 is "base key authoritative for the lifecycle mode -> ok (variant does not clobber exec)" "ok" "${CASE_STATE}"
+
+# (a3) same (ts, canonical type, seq) contradictory-mode starts (round-9 root
+# cause): the mode marker is NOT part of the identity tuple, so both keys must
+# reach the lifecycle resolver. The identity-clobber let the first-listed
+# key force-skip the second, so a stale `.exec` (B2 lists `.exec` < `.shell`)
+# silently exempted a session whose newer marker says shell -> false green.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":1200},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 shell)","ago":700}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "same-ts exec+shell starts, newer shell -> exit 1 (stale exec must not exempt)" "1" "${CASE_RC}"
+is "same-ts exec+shell starts, newer shell -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "same-ts start pair detail names recording-gap" ;; *) bad "same-ts start pair detail: ${CASE_DETAIL}" ;; esac
+
+# The equal-LastModified tie of the same pair has no newest marker, so it must
+# fail closed to the conservative `.shell` in both listing orders. Real B2
+# order lists `.exec` first; a fixture-ordered listing pins the `.shell`-first
+# order the identity-clobber also silently mis-resolved (it happened to alert,
+# but only via the clobber path - the resolver must see both keys).
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":1200},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 shell)","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "same-ts exec+shell start tie (exec first) -> exit 1 (fails closed)" "1" "${CASE_RC}"
+is "same-ts exec+shell start tie (exec first) -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "same-ts start tie (exec first) detail names recording-gap" ;; *) bad "same-ts start tie (exec first) detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","list_order":"fixture",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 shell)","ago":1200},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "same-ts exec+shell start tie (shell first, fixture order) -> exit 1 (both orders)" "1" "${CASE_RC}"
+is "same-ts exec+shell start tie (shell first) -> alert verdict" "alert" "${CASE_STATE}"
+
+# The same pair with a NEWER `.exec`, shell listed first: the strictly-newest
+# marker wins with its mode in either listing order, so the newer exec key
+# exempts the session (the identity-clobber kept the first-listed shell).
+fixture <<JSON
+{"bucket":"pc-admin-dr","list_order":"fixture",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 shell)","ago":1200},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":700}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "same-ts shell-first, newer exec start -> exit 0 (newest wins in both orders)" "0" "${CASE_RC}"
+is "same-ts shell-first, newer exec start -> ok verdict" "ok" "${CASE_STATE}"
+
+# The same identity-clobber on the authoritative end marker: a same-(ts, seq)
+# `.exec` end listed first (B2 order) silently exempted a session whose newer
+# end says shell (round-9 repro); both ends must reach the resolver.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 shell)","ago":1200},
+  {"key":"$(key session.data 20260925T134100Z "${SID}" 2)","ago":1199},
+  {"key":"$(key session.end 20260925T134200Z "${SID}" 3 exec)","ago":600},
+  {"key":"$(key session.end 20260925T134200Z "${SID}" 3 shell)","ago":500}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "same-ts exec+shell ends, newer shell -> exit 1 (stale exec end must not exempt)" "1" "${CASE_RC}"
+is "same-ts exec+shell ends, newer shell -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "same-ts end pair detail names recording-gap" ;; *) bad "same-ts end pair detail: ${CASE_DETAIL}" ;; esac
+
+# (a4) variant-first listing order (non-conformant; real B2 lists ascending
+# keys, so a base precedes its variant): the canonical base must still
+# resolve the lifecycle marker. The identity-clobber let the variant claim
+# the identity slot and force-skip the base -> a spurious
+# `session-start-missing` on a live exec session (round-9 repro).
+fixture <<JSON
+{"bucket":"pc-admin-dr","list_order":"fixture",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"$(variant_key "${START_BODY}" session.start 20260925T134000Z "${SID}" 1 exec)","ago":700},
+  {"key":"$(key session.start 20260925T134000Z "${SID}" 1 exec)","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "variant listed before its base -> exit 0 (base still resolves)" "0" "${CASE_RC}"
+is "variant listed before its base -> ok (no spurious session-start-missing)" "ok" "${CASE_STATE}"
 
 # (b) a session.rejected replay variant is the same documented sid-less event
 # after canonicalization - never naming drift.
@@ -1683,6 +1820,28 @@ if [ -f "${OVERSIZE_UTF8_DIR}/state.json.corrupt" ] && [ -f "${OVERSIZE_UTF8_DIR
 else
   bad "byte-oversized state was not preserved/repaired"
 fi
+
+# ---- round-9: an invalid-UTF-8 state file is invalid input, never a crash ---
+# The binary read decodes UTF-8 after the byte cap; a file with invalid byte
+# sequences must take the same preserve-and-repair path (error verdict +
+# `.corrupt` + verdict line) and name the encoding failure, instead of an
+# uncaught UnicodeDecodeError before any verdict.
+INVALID_UTF8_DIR="${WORK}/state-invalid-utf8"
+mkdir -p "${INVALID_UTF8_DIR}"
+printf '\377\376\375\374 invalid utf8 \303(\n' >"${INVALID_UTF8_DIR}/state.json"
+run_case "${INVALID_UTF8_DIR}"
+is "invalid-UTF-8 state.json -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "invalid-UTF-8 state.json -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"not valid UTF-8"*) ok "invalid-UTF-8 detail names the encoding failure" ;;
+  *) bad "invalid-UTF-8 detail: ${CASE_DETAIL}" ;;
+esac
+if [ -f "${INVALID_UTF8_DIR}/state.json.corrupt" ] && [ -f "${INVALID_UTF8_DIR}/verdict.log" ]; then
+  ok "invalid-UTF-8 state preserved as .corrupt + verdict written"
+else
+  bad "invalid-UTF-8 state was not preserved/repaired"
+fi
+if grep -q 'Traceback' "${WORK}/witness.err"; then bad "invalid-UTF-8 state crashed with a traceback"; else ok "invalid-UTF-8 state never crashes"; fi
 
 # ---- round-8: a failed preservation warning names the ACTUAL destination ---
 # With an unwritable state dir the preserve/rename cannot land; the warning

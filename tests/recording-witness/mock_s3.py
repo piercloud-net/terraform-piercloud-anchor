@@ -16,6 +16,10 @@ The fixture is JSON:
     {
       "bucket": "pc-admin-dr",
       "page_size": 2,                      # optional, forces pagination
+      "list_order": "fixture",               # optional; objects are served in
+                                            # fixture order instead of the
+                                            # real ascending-key order (pins
+                                            # listing-order independence)
       "fail": null | "list" | "all",       # list calls return HTTP 500
       "fail_objects": null | "malformed" | "error-doc" | "truncated-no-token",
       "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
@@ -197,10 +201,15 @@ class Handler(BaseHTTPRequestHandler):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
         offset = int(token) if token.isdigit() else 0
-        matching = sorted(
-            (obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)),
-            key=lambda obj: obj["key"],
-        )
+        matching = [
+            obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
+        ]
+        # Real S3/B2 lists ascending by key. A fixture can opt into fixture
+        # order to pin that the witness verdict is independent of the order
+        # the listing returns (e.g. `.shell` before `.exec` at the same ts, or
+        # a replay-conflict variant before its base).
+        if FIXTURE.get("list_order") != "fixture":
+            matching = sorted(matching, key=lambda obj: obj["key"])
         suppress_token = FIXTURE.get("fail_objects") == "truncated-no-token"
         page = matching[offset:offset + PAGE_SIZE]
         next_offset = offset + PAGE_SIZE
