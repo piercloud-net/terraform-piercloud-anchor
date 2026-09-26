@@ -2383,6 +2383,22 @@ def main():
         "last_notify_run": last_notify_run,
         "last_notify_epoch": last_notify_epoch,
     }
+    if state_bad_reason:
+        # Explicit repair evidence: an unreadable/invalid record has no
+        # readable baseline, so the counter restarts at 1 above. The run-once
+        # acceptance cannot tell that reset from a stale record by `run_seq`
+        # alone, so mark the repair here and name the systemd invocation that
+        # wrote it below; the acceptance only counts a repair written by the
+        # invocation that just ran.
+        record["repaired"] = True
+    invocation = env("INVOCATION_ID", "")
+    if invocation:
+        # systemd's per-runtime-cycle ID (unique 32-hex, the same value
+        # `systemctl show -p InvocationID` reports). A failed state write
+        # leaves the previous record - and its previous invocation - in
+        # place, so this is what lets the acceptance tell "this invocation
+        # repaired the record" from "this invocation never persisted state".
+        record["invocation"] = invocation
     if state == "error":
         # Held when it could be read: an un-runnable run never advances the
         # last good baseline. An unreadable state file has no readable
@@ -2518,7 +2534,7 @@ RECORDING_WITNESS_REDACT_PY
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced
   # Anchor freshness to THIS invocation, not to wall-clock recency: a run
   # that genuinely took longer than the old +/-300 s window must not be
   # rejected, and a wedged `systemctl start` that never executed ExecStart
@@ -2527,7 +2543,10 @@ recording_witness_run_once() { # run one check now and surface the verdict
   # only if the property is unavailable); state.json's per-run identity
   # (run_seq) must also advance so a run that could not persist state.json
   # never counts, while two runs in the same wall-clock second still count
-  # (updated_at is second-resolution and may legitimately repeat).
+  # (updated_at is second-resolution and may legitimately repeat). The one
+  # exception is an explicit repair written by THIS invocation (`repaired`
+  # plus a matching `invocation`): it resets `run_seq` to 1, but its verdict
+  # is always `error`, so it still fails the acceptance closed below.
   before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   before_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
@@ -2546,10 +2565,20 @@ recording_witness_run_once() { # run one check now and surface the verdict
   detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
   updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  repaired="$(jq -r '.repaired // false' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  state_invocation="$(jq -r '.invocation // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
     die "witness unit did not start a new invocation (InvocationID ${after_invocation} unchanged, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale state.json"
   fi
+  state_advanced=yes
   if [ -z "${run_seq}" ] || [ "${run_seq}" = "${before_run_seq}" ]; then
+    state_advanced=no
+    if [ -n "${run_seq}" ] && [ "${repaired}" = "true" ] && [ -n "${state_invocation}" ] && [ "${state_invocation}" = "${after_invocation}" ]; then
+      state_advanced=yes
+      log "witness state was repaired by this invocation (run_seq reset to ${run_seq}); reading the explicit repair verdict"
+    fi
+  fi
+  if [ "${state_advanced}" != "yes" ]; then
     die "witness state did not advance (run_seq=${run_seq:-none}, before=${before_run_seq:-none}, updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
   fi
   detail="$(recording_witness_redact "${detail}")"

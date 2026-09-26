@@ -93,7 +93,11 @@
 #       InvocationID did not advance) or when state.json's per-run identity
 #       (run_seq) did not advance this invocation (a failed state write, or a
 #       start that left the previous verdict) — run identity, not the
-#       second-resolution updated_at, so a genuine same-second run counts; a
+#       second-resolution updated_at, so a genuine same-second run counts; an
+#       explicit `repaired` record OF THIS invocation is accepted even though
+#       the repair resets run_seq to 1 (its verdict is always error, so it
+#       still fails closed), while a stale repair marker from a previous
+#       invocation still dies; a
 #       run longer than any recency window is accepted because the anchor is
 #       advancement, not recency; state and ExecMainStatus mismatches die; the
 #       printed detail has session ids redacted (public run-log safety);
@@ -1783,6 +1787,7 @@ PY
 run_case "${OVERSIZE_DIR}"
 is "oversized state.json -> exit 2 (error verdict, not a crash)" "2" "${CASE_RC}"
 is "oversized state.json -> error state" "error" "${CASE_STATE}"
+is "oversized state repair marks the record repaired" "True" "$(state_field repaired)"
 case "${CASE_DETAIL}" in
   *"state file exceeds"*) ok "oversized state detail names the size bound" ;;
   *) bad "oversized state detail: ${CASE_DETAIL}" ;;
@@ -1842,6 +1847,19 @@ else
   bad "invalid-UTF-8 state was not preserved/repaired"
 fi
 if grep -q 'Traceback' "${WORK}/witness.err"; then bad "invalid-UTF-8 state crashed with a traceback"; else ok "invalid-UTF-8 state never crashes"; fi
+
+# ---- round-10 NIT writer side: the record names the systemd invocation that
+# wrote it (the identity the run-once gate binds a run_seq-resetting repair
+# to), and a normal run is not marked repaired.
+INVOCATION_DIR="${WORK}/state-invocation"
+mkdir -p "${INVOCATION_DIR}"
+HARNESS_INVOCATION="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+export INVOCATION_ID="${HARNESS_INVOCATION}"
+run_case "${INVOCATION_DIR}"
+unset INVOCATION_ID
+is "state.json names the systemd INVOCATION_ID that wrote it" \
+  "${HARNESS_INVOCATION}" "$(state_field invocation)"
+is "a normal run is not marked repaired" "" "$(state_field repaired)"
 
 # ---- round-8: a failed preservation warning names the ACTUAL destination ---
 # With an unwritable state dir the preserve/rename cannot land; the warning
@@ -2066,7 +2084,7 @@ case "$1" in
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
     fi
     if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
-      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" <<'PYSTATE'
+      python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" <<'PYSTATE'
 import datetime
 import json
 import sys
@@ -2075,8 +2093,21 @@ try:
     data = json.load(open(sys.argv[1]))
 except (OSError, ValueError):
     data = {}
-data["run_seq"] = int(data.get("run_seq") or 0) + 1
+if sys.argv[4] == "1":
+    # Round-10 NIT: model the witness preserve+repair write. The old record
+    # was unreadable/invalid, so the run identity resets to 1 (which can equal
+    # the value jq read before the run), the verdict is forced to error, and
+    # the record carries `repaired` plus the INVOCATION_ID of the run that
+    # wrote it.
+    data["repaired"] = True
+    data["run_seq"] = 1
+    data["state"] = "error"
+else:
+    data.pop("repaired", None)
+    data["run_seq"] = int(data.get("run_seq") or 0) + 1
 data["updated_at"] = sys.argv[2] or (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+if sys.argv[3]:
+    data["invocation"] = open(sys.argv[3]).read().strip()
 json.dump(data, open(sys.argv[1], "w"))
 PYSTATE
     fi
@@ -2151,8 +2182,10 @@ mkdir -p "${WORK}/state"
 export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
 # The run-once freshness anchor is "THIS invocation advanced state": the fake
 # systemctl models a real run by bumping InvocationID and writing a new
-# per-run identity (run_seq; updated_at is second-resolution and may repeat);
-# the wedged/rollback paths switch that off.
+# per-run identity (run_seq; updated_at is second-resolution and may repeat)
+# plus the INVOCATION_ID that wrote the record; a read-failure repair is
+# modelled by keeping run_seq at 1 and writing `repaired`; the
+# wedged/rollback paths switch that off.
 export FAKE_STATE_FILE="${WORK}/state/state.json"
 export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
 printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
@@ -2160,6 +2193,20 @@ unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED
 seed_state() { # $1 = state, $2 = updated_at (wall clock), $3 = run_seq (default 41)
   printf '{"version":2,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","run_seq":%s,"last_notify_epoch":0}\n' \
     "$1" "${SID}" "${SID}" "$2" "${3:-41}" >"${WORK}/state/state.json"
+}
+seed_repair_state() { # $1 = invocation id recorded by an EARLIER repair run
+  seed_state error "$(fresh_stamp)" 1
+  python3 - "${WORK}/state/state.json" "$1" <<'PYSTATE'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["repaired"] = True
+data["invocation"] = sys.argv[2]
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PYSTATE
 }
 run_once_call() { # sets runonce_rc / runonce_out
   runonce_rc=0
@@ -2258,6 +2305,41 @@ is "run-once: rc=0 + state not advanced dies" "1" "${runonce_rc}"
 case "${runonce_out}" in
   *"did not advance"*) ok "run-once freshness gate names the unadvanced state" ;;
   *) bad "run-once unadvanced-state output: ${runonce_out}" ;;
+esac
+unset FAKE_NO_STATE_WRITE
+
+# Round-10 NIT: an explicit repair written by THIS invocation resets run_seq
+# to 1, which can equal the value jq still read off the unreadable record.
+# The repair must count as progress evidence so the acceptance reads the real
+# ERROR verdict instead of mis-filing it as a stale state (and the error
+# verdict still fails the run closed).
+seed_state error "$(fresh_stamp)" 1
+unset FAKE_START_RC
+unset FAKE_NO_STATE_WRITE
+export FAKE_EXEC_STATUS=2
+export FAKE_REPAIR_STATE=1
+run_once_call
+is "run-once: in-invocation repair (run_seq reset) reaches the ERROR verdict" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: ERROR"*) ok "run-once counts this invocation's explicit repair as progress" ;;
+  *) bad "run-once did not surface the repair ERROR verdict: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"did not advance"*) bad "run-once mis-filed a genuine repair as a stale state" ;;
+  *) ok "run-once does not mis-file a genuine repair as a stale state" ;;
+esac
+unset FAKE_REPAIR_STATE
+
+# ...but the stale-gate protection stays intact: a repair marker left by a
+# PREVIOUS invocation must not cover a run that never persisted state.json.
+seed_repair_state "inv-previous"
+export FAKE_EXEC_STATUS=0
+export FAKE_NO_STATE_WRITE=1
+run_once_call
+is "run-once: stale repair + failed state write still dies" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"did not advance"*) ok "run-once refuses a stale repair marker from a previous invocation" ;;
+  *) bad "run-once accepted a stale repair marker: ${runonce_out}" ;;
 esac
 unset FAKE_NO_STATE_WRITE
 

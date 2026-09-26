@@ -21,9 +21,11 @@ replica in this directory reproduces every vector before writing.
 The pin is the **grammar-defining SHA**: the builder grammar last changed at
 a7035a9 (the replay-conflict variant — `disambiguate_audit_key` appends
 `_<sha256[:16]>` to the event type when a rebuilt file replays a taken key
-with different bytes) and is unchanged since; the previous grammar points were
-41735ff (the over-long event-type truncation cap with the `_<sha256[:8]>`
-suffix) and 66bd304 (the `session.rejected` sid-less fold). Because the pin
+with different bytes) and is unchanged since. The previous grammar points were
+66bd304 (the `session.rejected` sid-less fold), 929d82c (the 128-char
+pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>`
+collision-resistant suffix on the truncated type) and 342a37c (the `10^18-1`
+seq-ceiling clamp in `build_audit_key`). Because the pin
 must name the grammar point, regeneration deliberately requires a checkout at
 exactly that SHA — no head chasing. When pc-admin's grammar changes: bump the
 pin in `shipper_keys.py`, regenerate this file against the new SHA, and update
@@ -299,9 +301,10 @@ def build_vectors(b2):
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
         "grammar_note": "builder grammar last changed at a7035a9 (the replay-conflict "
                         "`_<sha256[:16]>` variant keys from disambiguate_audit_key); "
-                        "unchanged since; previous grammar points 41735ff (over-long event-type "
-                        "truncation cap with the `_<sha256[:8]>` suffix) and 66bd304 "
-                        "(session.rejected sid-less)",
+                        "unchanged since; previous grammar points 66bd304 (session.rejected "
+                        "sid-less), 929d82c (the 128-char pre-hash event-type truncation cap), "
+                        "41735ff (the `_<sha256[:8]>` suffix on the truncated type) and 342a37c "
+                        "(the 10^18-1 seq-ceiling clamp in build_audit_key)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "refusals": refusals,
