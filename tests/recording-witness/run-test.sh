@@ -2518,8 +2518,8 @@ fi
 # `sleep 1` (a trailing comment is fine), and no `sleep` function may exist
 # (`sleep()` or `function sleep`; comments and quoted spans ignored).
 if awk '
-  /^recording_witness_wait_idle\(\)/ { in_fn = 1; next }
-  in_fn && /^}$/ { exit }
+  /^recording_witness_wait_idle\(\)/ { in_fn = 1; seen_marker = 0; seen_done = 0; depth = 0; prev = ""; loop_prev = ""; next }
+  in_fn && /^}$/ { in_fn = 0; next }
   in_fn {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
     if (!seen_marker) {
