@@ -2507,31 +2507,42 @@ if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
 else
   bad "run-once: drain polls and sleeps are not interleaved (issue #143): $(tr '\n' ' ' <"${WORK}/no-drain-poll-sleeps")"
 fi
-# Issue #143 red-team F2 (+ round-4 F1): counters cannot prove the sleep
+# Issue #143 red-team F2 (+ rounds 4/5 F1): counters cannot prove the sleep
 # blocks — a backgrounded `sleep 1 &` keeps them all green while the bounded
 # wait stops waiting, and a bare `sleep 1` line elsewhere in the function
 # keeps a presence-only tooth green while the executed loop sleep is
-# shortened (`timeout 0.5 sleep 1`) or shadowed by a `sleep` function (defined
-# anywhere in the script — a definition in the function span or at top level
-# both shadow the drain call). Pin
-# the executed line: the last non-comment statement before the loop's `done`
-# must be a foreground `sleep 1`, and no `sleep` function may exist.
+# shortened (`timeout 0.5 sleep 1`), shadowed by a `sleep` function (defined
+# anywhere in the script), or preceded by a decoy loop. Pin the executed
+# line: after the drain marker (`recording_witness_service_drained`), the
+# last non-comment statement before that loop's `done` must be a foreground
+# `sleep 1` (a trailing comment is fine), and no `sleep` function may exist
+# (`sleep()` or `function sleep`; comments and quoted spans ignored).
 if awk '
   /^recording_witness_wait_idle\(\)/ { in_fn = 1; next }
   in_fn && /^}$/ { exit }
   in_fn {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
-    if ($0 ~ /^[[:space:]]*done[[:space:]]*$/ && !seen_done) { loop_prev = prev; seen_done = 1 }
-    prev = $0
+    if (!seen_marker && $0 ~ /recording_witness_service_drained/) { seen_marker = 1; next }
+    if (seen_marker && !seen_done) {
+      if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) { loop_prev = prev; seen_done = 1; next }
+      prev = $0
+    }
   }
-  END { exit (seen_done && loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*$/) ? 0 : 1 }
+  END { exit (seen_marker && seen_done && loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1 }
 ' "${PROVISION}"; then
   ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
 else
   bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
 fi
 if awk '
-  /(^|[^[:alnum:]_])sleep[[:space:]]*\(\)/ { shadow = 1 }
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    gsub(/"[^"]*"/, "", line)
+    sub(/[[:space:]]#.*$/, "", line)
+    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]+sleep([[:space:]]*\(\))?[[:space:]]*\{/) shadow = 1
+    if (line ~ /(^|[^[:alnum:]_])sleep[[:space:]]*\(\)[[:space:]]*\{/) shadow = 1
+  }
   END { exit shadow ? 1 : 0 }
 ' "${PROVISION}"; then
   ok "run-once: no \`sleep\` function shadows the drain sleep (issue #143)"
