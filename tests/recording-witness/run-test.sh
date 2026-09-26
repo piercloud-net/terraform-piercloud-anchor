@@ -2177,14 +2177,18 @@ FAKE
 chmod +x "${FAKEBIN}/systemctl"
 # The drain-bound tooth drives all 100 wait-idle polls; FAKE_SLEEP_NOWAIT
 # removes the wall-clock cost while keeping the iteration count (and with it
-# the bound) exercised, and FAKE_SLEEP_COUNT_FILE pins the sleep count so a
-# bound regression that keeps the poll count (a deleted `sleep 1`, fewer
-# iterations with an early break) still fails. Every other test sleeps for real.
+# the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
+# the sleep count and its argument (`sleep 1`) so a bound regression that
+# keeps the poll count (a deleted `sleep 1`, a shorter sleep, fewer iterations
+# with an early break) still fails. Every other test sleeps for real.
 cat >"${FAKEBIN}/sleep" <<'FAKESLEEP'
 #!/usr/bin/env bash
 if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ]; then
   seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
   printf '%s\n' "$((seen + 1))" >"${FAKE_SLEEP_COUNT_FILE}"
+fi
+if [ -n "${FAKE_SLEEP_ARGS_FILE:-}" ]; then
+  printf '%s\n' "${1:-}" >>"${FAKE_SLEEP_ARGS_FILE}"
 fi
 if [ "${FAKE_SLEEP_NOWAIT:-0}" = "1" ]; then exit 0; fi
 exec /bin/sleep "$@"
@@ -2256,7 +2260,7 @@ export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
 printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
 unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT \
       FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE FAKE_START_COUNT_FILE FAKE_SERVICE_ACTIVE_POLLS \
-      FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_STATE FAKE_SLEEP_NOWAIT FAKE_SLEEP_COUNT_FILE
+      FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_STATE FAKE_SLEEP_NOWAIT FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE
 seed_state() { # $1 = state, $2 = updated_at (wall clock), $3 = run_seq (default 41)
   printf '{"version":2,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","run_seq":%s,"last_notify_epoch":0}\n' \
     "$1" "${SID}" "${SID}" "$2" "${3:-41}" >"${WORK}/state/state.json"
@@ -2449,17 +2453,20 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 # either way). FAKE_SLEEP_NOWAIT keeps the 100 iterations but removes their
 # wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
 # FAKE_ACTIVE_POLL_FILE pins the iteration count (100 loop polls + the final
-# ActiveState read for the die message = 101) and FAKE_SLEEP_COUNT_FILE pins
-# the sleeps (100) so a bound regression fails whether it changes the poll
-# count or only the wall-clock wait (a deleted `sleep 1`, an early break)
-# instead of shipping with a stale "100s" message. A regression that starts
-# before the drain, or retries beyond the bound, moves the start counter off
-# 0; one that loops without the bound hangs this check instead of failing it.
+# ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
+# the sleeps (100) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
+# bound regression fails whether it changes the poll count, the sleep count
+# or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
+# break) instead of shipping with a stale "100s" message. A regression that
+# starts before the drain, or retries beyond the bound, moves the start
+# counter off 0; one that loops without the bound hangs this check instead of
+# failing it.
 seed_state ok "$(fresh_stamp)" 61
 printf '0\n' >"${WORK}/no-drain-start-count"
 printf '0\n' >"${WORK}/no-drain-polls"
 printf '0\n' >"${WORK}/no-drain-sleeps"
-export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_ACTIVE_POLL_FILE="${WORK}/no-drain-polls" FAKE_SLEEP_COUNT_FILE="${WORK}/no-drain-sleeps" FAKE_SLEEP_NOWAIT=1
+: >"${WORK}/no-drain-sleep-args"
+export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_ACTIVE_POLL_FILE="${WORK}/no-drain-polls" FAKE_SLEEP_COUNT_FILE="${WORK}/no-drain-sleeps" FAKE_SLEEP_ARGS_FILE="${WORK}/no-drain-sleep-args" FAKE_SLEEP_NOWAIT=1
 unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE
 export FAKE_EXEC_STATUS=0
 run_once_call
@@ -2471,11 +2478,12 @@ esac
 is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
 is "run-once: a non-draining unit polls the bounded 100-iteration wait (100 + the final read)" "101" "$(cat "${WORK}/no-drain-polls")"
 is "run-once: a non-draining unit sleeps the bounded 100 iterations" "100" "$(cat "${WORK}/no-drain-sleeps")"
+is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
 case "${runonce_out}" in
   *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
   *) bad "run-once non-drain wording: ${runonce_out}" ;;
 esac
-unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_NOWAIT
+unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE FAKE_SLEEP_NOWAIT
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.
