@@ -96,7 +96,8 @@
 #       merged timer-triggered invocation is never mis-filed as a stale start
 #       (a merged write followed by a failed retry write dies on the
 #       re-anchored run_seq baseline, and a unit that never drains dies at the
-#       bound with zero starts); the
+#       bound with zero starts on the pre-start drain — the retry-path drain
+#       can fire after the merged start, fail-closed either way); the
 #       run also dies when state.json's per-run identity
 #       (run_seq) did not advance this invocation (a failed state write, or a
 #       start that left the previous verdict) — run identity, not the
@@ -2149,18 +2150,21 @@ PYSTATE
     case "${prop}" in
       InvocationID) cat "${FAKE_INVOCATION_FILE}" 2>/dev/null || true ;;
       ActiveState)
-        # FAKE_SERVICE_ACTIVE_POLLS=N models a unit that is still running for
-        # the first N-1 ActiveState polls and drained from poll N on (the
-        # issue #143 in-flight timer invocation); the default is drained.
-        polls="${FAKE_SERVICE_ACTIVE_POLLS:-0}"
-        if [ "${polls}" -gt 0 ] 2>/dev/null; then
-          seen="$(cat "${FAKE_ACTIVE_POLL_FILE:-/dev/null}" 2>/dev/null || echo 0)"
+        # FAKE_ACTIVE_POLL_FILE, when set, counts every ActiveState poll
+        # (the bounded-drain teeth assert the poll count). With
+        # FAKE_SERVICE_ACTIVE_POLLS=N the unit is still running for the first
+        # N-1 polls and drained from poll N on (the issue #143 in-flight
+        # timer invocation); the default is drained.
+        seen=0
+        if [ -n "${FAKE_ACTIVE_POLL_FILE:-}" ]; then
+          seen="$(cat "${FAKE_ACTIVE_POLL_FILE}" 2>/dev/null || echo 0)"
           seen=$((seen + 1))
           printf '%s\n' "${seen}" >"${FAKE_ACTIVE_POLL_FILE}"
-          if [ "${seen}" -lt "${polls}" ]; then
-            printf 'active\n'
-            exit 0
-          fi
+        fi
+        polls="${FAKE_SERVICE_ACTIVE_POLLS:-0}"
+        if [ "${polls}" -gt 0 ] 2>/dev/null && [ "${seen}" -lt "${polls}" ]; then
+          printf 'active\n'
+          exit 0
         fi
         printf '%s\n' "${FAKE_ACTIVE_STATE:-inactive}"
         ;;
@@ -2434,14 +2438,19 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 
 # Retry/drain bound (red-team INFO-2): a unit that never reports drained must
 # die fail-closed at the bounded 100-poll wait BEFORE any `systemctl start` —
-# zero starts, never a start-then-retry loop. FAKE_SLEEP_NOWAIT keeps the 100
-# iterations but removes their wall-clock cost; FAKE_ACTIVE_STATE=active
-# reports active on every poll. A regression that starts before the drain, or
-# retries beyond the bound, moves the start counter off 0; one that loops
-# without the bound hangs this check instead of failing it.
+# zero starts for this pre-start drain, never a start-then-retry loop (the
+# retry-path drain can fire after a merged start already ran — fail-closed
+# either way). FAKE_SLEEP_NOWAIT keeps the 100 iterations but removes their
+# wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll and
+# FAKE_ACTIVE_POLL_FILE pins the iteration count (100 loop polls + the final
+# ActiveState read for the die message = 101) so a bound regression fails
+# instead of shipping with a stale "100s" message. A regression that starts
+# before the drain, or retries beyond the bound, moves the start counter off
+# 0; one that loops without the bound hangs this check instead of failing it.
 seed_state ok "$(fresh_stamp)" 61
 printf '0\n' >"${WORK}/no-drain-start-count"
-export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_SLEEP_NOWAIT=1
+printf '0\n' >"${WORK}/no-drain-polls"
+export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_ACTIVE_POLL_FILE="${WORK}/no-drain-polls" FAKE_SLEEP_NOWAIT=1
 unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE
 export FAKE_EXEC_STATUS=0
 run_once_call
@@ -2451,7 +2460,8 @@ case "${runonce_out}" in
   *) bad "run-once non-drain output: ${runonce_out}" ;;
 esac
 is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
-unset FAKE_ACTIVE_STATE FAKE_SLEEP_NOWAIT
+is "run-once: a non-draining unit polls the bounded 100-iteration wait (100 + the final read)" "101" "$(cat "${WORK}/no-drain-polls")"
+unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_SLEEP_NOWAIT
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.

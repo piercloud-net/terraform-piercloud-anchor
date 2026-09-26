@@ -2551,7 +2551,7 @@ recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation 
     sleep 1
   done
   active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
-  die "witness unit did not drain within 100s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to start a possibly merged run"
+  die "witness unit did not drain within 100s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
