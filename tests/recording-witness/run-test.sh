@@ -2161,6 +2161,17 @@ PYSTATE
           seen=$((seen + 1))
           printf '%s\n' "${seen}" >"${FAKE_ACTIVE_POLL_FILE}"
         fi
+        if [ -n "${FAKE_ACTIVE_POLL_SLEEP_FILE:-}" ]; then
+          # Issue #143 red-team F1: record the sleep count observed at this
+          # poll, so the bounded-drain tooth can pin the poll->sleep
+          # interleaving (the volume counters alone stay green when the
+          # sleeps are moved out of the poll body).
+          sleep_seen=0
+          if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ] && [ -f "${FAKE_SLEEP_COUNT_FILE}" ]; then
+            sleep_seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
+          fi
+          printf '%s\n' "${sleep_seen}" >>"${FAKE_ACTIVE_POLL_SLEEP_FILE}"
+        fi
         polls="${FAKE_SERVICE_ACTIVE_POLLS:-0}"
         if [ "${polls}" -gt 0 ] 2>/dev/null && [ "${seen}" -lt "${polls}" ]; then
           printf 'active\n'
@@ -2457,7 +2468,13 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 # the sleeps (100) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
 # bound regression fails whether it changes the poll count, the sleep count
 # or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
-# break) instead of shipping with a stale "100s" message. A regression that
+# break) instead of shipping with a stale "100s" message. The count/arg
+# teeth pin volume, not the shape: FAKE_ACTIVE_POLL_SLEEP_FILE records the
+# sleep count observed at every poll so the interleaving tooth (poll N must
+# see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
+# (a busy poll with identical counters), and a static tooth pins the shipped
+# drain sleep as a foreground `sleep 1` (a backgrounded sleep keeps every
+# counter green while the wait stops waiting). A regression that
 # starts before the drain, or retries beyond the bound, moves the start
 # counter off 0; one that loops without the bound hangs this check instead of
 # failing it.
@@ -2466,7 +2483,8 @@ printf '0\n' >"${WORK}/no-drain-start-count"
 printf '0\n' >"${WORK}/no-drain-polls"
 printf '0\n' >"${WORK}/no-drain-sleeps"
 : >"${WORK}/no-drain-sleep-args"
-export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_ACTIVE_POLL_FILE="${WORK}/no-drain-polls" FAKE_SLEEP_COUNT_FILE="${WORK}/no-drain-sleeps" FAKE_SLEEP_ARGS_FILE="${WORK}/no-drain-sleep-args" FAKE_SLEEP_NOWAIT=1
+: >"${WORK}/no-drain-poll-sleeps"
+export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_ACTIVE_POLL_FILE="${WORK}/no-drain-polls" FAKE_SLEEP_COUNT_FILE="${WORK}/no-drain-sleeps" FAKE_SLEEP_ARGS_FILE="${WORK}/no-drain-sleep-args" FAKE_ACTIVE_POLL_SLEEP_FILE="${WORK}/no-drain-poll-sleeps" FAKE_SLEEP_NOWAIT=1
 unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE
 export FAKE_EXEC_STATUS=0
 run_once_call
@@ -2479,11 +2497,29 @@ is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-dra
 is "run-once: a non-draining unit polls the bounded 100-iteration wait (100 + the final read)" "101" "$(cat "${WORK}/no-drain-polls")"
 is "run-once: a non-draining unit sleeps the bounded 100 iterations" "100" "$(cat "${WORK}/no-drain-sleeps")"
 is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
+# Issue #143 red-team F1: poll N must observe N-1 sleeps (0..100 for the
+# shipped loop; the die path's final ActiveState read is poll 101). Moving
+# the sleeps out of the poll body keeps every volume counter green but
+# collapses the bounded wait to a busy poll — this fails it.
+if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
+  ok "run-once: every drain poll is separated by the preceding sleep (issue #143)"
+else
+  bad "run-once: drain polls and sleeps are not interleaved (issue #143): $(tr '\n' ' ' <"${WORK}/no-drain-poll-sleeps")"
+fi
+# Issue #143 red-team F2: counters cannot prove the sleep blocks — a
+# backgrounded `sleep 1 &` keeps them all green while the bounded wait stops
+# waiting. Pin the shipped drain sleep statically as a foreground `sleep 1`
+# (no `&`, no other command on the line).
+if awk '/^recording_witness_wait_idle\(\)/{in_fn=1} in_fn && /^}$/{in_fn=0} in_fn && /^[[:space:]]*sleep 1[[:space:]]*$/{found=1} END{exit found ? 0 : 1}' "${PROVISION}"; then
+  ok "run-once: the drain sleep is a foreground \`sleep 1\` (issue #143)"
+else
+  bad "run-once: the drain sleep is missing or backgrounded (issue #143)"
+fi
 case "${runonce_out}" in
   *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
   *) bad "run-once non-drain wording: ${runonce_out}" ;;
 esac
-unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE FAKE_SLEEP_NOWAIT
+unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_POLL_SLEEP_FILE FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE FAKE_SLEEP_NOWAIT
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.
