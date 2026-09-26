@@ -10,7 +10,7 @@ Every script in this directory follows the same invariants:
 
 | Script | Runs on | Purpose |
 |---|---|---|
-| `010-provision.sh` | the anchor box | install tang (loopback socket) + Caddy edge proxy (dispatch-managed Caddyfile: tang proxy, ACME HTTP-01, dashboard TLS) + dispatch-managed Gatus monitor (rendered from env, statuses printed) + per-anchor Origin CA key/CSR generation (key generated on the box, never leaves) and fail-closed cert install + print thumbprint, key-leak assertion, print clevis bind next steps |
+| `010-provision.sh` | the anchor box | install tang (loopback socket) + Caddy edge proxy (dispatch-managed Caddyfile: tang proxy, ACME HTTP-01, dashboard TLS) + dispatch-managed Gatus monitor (rendered from env, statuses printed) + per-anchor Origin CA key/CSR generation (key generated on the box, never leaves) and fail-closed cert install + optional list-only recording-completeness witness (rendered from `RECORDING_WITNESS_*` env: `/usr/local/sbin/pc-recording-witness.sh` + a 5 min systemd timer + a 0600 env file, strictly `ListObjectsV2`/`ListMultipartUploads` metadata, no content access; dormant without the env) + print thumbprint, key-leak assertion, print clevis bind next steps |
 
 ## CI-called scripts (`.github/scripts/`) — not human-run
 
