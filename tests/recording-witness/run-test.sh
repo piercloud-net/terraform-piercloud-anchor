@@ -2511,9 +2511,11 @@ fi
 # blocks — a backgrounded `sleep 1 &` keeps them all green while the bounded
 # wait stops waiting, and a bare `sleep 1` line elsewhere in the function
 # keeps a presence-only tooth green while the executed loop sleep is
-# shortened (`timeout 0.5 sleep 1`) or shadowed by a `sleep` function. Pin
+# shortened (`timeout 0.5 sleep 1`) or shadowed by a `sleep` function (defined
+# anywhere in the script — a definition in the function span or at top level
+# both shadow the drain call). Pin
 # the executed line: the last non-comment statement before the loop's `done`
-# must be a foreground `sleep 1`, and no `sleep` function may shadow it.
+# must be a foreground `sleep 1`, and no `sleep` function may exist.
 if awk '
   /^recording_witness_wait_idle\(\)/ { in_fn = 1; next }
   in_fn && /^}$/ { exit }
@@ -2529,9 +2531,7 @@ else
   bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
 fi
 if awk '
-  /^recording_witness_wait_idle\(\)/ { in_fn = 1; next }
-  in_fn && /^}$/ { exit }
-  in_fn && /(^|[^[:alnum:]_])sleep[[:space:]]*\(\)/ { shadow = 1 }
+  /(^|[^[:alnum:]_])sleep[[:space:]]*\(\)/ { shadow = 1 }
   END { exit shadow ? 1 : 0 }
 ' "${PROVISION}"; then
   ok "run-once: no \`sleep\` function shadows the drain sleep (issue #143)"
