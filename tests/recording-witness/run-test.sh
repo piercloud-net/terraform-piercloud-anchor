@@ -2522,9 +2522,19 @@ if awk '
   in_fn && /^}$/ { exit }
   in_fn {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
-    if (!seen_marker && $0 ~ /recording_witness_service_drained/) { seen_marker = 1; next }
+    if (!seen_marker) {
+      probe = $0
+      sub(/[[:space:]]#.*$/, "", probe)
+      if (probe ~ /(^|[[:space:]])recording_witness_service_drained([[:space:]]|;|$)/) { seen_marker = 1; next }
+    }
     if (seen_marker && !seen_done) {
-      if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) { loop_prev = prev; seen_done = 1; next }
+      if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) {
+        if (depth == 0) { loop_prev = prev; seen_done = 1; next }
+        depth--
+        prev = $0
+        next
+      }
+      if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
       prev = $0
     }
   }
