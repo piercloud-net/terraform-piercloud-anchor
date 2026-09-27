@@ -113,9 +113,9 @@
 #   RECORDING_WITNESS_*      optional recording-completeness witness (repo
 #                            secrets: ENDPOINT/BUCKET/AUDIT_PREFIX/
 #                            RECORDINGS_PREFIX/KEY_ID/KEY). KEY is a B2
-#                            listFiles-only application key — the witness
-#                            never reads object content. All six set = the
-#                            on-box script installs the witness; none set =
+#                            listFiles+listFileVersions application key — the
+#                            witness never reads object content. All six set =
+#                            the on-box script installs the witness; none set =
 #                            dormant and any previous install is removed.
 #                            Values are single-quote escaped into the piped
 #                            env prefix below — never argv, never logged.
