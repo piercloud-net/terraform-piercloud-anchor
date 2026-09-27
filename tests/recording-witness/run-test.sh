@@ -158,7 +158,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=413
+MIN_CHECKS=420
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -1547,7 +1547,30 @@ JSON
 start_mock
 run_case
 is "truncated upload list without key marker -> exit 2" "2" "${CASE_RC}"
-case "${CASE_DETAIL}" in *"truncated without a key marker"*) ok "upload truncation detail is explicit" ;; *) bad "upload truncation detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"truncated without a key/upload marker"*) ok "upload truncation detail is explicit" ;; *) bad "upload truncation detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"error-doc-200",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "200 error document on uploads -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListMultipartUploads*expected\ ListMultipartUploadsResult*) ok "200 error-document uploads detail names the non-list body" ;;
+  *) bad "200 error-document uploads detail: ${CASE_DETAIL}" ;;
+esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"truncated-no-upload-marker",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "truncated upload list without upload marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in *"truncated without a key/upload marker"*) ok "upload-marker truncation detail is explicit" ;; *) bad "upload-marker truncation detail: ${CASE_DETAIL}" ;; esac
 
 # ---- verdict.log rotation bound ------------------------------------------
 
@@ -2024,6 +2047,10 @@ case "${CASE_DETAIL}" in
   *hidden-object*audit=2*) ok "delete markers under audit/ alert hidden-object with the audit count" ;;
   *) bad "delete marker detail wrong: ${CASE_DETAIL}" ;;
 esac
+case "${CASE_DETAIL}" in
+  *"keys: ${K_HIDDEN_B}"*) ok "hidden-object samples the newest marker first (not listing order)" ;;
+  *) bad "newest-marker sampling wrong: ${CASE_DETAIL}" ;;
+esac
 case "${CASE_DETAIL}" in *"hiding detected"*) ok "hidden-object detail names hiding" ;; *) bad "hidden-object wording: ${CASE_DETAIL}" ;; esac
 fixture <<JSON
 {"bucket":"pc-admin-dr",
@@ -2099,7 +2126,8 @@ esac
 fixture <<JSON
 {"bucket":"pc-admin-dr","fail_versions":"truncated-no-version-marker",
  "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
- "uploads":[]}
+ "uploads":[],
+ "versions":[{"key":"audit/20260925T135100Z-session.data.${SID}.2.json","version_id":"v-1","is_latest":true,"delete_marker":false,"ago":300}]}
 JSON
 start_mock
 run_case
@@ -2107,6 +2135,25 @@ is "truncated version list without version marker -> exit 2" "2" "${CASE_RC}"
 case "${CASE_DETAIL}" in
   *ListObjectVersions*"truncated without a key/version marker"*) ok "version-marker truncation detail is explicit" ;;
   *) bad "version-marker truncation detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","versions_ignore_prefix":true,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_HIDDEN_A}","version_id":"dm-1","is_latest":true,"delete_marker":true,"ago":120}]}
+JSON
+start_mock
+run_case
+is "prefix-ignoring server double-listing one marker -> exit 1" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=1*) ok "one hidden version is counted once across both listings" ;;
+  *) bad "dedupe count wrong: ${CASE_DETAIL}" ;;
 esac
 fixture <<JSON
 {"bucket":"pc-admin-dr","fail_versions":"denied",

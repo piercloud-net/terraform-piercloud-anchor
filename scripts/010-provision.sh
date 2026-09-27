@@ -1795,6 +1795,11 @@ def list_uploads(config, prefix):
             root = ET.fromstring(body)
         except ET.ParseError as exc:
             raise WitnessError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListMultipartUploadsResult":
+            # Same fail-closed rule as the other two listings: a parseable
+            # non-list document at HTTP 200 must not read as "no uploads".
+            raise WitnessError("ListMultipartUploads %s returned %s (expected ListMultipartUploadsResult)" % (prefix, root_name))
         truncated = False
         next_key = ""
         next_upload = ""
@@ -1820,8 +1825,10 @@ def list_uploads(config, prefix):
                 next_upload = child.text or ""
         if not truncated:
             return uploads
-        if not next_key:
-            raise WitnessError("ListMultipartUploads %s truncated without a key marker" % prefix)
+        if not next_key or not next_upload:
+            # Resuming with only the key marker skips the remaining upload ids
+            # of that key (S3 key-marker-only semantics); require both.
+            raise WitnessError("ListMultipartUploads %s truncated without a key/upload marker" % prefix)
         key_marker = next_key
         upload_marker = next_upload
     raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)

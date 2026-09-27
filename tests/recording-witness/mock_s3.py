@@ -24,6 +24,8 @@ The fixture is JSON:
       "fail": null | "list" | "all",       # list calls return HTTP 500
       "fail_objects": null | "malformed" | "error-doc" | "truncated-no-token",
       "fail_versions": null | "denied" | "malformed" | "error-doc" | "truncated-no-token",
+      "versions_ignore_prefix": true,     # optional; serve every version entry
+                                          # for any prefix (nonconformant server)
       "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
@@ -267,7 +269,8 @@ class Handler(BaseHTTPRequestHandler):
         key_marker = query.get("key-marker", [""])[0]
         version_marker = query.get("version-id-marker", [""])[0]
         matching = sorted(
-            (entry for entry in FIXTURE.get("versions", []) if entry["key"].startswith(prefix)),
+            (entry for entry in FIXTURE.get("versions", [])
+             if FIXTURE.get("versions_ignore_prefix") or entry["key"].startswith(prefix)),
             key=lambda entry: (entry["key"], entry.get("version_id", "v")),
         )
         if FIXTURE.get("fail_versions") == "truncated-no-token":
@@ -347,6 +350,14 @@ class Handler(BaseHTTPRequestHandler):
             page = matching[:PAGE_SIZE]
             truncated = True
             next_key = ""
+            next_upload = ""
+        elif FIXTURE.get("fail_uploads") == "truncated-no-upload-marker":
+            # Nonconformant server: truncated page with a key marker but no
+            # upload-id marker. Resuming key-marker-only skips the remaining
+            # upload ids of that key (S3 semantics).
+            page = matching[:PAGE_SIZE]
+            truncated = True
+            next_key = page[-1]["key"] if page else ""
             next_upload = ""
         else:
             start = 0
