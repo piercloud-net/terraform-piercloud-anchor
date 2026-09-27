@@ -124,10 +124,16 @@
 #       state is suppressed inside the renotify window, renotifies outside it,
 #       a changed finding signature pushes immediately and an unchanged one
 #       stays quiet (signatures hash stable identities only - the separate
-#       finding-signature teeth below prove age-only drift never changes one),
-#       the operator's quiet pin quiets exactly its own signature to the quiet
-#       window while any other signature keeps the default window (a malformed
-#       pin disables quieting with a bounded warning, never aborting), a
+#       finding-signature teeth below prove age-only drift never changes one
+#       and that every identity component moves it: all sequence-gap ranges,
+#       the hidden version_id, the drift key, the session-start condition),
+#       the operator's quiet pin quiets exactly its own `alert` signature to
+#       the quiet window while any other signature keeps the default window
+#       (a malformed pin - including a trailing newline - disables quieting
+#       with a bounded warning, never aborting or echoing; an out-of-range
+#       window falls back to the default; the fixed error signature is never
+#       quieted), a failed push never advances `last_notify_signature` while a
+#       landed push does, a
 #       failed recovery push is retried on the next green run until it lands
 #       (the retry boundary is the per-run identity, so a same-second
 #       transition still retries), a stored last-notify epoch in the future
@@ -164,7 +170,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=455
+MIN_CHECKS=469
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -733,6 +739,43 @@ if [ "${gap_elapsed}" -le 15 ]; then
   ok "30 seq gaps complete without materialising the range (${gap_elapsed}s)"
 else
   bad "30 seq gaps took ${gap_elapsed}s (renderer may be materialising)"
+fi
+sig_capped_a="$(state_field signature)"
+# Red-team finding (PR #148): the identity must cover ALL missing ranges, not
+# only the 20 the detail renderer caps at. Fixture B keeps the same first 20
+# missing ranges (an identical detail render) and a different 21st+ remainder
+# -> the signature must move. Pre-fix both hashed the capped render, so the
+# tooth fails on the old code.
+python3 - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from shipper_keys import audit_key
+
+sid = sys.argv[2]
+objects = [
+    {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+    {"key": "audit/20260925T135000Z-session.start.%s.0.shell.json" % sid, "ago": 300},
+]
+# Missing odds 1..39 (the same first 20 single-value ranges as fixture A),
+# then odds 41..59 present: the remainder is now evens 42..60 instead of
+# 41,43,...,59.
+for seq in range(2, 41, 2):
+    objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq), "ago": 299})
+for seq in range(41, 60, 2):
+    objects.append({"key": audit_key("session.data", "20260925T135200Z", sid, seq), "ago": 298})
+objects.append({"key": audit_key("session.end", "20260925T135300Z", sid, 61, "shell"), "ago": 297})
+objects.append({"key": "recordings/%s.tar" % sid, "ago": 296})
+print(json.dumps({"bucket": "pc-admin-dr", "objects": objects, "uploads": []}))
+PY
+start_mock
+run_case
+is "capped-remainder gap fixture -> alert" "alert" "${CASE_STATE}"
+if [ -n "${sig_capped_a}" ] && [ "${sig_capped_a}" != "$(state_field signature)" ]; then
+  ok "sequence-gap identity covers ranges beyond the capped detail render"
+else
+  bad "sequence-gap identity ignored the capped remainder (signatures equal)"
 fi
 
 # ---- cross-repo: session mode markers (exec sessions ship no tar) --------
@@ -2488,6 +2531,165 @@ if [ -n "${sig_drift_a}" ] && [ "${sig_drift_a}" != "${sig_drift_b}" ]; then
 else
   bad "drift key identity did not enter the signature (${sig_drift_a} vs ${sig_drift_b})"
 fi
+# The hidden identity covers key AND version_id: the same key under a
+# different version id is a different marker set and must move it.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[{"key":"${K_HIDDEN_A}","version_id":"dm-ver-A","is_latest":true,"delete_marker":true,"ago":120}]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+sig_ver_a="$(state_field signature)"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[{"key":"${K_HIDDEN_A}","version_id":"dm-ver-B","is_latest":true,"delete_marker":true,"ago":120}]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+if [ -n "${sig_ver_a}" ] && [ "${sig_ver_a}" != "$(state_field signature)" ]; then
+  ok "hidden identity covers version_id (same key, different version)"
+else
+  bad "hidden identity ignored version_id (${sig_ver_a})"
+fi
+# Age-only drift for the remaining age-bearing classes: the displayed detail
+# (which carries the age) changes, the signature must not.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":2000},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1900},
+  {"key":"recordings/${SID}.tar","ago":1000}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+sig_end_a="$(state_field signature)"
+detail_end_a="${CASE_DETAIL}"
+is "completed tar without session.end -> alert" "alert" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":2000},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":1900},
+  {"key":"recordings/${SID}.tar","ago":2000}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+if [ -n "${sig_end_a}" ] && [ "${sig_end_a}" = "$(state_field signature)" ]; then
+  ok "age-only session-end-missing drift keeps the signature identical"
+else
+  bad "session-end-missing age drift changed the signature (${sig_end_a})"
+fi
+if [ "${detail_end_a}" != "${CASE_DETAIL}" ]; then
+  ok "session-end-missing age drift still shows in the detail (the tooth discriminates)"
+else
+  bad "session-end-missing detail did not carry the age: ${detail_end_a}"
+fi
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":4000},
+  {"key":"audit/20260925T135100Z-session.end.${SID}.2.shell.json","ago":1000}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-cl-1","ago":3000}]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+sig_cl_a="$(state_field signature)"
+detail_cl_a="${CASE_DETAIL}"
+is "old session.end upload -> alert" "alert" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":4000},
+  {"key":"audit/20260925T135100Z-session.end.${SID}.2.shell.json","ago":2000}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-cl-2","ago":3000}]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+if [ -n "${sig_cl_a}" ] && [ "${sig_cl_a}" = "$(state_field signature)" ]; then
+  ok "age-only completer-lag drift keeps the signature identical"
+else
+  bad "completer-lag age drift changed the signature (${sig_cl_a})"
+fi
+if [ "${detail_cl_a}" != "${CASE_DETAIL}" ]; then
+  ok "completer-lag age drift still shows in the detail (the tooth discriminates)"
+else
+  bad "completer-lag detail did not carry the age: ${detail_cl_a}"
+fi
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID2}.tar","upload_id":"u-ou-1","ago":46800}]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+sig_ou_a="$(state_field signature)"
+detail_ou_a="${CASE_DETAIL}"
+is "upload open 13h without session.end -> alert" "alert" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID2}.tar","upload_id":"u-ou-2","ago":50400}]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+if [ -n "${sig_ou_a}" ] && [ "${sig_ou_a}" = "$(state_field signature)" ]; then
+  ok "age-only open-upload-stale drift keeps the signature identical"
+else
+  bad "open-upload-stale age drift changed the signature (${sig_ou_a})"
+fi
+if [ "${detail_ou_a}" != "${CASE_DETAIL}" ]; then
+  ok "open-upload-stale age drift still shows in the detail (the tooth discriminates)"
+else
+  bad "open-upload-stale detail did not carry the age: ${detail_ou_a}"
+fi
+# The session-start-missing identity is tagged by condition: an events-without-
+# start set and an orphan-tar set for the same sid are different findings.
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.1.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.2.json","ago":298}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+sig_ss_a="$(state_field signature)"
+is "events without session.start -> alert" "alert" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"recordings/${SID}.tar","ago":1000}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${SIG_DIR}"
+if [ -n "${sig_ss_a}" ] && [ "${sig_ss_a}" != "$(state_field signature)" ]; then
+  ok "session-start-missing identity is tagged by condition (events vs orphan tar)"
+else
+  bad "session-start-missing conditions collapsed to one identity (${sig_ss_a})"
+fi
 
 # ---- (f) strictly list-only + SigV4 proof over every request -------------
 if python3 - "${REQUEST_LOG}" <<'PY'
@@ -3280,6 +3482,16 @@ spec.loader.exec_module(module)
 now = 1_800_000_000
 SIG_A = "sha256:" + "a" * 64
 SIG_B = "sha256:" + "b" * 64
+# Raw helper invariants: fixtures happen to feed sorted inputs, so pin order
+# independence directly, and pin the state entering the digest.
+if module.identity_digest(["b", "a"]) != module.identity_digest(["a", "b"]):
+    raise SystemExit("identity_digest must be order-independent")
+if module.finding_signature("alert", ["z", "a"]) != module.finding_signature("alert", ["a", "z"]):
+    raise SystemExit("finding_signature must be order-independent")
+if module.finding_signature("alert", []) == module.finding_signature("ok", []):
+    raise SystemExit("the state must enter the finding signature")
+if module.finding_signature("error", []) == module.finding_signature("ok", []):
+    raise SystemExit("the state must enter the finding signature")
 for label, actual, expected in [
     ("first non-green pushes", module.should_notify(None, 0, "alert", now, 1800), True),
     ("repeat inside window suppresses", module.should_notify("alert", now - 100, "alert", now, 1800), False),
@@ -3320,9 +3532,64 @@ for label, actual, expected in [
      module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), True),
     ("an empty signature skips the change-trigger",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, "", "", "", 86400), False),
+    ("the fixed error digest is never quieted",
+     module.should_notify("error", now - 1800, "error", now, 1800, 0, 0,
+                          module.finding_signature("error", []),
+                          module.finding_signature("error", []),
+                          module.finding_signature("error", []), 86400), True),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
+
+# Config defaults, bounds and pin validation are behavior, not decoration.
+# The six required values are set for these checks only, then restored.
+config_env = {
+    "RECORDING_WITNESS_ENDPOINT": "http://127.0.0.1:9",
+    "RECORDING_WITNESS_BUCKET": "pc-admin-dr",
+    "RECORDING_WITNESS_AUDIT_PREFIX": "audit/",
+    "RECORDING_WITNESS_RECORDINGS_PREFIX": "recordings/",
+    "RECORDING_WITNESS_KEY_ID": "k",
+    "RECORDING_WITNESS_KEY": "s",
+}
+config_knobs = ["RECORDING_WITNESS_RENOTIFY_SECONDS", "RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS",
+                "RECORDING_WITNESS_QUIET_SIGNATURE"]
+saved_env = {name: os.environ.get(name) for name in list(config_env) + config_knobs}
+os.environ.update(config_env)
+for name in config_knobs:
+    os.environ.pop(name, None)
+config = module.Config()
+if config.renotify != 1800 or config.quiet_renotify != 86400:
+    raise SystemExit("window defaults wrong: %r %r" % (config.renotify, config.quiet_renotify))
+config_logs = []
+real_log = module.log
+module.log = config_logs.append
+os.environ["RECORDING_WITNESS_RENOTIFY_SECONDS"] = "0"
+if module.Config().renotify != 1800:
+    raise SystemExit("an out-of-range renotify window must fall back to the default")
+os.environ["RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"] = "999999999"
+if module.Config().quiet_renotify != 86400:
+    raise SystemExit("an out-of-range quiet window must fall back to the default")
+os.environ.pop("RECORDING_WITNESS_RENOTIFY_SECONDS")
+os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS")
+if not any("outside [60, 7776000]" in entry for entry in config_logs):
+    raise SystemExit("an out-of-range window must warn")
+# Python's `$` also matches before a trailing newline: a full-string match is
+# what keeps a newline-suffixed pin from being accepted-but-never-matching.
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A + "\n"
+config = module.Config()
+if config.quiet_signature:
+    raise SystemExit("a trailing-newline pin must not validate")
+if not any("quiet signature is malformed" in entry for entry in config_logs):
+    raise SystemExit("a malformed pin must warn")
+if any(SIG_A in entry for entry in config_logs):
+    raise SystemExit("the malformed-pin warning must not echo the value")
+os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE")
+module.log = real_log
+for name, value in saved_env.items():
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 captured = []
 
@@ -3583,6 +3850,9 @@ record = json.load(open(state_path))
 record["last_notify_epoch"] = 1
 json.dump(record, open(state_path, "w"))
 verdict[0] = "ok"
+# A failed push must not advance last_notify_signature either: move the
+# signature first, so a mutation that advances it unconditionally is caught.
+sig[:] = ["sha256:" + "9" * 64]
 flaky["fail"] = True
 codes.append(module.main())  # recovery transition: push attempted, fails
 if len(captured) != 3:
@@ -3590,12 +3860,15 @@ if len(captured) != 3:
 record = json.load(open(state_path))
 if (record["state"] != "ok"
         or int(record.get("state_since_run") or 0) <= int(record.get("last_notify_run") or 0)
-        or record.get("last_notify_epoch") != 1):
-    raise SystemExit("failed recovery must record the ok transition (state_since_run > last_notify_run) without advancing last_notify_epoch: %r" % record)
+        or record.get("last_notify_epoch") != 1
+        or record.get("last_notify_signature") == sig[0]):
+    raise SystemExit("failed recovery must record the ok transition (state_since_run > last_notify_run) without advancing last_notify_epoch/last_notify_signature: %r" % record)
 flaky["fail"] = False
 codes.append(module.main())  # next green run retries the recovery push
 if len(captured) != 4:
     raise SystemExit("failed recovery must retry on the next green run, got %d" % len(captured))
+if json.load(open(state_path)).get("last_notify_signature") != sig[0]:
+    raise SystemExit("the landed recovery retry must advance last_notify_signature")
 if captured[-1].headers.get("Tags") != "white_check_mark":
     raise SystemExit("recovery retry must carry the ok tag: %r" % captured[-1].headers)
 record = json.load(open(state_path))
@@ -3810,8 +4083,10 @@ for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING
   fi
 done
 # The optional cadence knobs are public variables, not secrets, but a
-# dispatch that drops them would silently pin/quiet nothing - keep the wiring
-# asserted like the six required names above.
+# dispatch that drops them would silently pin/quiet nothing. The provision.yml
+# names are grepped; 020's pass-through is EXECUTED (the real ENV_PREFIX line,
+# evaluated with sentinels) so a regression to an empty assignment cannot stay
+# green behind a name grep.
 for witness_var in RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS \
                    RECORDING_WITNESS_QUIET_SIGNATURE; do
   if grep -q "$witness_var" "${ROOT}/.github/workflows/provision.yml"; then
@@ -3819,12 +4094,20 @@ for witness_var in RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RE
   else
     bad "provision.yml lost $witness_var (quiet cadence would never reach the box)"
   fi
-  if grep -q "$witness_var" "${ROOT}/.github/scripts/020-provision-anchor.sh"; then
-    ok "020 env prefix carries $witness_var"
-  else
-    bad "020 env prefix lost $witness_var (quiet cadence would never reach the box)"
-  fi
 done
+q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
+export TENANT_USER="tenant-sentinel" ANCHOR_HOSTNAME="anchor-sentinel" STATUS_HOST="status-sentinel" \
+  GATUS_ENDPOINTS="" NTFY_TOPIC="" NTFY_TOKEN="" ORIGIN_CA_CERT_PEM="" CF_AOP_CA_PEM="" \
+  RECORDING_WITNESS_ENDPOINT="endpoint-sentinel" RECORDING_WITNESS_BUCKET="bucket-sentinel" \
+  RECORDING_WITNESS_AUDIT_PREFIX="audit/" RECORDING_WITNESS_RECORDINGS_PREFIX="recordings/" \
+  RECORDING_WITNESS_KEY_ID="keyid-sentinel" RECORDING_WITNESS_KEY="key-sentinel" \
+  RECORDING_WITNESS_RENOTIFY_SECONDS="2400" RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS="172800" \
+  RECORDING_WITNESS_QUIET_SIGNATURE="${SIGNATURE_SEED}"
+eval "$(sed -n 's/^  \(ENV_PREFIX=.*\)$/\1/p' "${ROOT}/.github/scripts/020-provision-anchor.sh")"
+eval "$ENV_PREFIX"
+is "020 ENV_PREFIX passes the renotify window through" "2400" "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}"
+is "020 ENV_PREFIX passes the quiet window through" "172800" "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}"
+is "020 ENV_PREFIX passes the quiet signature through" "${SIGNATURE_SEED}" "${RECORDING_WITNESS_QUIET_SIGNATURE:-}"
 if grep -q 'tests/recording-witness/run-test.sh' "${ROOT}/.github/workflows/ci.yml"; then
   ok "ci.yml runs the recording-witness harness"
 else

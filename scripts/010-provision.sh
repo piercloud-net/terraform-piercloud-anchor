@@ -1484,8 +1484,10 @@ SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
 # canonicalize the type and count the (ts, type, seq) identity once per session.
 CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}$")
 # The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): a finding
-# signature exactly as emitted in state.json. Exact match only.
-QUIET_SIGNATURE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# signature exactly as emitted in state.json. \A/\Z is a FULL-string match -
+# Python's `$` also matches before a trailing newline, which would accept a
+# pin that can never equal a real signature and silently disable quieting.
+QUIET_SIGNATURE_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 
 
 def canonical_conflict_type(event_type):
@@ -1511,6 +1513,20 @@ def env_int(name, default):
         return int(raw)
     except ValueError:
         raise WitnessError("%s must be an integer, got %r" % (name, raw))
+
+
+def env_window(name, default):
+    """Notification window seconds in [60, 90 days]; out of range warns + default.
+
+    A cadence typo must neither flood (0/negative -> notify on every run) nor
+    silently freeze reminders (absurd values), and must not take the witness
+    down (the detector keeps running with the default cadence).
+    """
+    value = env_int(name, default)
+    if not 60 <= value <= 90 * 86400:
+        log("WARNING: %s=%d is outside [60, 7776000]; using the default %d" % (name, value, default))
+        return default
+    return value
 
 
 def log(message):
@@ -1600,8 +1616,8 @@ class Config(object):
         self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
         self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
         self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
-        self.renotify = env_int("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
-        self.quiet_renotify = env_int("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
+        self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
+        self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
         if self.quiet_signature and not QUIET_SIGNATURE_RE.match(self.quiet_signature):
             # Same posture as a bad ntfy token: skip the optional behavior
@@ -2123,7 +2139,7 @@ def run_checks(config, now):
                 "session-start-missing: session %s has %d audit event(s) but no session.start"
                 % (sid, len(state["seqs"]))
             )
-            finding_ids.append("session-start-missing:" + sid)
+            finding_ids.append("session-start-missing:events:" + sid)
             continue
         # session.end is authoritative for the exec/shell split: live Teleport
         # v18 emits `interactive` on the end event only (the start key reads
@@ -2202,7 +2218,7 @@ def run_checks(config, now):
                 "session-start-missing: %s completed %ds ago but session %s has no audit events at all "
                 "(no session.start; grace %ds)" % (key, completed_age, sid, config.completer_lag)
             )
-            finding_ids.append("session-start-missing:" + sid)
+            finding_ids.append("session-start-missing:orphan-tar:" + sid)
 
     for sid in sorted(sessions):
         seqs = sessions[sid]["seqs"]
@@ -2239,7 +2255,13 @@ def run_checks(config, now):
                 "sequence-gap: session %s missing <seq> %s"
                 % (sid, ",".join(rendered))
             )
-            finding_ids.append("sequence-gap:%s:%s" % (sid, ",".join(rendered)))
+            # Identity from ALL missing ranges: the detail render caps at 20
+            # ranges + ellipsis, and hashing the capped render would let a gap
+            # appearing beyond range 20 ride a quiet pin unchanged.
+            finding_ids.append(
+                "sequence-gap:%s:%s"
+                % (sid, identity_digest("%d-%d" % (start, stop) for start, stop in missing_ranges))
+            )
 
     for upload in uploads:
         key = upload["key"]
@@ -2475,9 +2497,12 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     changed (a new hidden marker, drift key or session alert is new
     information no matter how recently the previous push landed). An
     unchanged non-green state re-notifies every `renotify` window - or every
-    `quiet_renotify` window while the current signature equals the operator's
-    quiet pin, so a pinned known finding set reminds daily instead of every
-    30 minutes, and any signature change leaves the pin behind automatically.
+    `quiet_renotify` window while an `alert` state's signature equals the
+    operator's quiet pin, so a pinned known finding set reminds daily instead
+    of every 30 minutes, and any signature change leaves the pin behind
+    automatically. The quiet pin applies to `alert` finding sets only: the
+    fixed `error`/`ok` signatures are never quieted, so a new failure cause
+    always keeps the default cadence.
 
     Green pushes on the non-green -> ok recovery; a recovery push that failed
     is retried while the current ok state began after the last successful
@@ -2506,7 +2531,7 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
         # The finding set itself changed: push regardless of the window.
         return True
     window = renotify
-    if quiet_signature and signature == quiet_signature:
+    if state == "alert" and quiet_signature and signature == quiet_signature:
         window = quiet_renotify
     return now_epoch - last_epoch >= int(window)
 
