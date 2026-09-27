@@ -1339,7 +1339,7 @@ fi
 # Recording-completeness witness — optional component, dormant without env.
 # Renders /usr/local/sbin/pc-recording-witness.sh + its 0600 env file + a
 # 5-minute systemd timer. The witness is STRICTLY list-only (ListObjectsV2 +
-# ListObjectVersions + ListMultipartUploads with a listFiles+listFileVersions
+# ListObjectVersions + ListMultipartUploads with a listFiles application key (B2 has no separate version-listing capability)
 # B2 application key: no readFiles, no HEAD, no ListParts) and fail-closed (an
 # un-runnable witness reports
 # `error`; the last baseline is held). Design, key contract and checks:
@@ -1420,7 +1420,7 @@ exec python3 - <<'RECORDING_WITNESS_PY_EOF'
 """List-only recording-completeness witness (B2 S3 metadata).
 
 Strictly list-only: ListObjectsV2 + ListObjectVersions + ListMultipartUploads
-with a listFiles+listFileVersions application key. Never reads an object (no
+with a listFiles application key (object, version and multipart listings). Never reads an object (no
 GET/HEAD) and never calls the writeFiles-gated ListParts. Fail-closed: any
 failure to run reports state
 `error`, exits 2, and never advances the last good baseline (an unreadable or

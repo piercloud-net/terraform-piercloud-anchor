@@ -83,7 +83,7 @@
 #       at state.json.tmp/verdict.log are never followed or reused into a
 #       victim; malformed XML, an S3 error document and a truncated list
 #       without a continuation token all error; a denied (403, missing
-#       listFileVersions), malformed or truncated version listing errors too;
+#       listFiles), malformed or truncated version listing errors too;
 #   (f) strictly list-only: every request the witness makes is a signed GET
 #       list call (ListObjectsV2 / ListObjectVersions / ListMultipartUploads)
 #       — no HEAD, no object GET, no ListParts, no write; pagination is
@@ -2071,7 +2071,7 @@ fixture <<JSON
 JSON
 start_mock
 run_case
-is "denied version listing (no listFileVersions) -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "denied version listing (403) -> exit 2 (fail-closed)" "2" "${CASE_RC}"
 is "denied version listing -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in
   *ListObjectVersions*403*) ok "denied version listing detail names the call + status" ;;
