@@ -90,7 +90,15 @@
 #       alerting witness too, so the run maps the paired rc/ExecMainStatus
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
-#       InvocationID did not advance) or when state.json's per-run identity
+#       InvocationID did not advance); the timer's immediate first fire on a
+#       long-up box (issue #143) is drained (bounded, 100 polls) before the
+#       capture and retried exactly once if a start still merged with it, so a
+#       merged timer-triggered invocation is never mis-filed as a stale start
+#       (a merged write followed by a failed retry write dies on the
+#       re-anchored run_seq baseline, and a unit that never drains dies at the
+#       bound with zero starts on the pre-start drain — the retry-path drain
+#       can fire after the merged start, fail-closed either way); the
+#       run also dies when state.json's per-run identity
 #       (run_seq) did not advance this invocation (a failed state write, or a
 #       start that left the previous verdict) — run identity, not the
 #       second-resolution updated_at, so a genuine same-second run counts; an
@@ -2078,15 +2086,31 @@ case "$1" in
   start)
     # Type=oneshot realism: start fails whenever the main process exits
     # non-zero. FAKE_START_RC models a start that wedges before ExecStart:
-    # no new invocation and no state write. Otherwise the invocation counter
-    # advances and (unless FAKE_NO_STATE_WRITE=1) state.json gets a new
-    # per-run identity (run_seq) plus a fresh updated_at, exactly like a real
-    # witness run.
+    # no new invocation and no state write. FAKE_MERGE_FIRST_START models the
+    # issue #143 race: the first start merges with a timer-triggered
+    # invocation that was already running — that in-flight (real) run writes
+    # state.json, but InvocationID does not advance; the retry start does.
+    # Otherwise the invocation counter advances and (unless
+    # FAKE_NO_STATE_WRITE=1) state.json gets a new per-run identity (run_seq)
+    # plus a fresh updated_at, exactly like a real witness run.
+    start_count=0
+    if [ -n "${FAKE_START_COUNT_FILE:-}" ]; then
+      start_count="$(cat "${FAKE_START_COUNT_FILE}" 2>/dev/null || echo 0)"
+      start_count=$((start_count + 1))
+      printf '%s\n' "${start_count}" >"${FAKE_START_COUNT_FILE}"
+    fi
     if [ -n "${FAKE_START_RC:-}" ]; then exit "${FAKE_START_RC}"; fi
-    if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ]; then
+    merged=0
+    if [ "${FAKE_MERGE_FIRST_START:-0}" = "1" ] && [ "${start_count}" = "1" ]; then merged=1; fi
+    if [ "${FAKE_NO_INVOCATION_BUMP:-0}" != "1" ] && [ "${merged}" != "1" ]; then
       printf 'inv-%s-%s\n' "$$" "${RANDOM}" >"${FAKE_INVOCATION_FILE}"
     fi
-    if [ "${FAKE_NO_STATE_WRITE:-0}" != "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
+    # FAKE_RETRY_NO_STATE_WRITE=1 models a retry whose own state write fails:
+    # the merged first start writes its record, the second (retry) start does not.
+    write_state=1
+    if [ "${FAKE_NO_STATE_WRITE:-0}" = "1" ]; then write_state=0; fi
+    if [ "${FAKE_RETRY_NO_STATE_WRITE:-0}" = "1" ] && [ "${start_count}" -ge 2 ]; then write_state=0; fi
+    if [ "${write_state}" = "1" ] && [ -f "${FAKE_STATE_FILE:-/dev/null}" ]; then
       python3 - "${FAKE_STATE_FILE}" "${FAKE_NEW_UPDATED_AT:-}" "${FAKE_INVOCATION_FILE:-}" "${FAKE_REPAIR_STATE:-0}" "${FAKE_REPAIR_VERDICT:-error}" "${FAKE_REPAIR_RUN_SEQ:-}" <<'PYSTATE'
 import datetime
 import json
@@ -2125,6 +2149,36 @@ PYSTATE
   show)
     case "${prop}" in
       InvocationID) cat "${FAKE_INVOCATION_FILE}" 2>/dev/null || true ;;
+      ActiveState)
+        # FAKE_ACTIVE_POLL_FILE, when set, counts every ActiveState poll
+        # (the bounded-drain teeth assert the poll count). With
+        # FAKE_SERVICE_ACTIVE_POLLS=N the unit is still running for the first
+        # N-1 polls and drained from poll N on (the issue #143 in-flight
+        # timer invocation); the default is drained.
+        seen=0
+        if [ -n "${FAKE_ACTIVE_POLL_FILE:-}" ]; then
+          seen="$(cat "${FAKE_ACTIVE_POLL_FILE}" 2>/dev/null || echo 0)"
+          seen=$((seen + 1))
+          printf '%s\n' "${seen}" >"${FAKE_ACTIVE_POLL_FILE}"
+        fi
+        if [ -n "${FAKE_ACTIVE_POLL_SLEEP_FILE:-}" ]; then
+          # Issue #143 red-team F1: record the sleep count observed at this
+          # poll, so the bounded-drain tooth can pin the poll->sleep
+          # interleaving (the volume counters alone stay green when the
+          # sleeps are moved out of the poll body).
+          sleep_seen=0
+          if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ] && [ -f "${FAKE_SLEEP_COUNT_FILE}" ]; then
+            sleep_seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
+          fi
+          printf '%s\n' "${sleep_seen}" >>"${FAKE_ACTIVE_POLL_SLEEP_FILE}"
+        fi
+        polls="${FAKE_SERVICE_ACTIVE_POLLS:-0}"
+        if [ "${polls}" -gt 0 ] 2>/dev/null && [ "${seen}" -lt "${polls}" ]; then
+          printf 'active\n'
+          exit 0
+        fi
+        printf '%s\n' "${FAKE_ACTIVE_STATE:-inactive}"
+        ;;
       *) printf '%s\n' "${FAKE_EXEC_STATUS:-0}" ;;
     esac
     exit 0 ;;
@@ -2132,6 +2186,25 @@ esac
 exit 0
 FAKE
 chmod +x "${FAKEBIN}/systemctl"
+# The drain-bound tooth drives all 100 wait-idle polls; FAKE_SLEEP_NOWAIT
+# removes the wall-clock cost while keeping the iteration count (and with it
+# the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
+# the sleep count and its argument (`sleep 1`) so a bound regression that
+# keeps the poll count (a deleted `sleep 1`, a shorter sleep, fewer iterations
+# with an early break) still fails. Every other test sleeps for real.
+cat >"${FAKEBIN}/sleep" <<'FAKESLEEP'
+#!/usr/bin/env bash
+if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ]; then
+  seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
+  printf '%s\n' "$((seen + 1))" >"${FAKE_SLEEP_COUNT_FILE}"
+fi
+if [ -n "${FAKE_SLEEP_ARGS_FILE:-}" ]; then
+  printf '%s\n' "${1:-}" >>"${FAKE_SLEEP_ARGS_FILE}"
+fi
+if [ "${FAKE_SLEEP_NOWAIT:-0}" = "1" ]; then exit 0; fi
+exec /bin/sleep "$@"
+FAKESLEEP
+chmod +x "${FAKEBIN}/sleep"
 export FAKE_SYSTEMCTL_LOG="${WORK}/systemctl.log"
 export PATH="${FAKEBIN}:${PATH}"
 
@@ -2196,7 +2269,9 @@ export RECORDING_WITNESS_STATE_DIR="${WORK}/state"
 export FAKE_STATE_FILE="${WORK}/state/state.json"
 export FAKE_INVOCATION_FILE="${WORK}/fake-invocation"
 printf 'inv-seed\n' >"${FAKE_INVOCATION_FILE}"
-unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT \
+      FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE FAKE_START_COUNT_FILE FAKE_SERVICE_ACTIVE_POLLS \
+      FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_STATE FAKE_SLEEP_NOWAIT FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE
 seed_state() { # $1 = state, $2 = updated_at (wall clock), $3 = run_seq (default 41)
   printf '{"version":2,"state":"%s","detail":"sessions=1 uploads=0 audit_objects=3 recordings_objects=1 heartbeat_age=45s recording recordings/%s.tar session %s","updated_at":"%s","run_seq":%s,"last_notify_epoch":0}\n' \
     "$1" "${SID}" "${SID}" "$2" "${3:-41}" >"${WORK}/state/state.json"
@@ -2300,6 +2375,195 @@ case "${runonce_out}" in
   *"witness verdict: ALERT"*) bad "run-once reported the previous ALERT as current after a wedged start" ;;
   *) ok "run-once never reports the previous verdict after a wedged start" ;;
 esac
+
+# Issue #143: on a long-up box the witness timer fires its service as soon as
+# the timer is enabled, so a fresh install (or a reinstall whose timer is
+# already running) can find that timer-triggered invocation in flight when
+# run-once reads the unit. Its own `systemctl start` then merges with the
+# in-flight job: the merged start returns the in-flight run's result and
+# InvocationID does NOT advance, even though that run wrote a perfectly valid
+# state.json. The acceptance must drain the unit, retry exactly once (the
+# merged run's write becoming the new run_seq baseline), and read the retry
+# invocation's verdict — not refuse the valid record and not read the merged
+# run's record as this run's.
+seed_state ok "$(fresh_stamp)" 41
+printf 'inv-inflight-143\n' >"${FAKE_INVOCATION_FILE}"
+printf '0\n' >"${WORK}/start-count"
+export FAKE_MERGE_FIRST_START=1 FAKE_START_COUNT_FILE="${WORK}/start-count"
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+export FAKE_EXEC_STATUS=0
+unset FAKE_SERVICE_ACTIVE_POLLS FAKE_ACTIVE_POLL_FILE
+run_once_call
+is "run-once: merged timer invocation + bounded retry reaches a verdict (issue #143)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once retries the merged start and reads a trustworthy verdict" ;;
+  *) bad "run-once merged-start output: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"new invocation"*) bad "run-once refused the merged timer invocation as a wedged start" ;;
+  *) ok "run-once does not mis-file the merged timer invocation as a wedged start" ;;
+esac
+is "run-once: merged start was followed by exactly one retry" "2" "$(cat "${WORK}/start-count")"
+merged_invocation="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("invocation", ""))' "${WORK}/state/state.json")"
+if [ -n "${merged_invocation}" ] && [ "${merged_invocation}" != "inv-inflight-143" ]; then
+  ok "run-once verdict belongs to the retry invocation, not the merged in-flight run"
+else
+  bad "run-once read the merged in-flight run's record (invocation=${merged_invocation:-none})"
+fi
+unset FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE
+
+# Harness tooth for the retry re-anchor (red-team LOW / functional NIT-1):
+# the merged first start writes a valid record (run_seq 41 -> 42) but the
+# retry's OWN write fails. With the re-anchor, the merged record is the new
+# baseline and the missing retry write must die on it (42 == 42). Without the
+# re-anchor the stale baseline (41) makes the merged record look advanced, so
+# the acceptance reads the merged invocation's verdict as this run's (rc=0,
+# invocation=inv-inflight-143). Deleting the re-anchor line must fail this.
+seed_state ok "$(fresh_stamp)" 41
+printf 'inv-inflight-143\n' >"${FAKE_INVOCATION_FILE}"
+printf '0\n' >"${WORK}/retry-fail-count"
+export FAKE_MERGE_FIRST_START=1 FAKE_START_COUNT_FILE="${WORK}/retry-fail-count" FAKE_RETRY_NO_STATE_WRITE=1
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT FAKE_SERVICE_ACTIVE_POLLS FAKE_ACTIVE_POLL_FILE
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: merged write + failed retry write dies on the re-anchored baseline" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"did not advance (run_seq=42, before=42"*) ok "run-once re-anchored the retry baseline to the merged run's write" ;;
+  *) bad "run-once did not re-anchor the retry baseline: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"witness verdict: OK"*) bad "run-once accepted the merged record after the retry's write failed" ;;
+  *) ok "run-once never reports the merged record as the retry's verdict" ;;
+esac
+unset FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE FAKE_START_COUNT_FILE
+
+# Issue #143 (drain leg): a reinstall can catch a timer-triggered invocation
+# already running. run-once must wait (bounded) for the unit to go inactive
+# BEFORE it reads InvocationID, so its own start cannot merge with the
+# in-flight job at all. The fake reports the unit active for one poll and
+# drained from the second poll on; the fix must poll it out before starting.
+seed_state ok "$(fresh_stamp)" 51
+printf '0\n' >"${WORK}/active-polls"
+export FAKE_ACTIVE_POLL_FILE="${WORK}/active-polls" FAKE_SERVICE_ACTIVE_POLLS=2
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_NEW_UPDATED_AT
+export FAKE_EXEC_STATUS=0
+unset FAKE_MERGE_FIRST_START FAKE_START_COUNT_FILE
+run_once_call
+is "run-once: in-flight invocation is drained before the start (issue #143)" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness verdict: OK"*) ok "run-once waits out the in-flight timer invocation, then reads the verdict" ;;
+  *) bad "run-once drain output: ${runonce_out}" ;;
+esac
+is "run-once: drained the unit (active poll then inactive) before starting" "2" "$(cat "${WORK}/active-polls")"
+unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
+
+# Retry/drain bound (red-team INFO-2): a unit that never reports drained must
+# die fail-closed at the bounded 100-poll wait BEFORE any `systemctl start` —
+# zero starts for this pre-start drain, never a start-then-retry loop (the
+# retry-path drain can fire after a merged start already ran — fail-closed
+# either way). FAKE_SLEEP_NOWAIT keeps the 100 iterations but removes their
+# wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
+# FAKE_ACTIVE_POLL_FILE pins the iteration count (100 loop polls + the final
+# ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
+# the sleeps (100) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
+# bound regression fails whether it changes the poll count, the sleep count
+# or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
+# break) instead of shipping with a stale "100s" message. The count/arg
+# teeth pin volume, not the shape: FAKE_ACTIVE_POLL_SLEEP_FILE records the
+# sleep count observed at every poll so the interleaving tooth (poll N must
+# see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
+# (a busy poll with identical counters), and two static teeth pin the
+# executed drain sleep (the last statement before the loop's `done` must be
+# a foreground `sleep 1` — catches a backgrounded or shortened sleep — and
+# no `sleep` function may shadow it). A regression that
+# starts before the drain, or retries beyond the bound, moves the start
+# counter off 0; one that loops without the bound hangs this check instead of
+# failing it.
+seed_state ok "$(fresh_stamp)" 61
+printf '0\n' >"${WORK}/no-drain-start-count"
+printf '0\n' >"${WORK}/no-drain-polls"
+printf '0\n' >"${WORK}/no-drain-sleeps"
+: >"${WORK}/no-drain-sleep-args"
+: >"${WORK}/no-drain-poll-sleeps"
+export FAKE_ACTIVE_STATE=active FAKE_START_COUNT_FILE="${WORK}/no-drain-start-count" FAKE_ACTIVE_POLL_FILE="${WORK}/no-drain-polls" FAKE_SLEEP_COUNT_FILE="${WORK}/no-drain-sleeps" FAKE_SLEEP_ARGS_FILE="${WORK}/no-drain-sleep-args" FAKE_ACTIVE_POLL_SLEEP_FILE="${WORK}/no-drain-poll-sleeps" FAKE_SLEEP_NOWAIT=1
+unset FAKE_START_RC FAKE_NO_INVOCATION_BUMP FAKE_NO_STATE_WRITE FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once: a unit that never drains dies fail-closed (issue #143)" "1" "${runonce_rc}"
+case "${runonce_out}" in
+  *"did not drain within 100s"*) ok "run-once names the bounded drain failure" ;;
+  *) bad "run-once non-drain output: ${runonce_out}" ;;
+esac
+is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
+is "run-once: a non-draining unit polls the bounded 100-iteration wait (100 + the final read)" "101" "$(cat "${WORK}/no-drain-polls")"
+is "run-once: a non-draining unit sleeps the bounded 100 iterations" "100" "$(cat "${WORK}/no-drain-sleeps")"
+is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
+# Issue #143 red-team F1: poll N must observe N-1 sleeps (0..100 for the
+# shipped loop; the die path's final ActiveState read is poll 101). Moving
+# the sleeps out of the poll body keeps every volume counter green but
+# collapses the bounded wait to a busy poll — this fails it.
+if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
+  ok "run-once: every drain poll is separated by the preceding sleep (issue #143)"
+else
+  bad "run-once: drain polls and sleeps are not interleaved (issue #143): $(tr '\n' ' ' <"${WORK}/no-drain-poll-sleeps")"
+fi
+# Issue #143 red-team F2 (+ rounds 4-6 F1): counters cannot prove the sleep
+# blocks — a backgrounded `sleep 1 &` keeps them all green while the bounded
+# wait stops waiting, and a bare `sleep 1` elsewhere keeps a presence-only
+# tooth green while the executed loop sleep is shortened (`timeout 0.5 sleep
+# 1`) or shadowed by a `sleep` function. Pin the executed line: the drain
+# loop (the `for ((attempt...))` header) must end — at depth 0, so nested
+# decoy loops cannot latch — in a foreground `sleep 1` (a trailing comment is
+# fine); and no `sleep` function may exist in plain code (`sleep()` or
+# `function sleep`, same-line or brace-on-next-line; comments and quoted
+# spans ignored). Residual (intentional-crafting class, disclosed): `eval`/
+# `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
+# forms are not detected (fail-closed by design).
+if awk '
+  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*100;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
+    seen_loop = 1; in_loop = 1; depth = 0; prev = ""; next
+  }
+  in_loop {
+    if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
+    if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) {
+      if (depth == 0) { loop_prev = prev; in_loop = 0; next }
+      depth--
+      prev = $0
+      next
+    }
+    if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
+    prev = $0
+  }
+  END { exit (seen_loop && loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1 }
+' "${PROVISION}"; then
+  ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
+else
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
+fi
+if awk -v q="'" '
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
+    sub(/[[:space:]]#.*$/, "", line)
+    if (line ~ /^[[:space:]]*$/) next
+    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]+sleep([[:space:]]*\(\))?[[:space:]]*\{/) shadow = 1
+    if (line ~ /(^|[^[:alnum:]_])sleep[[:space:]]*\(\)[[:space:]]*\{/) shadow = 1
+    if (!pending && line ~ /(^|[^[:alnum:]_])(function[[:space:]]+sleep([[:space:]]*\(\))?|sleep[[:space:]]*\(\))[[:space:]]*$/) { pending = 1; next }
+    if (pending) { if (line ~ /^[[:space:]]*\{/) shadow = 1; pending = 0 }
+  }
+  END { exit shadow ? 1 : 0 }
+' "${PROVISION}"; then
+  ok "run-once: no \`sleep\` function shadows the drain sleep (issue #143)"
+else
+  bad "run-once: a \`sleep\` function shadows the drain sleep (issue #143)"
+fi
+case "${runonce_out}" in
+  *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
+  *) bad "run-once non-drain wording: ${runonce_out}" ;;
+esac
+unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_POLL_SLEEP_FILE FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE FAKE_SLEEP_NOWAIT
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.

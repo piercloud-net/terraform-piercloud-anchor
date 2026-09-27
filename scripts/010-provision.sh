@@ -2533,8 +2533,40 @@ sys.stdout.write(re.sub(
 RECORDING_WITNESS_REDACT_PY
 }
 
+recording_witness_service_drained() { # no witness invocation in flight right now?
+  local active
+  active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
+  case "${active}" in
+    ""|inactive|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation to finish
+  local attempt active
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    if recording_witness_service_drained; then
+      return 0
+    fi
+    sleep 1
+  done
+  active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
+  die "witness unit did not drain within 100s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+}
+
 recording_witness_run_once() { # run one check now and surface the verdict
   local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced
+  # Issue #143: on a long-up box the timer's OnBootSec=2min has already
+  # elapsed, so the timer fires the service as soon as it is enabled (fresh
+  # install) and a reinstall can find a timer-triggered invocation already
+  # in flight. Reading the unit while that invocation runs lets this
+  # function's `systemctl start` merge with its job: the merged start
+  # returns the in-flight run's result while InvocationID stays put, and the
+  # fail-closed gate below then refuses a perfectly valid verdict. Drain
+  # first (bounded) so the captured baseline is stable; the bounded retry
+  # after the start covers a fire that still lands between the drain and the
+  # start. If the unit will not drain, fail closed rather than guess.
+  recording_witness_wait_idle
   # Anchor freshness to THIS invocation, not to wall-clock recency: a run
   # that genuinely took longer than the old +/-300 s window must not be
   # rejected, and a wedged `systemctl start` that never executed ExecStart
@@ -2554,6 +2586,23 @@ recording_witness_run_once() { # run one check now and surface the verdict
   systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
   exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
   after_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  # Belt-and-braces for the residual race: if the start still landed on an
+  # in-flight invocation (InvocationID unchanged), a merged `systemctl start`
+  # has only returned once the shared job finished, so the unit is (or will
+  # shortly be) idle again. Retry exactly once and re-anchor the run_seq
+  # baseline to the merged run's write, so the verdict read below belongs to
+  # the retry invocation this run actually started. If InvocationID still
+  # does not advance, the unchanged check below dies exactly as before —
+  # this never accepts a stale state.
+  if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
+    log "witness start did not advance InvocationID (${after_invocation}) — the unit may have merged with an in-flight timer-triggered invocation; retrying once on the now-idle unit (issue #143)"
+    recording_witness_wait_idle
+    before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+    rc=0
+    systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
+    exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+    after_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  fi
   # Type=oneshot: the witness alert (exit 1) also makes `systemctl start`
   # non-zero. A witness run is exactly rc=0+ExecMainStatus=0 (ok),
   # rc=1+ExecMainStatus=1 (alert) or rc=1+ExecMainStatus=2 (error); anything
