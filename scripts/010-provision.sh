@@ -1694,6 +1694,11 @@ def list_objects(config, prefix):
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextContinuationToken":
                 next_token = child.text or ""
+        if not truncated and next_token:
+            # Contradictory server: a continuation token on a page that says
+            # IsTruncated=false. Follow the token instead of reading the short
+            # page as complete; the token-required guard below still applies.
+            truncated = True
         if not truncated:
             return objects
         if not next_token:
@@ -1764,6 +1769,11 @@ def list_object_versions(config, prefix):
                 next_key = child.text or ""
             elif name == "NextVersionIdMarker":
                 next_version = child.text or ""
+        if not truncated and (next_key or next_version):
+            # Contradictory server: Next* markers present while IsTruncated is
+            # false/absent. Follow them; the paired-marker guard below rejects
+            # a half-specified resume.
+            truncated = True
         if not truncated:
             return markers
         if not next_key or not next_version:
@@ -1823,6 +1833,11 @@ def list_uploads(config, prefix):
                 next_key = child.text or ""
             elif name == "NextUploadIdMarker":
                 next_upload = child.text or ""
+        if not truncated and (next_key or next_upload):
+            # Contradictory server: Next* markers present while IsTruncated is
+            # false/absent. Follow them; the paired-marker guard below rejects
+            # a half-specified resume.
+            truncated = True
         if not truncated:
             return uploads
         if not next_key or not next_upload:

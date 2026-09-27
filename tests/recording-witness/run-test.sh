@@ -158,7 +158,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=420
+MIN_CHECKS=424
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -1521,6 +1521,18 @@ is "malformed object-list XML -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *unparseable*) ok "malformed XML detail is explicit" ;; *) bad "malformed XML detail: ${CASE_DETAIL}" ;; esac
 
 fixture <<JSON
+{"bucket":"pc-admin-dr","fail_objects":"error-doc-200",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
+JSON
+start_mock
+run_case
+is "200 error document on objects -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectsV2*expected\ ListBucketResult*) ok "200 error-document objects detail names the non-list body" ;;
+  *) bad "200 error-document objects detail: ${CASE_DETAIL}" ;;
+esac
+
+fixture <<JSON
 {"bucket":"pc-admin-dr","fail_uploads":"error-doc",
  "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
 JSON
@@ -2135,6 +2147,30 @@ is "truncated version list without version marker -> exit 2" "2" "${CASE_RC}"
 case "${CASE_DETAIL}" in
   *ListObjectVersions*"truncated without a key/version marker"*) ok "version-marker truncation detail is explicit" ;;
   *) bad "version-marker truncation detail: ${CASE_DETAIL}" ;;
+esac
+# Contradictory server: no <IsTruncated> element at all while explicit Next*
+# markers are present. The witness must follow the markers (the marker on
+# page 2 is the only evidence of the hide), not read page 1 as complete.
+K_PAGE1="$(key session.data 20260925T135150Z "${SID}" 9)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,"versions_no_istruncated":true,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_PAGE1}","version_id":"v-page1","is_latest":false,"delete_marker":false,"ago":300},
+  {"key":"${K_HIDDEN_A}","version_id":"dm-page2","is_latest":true,"delete_marker":true,"ago":120}]}
+JSON
+start_mock
+run_case
+is "IsTruncated absent with Next markers present -> exit 1 (marker on page 2)" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=1*) ok "contradictory IsTruncated still follows the Next markers to the hidden object" ;;
+  *) bad "contradictory IsTruncated detail: ${CASE_DETAIL}" ;;
 esac
 fixture <<JSON
 {"bucket":"pc-admin-dr","versions_ignore_prefix":true,

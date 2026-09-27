@@ -26,6 +26,10 @@ The fixture is JSON:
       "fail_versions": null | "denied" | "malformed" | "error-doc" | "truncated-no-token",
       "versions_ignore_prefix": true,     # optional; serve every version entry
                                           # for any prefix (nonconformant server)
+      "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
+                                          # version listings while keeping the
+                                          # Next* markers on truncated pages
+                                          # (nonconformant server)
       "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
@@ -65,8 +69,11 @@ def xml_escape(value):
     )
 
 
-def iso_from_ago(ago):
-    moment = time.time() - float(ago)
+def iso_from_ago(ago, now=None):
+    # One timestamp per response: callers capture `now` once so every entry in
+    # a listing shares the same clock reading (equal-`ago` tie fixtures must
+    # not straddle a second boundary).
+    moment = (time.time() if now is None else now) - float(ago)
     return datetime.fromtimestamp(moment, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
@@ -222,6 +229,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_objects(self, query):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
+        now = time.time()
         offset = int(token) if token.isdigit() else 0
         matching = [
             obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
@@ -243,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
             "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
             "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
             "<StorageClass>STANDARD</StorageClass></Contents>"
-            % (xml_escape(obj["key"]), iso_from_ago(obj["ago"]))
+            % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
             for obj in page
         )
         body = (
@@ -268,6 +276,7 @@ class Handler(BaseHTTPRequestHandler):
         prefix = query.get("prefix", [""])[0]
         key_marker = query.get("key-marker", [""])[0]
         version_marker = query.get("version-id-marker", [""])[0]
+        now = time.time()
         matching = sorted(
             (entry for entry in FIXTURE.get("versions", [])
              if FIXTURE.get("versions_ignore_prefix") or entry["key"].startswith(prefix)),
@@ -312,18 +321,20 @@ class Handler(BaseHTTPRequestHandler):
                     xml_escape(entry["key"]),
                     xml_escape(entry.get("version_id", "v")),
                     "true" if entry.get("is_latest") else "false",
-                    iso_from_ago(entry["ago"]),
+                    iso_from_ago(entry["ago"], now),
                     extra,
                     tag,
                 )
             )
+        istruncated_element = "" if FIXTURE.get("versions_no_istruncated") else (
+            "<IsTruncated>%s</IsTruncated>" % ("true" if truncated else "false"))
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
             "<Name>%s</Name><Prefix>%s</Prefix>"
             "<KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker>"
             "<NextKeyMarker>%s</NextKeyMarker><NextVersionIdMarker>%s</NextVersionIdMarker>"
-            "<MaxKeys>%d</MaxKeys><IsTruncated>%s</IsTruncated>%s"
+            "<MaxKeys>%d</MaxKeys>%s%s"
             "</ListVersionsResult>"
             % (
                 xml_escape(FIXTURE.get("bucket", "")),
@@ -331,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
                 xml_escape(next_key),
                 xml_escape(next_version),
                 PAGE_SIZE,
-                "true" if truncated else "false",
+                istruncated_element,
                 rows,
             )
         )
@@ -342,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
         prefix = query.get("prefix", [""])[0]
         key_marker = query.get("key-marker", [""])[0]
         upload_marker = query.get("upload-id-marker", [""])[0]
+        now = time.time()
         matching = sorted(
             (upload for upload in FIXTURE.get("uploads", []) if upload["key"].startswith(prefix)),
             key=lambda upload: (upload["key"], upload.get("upload_id", "u")),
@@ -374,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
             next_upload = page[-1].get("upload_id", "u") if truncated else ""
         rows = "".join(
             "<Upload><Key>%s</Key><UploadId>%s</UploadId><Initiated>%s</Initiated></Upload>"
-            % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), iso_from_ago(upload["ago"]))
+            % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), iso_from_ago(upload["ago"], now))
             for upload in page
         )
         body = (
