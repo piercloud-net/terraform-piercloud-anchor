@@ -53,6 +53,7 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Cap artifact retention at 90 + fail-loud mode=check assert (closes #119)
 - *(security)* Contain device_code to a single runner step (closes #120)
 - *(device-flow)* Card copy nits — new-tab hint + drop "dead" (closes #70)
+- *(witness)* Close the run-once race against the timer's immediate first fire (closes #143)
 
 ### 💼 Other
 
