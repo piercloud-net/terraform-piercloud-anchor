@@ -1483,6 +1483,9 @@ SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
 # SAME event identity as its base key, re-shipped under a disambiguated name:
 # canonicalize the type and count the (ts, type, seq) identity once per session.
 CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}$")
+# The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): a finding
+# signature exactly as emitted in state.json. Exact match only.
+QUIET_SIGNATURE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def canonical_conflict_type(event_type):
@@ -1517,6 +1520,29 @@ def log(message):
 def clip(text, limit=300):
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+def identity_digest(identities):
+    """Stable sha256 over a sorted identity list (no ages, no timestamps).
+
+    One canonical digest per finding class keeps the notification signature
+    compact while still covering the whole finding set (every hidden marker
+    key+version, every drift key).
+    """
+    canonical = json.dumps(sorted(identities), separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def finding_signature(state, finding_ids):
+    """Stable digest of the finding set: state + identities, never ages.
+
+    The digest changes when the finding set changes and stays identical when
+    only an age drifts (a `%ds old` / `%ds ago` fragment is displayed, never
+    hashed), so the notification change-trigger pushes on real changes without
+    pushing on every check. `ok` and `error` carry fixed digests of their own.
+    """
+    canonical = state + "\0" + "\n".join(sorted(finding_ids))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def utc_stamp(instant):
@@ -1575,6 +1601,15 @@ class Config(object):
         self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
         self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
         self.renotify = env_int("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
+        self.quiet_renotify = env_int("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
+        self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
+        if self.quiet_signature and not QUIET_SIGNATURE_RE.match(self.quiet_signature):
+            # Same posture as a bad ntfy token: skip the optional behavior
+            # with a bounded warning that never contains the value; the
+            # verdict still lands, so a typo'd pin cannot take the witness
+            # down (it only keeps the default cadence).
+            log("WARNING: quiet signature is malformed (want sha256:<64 lowercase hex>); quieting disabled")
+            self.quiet_signature = ""
         self.ntfy_topic = env("NTFY_TOPIC")
         self.ntfy_token = env("NTFY_TOKEN")
         self.heartbeat_prefix = self.audit_prefix + "heartbeat/"
@@ -1900,6 +1935,10 @@ def run_checks(config, now):
         hidden_by_version[(marker["key"], marker["version_id"])] = marker
     hidden_objects = list(hidden_by_version.values())
     alerts = []
+    # Stable finding identities for the notification signature. Only stable
+    # identities enter (never an age: the displayed `%ds` fragments drift on
+    # every run and would otherwise trigger a push on every check).
+    finding_ids = []
     # Enforce the clock-skew contract at collection time: every S3 timestamp
     # the checks can read (object LastModified, delete-marker LastModified,
     # multipart Initiated) is
@@ -1933,6 +1972,12 @@ def run_checks(config, now):
             "(the pipeline never deletes; an account-admin delete-capable key hid object(s)) "
             "[%s; keys: %s]" % (len(hidden_objects), " ".join(hidden_counts), hidden_keys)
         )
+        finding_ids.append(
+            "hidden-object:"
+            + identity_digest(
+                "%s\0%s" % (marker["key"], marker["version_id"]) for marker in hidden_objects
+            )
+        )
 
     heartbeat_times = []
     unrecognized = []
@@ -1947,6 +1992,7 @@ def run_checks(config, now):
     heartbeat_age = None
     if not heartbeat_times:
         alerts.append("heartbeat-missing: no objects under %s" % config.heartbeat_prefix)
+        finding_ids.append("heartbeat-missing")
     else:
         heartbeat_age = age_seconds(
             now, max(heartbeat_times), "newest heartbeat", config.clock_skew_tolerance)
@@ -1955,9 +2001,10 @@ def run_checks(config, now):
                 "heartbeat-stale: newest heartbeat is %ds old (limit %ds)"
                 % (heartbeat_age, config.heartbeat_max_age)
             )
+            finding_ids.append("heartbeat-stale")
 
     sessions = {}
-    contract_bad = 0
+    contract_bad_keys = []
     for key, last_modified in audit_objects.items():
         if key.startswith(config.heartbeat_prefix):
             continue
@@ -1996,7 +2043,7 @@ def run_checks(config, now):
                 # A mode marker on a variant is naming drift exactly like a
                 # mode marker on any non-lifecycle base shape.
                 if mode:
-                    contract_bad += 1
+                    contract_bad_keys.append(relative)
                 continue
             # Duplicate starts and ends resolve by the newest LastModified,
             # exactly like each other: a re-PUT / replayed marker must not win
@@ -2013,7 +2060,7 @@ def run_checks(config, now):
             elif mode:
                 # The mode marker is contract-defined on start/end only; a
                 # marker anywhere else is naming drift.
-                contract_bad += 1
+                contract_bad_keys.append(relative)
             continue
         generic = NON_SESSION_KEY_RE.match(relative)
         if generic:
@@ -2026,20 +2073,22 @@ def run_checks(config, now):
         # type), not by one literal substring: a rename that drops
         # "-session." but keeps the sid still fails closed.
         if UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
-            contract_bad += 1
+            contract_bad_keys.append(relative)
         else:
             unrecognized.append(key)
 
-    if contract_bad:
+    if contract_bad_keys:
         alerts.append(
             "naming-contract: %d audit key(s) look like session events but do not match the shipper naming contract"
-            % contract_bad
+            % len(contract_bad_keys)
         )
+        finding_ids.append("naming-contract:" + identity_digest(contract_bad_keys))
     if unrecognized:
         alerts.append(
             "contract-mismatch: %d audit object(s) match no documented shipper key shape"
             % len(unrecognized)
         )
+        finding_ids.append("contract-mismatch:" + identity_digest(unrecognized))
 
     # Completed recordings and in-progress uploads keyed by lowercased sid:
     # sessions are grouped case-insensitively, so an uppercase-sid tar or
@@ -2074,6 +2123,7 @@ def run_checks(config, now):
                 "session-start-missing: session %s has %d audit event(s) but no session.start"
                 % (sid, len(state["seqs"]))
             )
+            finding_ids.append("session-start-missing:" + sid)
             continue
         # session.end is authoritative for the exec/shell split: live Teleport
         # v18 emits `interactive` on the end event only (the start key reads
@@ -2102,6 +2152,7 @@ def run_checks(config, now):
                         "session-end-missing: %s completed %ds ago but session %s has no session.end (grace %ds)"
                         % (recording_key, completed_age, sid, config.completer_lag)
                     )
+                    finding_ids.append("session-end-missing:" + sid)
             continue
         if sid in upload_sids:
             continue
@@ -2123,11 +2174,13 @@ def run_checks(config, now):
                 "may clear when the end or tar lands)"
                 % (sid, age, recording_key)
             )
+            finding_ids.append("recording-gap:pending:" + sid)
         else:
             alerts.append(
                 "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
                 % (session_mode, sid, age, recording_key)
             )
+            finding_ids.append("recording-gap:%s:%s" % (session_mode, sid))
 
     # Orphan completed recordings: a tar whose sid has no audit events at all
     # is the extreme tail of stream closure (no start -> no gap clock at all).
@@ -2149,16 +2202,18 @@ def run_checks(config, now):
                 "session-start-missing: %s completed %ds ago but session %s has no audit events at all "
                 "(no session.start; grace %ds)" % (key, completed_age, sid, config.completer_lag)
             )
+            finding_ids.append("session-start-missing:" + sid)
 
     for sid in sorted(sessions):
         seqs = sessions[sid]["seqs"]
         counts = collections.Counter(seqs)
         duplicates = sorted(seq for seq, count in counts.items() if count > 1)
         if duplicates:
+            rendered = ",".join(str(number) for number in duplicates)
             alerts.append(
-                "sequence-duplicate: session %s repeats <seq> %s"
-                % (sid, ",".join(str(number) for number in duplicates))
+                "sequence-duplicate: session %s repeats <seq> %s" % (sid, rendered)
             )
+            finding_ids.append("sequence-duplicate:%s:%s" % (sid, rendered))
             continue
         unique = sorted(counts)
         if unique[0] > 1:
@@ -2166,6 +2221,7 @@ def run_checks(config, now):
                 "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
                 % (sid, unique[0])
             )
+            finding_ids.append("sequence-origin:%s:%d" % (sid, unique[0]))
         if unique[-1] - unique[0] + 1 != len(unique):
             # Bounded missing-set: render gap ranges from the observed values
             # (never range(low, high+1), which crafted seq values could hang).
@@ -2183,6 +2239,7 @@ def run_checks(config, now):
                 "sequence-gap: session %s missing <seq> %s"
                 % (sid, ",".join(rendered))
             )
+            finding_ids.append("sequence-gap:%s:%s" % (sid, ",".join(rendered)))
 
     for upload in uploads:
         key = upload["key"]
@@ -2202,6 +2259,7 @@ def run_checks(config, now):
                     "completer-lag: %s still in progress %ds after session.end (started at %s)"
                     % (key, ended_age, utc_stamp(upload["initiated"]))
                 )
+                finding_ids.append("completer-lag:" + sid)
         elif initiated_age > config.open_upload_max_age:
             # Distinct from completer-lag (session.end seen) and from the
             # bare-old-multipart rule: an upload with no session.end has no
@@ -2210,13 +2268,14 @@ def run_checks(config, now):
                 "open-upload-stale: %s has been open %ds with no session.end (bound %ds)"
                 % (key, initiated_age, config.open_upload_max_age)
             )
+            finding_ids.append("open-upload-stale:" + sid)
 
     if alerts:
-        return "alert", "; ".join(alerts)
+        return "alert", "; ".join(alerts), finding_signature("alert", finding_ids)
     detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
         len(sessions), len(uploads), len(audit_objects), len(recording_objects),
         ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
-    return "ok", detail
+    return "ok", detail, finding_signature("ok", [])
 
 
 def corrupt_state_destination(path, now):
@@ -2407,10 +2466,19 @@ def notify(config, state, detail):
         return False
 
 
-def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_since_run=0, last_notify_run=0):
+def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
+                  state_since_run=0, last_notify_run=0, signature="", last_signature="",
+                  quiet_signature="", quiet_renotify=86400):
     """Notification bookkeeping.
 
-    Non-green states push on transition and re-notify every renotify window.
+    Non-green states push on transition and whenever the finding signature
+    changed (a new hidden marker, drift key or session alert is new
+    information no matter how recently the previous push landed). An
+    unchanged non-green state re-notifies every `renotify` window - or every
+    `quiet_renotify` window while the current signature equals the operator's
+    quiet pin, so a pinned known finding set reminds daily instead of every
+    30 minutes, and any signature change leaves the pin behind automatically.
+
     Green pushes on the non-green -> ok recovery; a recovery push that failed
     is retried while the current ok state began after the last successful
     notify (state_since_run > last_notify_run), so a green state never
@@ -2434,19 +2502,27 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify, state_
         # wall clock catches up; an impossible value is not a reason to stay
         # silent.
         return True
-    return now_epoch - last_epoch >= int(renotify)
+    if signature and signature != last_signature:
+        # The finding set itself changed: push regardless of the window.
+        return True
+    window = renotify
+    if quiet_signature and signature == quiet_signature:
+        window = quiet_renotify
+    return now_epoch - last_epoch >= int(window)
 
 
 def main():
     now = datetime.now(timezone.utc)
     now_epoch = int(now.timestamp())
     config = None
+    signature = finding_signature("error", [])
     try:
         config = Config()
-        state, detail = run_checks(config, now)
+        state, detail, signature = run_checks(config, now)
     except Exception as exc:  # fail-closed by design: any failure => error
         state = "error"
         detail = "error: %s: %s" % (type(exc).__name__, exc)
+        signature = finding_signature("error", [])
     detail = clip(detail, 1000)
 
     state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
@@ -2482,6 +2558,8 @@ def main():
                 % (corrupt_path or (state_path + ".corrupt"), clip(exc, 200)))
 
     renotify = config.renotify if config is not None else 1800
+    quiet_renotify = config.quiet_renotify if config is not None else 86400
+    quiet_signature = config.quiet_signature if config is not None else ""
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
     # Defensive numeric parsing: a type-valid state.json with a corrupted
     # counter (e.g. "run_seq": "not-a-number") must never crash the run
@@ -2505,9 +2583,16 @@ def main():
             detail = clip("%s (state record also invalid: %s)" % (detail, state_bad_reason), 1000)
         # An invalid record is not a trustworthy previous state: the error
         # verdict must push instead of comparing against it.
+        signature = finding_signature("error", [])
         previous = {}
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
+    last_notify_signature = previous.get("last_notify_signature")
+    if not isinstance(last_notify_signature, str):
+        # Notification bookkeeping only: a non-string value errs toward
+        # notifying (the change-trigger is never suppressed by a corrupted
+        # value), so it does not force the error/repair path.
+        last_notify_signature = ""
     # Per-run identity: a monotonic counter written into state.json, never a
     # second-resolution timestamp, so a genuine same-second run still advances
     # it while a run that failed to persist state still repeats it.
@@ -2521,10 +2606,13 @@ def main():
     if previous_state is not None and previous_state != state:
         state_since_run = run_seq
         state_since_epoch = now_epoch
-    if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify, state_since_run, last_notify_run):
+    if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify,
+                     state_since_run, last_notify_run, signature, last_notify_signature,
+                     quiet_signature, quiet_renotify):
         if config is not None and notify(config, state, detail):
             last_notify_epoch = now_epoch
             last_notify_run = run_seq
+            last_notify_signature = signature
     record = {
         "version": STATE_VERSION,
         "state": state,
@@ -2535,6 +2623,8 @@ def main():
         "state_since_epoch": state_since_epoch,
         "last_notify_run": last_notify_run,
         "last_notify_epoch": last_notify_epoch,
+        "signature": signature,
+        "last_notify_signature": last_notify_signature,
     }
     if state_bad_reason:
         # Explicit repair evidence: an unreadable/invalid record has no
@@ -2649,6 +2739,9 @@ recording_witness_install() { # render + install the component (idempotent)
     printf 'RECORDING_WITNESS_KEY=%q\n' "$RECORDING_WITNESS_KEY"
     printf 'RECORDING_WITNESS_STATE_DIR=%q\n' "$RECORDING_WITNESS_STATE_DIR"
     if [ -n "${RECORDING_WITNESS_REGION:-}" ]; then printf 'RECORDING_WITNESS_REGION=%q\n' "$RECORDING_WITNESS_REGION"; fi
+    if [ -n "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_RENOTIFY_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_QUIET_SIGNATURE:-}" ]; then printf 'RECORDING_WITNESS_QUIET_SIGNATURE=%q\n' "$RECORDING_WITNESS_QUIET_SIGNATURE"; fi
     if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
     if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
   } >"$tmp"
@@ -2708,7 +2801,7 @@ recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation 
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced signature
   # Issue #143: on a long-up box the timer's OnBootSec=2min has already
   # elapsed, so the timer fires the service as soon as it is enabled (fresh
   # install) and a reinstall can find a timer-triggered invocation already
@@ -2798,12 +2891,19 @@ recording_witness_run_once() { # run one check now and surface the verdict
     die "witness state carries repaired=true but state=${state} (a repaired record must be error) — no trustworthy verdict; refusing to finish blind"
   fi
   detail="$(recording_witness_redact "${detail}")"
+  signature="$(jq -r '.signature // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   case "${state}:${exec_status}" in
     ok:0) log "witness verdict: OK - ${detail}" ;;
     alert:1) warn "witness verdict: ALERT - ${detail} (the witness works; the recording pipeline has an open alert)" ;;
     error:2) die "witness verdict: ERROR - ${detail} (an un-runnable witness fails the run closed; fix the config and re-dispatch)" ;;
     *) die "witness produced no trustworthy verdict (state=${state:-missing} ExecMainStatus=${exec_status} rc=${rc}) - refusing to finish blind" ;;
   esac
+  if [ -n "${signature}" ]; then
+    # Safe to log: a sha256 over finding identities, never raw keys. The
+    # operator copies it into the RECORDING_WITNESS_QUIET_SIGNATURE variable
+    # to keep the daily quiet re-notify while this exact finding set persists.
+    log "witness finding signature: ${signature}"
+  fi
 }
 
 recording_witness_disable() { # remove a previously installed component
