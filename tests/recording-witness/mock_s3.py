@@ -200,6 +200,13 @@ class Handler(BaseHTTPRequestHandler):
             self.record("GET", False, "fixture: error document")
             self.send_body(403, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
             return
+        if failure == "error-doc-200":
+            # Nonconformant server: an S3 <Error> body served with HTTP 200.
+            # A client that only checks the status would read it as an empty
+            # listing; the root-element guard must fail closed instead.
+            self.record("GET", False, "fixture: error document at 200")
+            self.send_body(200, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
+            return
         if kind == "objects":
             self.handle_objects(query)
         elif kind == "versions":
@@ -267,6 +274,14 @@ class Handler(BaseHTTPRequestHandler):
             page = matching[:PAGE_SIZE]
             truncated = True
             next_key = ""
+            next_version = ""
+        elif FIXTURE.get("fail_versions") == "truncated-no-version-marker":
+            # Nonconformant server: truncated page carrying a key marker but
+            # no version marker. Resuming with the key marker alone would skip
+            # the rest of that key (possibly a hidden marker).
+            page = matching[:PAGE_SIZE]
+            truncated = True
+            next_key = page[-1]["key"] if page else ""
             next_version = ""
         else:
             start = 0

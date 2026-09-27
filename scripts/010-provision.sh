@@ -1397,7 +1397,8 @@ render_recording_witness() { # print the on-box witness script to stdout
 # Contract + checks: docs/recording-witness.md (repo).
 #
 # Strictly list-only: reads /etc/piercloud/recording-witness.env (0600) and
-# makes only ListObjectsV2 / ListMultipartUploads calls. Never fetches object
+# makes only ListObjectsV2 / ListObjectVersions / ListMultipartUploads calls.
+# Never fetches object
 # content (no GET/HEAD) and never calls ListParts (writeFiles).
 set -euo pipefail
 
@@ -1665,6 +1666,12 @@ def list_objects(config, prefix):
             root = ET.fromstring(body)
         except ET.ParseError as exc:
             raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
+            # body served with the wrong status) must never read as an empty
+            # listing: that would turn a listing failure into a false green.
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
         truncated = False
         next_token = ""
         for child in root:
@@ -1721,6 +1728,12 @@ def list_object_versions(config, prefix):
             root = ET.fromstring(body)
         except ET.ParseError as exc:
             raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListVersionsResult":
+            # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
+            # body served with the wrong status) must never read as "no delete
+            # markers": that would be a false green on the top-severity signal.
+            raise WitnessError("ListObjectVersions %s returned %s (expected ListVersionsResult)" % (prefix, root_name))
         truncated = False
         next_key = ""
         next_version = ""
@@ -1753,8 +1766,10 @@ def list_object_versions(config, prefix):
                 next_version = child.text or ""
         if not truncated:
             return markers
-        if not next_key:
-            raise WitnessError("ListObjectVersions %s truncated without a key marker" % prefix)
+        if not next_key or not next_version:
+            # Resuming with only the key marker would skip the remaining
+            # versions of that key, hiding markers; require both markers.
+            raise WitnessError("ListObjectVersions %s truncated without a key/version marker" % prefix)
         key_marker = next_key
         version_marker = next_version
     raise WitnessError("ListObjectVersions %s exceeded 1000 pages" % prefix)
@@ -1845,6 +1860,12 @@ def run_checks(config, now):
         if marker["key"].startswith(config.audit_prefix)
         or marker["key"].startswith(config.recordings_prefix)
     ]
+    # Overlapping watched prefixes report one marker twice (same key + version
+    # id in both listings); count each hidden version once.
+    hidden_by_version = {}
+    for marker in hidden_objects:
+        hidden_by_version[(marker["key"], marker["version_id"])] = marker
+    hidden_objects = list(hidden_by_version.values())
     alerts = []
     # Enforce the clock-skew contract at collection time: every S3 timestamp
     # the checks can read (object LastModified, delete-marker LastModified,
@@ -1865,13 +1886,15 @@ def run_checks(config, now):
 
     if hidden_objects:
         # Hiding is top-severity tamper evidence: list it first and keep the
-        # detail bounded (counts per prefix, at most two sample keys).
+        # detail bounded (counts per prefix, the two newest sample keys —
+        # listing order is not recency, and the newest hides matter most).
         hidden_counts = []
         for label, prefix in (("audit", config.audit_prefix), ("recordings", config.recordings_prefix)):
             number = sum(1 for marker in hidden_objects if marker["key"].startswith(prefix))
             if number:
                 hidden_counts.append("%s=%d" % (label, number))
-        hidden_keys = ", ".join(clip(marker["key"], 120) for marker in hidden_objects[:2])
+        newest = sorted(hidden_objects, key=lambda marker: marker["last_modified"], reverse=True)
+        hidden_keys = ", ".join(clip(marker["key"], 120) for marker in newest[:2])
         alerts.append(
             "hidden-object: %d hidden object(s) (delete marker) — hiding detected "
             "(the pipeline never deletes; an account-admin delete-capable key hid object(s)) "

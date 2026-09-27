@@ -962,7 +962,7 @@ jobs:
           ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
           # Optional recording-completeness witness (docs/recording-witness.md):
-          # KEY is a B2 listFiles+listFileVersions application key — the
+          # KEY is a B2 listFiles application key — the
           # witness lists metadata and never reads object content. All six
           # set = the witness installs; empty = the component stays dormant
           # (tenant anchors are unaffected; a previous install is removed).

@@ -158,7 +158,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=406
+MIN_CHECKS=413
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -2065,6 +2065,50 @@ case "${CASE_DETAIL}" in
   *) ok "noncurrent version stays free of hidden-object" ;;
 esac
 fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","version_id":"dm-old","is_latest":false,"delete_marker":true,"ago":4000}]}
+JSON
+start_mock
+run_case
+is "noncurrent delete marker (a delete happened) -> exit 1" "1" "${CASE_RC}"
+is "noncurrent delete marker -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=1*) ok "noncurrent delete marker still alerts hidden-object" ;;
+  *) bad "noncurrent delete marker detail wrong: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"error-doc-200",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "200 error document on versions -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*expected\ ListVersionsResult*) ok "200 error-document detail names the non-list body" ;;
+  *) bad "200 error-document detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"truncated-no-version-marker",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "truncated version list without version marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"truncated without a key/version marker"*) ok "version-marker truncation detail is explicit" ;;
+  *) bad "version-marker truncation detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
 {"bucket":"pc-admin-dr","fail_versions":"denied",
  "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
  "uploads":[]}
@@ -2098,7 +2142,7 @@ start_mock
 run_case
 is "truncated version list without key marker -> exit 2" "2" "${CASE_RC}"
 case "${CASE_DETAIL}" in
-  *ListObjectVersions*"truncated without a key marker"*) ok "version-list truncation detail is explicit" ;;
+  *ListObjectVersions*"truncated without a key/version marker"*) ok "version-list truncation detail is explicit" ;;
   *) bad "version-list truncation detail: ${CASE_DETAIL}" ;;
 esac
 
