@@ -158,7 +158,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=428
+MIN_CHECKS=432
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -1531,6 +1531,17 @@ case "${CASE_DETAIL}" in
   *ListObjectsV2*expected\ ListBucketResult*) ok "200 error-document objects detail names the non-list body" ;;
   *) bad "200 error-document objects detail: ${CASE_DETAIL}" ;;
 esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_objects":"error-doc-in-list-root",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
+JSON
+start_mock
+run_case
+is "wrapped error document on objects -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectsV2*"<Error> child"*) ok "wrapped error-document objects detail names the Error child" ;;
+  *) bad "wrapped error-document objects detail: ${CASE_DETAIL}" ;;
+esac
 
 fixture <<JSON
 {"bucket":"pc-admin-dr","fail_uploads":"error-doc",
@@ -1572,6 +1583,18 @@ is "200 error document on uploads -> exit 2 (fail-closed)" "2" "${CASE_RC}"
 case "${CASE_DETAIL}" in
   *ListMultipartUploads*expected\ ListMultipartUploadsResult*) ok "200 error-document uploads detail names the non-list body" ;;
   *) bad "200 error-document uploads detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"error-doc-in-list-root",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "wrapped error document on uploads -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListMultipartUploads*"<Error> child"*) ok "wrapped error-document uploads detail names the Error child" ;;
+  *) bad "wrapped error-document uploads detail: ${CASE_DETAIL}" ;;
 esac
 
 fixture <<JSON

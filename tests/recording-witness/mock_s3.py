@@ -35,7 +35,7 @@ The fixture is JSON:
                                           # (nonconformant server; the witness
                                           # must fail closed on the missing
                                           # key marker)
-      "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
+      "fail_uploads": null | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
       },                                   # request is SigV4-verified
