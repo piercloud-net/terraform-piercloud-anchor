@@ -158,7 +158,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=424
+MIN_CHECKS=428
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -2135,6 +2135,21 @@ case "${CASE_DETAIL}" in
   *ListObjectVersions*expected\ ListVersionsResult*) ok "200 error-document detail names the non-list body" ;;
   *) bad "200 error-document detail: ${CASE_DETAIL}" ;;
 esac
+# Nonconformant server: a genuine error document wrapped inside a valid list
+# root at HTTP 200. The root-name guard passes, so the child <Error> guard
+# must fail closed instead of reading the body as an empty version listing.
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"error-doc-in-list-root",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "error document wrapped in a list root -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"<Error> child"*) ok "wrapped error-document detail names the Error child" ;;
+  *) bad "wrapped error-document detail: ${CASE_DETAIL}" ;;
+esac
 fixture <<JSON
 {"bucket":"pc-admin-dr","fail_versions":"truncated-no-version-marker",
  "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
@@ -2171,6 +2186,30 @@ is "IsTruncated absent with Next markers present -> exit 1 (marker on page 2)" "
 case "${CASE_DETAIL}" in
   *hidden-object*audit=1*) ok "contradictory IsTruncated still follows the Next markers to the hidden object" ;;
   *) bad "contradictory IsTruncated detail: ${CASE_DETAIL}" ;;
+esac
+# Nonconformant server: a truncated version page with no <IsTruncated> and
+# only the version marker. The guard must treat the version marker as
+# truncation (paired-marker guard → error), so a future regression to a
+# key-marker-only guard is caught.
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,"versions_no_istruncated":true,"versions_partial_marker":"version-only",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_PAGE1}","version_id":"v-page1","is_latest":false,"delete_marker":false,"ago":300},
+  {"key":"${K_HIDDEN_A}","version_id":"v-page2","is_latest":false,"delete_marker":false,"ago":120}]}
+JSON
+start_mock
+run_case
+is "truncated version page with only a version marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"truncated without a key/version marker"*) ok "version-only marker still fails closed via the paired-marker guard" ;;
+  *) bad "version-only marker detail: ${CASE_DETAIL}" ;;
 esac
 fixture <<JSON
 {"bucket":"pc-admin-dr","versions_ignore_prefix":true,

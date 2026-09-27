@@ -22,14 +22,19 @@ The fixture is JSON:
                                             # real ascending-key order (pins
                                             # listing-order independence)
       "fail": null | "list" | "all",       # list calls return HTTP 500
-      "fail_objects": null | "malformed" | "error-doc" | "truncated-no-token",
-      "fail_versions": null | "denied" | "malformed" | "error-doc" | "truncated-no-token",
+      "fail_objects": null | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
+      "fail_versions": null | "denied" | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
       "versions_ignore_prefix": true,     # optional; serve every version entry
                                           # for any prefix (nonconformant server)
       "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
                                           # version listings while keeping the
                                           # Next* markers on truncated pages
                                           # (nonconformant server)
+      "versions_partial_marker": "version-only",  # optional; truncated version
+                                          # pages carry only NextVersionIdMarker
+                                          # (nonconformant server; the witness
+                                          # must fail closed on the missing
+                                          # key marker)
       "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
@@ -216,6 +221,15 @@ class Handler(BaseHTTPRequestHandler):
             self.record("GET", False, "fixture: error document at 200")
             self.send_body(200, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
             return
+        if failure == "error-doc-in-list-root":
+            # Nonconformant server: a genuine error document wrapped inside a
+            # valid list root at HTTP 200. The root-name guard passes; the
+            # child <Error> guard must fail closed instead.
+            root = {"objects": "ListBucketResult", "versions": "ListVersionsResult",
+                    "uploads": "ListMultipartUploadsResult"}[kind]
+            self.record("GET", False, "fixture: error document wrapped in a list root")
+            self.send_body(200, "<%s><Error><Code>AccessDenied</Code></Error></%s>" % (root, root))
+            return
         if kind == "objects":
             self.handle_objects(query)
         elif kind == "versions":
@@ -308,6 +322,11 @@ class Handler(BaseHTTPRequestHandler):
             truncated = start + PAGE_SIZE < len(matching)
             next_key = page[-1]["key"] if truncated else ""
             next_version = page[-1].get("version_id", "v") if truncated else ""
+        if FIXTURE.get("versions_partial_marker") == "version-only":
+            # Nonconformant server: a truncated page carrying only the version
+            # marker. The witness must still fail closed via the paired-marker
+            # guard, not read the page as complete.
+            next_key = ""
         rows = ""
         for entry in page:
             tag = "DeleteMarker" if entry.get("delete_marker") else "Version"
