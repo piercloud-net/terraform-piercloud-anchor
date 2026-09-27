@@ -1339,8 +1339,9 @@ fi
 # Recording-completeness witness — optional component, dormant without env.
 # Renders /usr/local/sbin/pc-recording-witness.sh + its 0600 env file + a
 # 5-minute systemd timer. The witness is STRICTLY list-only (ListObjectsV2 +
-# ListMultipartUploads with a listFiles-only B2 application key: no readFiles,
-# no HEAD, no ListParts) and fail-closed (an un-runnable witness reports
+# ListObjectVersions + ListMultipartUploads with a listFiles application key (B2 has no separate version-listing capability)
+# B2 application key: no readFiles, no HEAD, no ListParts) and fail-closed (an
+# un-runnable witness reports
 # `error`; the last baseline is held). Design, key contract and checks:
 # docs/recording-witness.md.
 #
@@ -1396,7 +1397,8 @@ render_recording_witness() { # print the on-box witness script to stdout
 # Contract + checks: docs/recording-witness.md (repo).
 #
 # Strictly list-only: reads /etc/piercloud/recording-witness.env (0600) and
-# makes only ListObjectsV2 / ListMultipartUploads calls. Never fetches object
+# makes only ListObjectsV2 / ListObjectVersions / ListMultipartUploads calls.
+# Never fetches object
 # content (no GET/HEAD) and never calls ListParts (writeFiles).
 set -euo pipefail
 
@@ -1418,9 +1420,10 @@ fi
 exec python3 - <<'RECORDING_WITNESS_PY_EOF'
 """List-only recording-completeness witness (B2 S3 metadata).
 
-Strictly list-only: ListObjectsV2 + ListMultipartUploads with a listFiles-only
-application key. Never reads an object (no GET/HEAD) and never calls the
-writeFiles-gated ListParts. Fail-closed: any failure to run reports state
+Strictly list-only: ListObjectsV2 + ListObjectVersions + ListMultipartUploads
+with a listFiles application key (object, version and multipart listings). Never reads an object (no
+GET/HEAD) and never calls the writeFiles-gated ListParts. Fail-closed: any
+failure to run reports state
 `error`, exits 2, and never advances the last good baseline (an unreadable or
 oversized state file is preserved as `state.json.corrupt` - or a timestamped
 `.corrupt.<stamp>` sibling when that name is taken - and the repaired record
@@ -1663,6 +1666,12 @@ def list_objects(config, prefix):
             root = ET.fromstring(body)
         except ET.ParseError as exc:
             raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
+            # body served with the wrong status) must never read as an empty
+            # listing: that would turn a listing failure into a false green.
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
         truncated = False
         next_token = ""
         for child in root:
@@ -1685,12 +1694,103 @@ def list_objects(config, prefix):
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextContinuationToken":
                 next_token = child.text or ""
+            elif name == "Error":
+                # A genuine error document wrapped in a list root at HTTP 200
+                # (nonconformant server) must fail closed, not read as empty.
+                raise WitnessError("ListObjectsV2 %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and next_token:
+            # Contradictory server: a continuation token on a page that says
+            # IsTruncated=false. Follow the token instead of reading the short
+            # page as complete; the token-required guard below still applies.
+            truncated = True
         if not truncated:
             return objects
         if not next_token:
             raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
         token = next_token
     raise WitnessError("ListObjectsV2 %s exceeded 1000 pages" % prefix)
+
+
+def list_object_versions(config, prefix):
+    """ListObjectVersions -> [{key, version_id, last_modified}] delete markers.
+
+    Under B2 Object Lock a delete is a HIDE MARKER: the current object
+    disappears from ListObjectsV2 while the locked version survives. The
+    pipeline never deletes, so a delete marker under a watched prefix is
+    tamper evidence by construction. Noncurrent versions from legitimate
+    re-PUTs are not findings, and IsLatest is deliberately ignored: ANY delete
+    marker (not only the latest) means a delete happened. Metadata-only.
+    """
+    markers = []
+    key_marker = ""
+    version_marker = ""
+    for _ in range(1000):
+        params = {"versions": "", "prefix": prefix}
+        if key_marker:
+            params["key-marker"] = key_marker
+        if version_marker:
+            params["version-id-marker"] = version_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListVersionsResult":
+            # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
+            # body served with the wrong status) must never read as "no delete
+            # markers": that would be a false green on the top-severity signal.
+            raise WitnessError("ListObjectVersions %s returned %s (expected ListVersionsResult)" % (prefix, root_name))
+        truncated = False
+        next_key = ""
+        next_version = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name in ("Version", "DeleteMarker"):
+                key = ""
+                version_id = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "VersionId":
+                        version_id = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if name == "DeleteMarker" and key:
+                    try:
+                        moment = parse_timestamp(last_modified)
+                    except ValueError:
+                        raise WitnessError(
+                            "delete marker %s has unparseable LastModified %r" % (key, last_modified))
+                    markers.append({"key": key, "version_id": version_id, "last_modified": moment})
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextVersionIdMarker":
+                next_version = child.text or ""
+            elif name == "Error":
+                # Same fail-closed rule as the object listing: an <Error> child
+                # inside a list root must never read as "no delete markers".
+                raise WitnessError("ListObjectVersions %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and (next_key or next_version):
+            # Contradictory server: Next* markers present while IsTruncated is
+            # false/absent. Follow them; the paired-marker guard below rejects
+            # a half-specified resume.
+            truncated = True
+        if not truncated:
+            return markers
+        if not next_key or not next_version:
+            # Resuming with only the key marker would skip the remaining
+            # versions of that key, hiding markers; require both markers.
+            raise WitnessError("ListObjectVersions %s truncated without a key/version marker" % prefix)
+        key_marker = next_key
+        version_marker = next_version
+    raise WitnessError("ListObjectVersions %s exceeded 1000 pages" % prefix)
 
 
 def list_uploads(config, prefix):
@@ -1713,6 +1813,11 @@ def list_uploads(config, prefix):
             root = ET.fromstring(body)
         except ET.ParseError as exc:
             raise WitnessError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListMultipartUploadsResult":
+            # Same fail-closed rule as the other two listings: a parseable
+            # non-list document at HTTP 200 must not read as "no uploads".
+            raise WitnessError("ListMultipartUploads %s returned %s (expected ListMultipartUploadsResult)" % (prefix, root_name))
         truncated = False
         next_key = ""
         next_upload = ""
@@ -1736,10 +1841,20 @@ def list_uploads(config, prefix):
                 next_key = child.text or ""
             elif name == "NextUploadIdMarker":
                 next_upload = child.text or ""
+            elif name == "Error":
+                # Same fail-closed rule as the other two listings.
+                raise WitnessError("ListMultipartUploads %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and (next_key or next_upload):
+            # Contradictory server: Next* markers present while IsTruncated is
+            # false/absent. Follow them; the paired-marker guard below rejects
+            # a half-specified resume.
+            truncated = True
         if not truncated:
             return uploads
-        if not next_key:
-            raise WitnessError("ListMultipartUploads %s truncated without a key marker" % prefix)
+        if not next_key or not next_upload:
+            # Resuming with only the key marker skips the remaining upload ids
+            # of that key (S3 key-marker-only semantics); require both.
+            raise WitnessError("ListMultipartUploads %s truncated without a key/upload marker" % prefix)
         key_marker = next_key
         upload_marker = next_upload
     raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
@@ -1767,9 +1882,27 @@ def run_checks(config, now):
     audit_objects = list_objects(config, config.audit_prefix)
     recording_objects = list_objects(config, config.recordings_prefix)
     uploads = list_uploads(config, config.recordings_prefix)
+    # Delete markers = hidden objects. The server scopes both calls by prefix;
+    # the client-side re-filter keeps a server that returns out-of-prefix keys
+    # from inflating the finding. A 403/error here raises WitnessError and the
+    # verdict is `error` (main()'s catch), never a silent green.
+    hidden_objects = [
+        marker
+        for marker in list_object_versions(config, config.audit_prefix)
+        + list_object_versions(config, config.recordings_prefix)
+        if marker["key"].startswith(config.audit_prefix)
+        or marker["key"].startswith(config.recordings_prefix)
+    ]
+    # Overlapping watched prefixes report one marker twice (same key + version
+    # id in both listings); count each hidden version once.
+    hidden_by_version = {}
+    for marker in hidden_objects:
+        hidden_by_version[(marker["key"], marker["version_id"])] = marker
+    hidden_objects = list(hidden_by_version.values())
     alerts = []
     # Enforce the clock-skew contract at collection time: every S3 timestamp
-    # the checks can read (object LastModified, multipart Initiated) is
+    # the checks can read (object LastModified, delete-marker LastModified,
+    # multipart Initiated) is
     # validated once here, so "any S3 timestamp more than 5 min in the future
     # -> error" holds for every key - including exec sessions that are later
     # exempt from the gap clock and completed tars whose session.end is
@@ -1780,6 +1913,26 @@ def run_checks(config, now):
         age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
     for upload in uploads:
         age_seconds(now, upload["initiated"], "upload %s initiated" % upload["key"], config.clock_skew_tolerance)
+    for marker in hidden_objects:
+        age_seconds(
+            now, marker["last_modified"], "delete marker %s" % marker["key"], config.clock_skew_tolerance)
+
+    if hidden_objects:
+        # Hiding is top-severity tamper evidence: list it first and keep the
+        # detail bounded (counts per prefix, the two newest sample keys —
+        # listing order is not recency, and the newest hides matter most).
+        hidden_counts = []
+        for label, prefix in (("audit", config.audit_prefix), ("recordings", config.recordings_prefix)):
+            number = sum(1 for marker in hidden_objects if marker["key"].startswith(prefix))
+            if number:
+                hidden_counts.append("%s=%d" % (label, number))
+        newest = sorted(hidden_objects, key=lambda marker: marker["last_modified"], reverse=True)
+        hidden_keys = ", ".join(clip(marker["key"], 120) for marker in newest[:2])
+        alerts.append(
+            "hidden-object: %d hidden object(s) (delete marker) — hiding detected "
+            "(the pipeline never deletes; an account-admin delete-capable key hid object(s)) "
+            "[%s; keys: %s]" % (len(hidden_objects), " ".join(hidden_counts), hidden_keys)
+        )
 
     heartbeat_times = []
     unrecognized = []

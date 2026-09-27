@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Mock S3 listing endpoint for tests/recording-witness (offline, cred-free).
 
-Serves only the two list operations the witness may use:
+Serves only the three list operations the witness may use:
 
     GET /<bucket>?list-type=2&prefix=... [&continuation-token=...]
+    GET /<bucket>?versions&prefix=... [&key-marker=...&version-id-marker=...]
     GET /<bucket>?uploads[&prefix=...] [&key-marker=...&upload-id-marker=...]
 
 Every request is appended to the request log as one JSON line (method, path,
@@ -21,16 +22,32 @@ The fixture is JSON:
                                             # real ascending-key order (pins
                                             # listing-order independence)
       "fail": null | "list" | "all",       # list calls return HTTP 500
-      "fail_objects": null | "malformed" | "error-doc" | "truncated-no-token",
-      "fail_uploads": null | "malformed" | "error-doc" | "truncated-no-token",
+      "fail_objects": null | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
+      "fail_versions": null | "denied" | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
+      "versions_ignore_prefix": true,     # optional; serve every version entry
+                                          # for any prefix (nonconformant server)
+      "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
+                                          # version listings while keeping the
+                                          # Next* markers on truncated pages
+                                          # (nonconformant server)
+      "versions_partial_marker": "version-only",  # optional; truncated version
+                                          # pages carry only NextVersionIdMarker
+                                          # (nonconformant server; the witness
+                                          # must fail closed on the missing
+                                          # key marker)
+      "fail_uploads": null | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
       },                                   # request is SigV4-verified
       "objects": [{"key": "...", "ago": 60}],
+      "versions": [{"key": "...", "version_id": "v1", "is_latest": true,
+                    "delete_marker": false, "ago": 60}],
       "uploads": [{"key": "...", "upload_id": "u1", "ago": 3600}]
     }
 
 `ago` is seconds before serve time, so the harness never does clock math.
+A `versions` entry with `delete_marker: true` is served as a `<DeleteMarker>`
+element (a hidden object); the other entries are `<Version>` elements.
 """
 
 import hashlib
@@ -57,8 +74,11 @@ def xml_escape(value):
     )
 
 
-def iso_from_ago(ago):
-    moment = time.time() - float(ago)
+def iso_from_ago(ago, now=None):
+    # One timestamp per response: callers capture `now` once so every entry in
+    # a listing shares the same clock reading (equal-`ago` tie fixtures must
+    # not straddle a second boundary).
+    moment = (time.time() if now is None else now) - float(ago)
     return datetime.fromtimestamp(moment, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
@@ -179,8 +199,13 @@ class Handler(BaseHTTPRequestHandler):
             self.record("GET", False, "fixture failure mode")
             self.send_body(500, "<Error><Code>InternalError</Code></Error>")
             return
-        kind = "objects" if query.get("list-type") == ["2"] else ("uploads" if "uploads" in query else "")
+        kind = "objects" if query.get("list-type") == ["2"] else (
+            "versions" if "versions" in query else ("uploads" if "uploads" in query else ""))
         failure = FIXTURE.get("fail_%s" % kind, "") if kind else ""
+        if failure == "denied":
+            self.record("GET", False, "fixture: listing denied (missing capability)")
+            self.send_body(403, "<Error><Code>AccessDenied</Code><Message>capability missing</Message></Error>")
+            return
         if failure == "malformed":
             self.record("GET", False, "fixture: malformed XML")
             self.send_body(200, "this is not XML <<<")
@@ -189,8 +214,26 @@ class Handler(BaseHTTPRequestHandler):
             self.record("GET", False, "fixture: error document")
             self.send_body(403, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
             return
+        if failure == "error-doc-200":
+            # Nonconformant server: an S3 <Error> body served with HTTP 200.
+            # A client that only checks the status would read it as an empty
+            # listing; the root-element guard must fail closed instead.
+            self.record("GET", False, "fixture: error document at 200")
+            self.send_body(200, "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")
+            return
+        if failure == "error-doc-in-list-root":
+            # Nonconformant server: a genuine error document wrapped inside a
+            # valid list root at HTTP 200. The root-name guard passes; the
+            # child <Error> guard must fail closed instead.
+            root = {"objects": "ListBucketResult", "versions": "ListVersionsResult",
+                    "uploads": "ListMultipartUploadsResult"}[kind]
+            self.record("GET", False, "fixture: error document wrapped in a list root")
+            self.send_body(200, "<%s><Error><Code>AccessDenied</Code></Error></%s>" % (root, root))
+            return
         if kind == "objects":
             self.handle_objects(query)
+        elif kind == "versions":
+            self.handle_versions(query)
         elif kind == "uploads":
             self.handle_uploads(query)
         else:
@@ -200,6 +243,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_objects(self, query):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
+        now = time.time()
         offset = int(token) if token.isdigit() else 0
         matching = [
             obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
@@ -221,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
             "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
             "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
             "<StorageClass>STANDARD</StorageClass></Contents>"
-            % (xml_escape(obj["key"]), iso_from_ago(obj["ago"]))
+            % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
             for obj in page
         )
         body = (
@@ -242,10 +286,93 @@ class Handler(BaseHTTPRequestHandler):
         self.record("GET", True, "list-type=2 prefix=%s" % prefix)
         self.send_body(200, body)
 
+    def handle_versions(self, query):
+        prefix = query.get("prefix", [""])[0]
+        key_marker = query.get("key-marker", [""])[0]
+        version_marker = query.get("version-id-marker", [""])[0]
+        now = time.time()
+        matching = sorted(
+            (entry for entry in FIXTURE.get("versions", [])
+             if FIXTURE.get("versions_ignore_prefix") or entry["key"].startswith(prefix)),
+            key=lambda entry: (entry["key"], entry.get("version_id", "v")),
+        )
+        if FIXTURE.get("fail_versions") == "truncated-no-token":
+            page = matching[:PAGE_SIZE]
+            truncated = True
+            next_key = ""
+            next_version = ""
+        elif FIXTURE.get("fail_versions") == "truncated-no-version-marker":
+            # Nonconformant server: truncated page carrying a key marker but
+            # no version marker. Resuming with the key marker alone would skip
+            # the rest of that key (possibly a hidden marker).
+            page = matching[:PAGE_SIZE]
+            truncated = True
+            next_key = page[-1]["key"] if page else ""
+            next_version = ""
+        else:
+            start = 0
+            if key_marker or version_marker:
+                marker = (key_marker, version_marker)
+                start = next(
+                    (index for index, entry in enumerate(matching)
+                     if (entry["key"], entry.get("version_id", "v")) > marker),
+                    len(matching),
+                )
+            page = matching[start:start + PAGE_SIZE]
+            truncated = start + PAGE_SIZE < len(matching)
+            next_key = page[-1]["key"] if truncated else ""
+            next_version = page[-1].get("version_id", "v") if truncated else ""
+        if FIXTURE.get("versions_partial_marker") == "version-only":
+            # Nonconformant server: a truncated page carrying only the version
+            # marker. The witness must still fail closed via the paired-marker
+            # guard, not read the page as complete.
+            next_key = ""
+        rows = ""
+        for entry in page:
+            tag = "DeleteMarker" if entry.get("delete_marker") else "Version"
+            extra = "" if tag == "DeleteMarker" else (
+                "<ETag>&quot;mock&quot;</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass>")
+            rows += (
+                "<%s><Key>%s</Key><VersionId>%s</VersionId><IsLatest>%s</IsLatest>"
+                "<LastModified>%s</LastModified>%s</%s>"
+                % (
+                    tag,
+                    xml_escape(entry["key"]),
+                    xml_escape(entry.get("version_id", "v")),
+                    "true" if entry.get("is_latest") else "false",
+                    iso_from_ago(entry["ago"], now),
+                    extra,
+                    tag,
+                )
+            )
+        istruncated_element = "" if FIXTURE.get("versions_no_istruncated") else (
+            "<IsTruncated>%s</IsTruncated>" % ("true" if truncated else "false"))
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            "<Name>%s</Name><Prefix>%s</Prefix>"
+            "<KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker>"
+            "<NextKeyMarker>%s</NextKeyMarker><NextVersionIdMarker>%s</NextVersionIdMarker>"
+            "<MaxKeys>%d</MaxKeys>%s%s"
+            "</ListVersionsResult>"
+            % (
+                xml_escape(FIXTURE.get("bucket", "")),
+                xml_escape(prefix),
+                xml_escape(next_key),
+                xml_escape(next_version),
+                PAGE_SIZE,
+                istruncated_element,
+                rows,
+            )
+        )
+        self.record("GET", True, "versions prefix=%s" % prefix)
+        self.send_body(200, body)
+
     def handle_uploads(self, query):
         prefix = query.get("prefix", [""])[0]
         key_marker = query.get("key-marker", [""])[0]
         upload_marker = query.get("upload-id-marker", [""])[0]
+        now = time.time()
         matching = sorted(
             (upload for upload in FIXTURE.get("uploads", []) if upload["key"].startswith(prefix)),
             key=lambda upload: (upload["key"], upload.get("upload_id", "u")),
@@ -254,6 +381,14 @@ class Handler(BaseHTTPRequestHandler):
             page = matching[:PAGE_SIZE]
             truncated = True
             next_key = ""
+            next_upload = ""
+        elif FIXTURE.get("fail_uploads") == "truncated-no-upload-marker":
+            # Nonconformant server: truncated page with a key marker but no
+            # upload-id marker. Resuming key-marker-only skips the remaining
+            # upload ids of that key (S3 semantics).
+            page = matching[:PAGE_SIZE]
+            truncated = True
+            next_key = page[-1]["key"] if page else ""
             next_upload = ""
         else:
             start = 0
@@ -270,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
             next_upload = page[-1].get("upload_id", "u") if truncated else ""
         rows = "".join(
             "<Upload><Key>%s</Key><UploadId>%s</UploadId><Initiated>%s</Initiated></Upload>"
-            % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), iso_from_ago(upload["ago"]))
+            % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), iso_from_ago(upload["ago"], now))
             for upload in page
         )
         body = (

@@ -9,7 +9,11 @@
 #   (b) the rendered systemd units carry the canonical paths and the decided
 #       5-minute cadence (OnUnitInactiveSec=5min);
 #   (c) env parsing: none = off, all-valid = on, partial/invalid = partial;
-#   (d) verdicts on mocked S3 metadata: healthy -> ok; missing/stale heartbeat ->
+#   (d) verdicts on mocked S3 metadata: healthy -> ok (and free of any
+#       hidden-object finding; a noncurrent version from a legitimate re-PUT
+#       is not one); a delete marker under audit/ or recordings/ -> alert
+#       hidden-object (hiding detected; counts per prefix + sampled keys);
+#       missing/stale heartbeat ->
 #       alert heartbeat-missing / heartbeat-stale; session.start older than the
 #       grace with no recording object/upload -> alert recording-gap; a
 #       completed tar with no session.end past the grace -> alert
@@ -78,11 +82,13 @@
 #       planted symlinks
 #       at state.json.tmp/verdict.log are never followed or reused into a
 #       victim; malformed XML, an S3 error document and a truncated list
-#       without a continuation token all error;
+#       without a continuation token all error; a denied (403, missing
+#       listFiles), malformed or truncated version listing errors too;
 #   (f) strictly list-only: every request the witness makes is a signed GET
-#       list call (ListObjectsV2 / ListMultipartUploads) — no HEAD, no
-#       object GET, no ListParts, no write; pagination is followed for both
-#       list families, and every scenario SigV4-signature-verifies server-side;
+#       list call (ListObjectsV2 / ListObjectVersions / ListMultipartUploads)
+#       — no HEAD, no object GET, no ListParts, no write; pagination is
+#       followed for all three list families, and every scenario
+#       SigV4-signature-verifies server-side;
 #   (g) the 0600 env file holds the key and the witness never prints it;
 #   (h) install renders all four artifacts (mode 0600 env) and a later
 #       provision without the env removes them (no stale timer);
@@ -149,6 +155,10 @@ command -v python3 >/dev/null 2>&1 || { printf 'FAIL python3 is required\n'; exi
 
 pass=0
 fail=0
+# Check-count floor: pinned to the real count so a removed tooth (or a suite
+# that stops running scenarios) fails loudly instead of shrinking silently.
+# Bump it with every intended check.
+MIN_CHECKS=432
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -507,6 +517,10 @@ start_mock
 run_case
 is "healthy fixture (paginated) -> exit 0" "0" "${CASE_RC}"
 is "healthy fixture -> ok verdict" "ok" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*) bad "healthy fixture (no delete markers) reported hidden-object: ${CASE_DETAIL}" ;;
+  *) ok "healthy fixture with no delete markers stays free of hidden-object" ;;
+esac
 
 fixture <<JSON
 {"bucket":"pc-admin-dr",
@@ -1507,6 +1521,29 @@ is "malformed object-list XML -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *unparseable*) ok "malformed XML detail is explicit" ;; *) bad "malformed XML detail: ${CASE_DETAIL}" ;; esac
 
 fixture <<JSON
+{"bucket":"pc-admin-dr","fail_objects":"error-doc-200",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
+JSON
+start_mock
+run_case
+is "200 error document on objects -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectsV2*expected\ ListBucketResult*) ok "200 error-document objects detail names the non-list body" ;;
+  *) bad "200 error-document objects detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_objects":"error-doc-in-list-root",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
+JSON
+start_mock
+run_case
+is "wrapped error document on objects -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectsV2*"<Error> child"*) ok "wrapped error-document objects detail names the Error child" ;;
+  *) bad "wrapped error-document objects detail: ${CASE_DETAIL}" ;;
+esac
+
+fixture <<JSON
 {"bucket":"pc-admin-dr","fail_uploads":"error-doc",
  "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],"uploads":[]}
 JSON
@@ -1533,7 +1570,42 @@ JSON
 start_mock
 run_case
 is "truncated upload list without key marker -> exit 2" "2" "${CASE_RC}"
-case "${CASE_DETAIL}" in *"truncated without a key marker"*) ok "upload truncation detail is explicit" ;; *) bad "upload truncation detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"truncated without a key/upload marker"*) ok "upload truncation detail is explicit" ;; *) bad "upload truncation detail: ${CASE_DETAIL}" ;; esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"error-doc-200",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "200 error document on uploads -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListMultipartUploads*expected\ ListMultipartUploadsResult*) ok "200 error-document uploads detail names the non-list body" ;;
+  *) bad "200 error-document uploads detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"error-doc-in-list-root",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "wrapped error document on uploads -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListMultipartUploads*"<Error> child"*) ok "wrapped error-document uploads detail names the Error child" ;;
+  *) bad "wrapped error-document uploads detail: ${CASE_DETAIL}" ;;
+esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_uploads":"truncated-no-upload-marker",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[{"key":"recordings/${SID}.tar","upload_id":"u-1","ago":300}]}
+JSON
+start_mock
+run_case
+is "truncated upload list without upload marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in *"truncated without a key/upload marker"*) ok "upload-marker truncation detail is explicit" ;; *) bad "upload-marker truncation detail: ${CASE_DETAIL}" ;; esac
 
 # ---- verdict.log rotation bound ------------------------------------------
 
@@ -1982,6 +2054,243 @@ case "${CASE_DETAIL}" in
   *) bad "per-session sid normalization wrong: ${CASE_DETAIL}" ;;
 esac
 
+# ---- hidden objects: delete markers are tamper evidence -------------------
+# Under B2 Object Lock compliance a delete is a HIDE MARKER: the current
+# object disappears from ListObjectsV2 while the locked version survives. The
+# pipeline never deletes, so ANY delete marker under a watched prefix alerts;
+# a noncurrent version from a legitimate re-PUT is not a finding.
+K_HIDDEN_A="$(key session.data 20260925T135300Z "${SID}" 3)"
+K_HIDDEN_B="$(key session.data 20260925T135400Z "${SID2}" 3)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_HIDDEN_A}","version_id":"dm-1","is_latest":true,"delete_marker":true,"ago":120},
+  {"key":"${K_HIDDEN_B}","version_id":"dm-2","is_latest":true,"delete_marker":true,"ago":119}]}
+JSON
+start_mock
+run_case
+is "delete markers under audit/ -> exit 1" "1" "${CASE_RC}"
+is "delete markers under audit/ -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=2*) ok "delete markers under audit/ alert hidden-object with the audit count" ;;
+  *) bad "delete marker detail wrong: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *"keys: ${K_HIDDEN_B}"*) ok "hidden-object samples the newest marker first (not listing order)" ;;
+  *) bad "newest-marker sampling wrong: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in *"hiding detected"*) ok "hidden-object detail names hiding" ;; *) bad "hidden-object wording: ${CASE_DETAIL}" ;; esac
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"recordings/${SID2}.tar","version_id":"dm-rec-1","is_latest":true,"delete_marker":true,"ago":100}]}
+JSON
+start_mock
+run_case
+is "delete marker under recordings/ -> exit 1" "1" "${CASE_RC}"
+is "delete marker under recordings/ -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*recordings=1*) ok "delete marker under recordings/ alerts hidden-object with the recordings count" ;;
+  *) bad "recordings delete marker detail wrong: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","version_id":"v-old","is_latest":false,"delete_marker":false,"ago":5000}]}
+JSON
+start_mock
+run_case
+is "noncurrent version (legitimate re-PUT) does not alert" "ok" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*) bad "noncurrent version reported hidden-object: ${CASE_DETAIL}" ;;
+  *) ok "noncurrent version stays free of hidden-object" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","version_id":"dm-old","is_latest":false,"delete_marker":true,"ago":4000}]}
+JSON
+start_mock
+run_case
+is "noncurrent delete marker (a delete happened) -> exit 1" "1" "${CASE_RC}"
+is "noncurrent delete marker -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=1*) ok "noncurrent delete marker still alerts hidden-object" ;;
+  *) bad "noncurrent delete marker detail wrong: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"error-doc-200",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "200 error document on versions -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*expected\ ListVersionsResult*) ok "200 error-document detail names the non-list body" ;;
+  *) bad "200 error-document detail: ${CASE_DETAIL}" ;;
+esac
+# Nonconformant server: a genuine error document wrapped inside a valid list
+# root at HTTP 200. The root-name guard passes, so the child <Error> guard
+# must fail closed instead of reading the body as an empty version listing.
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"error-doc-in-list-root",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "error document wrapped in a list root -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"<Error> child"*) ok "wrapped error-document detail names the Error child" ;;
+  *) bad "wrapped error-document detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"truncated-no-version-marker",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[],
+ "versions":[{"key":"audit/20260925T135100Z-session.data.${SID}.2.json","version_id":"v-1","is_latest":true,"delete_marker":false,"ago":300}]}
+JSON
+start_mock
+run_case
+is "truncated version list without version marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"truncated without a key/version marker"*) ok "version-marker truncation detail is explicit" ;;
+  *) bad "version-marker truncation detail: ${CASE_DETAIL}" ;;
+esac
+# Contradictory server: no <IsTruncated> element at all while explicit Next*
+# markers are present. The witness must follow the markers (the marker on
+# page 2 is the only evidence of the hide), not read page 1 as complete.
+K_PAGE1="$(key session.data 20260925T135150Z "${SID}" 9)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,"versions_no_istruncated":true,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_PAGE1}","version_id":"v-page1","is_latest":false,"delete_marker":false,"ago":300},
+  {"key":"${K_HIDDEN_A}","version_id":"dm-page2","is_latest":true,"delete_marker":true,"ago":120}]}
+JSON
+start_mock
+run_case
+is "IsTruncated absent with Next markers present -> exit 1 (marker on page 2)" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=1*) ok "contradictory IsTruncated still follows the Next markers to the hidden object" ;;
+  *) bad "contradictory IsTruncated detail: ${CASE_DETAIL}" ;;
+esac
+# Nonconformant server: a truncated version page with no <IsTruncated> and
+# only the version marker. The guard must treat the version marker as
+# truncation (paired-marker guard → error), so a future regression to a
+# key-marker-only guard is caught.
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,"versions_no_istruncated":true,"versions_partial_marker":"version-only",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_PAGE1}","version_id":"v-page1","is_latest":false,"delete_marker":false,"ago":300},
+  {"key":"${K_HIDDEN_A}","version_id":"v-page2","is_latest":false,"delete_marker":false,"ago":120}]}
+JSON
+start_mock
+run_case
+is "truncated version page with only a version marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"truncated without a key/version marker"*) ok "version-only marker still fails closed via the paired-marker guard" ;;
+  *) bad "version-only marker detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","versions_ignore_prefix":true,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_HIDDEN_A}","version_id":"dm-1","is_latest":true,"delete_marker":true,"ago":120}]}
+JSON
+start_mock
+run_case
+is "prefix-ignoring server double-listing one marker -> exit 1" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *hidden-object*audit=1*) ok "one hidden version is counted once across both listings" ;;
+  *) bad "dedupe count wrong: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"denied",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "denied version listing (403) -> exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "denied version listing -> error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*403*) ok "denied version listing detail names the call + status" ;;
+  *) bad "denied version listing detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"malformed",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "malformed version-list XML -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*unparseable*) ok "malformed version-list detail is explicit" ;;
+  *) bad "malformed version-list detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","fail_versions":"truncated-no-token",
+ "objects":[{"key":"audit/heartbeat/20260925T140000Z.json","ago":45}],
+ "uploads":[]}
+JSON
+start_mock
+run_case
+is "truncated version list without key marker -> exit 2" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *ListObjectVersions*"truncated without a key/version marker"*) ok "version-list truncation detail is explicit" ;;
+  *) bad "version-list truncation detail: ${CASE_DETAIL}" ;;
+esac
+
 # ---- (f) strictly list-only + SigV4 proof over every request -------------
 if python3 - "${REQUEST_LOG}" <<'PY'
 import json
@@ -1990,6 +2299,7 @@ import sys
 violations = []
 entries = 0
 pagination = 0
+versions_pagination = 0
 uploads_pagination = 0
 sig_ok = 0
 signed_shape = False
@@ -2013,14 +2323,17 @@ for raw in open(sys.argv[1], encoding="utf-8"):
         violations.append("SigV4 verification: %s" % entry["sig_check"])
     if not entry["ok"] and "fixture" not in entry["note"]:
         violations.append("rejected request: %s" % entry["note"])
-    if "list-type=2" not in entry["note"] and "uploads" not in entry["note"] and entry["ok"]:
+    if ("list-type=2" not in entry["note"] and "uploads" not in entry["note"]
+            and "versions" not in entry["note"] and entry["ok"]):
         violations.append("non-list OK request: %s" % entry["note"])
     for forbidden in ("partNumber=", "uploadId=", "?acl", "?versioning"):
         if forbidden in entry["path"]:
             violations.append("forbidden query %s in %s" % (forbidden, entry["path"]))
     if "continuation-token=" in entry["path"]:
         pagination += 1
-    if "key-marker=" in entry["path"]:
+    if "versions" in entry["note"] and "version-id-marker=" in entry["path"]:
+        versions_pagination += 1
+    if "uploads" in entry["note"] and "key-marker=" in entry["path"]:
         uploads_pagination += 1
 
 if entries < 20:
@@ -2029,6 +2342,8 @@ if pagination < 1:
     violations.append("no continuation-token request - object pagination not followed")
 if uploads_pagination < 1:
     violations.append("no key-marker request - upload pagination not followed")
+if versions_pagination < 1:
+    violations.append("no version-id-marker request - version pagination not followed")
 if sig_ok != entries:
     violations.append("SigV4 verified on only %d/%d requests (all must verify)" % (sig_ok, entries))
 if not signed_shape:
@@ -2038,8 +2353,8 @@ if violations:
     for violation in violations:
         print("VIOLATION " + violation)
     sys.exit(1)
-print("requests=%d pagination=%d uploads_pagination=%d sig_ok=%d" % (
-    entries, pagination, uploads_pagination, sig_ok))
+print("requests=%d pagination=%d versions_pagination=%d uploads_pagination=%d sig_ok=%d" % (
+    entries, pagination, versions_pagination, uploads_pagination, sig_ok))
 PY
 then ok "every witness request was a signed list call (no HEAD/GET-object/ListParts/write)"; else bad "list-only/SigV4 proof failed"; fi
 
@@ -3183,5 +3498,8 @@ else
   bad "ci.yml path gate missing tests/recording-witness/"
 fi
 
+if [ "$pass" -lt "${MIN_CHECKS}" ]; then
+  bad "check-count floor: ${pass} passed < ${MIN_CHECKS} pinned"
+fi
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
