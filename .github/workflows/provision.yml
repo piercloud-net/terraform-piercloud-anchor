@@ -972,6 +972,15 @@ jobs:
           RECORDING_WITNESS_RECORDINGS_PREFIX: ${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}
           RECORDING_WITNESS_KEY_ID: ${{ secrets.RECORDING_WITNESS_KEY_ID }}
           RECORDING_WITNESS_KEY: ${{ secrets.RECORDING_WITNESS_KEY }}
+          # Optional notification cadence (public repo VARIABLES, not secrets;
+          # empty = the witness defaults): renotify default 1800s,
+          # quiet_renotify default 86400s. quiet_signature pins the current
+          # finding set (stable identities, no ages) to the quiet cadence; the
+          # run-once acceptance prints the value to pin. Any finding-set
+          # change pushes immediately and leaves the pin behind.
+          RECORDING_WITNESS_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_RENOTIFY_SECONDS }}
+          RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS }}
+          RECORDING_WITNESS_QUIET_SIGNATURE: ${{ vars.RECORDING_WITNESS_QUIET_SIGNATURE }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail
