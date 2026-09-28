@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - *(hostname)* Anchor-01-<tenant> — canonical naming lib + real bind outputs (closes #105)
 - *(a2)* Recording-completeness witness (list-only) (closes #141)
 - *(witness)* Detect hidden objects (delete markers) (closes #145)
+- *(witness)* Finding-signature change-trigger + quiet pin for known finding sets (closes #147)
 
 ### 🐛 Bug Fixes
 
