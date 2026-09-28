@@ -172,7 +172,7 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check.
-MIN_CHECKS=469
+MIN_CHECKS=474
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -241,6 +241,12 @@ is "replica golden multi-segment session.* sanitized to unknown" \
 is "replica golden sid-less session.data sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000002.json" \
   "$(key session.data 20260925T100008Z "" 2)"
+# A non-UUID (but string) sid must take the same sanctioned path: the sanction
+# predicate is the *effective* sid, not the raw truthiness — the red-team
+# round-1 ``not effective_sid`` -> ``not sid`` mutant must fail here.
+is "replica golden session.data with a non-UUID sid sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000003.json" \
+  "$(key session.data 20260925T100008Z not-a-uuid 3)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -296,7 +302,10 @@ fi
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
 replica_refuses() { # label + shipper_keys.py args; non-zero = refused
-  if python3 "${HARNESS_DIR}/shipper_keys.py" "$@" >/dev/null 2>&1; then
+  # Drop the label: the CLI signature is <event-type> <ts> [sid] [seq] [mode].
+  # Passing the label as the event type made every tooth a no-op (red-team
+  # round-1 HIGH on #149) — the CLI died on the shifted ``ts`` argument.
+  if python3 "${HARNESS_DIR}/shipper_keys.py" "${@:2}" >/dev/null 2>&1; then
     bad "replica accepted an unexpected shape: $*"
   else
     ok "replica refuses unexpected shape: $*"
@@ -317,7 +326,7 @@ replica_refuses "session.Data case-variant non-UUID sid (the #19 sanction is exa
   session.Data 20260925T100008Z not-a-uuid 1
 replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exact)" \
   session.dAtA 20260925T100008Z not-a-uuid 1
-replica_refuses "over-long non-exact session.data type without a sid (sanction runs pre-cap)" \
+replica_refuses "over-long non-exact session.data type without a sid (capped near-match stays refused)" \
   "$(python3 -c 'print("session.data" + "q" * 500)')" 20260925T100008Z "" 1
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was

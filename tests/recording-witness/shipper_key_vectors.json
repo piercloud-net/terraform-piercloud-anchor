@@ -178,7 +178,7 @@
       "replica_args": [
         "session.data",
         "20260925T100008Z",
-        "",
+        "not-a-uuid",
         "4"
       ],
       "expected": "audit/20260925T100008Z-unknown.000004.json"

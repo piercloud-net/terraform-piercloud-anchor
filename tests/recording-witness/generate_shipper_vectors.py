@@ -177,11 +177,14 @@ def build_vectors(b2):
         ["session.data", TS, "", "3"],
         global_seq=2,
     )
+    # The non-UUID (string) case is two-sided: the replica args carry the raw
+    # sid, so a ``not effective_sid`` -> ``not sid`` mutant refuses instead of
+    # sanitizing and the vector replay reddens (red-team round-1 MED on #149).
     vector(
         "sid-less session.data (non-UUID sid) sanitized to unknown",
         "golden",
         {"time": EVENT_TIME, "event": "session.data", "sid": "not-a-uuid"},
-        ["session.data", TS, "", "4"],
+        ["session.data", TS, "not-a-uuid", "4"],
         global_seq=3,
     )
     vector(
@@ -390,6 +393,19 @@ def main():
         raise SystemExit(
             "pc-admin checkout %s is at %s, not the pinned %s; bump the pin deliberately first "
             "(or pass --allow-sha-mismatch for a debug run)" % (repo, head[:12], PINNED_PC_ADMIN_SHA[:12])
+        )
+    # A checkout at the pin with a dirty b2_client.py still imports UNPINNED
+    # builder bytes while the file would claim the pin (security round-1 LOW
+    # on #149). Refuse unless this is an explicit debug run: the pin is a
+    # provenance claim about the committed blob, not just the commit id.
+    dirty = subprocess.run(
+        ["git", "-C", repo, "status", "--porcelain", "--", "scripts/lib/b2_client.py"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    if dirty and not args.allow_sha_mismatch:
+        raise SystemExit(
+            "pc-admin checkout %s has uncommitted changes in scripts/lib/b2_client.py (%s); "
+            "the vectors must come from the committed blob at the pinned SHA "
+            "(or pass --allow-sha-mismatch for a debug run)" % (repo, dirty.splitlines()[0])
         )
     b2 = load_module(os.path.join(repo, "scripts", "lib", "b2_client.py"), "pcadmin_b2_client")
     payload = build_vectors(b2)
