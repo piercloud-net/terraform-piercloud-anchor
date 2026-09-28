@@ -62,6 +62,7 @@ All notable changes to this project will be documented in this file.
 - Per-anchor Origin CA certs (M2) — retire the shared wildcard pair (closes #123)
 - Alerts stanza on dashboard TLS + comment/dr.md truth (closes #118)
 - Unset-safe NTFY_TOKEN guard for hand runs (closes #137)
+- *(verification-browser)* Shared base CfT (~/.cft) + CFT_SKIP_FETCH rebuild knob (closes #139) ([#140](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/140))
 
 ### 📚 Documentation
 
