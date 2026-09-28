@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ a7035a9701517c7d9edfc5baa7cc04cc0ca72189 — the
-**grammar-defining SHA**: the builder grammar last changed there (the
-replay-conflict variant: `disambiguate_audit_key` appends `_<sha256[:16]>` to
-the event type when a rebuilt file replays a taken key with different bytes)
-and is unchanged since (pc-admin round-9 @ `e41fac8` added ETag normalization
-and persisted-float validation only — no key-grammar change).
-The previous grammar points were 66bd304 (the session.rejected sid-less fold),
-929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the
+PINNED AGAINST: cad0p/pc-admin @ 3325aeb848219488168778cbd944fcbf6b7c73bd — the
+**grammar-defining SHA**: pc-admin #19 scoped the sid-less sanitize (the
+exact single-segment `session.data` with no effective strict-UUID sid ships
+on the documented `unknown` non-session shape instead of the sid-less
+`session.*` drift shape).
+The previous grammar point was a7035a9 (the replay-conflict variant:
+`disambiguate_audit_key` appends `_<sha256[:16]>` to the event type when a
+rebuilt file replays a taken key with different bytes; pc-admin round-9 @
+`e41fac8` added ETag normalization and persisted-float validation only — no
+key-grammar change). Earlier points: 66bd304 (the session.rejected sid-less
+fold), 929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the
 `_<sha256[:8]>` collision-resistant suffix on the truncated type) and 342a37c
 (the `10^18-1` seq-ceiling clamp in `build_audit_key`).
 The golden strings in tests/recording-witness/run-test.sh and the checked-in
 vector matrix were generated from the pinned SHA; a pc-admin grammar change
-must bump this pin, regenerate both and update the witness contract in the
-same breath.
+must bump this pin and regenerate both (a contract-neutral change like #19
+needs no witness-contract edit — `audit/<ts>-unknown.<seq>.json` is already a
+documented non-session shape the collector absorbs).
 
 The witness correlates audit events with recordings through object key names, so
 harness fixtures MUST be built with the real shipper grammar (6-digit
@@ -33,10 +37,13 @@ Replica rules (deliberately strict — the harness fails loudly instead of
 silently building a shape the real shipper never emits, but every shape the
 real builder DOES emit on its documented path is reproduced faithfully):
 
-- Only a `session.*` event with a **strict-UUID** sid becomes a session key; a
-  non-UUID sid is refused here. (The real builder at the pinned SHA would ship
-  it on the sid-less global shape — refuse so a fixture can never pin a shape
-  the shipper cannot produce.)
+- Only a `session.*` event with a **strict-UUID** sid becomes a session key.
+  The exact single-segment `session.data` with no effective strict-UUID sid
+  (missing, `""`, non-UUID) is sanctioned to the documented `unknown`
+  non-session shape exactly like the real builder (pc-admin #19); every other
+  `session.*` with a non-UUID sid is refused here (the real builder keeps
+  shipping it on the sid-less drift shape — refuse so a fixture can never pin
+  a shape the shipper cannot produce).
 - The sid is **lowercased** exactly like the real builder (`build_audit_key`
   lowercases a strict-UUID sid); the witness groups sessions
   case-insensitively, so an uppercase fixture pins the lowercased key.
@@ -49,7 +56,7 @@ real builder DOES emit on its documented path is reproduced faithfully):
   classifier is single-segment, so the raw type would read as drift).
 - Non-session events never carry a sid (the real builder drops it).
 - `session.rejected` is forced to the sid-less non-session shape: the witness
-  allowlists it there and the real builder at the pinned SHA (`a7035a9`;
+  allowlists it there and the real builder at the pinned SHA (behavior here
   unchanged since `66bd304`) drops any sid for this type, shipping it under
   the global counter. A regression to
   the pre-fold sid-bearing shape would be read by the witness as a session
@@ -83,7 +90,7 @@ import hashlib
 import re
 import sys
 
-PINNED_PC_ADMIN_SHA = "a7035a9701517c7d9edfc5baa7cc04cc0ca72189"
+PINNED_PC_ADMIN_SHA = "3325aeb848219488168778cbd944fcbf6b7c73bd"
 
 TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z$"
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -126,6 +133,11 @@ SESSION_MODE_EVENTS = frozenset({"session.start", "session.end"})
 # Teleport v18 emits session.rejected without a session id; the witness
 # allowlists it on the sid-less shape (documented, not naming drift).
 SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
+# pc-admin #19 (pinned @ 3325aeb): the exact single-segment `session.data`
+# with no effective strict-UUID sid ships on the documented `unknown`
+# non-session shape (Teleport v18 port-forward traffic accounting carries no
+# sid). Same constant name as pc-admin's for cross-repo grepping.
+SID_LESS_UNKNOWN_SESSION_EVENTS = frozenset({"session.data"})
 
 
 def audit_key(event_type, ts, sid="", seq=1, mode=""):
@@ -139,10 +151,20 @@ def audit_key(event_type, ts, sid="", seq=1, mode=""):
         )
     if not EVENT_TYPE_RE.match(event_type):
         raise ValueError("event type outside the shipper grammar: %r" % event_type)
-    if event_type.startswith("session.") and not SESSION_TYPE_RE.match(event_type):
+    effective_sid = sid if isinstance(sid, str) and UUID_RE.fullmatch(sid) else ""
+    if event_type.startswith("session.") and (
+        not SESSION_TYPE_RE.match(event_type)
+        or (not effective_sid and event_type in SID_LESS_UNKNOWN_SESSION_EVENTS)
+    ):
         # Multi-segment session.*: the witness's session classifier is
         # single-segment, so the real builder sanitizes the whole type to
-        # `unknown` and drops the sid (global shape). Mirror it.
+        # `unknown` and drops the sid (global shape). Scoped sanction
+        # (pc-admin #19 @ 3325aeb): the exact single-segment `session.data`
+        # with no effective strict-UUID sid (missing, "", non-UUID) is
+        # likewise sanctioned to the documented `unknown` non-session shape;
+        # every other `session.*` keeps the sid-less drift shape the replica
+        # refuses below. Exact match on the raw type, before the truncation
+        # cap.
         event_type = "unknown"
         sid = ""
     if len(event_type) > MAX_EVENT_TYPE_LENGTH:

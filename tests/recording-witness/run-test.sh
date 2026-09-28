@@ -34,9 +34,11 @@
 #       lands; shell/legacy sessions with an end and no tar -> alert
 #       recording-gap; duplicate session.end objects resolve by the newest
 #       LastModified (both mode directions pinned); a malformed mode marker ->
-#       naming-contract; sid-less session.rejected keys are not drift, while a
-#       sid-bearing rejected key (the pre-fold pc-admin shape) is read as a
-#       session with no session.start -> session-start-missing; a
+#       naming-contract; sid-less session.rejected keys are not drift (nor is
+#       the pc-admin #19-sanctioned `unknown` shape for a sid-less
+#       session.data), while a sid-bearing rejected key (the pre-fold pc-admin
+#       shape) is read as a session with no session.start ->
+#       session-start-missing; a
 #       replay-conflict variant key (base + `_<sha256[:16]>`) is absorbed as
 #       the SAME event identity as its base (no sequence-duplicate, no naming
 #       drift) with the base key authoritative for the lifecycle mode, while a
@@ -61,7 +63,7 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ a7035a9; golden strings,
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 3325aeb; golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
 #       the over-long event-type truncation cap with its `_<sha256[:8]>`
@@ -187,14 +189,16 @@ fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ a7035a9
+# were generated from the real builder at cad0p/pc-admin @ 3325aeb
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key,
-# the full-SHA pin in shipper_keys.py; the grammar-defining point added the
+# the full-SHA pin in shipper_keys.py; the grammar-defining point (pc-admin
+# #19) scoped the sid-less `session.data` sanction onto the documented
+# `unknown` non-session shape, the previous point a7035a9 added the
 # replay-conflict `_<sha256[:16]>` variant keys, and the earlier point 41735ff
 # added the over-long event-type truncation cap with the `_<sha256[:8]>`
-# suffix — both are pinned by the vector matrix below); a pc-admin grammar
-# change must bump the pin, regenerate these and update the witness contract
-# together. Drift fixtures (non-UUID or
+# suffix — all pinned by the vector matrix below); a pc-admin grammar change
+# must bump the pin and regenerate these (a contract-neutral change needs no
+# witness-contract edit). Drift fixtures (non-UUID or
 # sid-less session keys, malformed modes) stay hand-written literals on
 # purpose: the replica now refuses shapes the real shipper never emits, so a
 # fixture request for one is itself a failure (the teeth after the golden).
@@ -228,6 +232,15 @@ is "replica golden uppercase sid lowercased" \
 is "replica golden multi-segment session.* sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000001.json" \
   "$(key session.foo.bar 20260925T100008Z "" 1)"
+# pc-admin #19 (@ 3325aeb): the exact single-segment `session.data` with no
+# effective strict-UUID sid is sanctioned onto the documented `unknown`
+# non-session shape (v18 port-forward traffic accounting); the expected
+# literal is re-derived from the rule, so a replica that stops mirroring the
+# scoped sanction fails here too (the vector matrix pins the real-builder
+# output).
+is "replica golden sid-less session.data sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000002.json" \
+  "$(key session.data 20260925T100008Z "" 2)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -300,6 +313,12 @@ replica_refuses "seq beyond the witness 18-digit grammar" session.data 20260925T
 replica_refuses "session.start missing sid with mode" session.start 20260925T100008Z "" 1 shell
 replica_refuses "over-long type outside the grammar (real builder sanitizes to unknown)" \
   "$(python3 -c 'print("a" * 128 + "-bad")')" 20260925T100008Z "" 1
+replica_refuses "session.Data case-variant non-UUID sid (the #19 sanction is exact)" \
+  session.Data 20260925T100008Z not-a-uuid 1
+replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exact)" \
+  session.dAtA 20260925T100008Z not-a-uuid 1
+replica_refuses "over-long non-exact session.data type without a sid (sanction runs pre-cap)" \
+  "$(python3 -c 'print("session.data" + "q" * 500)')" 20260925T100008Z "" 1
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
 # generated from the REAL pc-admin builder at the pinned SHA
@@ -1196,13 +1215,14 @@ fixture <<JSON
   {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
   {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
   {"key":"audit/20260925T135300Z-session.rejected.000001.json","ago":297},
+  {"key":"$(key session.data 20260925T135300Z "" 2)","ago":296},
   {"key":"recordings/${SID}.tar","ago":296}],
  "uploads":[]}
 JSON
 start_mock
 run_case
-is "sid-less session.rejected key -> exit 0" "0" "${CASE_RC}"
-is "sid-less session.rejected key -> ok verdict (no naming-contract false positive)" "ok" "${CASE_STATE}"
+is "sid-less session.rejected + sanctioned session.data keys -> exit 0" "0" "${CASE_RC}"
+is "sid-less session.rejected + sanctioned unknown keys -> ok verdict (no naming-contract false positive)" "ok" "${CASE_STATE}"
 
 # Regression punch-through tooth: the pre-fold pc-admin shape (a sid-bearing
 # session.rejected key) must be caught by the witness as a session with no
