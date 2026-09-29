@@ -143,14 +143,14 @@ SID_LESS_UNKNOWN_SESSION_EVENTS = frozenset({"session.data"})
 
 def audit_key(event_type, ts, sid="", seq=1, mode=""):
     """Build one audit object key exactly as pc-admin's shipper does."""
-    if not TS_RE.match(ts):
+    if not isinstance(ts, str) or not TS_RE.match(ts):
         raise ValueError("timestamp must be YYYYmmddTHHMMSSZ, got %r" % ts)
     if not isinstance(seq, int) or isinstance(seq, bool) or not 1 <= seq <= SEQ_MAX:
         raise ValueError(
             "seq must be >= 1 (the real builder emits previous+1; seq 0 is a "
             "hand-written legacy fixture) and fit the witness's 18-digit grammar, got %r" % (seq,)
         )
-    if not EVENT_TYPE_RE.match(event_type):
+    if not isinstance(event_type, str) or not EVENT_TYPE_RE.match(event_type):
         raise ValueError("event type outside the shipper grammar: %r" % event_type)
     effective_sid = sid if isinstance(sid, str) and UUID_RE.fullmatch(sid) else ""
     if event_type.startswith("session.") and (

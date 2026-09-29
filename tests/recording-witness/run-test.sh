@@ -393,8 +393,13 @@ replica_refuses "over-long non-exact session.data type without a sid (capped nea
 # string-only, so only a direct call can pass a non-string sid. The real
 # builder normalizes a non-string/non-UUID sid to ""; the replica must drop
 # it on session.rejected, sanitize it on the exact session.data, and refuse
-# with ValueError elsewhere — never crash with a TypeError from the regex.
-if python3 - "${HARNESS_DIR}" <<'PY'
+# with ValueError everywhere else — never crash with a TypeError from the
+# regex. Non-string ts/event_type take the same clean ValueError path
+# (functional round-11 INFO). Every replica-importing heredoc runs under
+# `python3 -I` (cwd off sys.path), including this one. The checker prints a
+# sentinel the bash layer asserts, so an import-time exit/panic that skips the
+# whole checker cannot count as a pass (red-team round-11 LOW).
+if teeth_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
 import sys
@@ -414,14 +419,33 @@ except ValueError:
     pass
 else:
     raise SystemExit("session.start with a non-string sid must be refused with ValueError")
+try:
+    replica.audit_key("user.login", 1, "", 1)
+except ValueError:
+    pass
+else:
+    raise SystemExit("a non-string ts must be refused with ValueError")
+try:
+    replica.audit_key(1, ts, "", 1)
+except ValueError:
+    pass
+else:
+    raise SystemExit("a non-string event type must be refused with ValueError")
+print("teeth=ok")
 PY
-then ok "replica: non-string sid handling (drop on rejected/data, clean ValueError elsewhere)"; else bad "replica non-string sid handling diverged (TypeError or wrong key)"; fi
+)" && [[ "$teeth_out" == "teeth=ok" ]]; then
+  ok "replica: non-string sid handling (drop on rejected/data, clean ValueError elsewhere)"
+else
+  bad "replica non-string sid handling diverged or the checker did not run (out: ${teeth_out:-<empty>})"
+fi
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
 # generated from the REAL pc-admin builder at the pinned SHA
 # (generate_shipper_vectors.py); every vector must replay exactly and every
 # refusal must stay refused, or silent replica drift passes the harness.
-if python3 -I - "${HARNESS_DIR}" <<'PY'
+# The bash layer asserts the printed sentinel (counts pinned here too), so a
+# checker skipped by an import-time exit cannot read as a pass.
+if matrix_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import hashlib
 import importlib.util
 import json
@@ -542,7 +566,11 @@ for refusal in vectors["refusals"]:
 print("vectors=%d refusals=%d pin=%s source=%s" % (
     len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-then ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"; else bad "shipper replica diverged from the checked-in real-builder vectors"; fi
+)" && [[ "$matrix_out" == "vectors=26 refusals=12 "* ]]; then
+  ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
+else
+  bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
+fi
 
 # Canonical-sid oracle: a literal grid cannot enumerate every normalization
 # mutant of the sid predicate. Assert the replica's acceptance equals an
@@ -555,8 +583,9 @@ then ok "replica replays the real-builder golden+boundary vectors (pin-matched, 
 # (strip/trim/replace/translate/normalize) diverges somewhere below; a
 # mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
 # pin in the vector block. The corpus-size floor makes a gutted corpus fail
-# loudly, and this block emits its own counted check.
-if python3 -I - "${HARNESS_DIR}" <<'PY'
+# loudly, and this block emits its own counted check the bash layer asserts
+# (a skipped/gutted oracle cannot read as a pass).
+if oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
 import re
@@ -663,7 +692,11 @@ if failures:
         % (len(failures), len(oracle_sids), sid, canonical, start_scoped, data_key))
 print("oracle=%d cases" % len(oracle_sids))
 PY
-then ok "canonical-sid oracle corpus (generated; no normalization divergence)"; else bad "shipper replica diverged from the canonical-sid oracle corpus"; fi
+)" && [[ "$oracle_out" == "oracle=7707 cases" ]]; then
+  ok "canonical-sid oracle corpus (generated; no normalization divergence)"
+else
+  bad "shipper replica diverged from the canonical-sid oracle corpus or the checker did not run (out: ${oracle_out:-<empty>})"
+fi
 
 # The extracted span calls these on-box helpers; stub them in the harness.
 log()  { printf 'harness: %s\n' "$*" >&2; }
@@ -992,8 +1025,9 @@ case "${CASE_DETAIL}" in *open-upload-stale*) ok "open-upload detail names open-
 # 30 single-value gaps (seqs 0,2,4,...,60 + end 61): the renderer must cap at
 # 20 ranges + ellipsis and complete fast. The round-1 length assertion was
 # tautological because state.json is clipped server-side; this checks the
-# bounded renderer itself. Keys come from the shipper grammar.
-python3 - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+# bounded renderer itself. Keys come from the shipper grammar (the
+# replica-importing heredocs run `python3 -I`: cwd off sys.path).
+python3 -I - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
 import json
 import sys
 
@@ -1044,7 +1078,7 @@ sig_capped_a="$(state_field signature)"
 # missing ranges (an identical detail render) and a different 21st+ remainder
 # -> the signature must move. Pre-fix both hashed the capped render, so the
 # tooth fails on the old code.
-python3 - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+python3 -I - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
 import json
 import sys
 
