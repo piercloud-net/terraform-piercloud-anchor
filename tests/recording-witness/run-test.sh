@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=512
+MIN_CHECKS=513
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -454,6 +454,14 @@ if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN:
     raise SystemExit(
         "replica UUID_PATTERN %r != pinned canonical pattern %r"
         % (replica.UUID_PATTERN, CANONICAL_UUID_PATTERN))
+# The compiled matcher is what both call sites actually use: pin its pattern
+# too, or a `re.compile(<other pattern>)` rebind bypasses the constant pin
+# (round-7 MEDIUM — the semantics the constant pin rejects when written on
+# the pattern line stay reachable on the compile line).
+if replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
+    raise SystemExit(
+        "replica UUID_RE.pattern %r != pinned canonical pattern %r"
+        % (replica.UUID_RE.pattern, CANONICAL_UUID_PATTERN))
 
 
 def source_sha_ok(value):
@@ -501,6 +509,102 @@ print("vectors=%d refusals=%d pin=%s source=%s" % (
     len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
 then ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"; else bad "shipper replica diverged from the checked-in real-builder vectors"; fi
+
+# Canonical-sid oracle: a literal grid cannot enumerate every normalization
+# mutant of the sid predicate. Assert the replica's acceptance equals an
+# INDEPENDENT canonical oracle over a GENERATED corpus: every Unicode
+# control/format/space codepoint inserted at prefix/suffix/interior, ASCII
+# punctuation insertions and wrapper pairs, separator translations, a
+# confusable/compatibility substitution set (incl. NFKC-foldable forms), and
+# single-char deletions. A mutant that normalizes the sid before matching
+# (strip/trim/replace/translate/normalize) diverges somewhere below; a
+# mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
+# pin in the vector block. The corpus-size floor makes a gutted corpus fail
+# loudly, and this block emits its own counted check.
+if python3 - "${HARNESS_DIR}" <<'PY'
+import importlib.util
+import os
+import re
+import sys
+import unicodedata
+
+here = sys.argv[1]
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+
+ORACLE_TS = "20260925T100008Z"
+ORACLE_BASE = "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+# Independent canonical predicate: same literal as the vector-block pin.
+CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
+
+oracle_sids = [ORACLE_BASE, ORACLE_BASE.upper()]
+pad_chars = []
+for codepoint in range(0x110000):
+    char = chr(codepoint)
+    if char != "\x00" and unicodedata.category(char) in ("Cc", "Cf", "Zs"):
+        pad_chars.append(char)
+pad_chars.extend("_-.:;,'\"`()[]{}<>|/\\!?@#$%^&*+=~ ")
+for char in pad_chars:
+    oracle_sids.append(char + ORACLE_BASE)
+    oracle_sids.append(ORACLE_BASE + char)
+    oracle_sids.append(ORACLE_BASE[:4] + char + ORACLE_BASE[4:])
+for open_char, close_char in (("(", ")"), ("<", ">"), ("[", "]"), ("{", "}"),
+                              ("`", "`"), ("'", "'"), ('"', '"')):
+    oracle_sids.append(open_char + ORACLE_BASE + close_char)
+oracle_sids.append("urn:uuid:" + ORACLE_BASE)
+for separator in (".", "_", ":", " ", "|", "/", "\\", ",", ";", ""):
+    oracle_sids.append(ORACLE_BASE.replace("-", separator))
+confusables = {
+    "0": "oOо", "1": "lIі", "2": "٢", "3": "٣", "4": "٤", "5": "٥",
+    "6": "٦", "7": "٧", "8": "٨", "9": "٩",
+    "a": "аáα", "b": "Ь", "c": "сϲ", "d": "ԁ", "e": "еé", "f": "ғ",
+}
+for index, char in enumerate(ORACLE_BASE):
+    for replacement in confusables.get(char.lower(), ""):
+        oracle_sids.append(ORACLE_BASE[:index] + replacement + ORACLE_BASE[index + 1:])
+for low, high in ((0x2070, 0x209F), (0x2100, 0x214F), (0x2150, 0x218F),
+                  (0x2460, 0x24FF), (0x1D400, 0x1D7FF), (0xFF01, 0xFF5E)):
+    for codepoint in range(low, high + 1):
+        folded = unicodedata.normalize("NFKC", chr(codepoint))
+        if len(folded) == 1 and folded in "0123456789abcdefABCDEF":
+            for index, char in enumerate(ORACLE_BASE):
+                if char == folded.lower():
+                    oracle_sids.append(ORACLE_BASE[:index] + chr(codepoint) + ORACLE_BASE[index + 1:])
+for index in range(len(ORACLE_BASE)):
+    oracle_sids.append(ORACLE_BASE[:index] + ORACLE_BASE[index + 1:])
+if len(oracle_sids) < 900:
+    raise SystemExit("canonical-sid oracle corpus shrank: %d cases" % len(oracle_sids))
+
+failures = []
+for sid in oracle_sids:
+    canonical = ORACLE_RE.fullmatch(sid) is not None
+    try:
+        data_key = replica.audit_key("session.data", ORACLE_TS, sid, 1)
+    except ValueError:
+        data_key = None
+    try:
+        replica.audit_key("session.start", ORACLE_TS, sid, 1, "shell")
+        start_scoped = True
+    except ValueError:
+        start_scoped = False
+    if canonical:
+        good = start_scoped and data_key == "audit/%s-session.data.%s.000001.json" % (ORACLE_TS, sid.lower())
+    else:
+        good = (not start_scoped) and data_key == "audit/%s-unknown.000001.json" % ORACLE_TS
+    if not good:
+        failures.append((sid, canonical, start_scoped, data_key))
+if failures:
+    sid, canonical, start_scoped, data_key = failures[0]
+    raise SystemExit(
+        "canonical-sid oracle divergence on %d/%d cases "
+        "(first %r canonical=%s start_scoped=%s data_key=%s)"
+        % (len(failures), len(oracle_sids), sid, canonical, start_scoped, data_key))
+print("oracle=%d cases" % len(oracle_sids))
+PY
+then ok "canonical-sid oracle corpus (generated; no normalization divergence)"; else bad "shipper replica diverged from the canonical-sid oracle corpus"; fi
 
 # The extracted span calls these on-box helpers; stub them in the harness.
 log()  { printf 'harness: %s\n' "$*" >&2; }
