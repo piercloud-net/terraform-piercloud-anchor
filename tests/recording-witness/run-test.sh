@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=480
+MIN_CHECKS=492
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -252,26 +252,6 @@ is "replica golden sid-less session.data sanitized to unknown" \
 is "replica golden session.data with a non-UUID sid sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000003.json" \
   "$(key session.data 20260925T100008Z not-a-uuid 3)"
-# A sid that merely CONTAINS a UUID is still not a strict-UUID sid: the
-# predicate is ``fullmatch``. A ``fullmatch`` -> ``search`` mutant (red-team
-# round-2 LOW) would treat "x<uuid>y" as an effective sid and refuse this
-# sanctioned `session.data` (the real builder sanitizes it to `unknown`).
-is "replica golden session.data with a UUID-substring sid sanitized to unknown" \
-  "audit/20260925T100008Z-unknown.000004.json" \
-  "$(key session.data 20260925T100008Z "x${REPLICA_SID}y" 4)"
-# A UUID PREFIX with trailing junk is also not a strict-UUID sid. The
-# ``search``/``match`` checks use leading junk; ``re.match`` (anchored at the
-# start, not the end) would accept this shape and diverge from the real
-# builder — red-team round-3 LOW.
-is "replica golden session.data with a UUID-prefix sid sanitized to unknown" \
-  "audit/20260925T100008Z-unknown.000005.json" \
-  "$(key session.data 20260925T100008Z "${REPLICA_SID}y" 5)"
-# Whitespace-padded sids are NOT strict UUIDs either: the real builder never
-# strips (red-team round-3 LOW). A leading-space golden pins its ``fullmatch``
-# against a ``fullmatch(sid.strip())`` mutant at the effective-sid site.
-is "replica golden session.data with a leading-space sid sanitized to unknown" \
-  "audit/20260925T100008Z-unknown.000006.json" \
-  "$(key session.data 20260925T100008Z " ${REPLICA_SID}" 6)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -345,17 +325,34 @@ replica_refuses() { # <label> <expected-refusal-reason> + shipper_keys.py args; 
   fi
 }
 replica_refuses "session.start non-UUID sid" "non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
-# A UUID-substring sid is still not a strict UUID. A ``fullmatch`` ->
-# ``search`` mutant at the refusal site (red-team round-2 LOW) would accept
-# it and pin a session key the real shipper can never emit.
-replica_refuses "session.start UUID-substring sid" "non-UUID sid" session.start 20260925T100008Z "x${REPLICA_SID}y" 1 shell
-# ``re.match`` at the refusal site would accept a UUID-prefix sid and pin a
-# session key the real shipper can never emit (red-team round-3 LOW).
-replica_refuses "session.start UUID-prefix sid" "non-UUID sid" session.start 20260925T100008Z "${REPLICA_SID}y" 1 shell
-# A trailing-space sid is refused like any non-UUID sid: the real builder does
-# not strip. Pins the refusal site against a ``fullmatch(sid.strip())``
-# mutant (red-team round-3 LOW).
-replica_refuses "session.start trailing-space sid" "non-UUID sid" session.start 20260925T100008Z "${REPLICA_SID} " 1 shell
+# Non-canonical sid shapes: the replica must NOT normalize (no strip/lstrip/
+# rstrip, no de-dashing, no brace/URN unwrapping) — the real builder
+# ``fullmatch``es the canonical strict-UUID pattern only. Every shape here
+# takes the sanctioned `unknown` path on the exact single-segment
+# `session.data` and the refusal path on any other session type. The grid
+# pins the per-shape mutants found across lens rounds 2–5 (search/match,
+# leading/trailing junk, strip/lstrip/rstrip/partition, pattern-arity
+# {12,}/{11}, de-dash/brace/URN normalization). Uppercase is canonical (the
+# builder lowercases) and is pinned by the vector matrix separately.
+SID_SHAPE_SEQ=6
+for sid_shape in \
+  "leading-junk|x${REPLICA_SID}y" \
+  "trailing-junk|${REPLICA_SID}y" \
+  "leading-space| ${REPLICA_SID}" \
+  "trailing-space|${REPLICA_SID} " \
+  "overlong-tail|${REPLICA_SID}f" \
+  "short-tail|${REPLICA_SID%?}" \
+  "no-dash|${REPLICA_SID//-/}" \
+  "braces|{${REPLICA_SID}}" \
+  "urn|urn:uuid:${REPLICA_SID}" \
+; do
+  shape_name="${sid_shape%%|*}"; shaped_sid="${sid_shape#*|}"
+  SID_SHAPE_SEQ=$((SID_SHAPE_SEQ + 1))
+  is "replica golden session.data with a ${shape_name} sid sanitized to unknown" \
+    "audit/20260925T100008Z-unknown.$(printf '%06d' "${SID_SHAPE_SEQ}").json" \
+    "$(key session.data 20260925T100008Z "${shaped_sid}" "${SID_SHAPE_SEQ}")"
+  replica_refuses "session.start ${shape_name} sid" "non-UUID sid" session.start 20260925T100008Z "${shaped_sid}" 1 shell
+done
 replica_refuses "session.start missing sid and mode" "mandatory" session.start 20260925T100008Z "" 1
 replica_refuses "non-session with sid" "non-session" user.login 20260925T100008Z "${REPLICA_SID}" 1
 replica_refuses "mode on non-lifecycle event" "only valid" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
