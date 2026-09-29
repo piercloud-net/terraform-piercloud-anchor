@@ -530,22 +530,32 @@ import sys
 import unicodedata
 
 here = sys.argv[1]
-spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
-replica = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(replica)
-
 ORACLE_TS = "20260925T100008Z"
 ORACLE_BASE = "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
 # Independent canonical predicate: same literal as the vector-block pin.
 CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
+# Snapshot the predicate primitives BEFORE importing the replica: an import
+# could otherwise rebind re.compile / unicodedata.category / .normalize and
+# make this oracle agree with a relaxed matcher while the CLI and vector
+# processes stay strict (red-team round-9 LOW).
+_oracle_compile = re.compile
+_oracle_category = unicodedata.category
+_oracle_normalize = unicodedata.normalize
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+# Re-assert the pattern pins in THIS process too: the vector-block pins run
+# in a separate interpreter, so a per-process rebind would escape them.
+if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN or replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
+    raise SystemExit("replica UUID pattern pins diverged in the oracle process")
+ORACLE_RE = _oracle_compile(CANONICAL_UUID_PATTERN)
 
 oracle_sids = [ORACLE_BASE, ORACLE_BASE.upper()]
 pad_chars = []
 for codepoint in range(0x110000):
     char = chr(codepoint)
-    if char != "\x00" and unicodedata.category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
+    if _oracle_category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
         pad_chars.append(char)
 pad_chars.extend("_-.:;,'\"`()[]{}<>|/\\!?@#$%^&*+=~ ")
 for char in pad_chars:
@@ -559,8 +569,8 @@ oracle_sids.append("urn:uuid:" + ORACLE_BASE)
 for separator in (".", "_", ":", " ", "|", "/", "\\", ",", ";", ""):
     oracle_sids.append(ORACLE_BASE.replace("-", separator))
 confusables = {
-    "0": "oOо", "1": "lIі", "2": "zZ٤", "3": "з", "4": "٤д", "5": "sS$",
-    "6": "gGб", "7": "tT۷", "8": "bBȢ", "9": "gq٩",
+    "0": "oOо٠", "1": "lIі١", "2": "zZ٢", "3": "з٣", "4": "٤д", "5": "sS$٥",
+    "6": "gGб٦", "7": "tT۷", "8": "Ȣ٨", "9": "gq٩",
     "a": "аáα@", "b": "Ьß", "c": "сϲ¢", "d": "ԁդ", "e": "еé€", "f": "ғƒ",
 }
 for index, char in enumerate(ORACLE_BASE):
@@ -569,18 +579,23 @@ for index, char in enumerate(ORACLE_BASE):
 for low, high in ((0x2070, 0x209F), (0x2100, 0x214F), (0x2150, 0x218F),
                   (0x2460, 0x24FF), (0x1D400, 0x1D7FF), (0xFF01, 0xFF5E)):
     for codepoint in range(low, high + 1):
-        folded = unicodedata.normalize("NFKC", chr(codepoint))
+        folded = _oracle_normalize("NFKC", chr(codepoint))
         if len(folded) == 1 and folded in "0123456789abcdefABCDEF":
             for index, char in enumerate(ORACLE_BASE):
                 if char == folded.lower():
                     oracle_sids.append(ORACLE_BASE[:index] + chr(codepoint) + ORACLE_BASE[index + 1:])
 for index in range(len(ORACLE_BASE)):
     oracle_sids.append(ORACLE_BASE[:index] + ORACLE_BASE[index + 1:])
-if len(oracle_sids) < 900:
+# Synthetic canonical-pattern near-misses: a 36-char dashless hex string and
+# an all-dash string are non-canonical; they pin hostile same-`.pattern`
+# matchers that accept a broad hex/dash class behaviorally.
+oracle_sids.append("a" * 36)
+oracle_sids.append("-" * 36)
+if len(oracle_sids) < 6500:
     raise SystemExit("canonical-sid oracle corpus shrank: %d cases" % len(oracle_sids))
 # A size floor alone passes a degenerate corpus ([BASE] * 901); require
 # distinct sids too so the corpus cannot be replaced by a repeated literal.
-if len(set(oracle_sids)) < 900:
+if len(set(oracle_sids)) < 6500:
     raise SystemExit("canonical-sid oracle corpus lost distinctness: %d unique sids" % len(set(oracle_sids)))
 
 failures = []
