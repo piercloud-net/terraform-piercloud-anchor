@@ -43,7 +43,8 @@ real builder DOES emit on its documented path is reproduced faithfully):
   non-session shape exactly like the real builder (pc-admin #19); every other
   `session.*` with a non-UUID sid is refused here (the real builder keeps
   shipping it on the sid-less drift shape — refuse so a fixture can never pin
-  a shape the shipper cannot produce).
+  a shape the shipper cannot produce), except `session.rejected`, which drops
+  any sid under the forced-sid-less rule below.
 - The sid is **lowercased** exactly like the real builder (`build_audit_key`
   lowercases a strict-UUID sid); the witness groups sessions
   case-insensitively, so an uppercase fixture pins the lowercased key.
@@ -176,10 +177,17 @@ def audit_key(event_type, ts, sid="", seq=1, mode=""):
         digest = hashlib.sha256(event_type.encode("utf-8")).hexdigest()
         head = event_type[: MAX_EVENT_TYPE_LENGTH - EVENT_TYPE_HASH_LENGTH - 1].rstrip(".")
         event_type = "%s_%s" % (head, digest[:EVENT_TYPE_HASH_LENGTH])
-    if sid and not UUID_RE.fullmatch(sid):
-        raise ValueError(
-            "non-UUID sid %r: the real shipper ships this on the sid-less global shape" % sid
-        )
+    if sid and (not isinstance(sid, str) or not UUID_RE.fullmatch(sid)):
+        if event_type not in SID_LESS_SESSION_EVENTS:
+            raise ValueError(
+                "non-UUID sid %r: the real shipper ships this on the sid-less global shape" % sid
+            )
+        # session.rejected drops any sid — non-string/non-UUID included: the
+        # real builder normalizes the sid to "" before the forced-sid-less
+        # shape, so the documented key stays buildable from the live input
+        # (functional round-10 LOWs) instead of refusing or crashing on a
+        # non-string that would raise TypeError from the regex.
+        sid = ""
     if sid:
         # The real builder lowercases; the witness groups sessions
         # case-insensitively, so an uppercase fixture pins the lowercased key.

@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=513
+MIN_CHECKS=515
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -225,6 +225,12 @@ is "replica golden session.rejected forced sid-less" \
 is "replica golden session.rejected sid-less (sid dropped, not consumed)" \
   "audit/20260925T100008Z-session.rejected.000005.json" \
   "$(key session.rejected 20260925T100008Z "" 5)"
+# The forced-sid-less rule drops ANY sid, non-UUID included, exactly like the
+# real builder (functional round-10 LOW: the non-UUID check used to precede
+# the forced-sid-less branch and refused the documented key).
+is "replica golden session.rejected with a non-UUID sid (any sid dropped)" \
+  "audit/20260925T100008Z-session.rejected.000005.json" \
+  "$(key session.rejected 20260925T100008Z not-a-uuid 5)"
 is "replica golden non-session key sid-less" \
   "audit/20260925T100008Z-user.login.000006.json" \
   "$(key user.login 20260925T100008Z "" 6)"
@@ -382,6 +388,34 @@ replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exa
   session.dAtA 20260925T100008Z not-a-uuid 1
 replica_refuses "over-long non-exact session.data type without a sid (capped near-match stays refused)" "without a sid" \
   "$(python3 -c 'print("session.data" + "q" * 500)')" 20260925T100008Z "" 1
+
+# Direct-API teeth for the sid type (functional round-10 LOWs): the CLI is
+# string-only, so only a direct call can pass a non-string sid. The real
+# builder normalizes a non-string/non-UUID sid to ""; the replica must drop
+# it on session.rejected, sanitize it on the exact session.data, and refuse
+# with ValueError elsewhere — never crash with a TypeError from the regex.
+if python3 - "${HARNESS_DIR}" <<'PY'
+import importlib.util
+import os
+import sys
+
+here = sys.argv[1]
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+ts = "20260925T100008Z"
+if replica.audit_key("session.rejected", ts, 123, 5) != "audit/%s-session.rejected.000005.json" % ts:
+    raise SystemExit("session.rejected with a non-string sid must drop the sid")
+if replica.audit_key("session.data", ts, 123, 1) != "audit/%s-unknown.000001.json" % ts:
+    raise SystemExit("session.data with a non-string sid must sanitize to unknown")
+try:
+    replica.audit_key("session.start", ts, 123, 1, "shell")
+except ValueError:
+    pass
+else:
+    raise SystemExit("session.start with a non-string sid must be refused with ValueError")
+PY
+then ok "replica: non-string sid handling (drop on rejected/data, clean ValueError elsewhere)"; else bad "replica non-string sid handling diverged (TypeError or wrong key)"; fi
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
 # generated from the REAL pc-admin builder at the pinned SHA
@@ -593,7 +627,7 @@ oracle_sids.append("a" * 36)
 oracle_sids.append("-" * 36)
 if len(oracle_sids) < 6500:
     raise SystemExit("canonical-sid oracle corpus shrank: %d cases" % len(oracle_sids))
-# A size floor alone passes a degenerate corpus ([BASE] * 901); require
+# A size floor alone passes a degenerate corpus (one literal repeated); require
 # distinct sids too so the corpus cannot be replaced by a repeated literal.
 if len(set(oracle_sids)) < 6500:
     raise SystemExit("canonical-sid oracle corpus lost distinctness: %d unique sids" % len(set(oracle_sids)))
