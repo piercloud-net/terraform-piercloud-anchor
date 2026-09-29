@@ -623,7 +623,7 @@ CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
 # off sys.path and a shadow 're.py'/'unicodedata.py' cannot load either
 # (red-team round-10 INFO).
 ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
-# Snapshot the floor primitives BEFORE the import: the post-import floor
+# Capture the floor primitives BEFORE the import: the post-import floor
 # re-check and the printed counts must not see a replica-builtins rebind
 # (red-team round-14 LOW), and a count-preserving corpus replacement must
 # still fail the distinctness floor (round-14 MEDIUM).
@@ -690,7 +690,7 @@ if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN or replica.UUID_RE.pattern != 
 # a replica can reassign __main__.oracle_sids at import time, and a
 # count-preserving replacement would otherwise mask a divergence while the
 # pre-import floors still vouch for the original corpus (red-team round-14
-# MEDIUM). _canonical_len/_canonical_set are the pre-import snapshots, so a
+# MEDIUM). _canonical_len/_canonical_set are the pre-import captures, so a
 # builtins rebind cannot fabricate these numbers either (round-14 LOW).
 if _canonical_len(oracle_sids) < 6500:
     raise SystemExit("canonical-sid oracle corpus shrank after import: %d cases" % _canonical_len(oracle_sids))
