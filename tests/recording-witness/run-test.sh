@@ -588,13 +588,17 @@ fi
 # (strip/trim/replace/translate/normalize) diverges somewhere below; a
 # mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
 # pin in the vector block. The corpus-size floor makes a gutted corpus fail
-# loudly, and this block emits its own completion marker the bash layer
-# asserts. The corpus size tracks the interpreter's Unicode DB (7137 on 3.9,
-# 7476 on 3.11, 7602 on 3.12/3.13, 7707 on 3.14; the internal 6500 floors are
-# the contract), so the marker line is the version-stable sentinel and the
-# count is diagnostic only: a skipped/gutted oracle cannot accidentally read
-# as a pass.
-if oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+# loudly pre-import; the bash layer asserts both this block's completion
+# marker and the corpus floor on the printed count line — a post-import
+# truncation of __main__.oracle_sids prints the genuine reduced count + the
+# marker and would otherwise pass (red-team round-13 MEDIUM). The corpus size
+# tracks the interpreter's Unicode DB (7137 on 3.9, 7476 on 3.11, 7602 on
+# 3.12/3.13, 7707 on 3.14; the internal 6500 floors are the contract), so
+# bash checks the count only against the floor, never an exact value: a
+# skipped checker or a corpus gutted below the floor cannot read as a pass (a
+# truncation that stays >=6500 is the documented finite-corpus residue).
+oracle_rc=0
+oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
 import re
@@ -702,7 +706,19 @@ if failures:
 print("oracle=%d cases" % len(oracle_sids))
 print("oracle=ok")
 PY
-)" && [[ "${oracle_out##*$'\n'}" == "oracle=ok" ]]; then
+)" || oracle_rc=$?
+# Enforce the corpus floor on the printed count line (second-to-last): the
+# checker's internal floors run before the replica import, so a post-import
+# truncation of __main__.oracle_sids would otherwise ship the marker with a
+# reduced count and pass (red-team round-13 MEDIUM).
+oracle_last="${oracle_out##*$'\n'}"
+oracle_prev="${oracle_out%$'\n'*}"
+oracle_prev="${oracle_prev##*$'\n'}"
+oracle_count="${oracle_prev#oracle=}"
+oracle_count="${oracle_count% cases}"
+if [[ "$oracle_rc" == 0 && "$oracle_last" == "oracle=ok" \
+      && "$oracle_prev" == oracle=*" cases" && "$oracle_count" =~ ^[0-9]+$ \
+      && "$oracle_count" -ge 6500 ]]; then
   ok "canonical-sid oracle corpus (generated; no normalization divergence)"
 else
   bad "shipper replica diverged from the canonical-sid oracle corpus or the checker did not run (out: ${oracle_out:-<empty>})"
