@@ -421,7 +421,7 @@ then ok "replica: non-string sid handling (drop on rejected/data, clean ValueErr
 # generated from the REAL pc-admin builder at the pinned SHA
 # (generate_shipper_vectors.py); every vector must replay exactly and every
 # refusal must stay refused, or silent replica drift passes the harness.
-if python3 - "${HARNESS_DIR}" <<'PY'
+if python3 -I - "${HARNESS_DIR}" <<'PY'
 import hashlib
 import importlib.util
 import json
@@ -556,7 +556,7 @@ then ok "replica replays the real-builder golden+boundary vectors (pin-matched, 
 # mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
 # pin in the vector block. The corpus-size floor makes a gutted corpus fail
 # loudly, and this block emits its own counted check.
-if python3 - "${HARNESS_DIR}" <<'PY'
+if python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
 import re
@@ -569,27 +569,22 @@ ORACLE_BASE = "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
 # Independent canonical predicate: same literal as the vector-block pin.
 CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-# Freeze the predicate primitives BEFORE importing the replica: an import
-# could otherwise rebind re.compile / unicodedata.category / .normalize and
-# make this oracle agree with a relaxed matcher while the CLI and vector
-# processes stay strict (red-team round-9 LOW).
-_oracle_compile = re.compile
-_oracle_category = unicodedata.category
-_oracle_normalize = unicodedata.normalize
-spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
-replica = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(replica)
-# Re-assert the pattern pins in THIS process too: the vector-block pins run
-# in a separate interpreter, so a per-process rebind would escape them.
-if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN or replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
-    raise SystemExit("replica UUID pattern pins diverged in the oracle process")
-ORACLE_RE = _oracle_compile(CANONICAL_UUID_PATTERN)
+# Build the independent predicate and the generated corpus BEFORE importing
+# the replica, from the pristine primitives: an import-time rebind of
+# `re.compile` / `unicodedata.category` / `.normalize` — or a mutation of the
+# shared function objects themselves (`re.compile.__code__ = ...`, which a
+# by-reference "freeze" cannot stop) — cannot change what the oracle already
+# captured, and the corpus plus both floors are final before any replica code
+# runs (red-team round-10 LOWs). The invocation is `python3 -I` so the cwd is
+# off sys.path and a shadow `re.py`/`unicodedata.py` cannot load either
+# (red-team round-10 INFO).
+ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
 
 oracle_sids = [ORACLE_BASE, ORACLE_BASE.upper()]
 pad_chars = []
 for codepoint in range(0x110000):
     char = chr(codepoint)
-    if _oracle_category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
+    if unicodedata.category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
         pad_chars.append(char)
 pad_chars.extend("_-.:;,'\"`()[]{}<>|/\\!?@#$%^&*+=~ ")
 for char in pad_chars:
@@ -613,7 +608,7 @@ for index, char in enumerate(ORACLE_BASE):
 for low, high in ((0x2070, 0x209F), (0x2100, 0x214F), (0x2150, 0x218F),
                   (0x2460, 0x24FF), (0x1D400, 0x1D7FF), (0xFF01, 0xFF5E)):
     for codepoint in range(low, high + 1):
-        folded = _oracle_normalize("NFKC", chr(codepoint))
+        folded = unicodedata.normalize("NFKC", chr(codepoint))
         if len(folded) == 1 and folded in "0123456789abcdefABCDEF":
             for index, char in enumerate(ORACLE_BASE):
                 if char == folded.lower():
@@ -631,6 +626,16 @@ if len(oracle_sids) < 6500:
 # distinct sids too so the corpus cannot be replaced by a repeated literal.
 if len(set(oracle_sids)) < 6500:
     raise SystemExit("canonical-sid oracle corpus lost distinctness: %d unique sids" % len(set(oracle_sids)))
+
+# Now import the replica and run its checks against the already-frozen corpus
+# and predicate. Re-assert the pattern pins in THIS process too: the
+# vector-block pins run in a separate interpreter, so a per-process rebind
+# would escape them.
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN or replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
+    raise SystemExit("replica UUID pattern pins diverged in the oracle process")
 
 failures = []
 for sid in oracle_sids:
