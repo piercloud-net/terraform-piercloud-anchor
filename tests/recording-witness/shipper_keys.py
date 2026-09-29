@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
+r"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 3325aeb848219488168778cbd944fcbf6b7c73bd — the
-**grammar-defining SHA**: pc-admin #19 scoped the sid-less sanitize (the
-exact single-segment `session.data` with no effective strict-UUID sid ships
-on the documented `unknown` non-session shape instead of the sid-less
-`session.*` drift shape).
-The previous grammar point was a7035a9 (the replay-conflict variant:
+PINNED AGAINST: cad0p/pc-admin @ 25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 — the
+**grammar-defining SHA**: pc-admin #20 anchored the audit-key type regexes at
+`\Z` (Python's `$` also matches before a trailing newline, so a type like
+`user.login\n` would pass and build a key with an embedded newline the witness
+reads as `contract-mismatch` drift; the real builder now sanitizes such a type
+to the documented `unknown` non-session shape and the replica refuses it).
+The previous grammar point was 3325aeb (pc-admin #19: the exact single-segment
+`session.data` with no effective strict-UUID sid ships on the documented
+`unknown` non-session shape instead of the sid-less `session.*` drift shape).
+Earlier points: a7035a9 (the replay-conflict variant:
 `disambiguate_audit_key` appends `_<sha256[:16]>` to the event type when a
 rebuilt file replays a taken key with different bytes; pc-admin round-9 @
 `e41fac8` added ETag normalization and persisted-float validation only — no
-key-grammar change). Earlier points: 66bd304 (the session.rejected sid-less
+key-grammar change), 66bd304 (the session.rejected sid-less
 fold), 929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the
 `_<sha256[:8]>` collision-resistant suffix on the truncated type) and 342a37c
 (the `10^18-1` seq-ceiling clamp in `build_audit_key`).
@@ -63,6 +67,10 @@ real builder DOES emit on its documented path is reproduced faithfully):
   the pre-fold sid-bearing shape would be read by the witness as a session
   with no `session.start` (`session-start-missing`), so the replica never
   builds it and the golden/refusal teeth pin that.
+- A type with a trailing newline is out of grammar (`\Z`-anchored type
+  regexes, pc-admin #20): the real builder sanitizes it to `unknown`; the
+  replica refuses it so a fixture can never pin a key with an embedded
+  newline the witness reads as `contract-mismatch` drift.
 - An event type longer than 128 chars is truncated to the cap with a trailing
   separator dropped and `_<sha256[:8]>` appended (an underscore segment inside
   the witness's `[A-Za-z0-9_]+` type grammar): the cap keeps B2 keys bounded
@@ -91,14 +99,17 @@ import hashlib
 import re
 import sys
 
-PINNED_PC_ADMIN_SHA = "3325aeb848219488168778cbd944fcbf6b7c73bd"
+PINNED_PC_ADMIN_SHA = "25f79223cadd2a0ca6781d575215ebd2a7c0ddc8"
 
 TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z$"
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 TS_RE = re.compile(TS_PATTERN)
 UUID_RE = re.compile(UUID_PATTERN)
-EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$")
-SESSION_TYPE_RE = re.compile(r"^session\.[A-Za-z0-9_]+$")
+# ``\Z``, not ``$``: Python's ``$`` also matches before a trailing newline,
+# so a type like ``user.login\n`` would pass and build a key with an embedded
+# newline the witness reads as contract-mismatch drift (pc-admin #20).
+EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\Z")
+SESSION_TYPE_RE = re.compile(r"^session\.[A-Za-z0-9_]+\Z")
 # The real builder emits `%06d` (7+ digits past 999999); the ceiling mirrors
 # the witness's `[0-9]{1,18}` grammar that pc-admin's SEQ_PATTERN mirrors.
 SEQ_MAX = 10 ** 18 - 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate shipper_key_vectors.json from the REAL pc-admin key builder.
+r"""Regenerate shipper_key_vectors.json from the REAL pc-admin key builder.
 
 Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 `shipper_key_vectors.json` and replays every vector against the local replica
@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 3325aeb
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 25f7922
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex; `--allow-sha-mismatch` only
@@ -19,13 +19,17 @@ variant matrix through `disambiguate_audit_key`, and self-checks that the
 replica in this directory reproduces every vector before writing.
 
 The pin is the **grammar-defining SHA**: the builder grammar last changed at
+25f7922 (pc-admin #20: the audit-key type regexes are `\Z`-anchored, so a
+trailing-newline type such as `user.login\n` is out of grammar and the real
+builder sanitizes it to the documented `unknown` non-session shape instead of
+building a key with an embedded newline). The previous grammar point was
 3325aeb (pc-admin #19: the exact single-segment `session.data` with no
 effective strict-UUID sid is sanctioned onto the documented `unknown`
-non-session shape instead of the sid-less `session.*` drift shape). The
-previous grammar point was a7035a9 (the replay-conflict variant —
+non-session shape instead of the sid-less `session.*` drift shape). Earlier
+points: a7035a9 (the replay-conflict variant —
 `disambiguate_audit_key` appends `_<sha256[:16]>` to the event type when a
-rebuilt file replays a taken key with different bytes). Earlier points:
-66bd304 (the `session.rejected` sid-less fold), 929d82c (the 128-char
+rebuilt file replays a taken key with different bytes), 66bd304 (the
+`session.rejected` sid-less fold), 929d82c (the 128-char
 pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>`
 collision-resistant suffix on the truncated type) and 342a37c (the `10^18-1`
 seq-ceiling clamp in `build_audit_key`). Because the pin must name the
@@ -354,6 +358,38 @@ def build_vectors(b2):
          "why": "the real builder sanitizes an invalid type to `unknown`; the "
                 "truncation cap applies only to grammar-valid types, so the "
                 "replica must refuse the literal shape"},
+        # pc-admin #20 (\Z anchors): a trailing newline is outside the type
+        # grammar, so the real builder sanitizes it to the documented `unknown`
+        # shape and the replica refuses it. The UUID sid on the session.data/
+        # session.start cases keeps the refusal regression-sensitive: under a
+        # `$` mutant those args would build an embedded-newline key instead of
+        # refusing. The trailing-CR and embedded-newline cases are pins that
+        # keep refusing under either anchor (a `$` never ignored a trailing
+        # CR; position-0 anchoring rejects an embedded newline).
+        {"name": "user.login with a trailing newline (\\Z anchors)",
+         "replica_args": ["user.login\n", TS, "", "1"],
+         "why": "pc-admin #20 \\Z-anchored the type regexes; a trailing newline "
+                "is out of grammar and the real builder sanitizes the type to "
+                "`unknown`"},
+        {"name": "session.data with a trailing newline and a UUID sid (\\Z anchors)",
+         "replica_args": ["session.data\n", TS, LSID, "1"],
+         "why": "pc-admin #20 \\Z-anchored the type regexes; the real builder "
+                "sanitizes the type to `unknown`, never a session key with an "
+                "embedded newline"},
+        {"name": "session.start with a trailing newline and a UUID sid (\\Z anchors)",
+         "replica_args": ["session.start\n", TS, LSID, "1", ""],
+         "why": "pc-admin #20 \\Z-anchored the type regexes; the real builder "
+                "sanitizes the type to `unknown`, never a key with an embedded "
+                "newline"},
+        {"name": "session.data with a trailing CR (\\Z anchors; pre-#20 pin)",
+         "replica_args": ["session.data\r", TS, "", "1"],
+         "why": "already refused before #20 (`$` ignores only a trailing "
+                "newline); the \\Z anchor keeps it out of the grammar"},
+        {"name": "user.login with an embedded newline (position-0 anchoring pin)",
+         "replica_args": ["evil\nuser.login", TS, "", "1"],
+         "why": "an embedded newline is out of grammar under any anchor; the "
+                "real builder sanitizes the type to `unknown` and the replica "
+                "refuses it"},
     ]
     for refusal in refusals:
         try:
@@ -363,14 +399,18 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder grammar last changed at 3325aeb (pc-admin #19: the exact "
-                        "single-segment `session.data` with no effective strict-UUID sid is "
-                        "sanctioned onto the documented `unknown` non-session shape); previous "
-                        "grammar points a7035a9 (the replay-conflict `_<sha256[:16]>` variant "
-                        "keys from disambiguate_audit_key), 66bd304 (session.rejected sid-less), "
-                        "929d82c (the 128-char pre-hash event-type truncation cap), 41735ff "
-                        "(the `_<sha256[:8]>` suffix on the truncated type) and 342a37c "
-                        "(the 10^18-1 seq-ceiling clamp in build_audit_key)",
+        "grammar_note": "builder grammar last changed at 25f7922 (pc-admin #20: the "
+                        "audit-key type regexes are \\Z-anchored, so a trailing-newline "
+                        "type is out of grammar and is sanitized to the documented "
+                        "`unknown` non-session shape); previous grammar points 3325aeb "
+                        "(pc-admin #19: the exact single-segment `session.data` with no "
+                        "effective strict-UUID sid is sanctioned onto the documented "
+                        "`unknown` non-session shape), a7035a9 (the replay-conflict "
+                        "`_<sha256[:16]>` variant keys from disambiguate_audit_key), "
+                        "66bd304 (session.rejected sid-less), 929d82c (the 128-char "
+                        "pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>` "
+                        "suffix on the truncated type) and 342a37c (the 10^18-1 seq-ceiling "
+                        "clamp in build_audit_key)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "refusals": refusals,
