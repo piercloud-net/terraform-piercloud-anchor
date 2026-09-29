@@ -513,8 +513,9 @@ then ok "replica replays the real-builder golden+boundary vectors (pin-matched, 
 # Canonical-sid oracle: a literal grid cannot enumerate every normalization
 # mutant of the sid predicate. Assert the replica's acceptance equals an
 # INDEPENDENT canonical oracle over a GENERATED corpus: every Unicode
-# control/format/space codepoint inserted at prefix/suffix/interior, ASCII
-# punctuation insertions and wrapper pairs, separator translations, a
+# control (Cc), format (Cf), separator (Zs/Zl/Zp) and combining-mark
+# (Mn/Me) codepoint inserted at prefix/suffix/interior, ASCII punctuation
+# insertions and wrapper pairs, separator translations, a
 # confusable/compatibility substitution set (incl. NFKC-foldable forms), and
 # single-char deletions. A mutant that normalizes the sid before matching
 # (strip/trim/replace/translate/normalize) diverges somewhere below; a
@@ -544,7 +545,7 @@ oracle_sids = [ORACLE_BASE, ORACLE_BASE.upper()]
 pad_chars = []
 for codepoint in range(0x110000):
     char = chr(codepoint)
-    if char != "\x00" and unicodedata.category(char) in ("Cc", "Cf", "Zs"):
+    if char != "\x00" and unicodedata.category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
         pad_chars.append(char)
 pad_chars.extend("_-.:;,'\"`()[]{}<>|/\\!?@#$%^&*+=~ ")
 for char in pad_chars:
@@ -558,9 +559,9 @@ oracle_sids.append("urn:uuid:" + ORACLE_BASE)
 for separator in (".", "_", ":", " ", "|", "/", "\\", ",", ";", ""):
     oracle_sids.append(ORACLE_BASE.replace("-", separator))
 confusables = {
-    "0": "oOо", "1": "lIі", "2": "٢", "3": "٣", "4": "٤", "5": "٥",
-    "6": "٦", "7": "٧", "8": "٨", "9": "٩",
-    "a": "аáα", "b": "Ь", "c": "сϲ", "d": "ԁ", "e": "еé", "f": "ғ",
+    "0": "oOо", "1": "lIі", "2": "zZ٤", "3": "з", "4": "٤д", "5": "sS$",
+    "6": "gGб", "7": "tT۷", "8": "bBȢ", "9": "gq٩",
+    "a": "аáα@", "b": "Ьß", "c": "сϲ¢", "d": "ԁդ", "e": "еé€", "f": "ғƒ",
 }
 for index, char in enumerate(ORACLE_BASE):
     for replacement in confusables.get(char.lower(), ""):
@@ -577,6 +578,10 @@ for index in range(len(ORACLE_BASE)):
     oracle_sids.append(ORACLE_BASE[:index] + ORACLE_BASE[index + 1:])
 if len(oracle_sids) < 900:
     raise SystemExit("canonical-sid oracle corpus shrank: %d cases" % len(oracle_sids))
+# A size floor alone passes a degenerate corpus ([BASE] * 901); require
+# distinct sids too so the corpus cannot be replaced by a repeated literal.
+if len(set(oracle_sids)) < 900:
+    raise SystemExit("canonical-sid oracle corpus lost distinctness: %d unique sids" % len(set(oracle_sids)))
 
 failures = []
 for sid in oracle_sids:
