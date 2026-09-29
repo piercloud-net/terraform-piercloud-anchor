@@ -587,16 +587,18 @@ fi
 # single-char deletions. A mutant that normalizes the sid before matching
 # (strip/trim/replace/translate/normalize) diverges somewhere below; a
 # mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
-# pin in the vector block. The corpus-size floor makes a gutted corpus fail
-# loudly pre-import; the bash layer asserts both this block's completion
-# marker and the corpus floor on the printed count line — a post-import
-# truncation of __main__.oracle_sids prints the genuine reduced count + the
-# marker and would otherwise pass (red-team round-13 MEDIUM). The corpus size
-# tracks the interpreter's Unicode DB (7137 on 3.9, 7476 on 3.11, 7602 on
-# 3.12/3.13, 7707 on 3.14; the internal 6500 floors are the contract), so
-# bash checks the count only against the floor, never an exact value: a
-# skipped checker or a corpus gutted below the floor cannot read as a pass (a
-# truncation that stays >=6500 is the documented finite-corpus residue).
+# pin in the vector block. The internal size AND distinctness floors run
+# before the replica import and are re-checked immediately after it; the bash
+# layer asserts the completion marker plus both printed numbers (size and
+# distinct) against the 6500 floor — a post-import replacement of
+# __main__.oracle_sids (truncated, or a same-size repeated literal) would
+# otherwise ship the marker and pass (red-team round-13/round-14 MEDIUMs).
+# The corpus size tracks the interpreter's Unicode DB (7137 on 3.9, 7476 on
+# 3.11, 7602 on 3.12/3.13, 7707 on 3.14), so bash checks the numbers only
+# against the floors, never an exact value: a skipped checker or a corpus
+# below either floor cannot read as a pass (a replacement that clears both
+# floors with substituted content is the documented deliberate-tamper
+# residue).
 oracle_rc=0
 oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
@@ -621,6 +623,12 @@ CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
 # off sys.path and a shadow 're.py'/'unicodedata.py' cannot load either
 # (red-team round-10 INFO).
 ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
+# Snapshot the floor primitives BEFORE the import: the post-import floor
+# re-check and the printed counts must not see a replica-builtins rebind
+# (red-team round-14 LOW), and a count-preserving corpus replacement must
+# still fail the distinctness floor (round-14 MEDIUM).
+_canonical_len = len
+_canonical_set = set
 
 oracle_sids = [ORACLE_BASE, ORACLE_BASE.upper()]
 pad_chars = []
@@ -678,6 +686,16 @@ replica = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replica)
 if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN or replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
     raise SystemExit("replica UUID pattern pins diverged in the oracle process")
+# Re-enforce both floors on the corpus as it stands AFTER the replica import:
+# a replica can reassign __main__.oracle_sids at import time, and a
+# count-preserving replacement would otherwise mask a divergence while the
+# pre-import floors still vouch for the original corpus (red-team round-14
+# MEDIUM). _canonical_len/_canonical_set are the pre-import snapshots, so a
+# builtins rebind cannot fabricate these numbers either (round-14 LOW).
+if _canonical_len(oracle_sids) < 6500:
+    raise SystemExit("canonical-sid oracle corpus shrank after import: %d cases" % _canonical_len(oracle_sids))
+if _canonical_len(_canonical_set(oracle_sids)) < 6500:
+    raise SystemExit("canonical-sid oracle corpus lost distinctness after import: %d unique sids" % _canonical_len(_canonical_set(oracle_sids)))
 
 failures = []
 for sid in oracle_sids:
@@ -703,22 +721,28 @@ if failures:
         "canonical-sid oracle divergence on %d/%d cases "
         "(first %r canonical=%s start_scoped=%s data_key=%s)"
         % (len(failures), len(oracle_sids), sid, canonical, start_scoped, data_key))
-print("oracle=%d cases" % len(oracle_sids))
+print("oracle=%d cases, %d distinct" % (_canonical_len(oracle_sids), _canonical_len(_canonical_set(oracle_sids))))
 print("oracle=ok")
 PY
 )" || oracle_rc=$?
-# Enforce the corpus floor on the printed count line (second-to-last): the
+# Enforce both corpus floors on the printed counts (second-to-last line): the
 # checker's internal floors run before the replica import, so a post-import
-# truncation of __main__.oracle_sids would otherwise ship the marker with a
-# reduced count and pass (red-team round-13 MEDIUM).
+# replacement of __main__.oracle_sids — truncated, or the same-size repeated
+# literal — would otherwise ship the marker and pass (red-team round-13/14
+# MEDIUMs; the checker re-checks the floors too). The count is
+# interpreter-dependent, so only the floors are compared, never an exact
+# value.
 oracle_last="${oracle_out##*$'\n'}"
 oracle_prev="${oracle_out%$'\n'*}"
 oracle_prev="${oracle_prev##*$'\n'}"
-oracle_count="${oracle_prev#oracle=}"
-oracle_count="${oracle_count% cases}"
+oracle_counts="${oracle_prev#oracle=}"
+oracle_count="${oracle_counts%% cases*}"
+oracle_distinct="${oracle_counts##* cases, }"
+oracle_distinct="${oracle_distinct%% *}"
 if [[ "$oracle_rc" == 0 && "$oracle_last" == "oracle=ok" \
-      && "$oracle_prev" == oracle=*" cases" && "$oracle_count" =~ ^[0-9]+$ \
-      && "$oracle_count" -ge 6500 ]]; then
+      && "$oracle_prev" == oracle=*" cases, "*" distinct" \
+      && "$oracle_count" =~ ^[0-9]+$ && "$oracle_distinct" =~ ^[0-9]+$ \
+      && "$oracle_count" -ge 6500 && "$oracle_distinct" -ge 6500 ]]; then
   ok "canonical-sid oracle corpus (generated; no normalization divergence)"
 else
   bad "shipper replica diverged from the canonical-sid oracle corpus or the checker did not run (out: ${oracle_out:-<empty>})"
