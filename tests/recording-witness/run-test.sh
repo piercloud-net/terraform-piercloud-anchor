@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=516
+MIN_CHECKS=525  # 516 (#151 matrix tooth) + 9 trailing-newline teeth (#152)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -1856,6 +1856,77 @@ run_case
 is "unknown audit key shape -> exit 1" "1" "${CASE_RC}"
 is "unknown audit key shape -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *contract-mismatch*) ok "contract-mismatch is reachable with a heartbeat present" ;; *) bad "contract-mismatch detail: ${CASE_DETAIL}" ;; esac
+
+# ---- trailing-newline key names: \Z-anchored key classifiers (#152) -------
+# The provisioned span's key classifiers are \Z-anchored (full string), so a
+# newline-suffixed key name is judged as drift instead of being absorbed as
+# its non-newline shape. pc-admin #20 \Z-anchors the builder, so the real
+# producer cannot emit these names - the teeth are the anti-regression proof
+# for the anchored span (a `$` reversion turns them green/misclassified).
+NEWLINE_USER_KEY="$(key user.login 20260925T135000Z "" 6)"$'\n'
+python3 - "${NEWLINE_USER_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+        {"key": sys.argv[1], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed user.login key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed user.login key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *contract-mismatch*) ok "newline-suffixed user.login key alerts contract-mismatch" ;; *) bad "newline-suffixed user.login detail: ${CASE_DETAIL}" ;; esac
+
+NEWLINE_SESSION_KEY="$(key session.start 20260925T135000Z "${SID}" 1 shell)"$'\n'
+python3 - "${NEWLINE_SESSION_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+        {"key": sys.argv[1], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed session.start key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed session.start key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "newline-suffixed session.start key alerts naming-contract" ;; *) bad "newline-suffixed session.start detail: ${CASE_DETAIL}" ;; esac
+
+# A newline-suffixed recording key never matches the recording check, so it
+# cannot satisfy the shell session's gap: the session still alerts
+# recording-gap (with `$` the tar is absorbed and this fixture stays green).
+NEWLINE_GAP_START="$(key session.start 20260925T130000Z "${SID}" 1 shell)"
+NEWLINE_TAR_KEY="recordings/${SID}.tar"$'\n'
+python3 - "${NEWLINE_GAP_START}" "${NEWLINE_TAR_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+        {"key": sys.argv[1], "ago": 1200},
+        {"key": sys.argv[2], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed recording key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed recording key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "newline-suffixed tar never satisfies the recording check (recording-gap)" ;; *) bad "newline-suffixed tar detail: ${CASE_DETAIL}" ;; esac
 
 # ---- clock skew: future timestamps must error, never look healthy --------
 

@@ -1454,7 +1454,9 @@ VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous k
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
 # Classification is shape-strict so a malformed session key cannot be re-parsed
-# as a non-session event (or vice versa).
+# as a non-session event (or vice versa). Every key classifier is \Z-anchored
+# (full string): Python's `$` also matches before a trailing newline, which
+# would absorb a newline-suffixed key name as its non-newline shape.
 TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
 # Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
 # optional mode marker (.shell/.exec) is contract-defined for session.start
@@ -1462,15 +1464,15 @@ TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
 SESSION_KEY_RE = re.compile(
     r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
     r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
-    r"(?:\.(?P<mode>shell|exec))?\.json$"
+    r"(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
 # Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
 NON_SESSION_KEY_RE = re.compile(
-    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
 )
-HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json$")
+HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json\Z")
 UUID_RE = re.compile(UUID_PATTERN)
-RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
+RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar\Z")
 # Sid-less session.* event types documented by the shipper contract (Teleport
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
@@ -1482,7 +1484,9 @@ SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
 # line. The witness is list-only and cannot see bytes, so a variant is the
 # SAME event identity as its base key, re-shipped under a disambiguated name:
 # canonicalize the type and count the (ts, type, seq) identity once per session.
-CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}$")
+# Anchoring is hygiene only here: the input is the newline-free etype capture,
+# never a raw key name.
+CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}\Z")
 # The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): a finding
 # signature exactly as emitted in state.json. \A/\Z is a FULL-string match -
 # Python's `$` also matches before a trailing newline, which would accept a
