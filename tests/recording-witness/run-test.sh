@@ -398,7 +398,11 @@ replica_refuses "over-long non-exact session.data type without a sid (capped nea
 # (functional round-11 INFO). Every replica-importing heredoc runs under
 # `python3 -I` (cwd off sys.path), including this one. The checker prints a
 # sentinel the bash layer asserts, so an import-time exit/panic that skips the
-# whole checker cannot count as a pass (red-team round-11 LOW).
+# whole checker cannot accidentally count as a pass; a replica that deliberately
+# forges the marker is the documented in-process residual (red-team round-11
+# LOW; trust round-12 INFO). Keep the wrapped heredoc bodies backtick-free:
+# bash 3.2's `$()` scanner miscounts them and fails to parse (functional
+# round-12 LOW).
 if teeth_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
@@ -443,8 +447,9 @@ fi
 # generated from the REAL pc-admin builder at the pinned SHA
 # (generate_shipper_vectors.py); every vector must replay exactly and every
 # refusal must stay refused, or silent replica drift passes the harness.
-# The bash layer asserts the printed sentinel (counts pinned here too), so a
-# checker skipped by an import-time exit cannot read as a pass.
+# The bash layer asserts the exact printed sentinel line (counts + pinned
+# source), so neither a skipped checker nor an appended extra line can read as
+# a pass.
 if matrix_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import hashlib
 import importlib.util
@@ -471,8 +476,8 @@ def replay(args, body=None):
     args[3] = int(args[3])
     key = replica.audit_key(*args)
     if body is not None:
-        # `kind: "variant"` vectors carry the real builder's
-        # `disambiguate_audit_key` output for this body.
+        # 'kind: "variant"' vectors carry the real builder's
+        # 'disambiguate_audit_key' output for this body.
         key = replica.disambiguate_key(key, body)
     return key
 
@@ -513,7 +518,7 @@ if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN:
         "replica UUID_PATTERN %r != pinned canonical pattern %r"
         % (replica.UUID_PATTERN, CANONICAL_UUID_PATTERN))
 # The compiled matcher is what both call sites actually use: pin its pattern
-# too, or a `re.compile(<other pattern>)` rebind bypasses the constant pin
+# too, or a 're.compile(<other pattern>)' rebind bypasses the constant pin
 # (round-7 MEDIUM — the semantics the constant pin rejects when written on
 # the pattern line stay reachable on the compile line).
 if replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
@@ -523,7 +528,7 @@ if replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
 
 
 def source_sha_ok(value):
-    # Round-6 F6: exact 40-hex equality. `startswith(pin)` accepted the short
+    # Round-6 F6: exact 40-hex equality. 'startswith(pin)' accepted the short
     # prefix, a prefix plus junk, and any longer prefix-sharing hex string.
     return (isinstance(value, str)
             and re.fullmatch(r"[0-9a-f]{40}", value) is not None
@@ -566,7 +571,7 @@ for refusal in vectors["refusals"]:
 print("vectors=%d refusals=%d pin=%s source=%s" % (
     len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=26 refusals=12 "* ]]; then
+)" && [[ "$matrix_out" == "vectors=26 refusals=12 pin=3325aeb848219488168778cbd944fcbf6b7c73bd source=3325aeb84821" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
@@ -583,8 +588,12 @@ fi
 # (strip/trim/replace/translate/normalize) diverges somewhere below; a
 # mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
 # pin in the vector block. The corpus-size floor makes a gutted corpus fail
-# loudly, and this block emits its own counted check the bash layer asserts
-# (a skipped/gutted oracle cannot read as a pass).
+# loudly, and this block emits its own completion marker the bash layer
+# asserts. The corpus size tracks the interpreter's Unicode DB (7137 on 3.9,
+# 7476 on 3.11, 7602 on 3.12/3.13, 7707 on 3.14; the internal 6500 floors are
+# the contract), so the marker line is the version-stable sentinel and the
+# count is diagnostic only: a skipped/gutted oracle cannot accidentally read
+# as a pass.
 if oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
@@ -600,12 +609,12 @@ CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 # Build the independent predicate and the generated corpus BEFORE importing
 # the replica, from the pristine primitives: an import-time rebind of
-# `re.compile` / `unicodedata.category` / `.normalize` — or a mutation of the
-# shared function objects themselves (`re.compile.__code__ = ...`, which a
+# 're.compile' / 'unicodedata.category' / '.normalize' — or a mutation of the
+# shared function objects themselves ('re.compile.__code__ = ...', which a
 # by-reference "freeze" cannot stop) — cannot change what the oracle already
 # captured, and the corpus plus both floors are final before any replica code
-# runs (red-team round-10 LOWs). The invocation is `python3 -I` so the cwd is
-# off sys.path and a shadow `re.py`/`unicodedata.py` cannot load either
+# runs (red-team round-10 LOWs). The invocation is 'python3 -I' so the cwd is
+# off sys.path and a shadow 're.py'/'unicodedata.py' cannot load either
 # (red-team round-10 INFO).
 ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
 
@@ -615,13 +624,13 @@ for codepoint in range(0x110000):
     char = chr(codepoint)
     if unicodedata.category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
         pad_chars.append(char)
-pad_chars.extend("_-.:;,'\"`()[]{}<>|/\\!?@#$%^&*+=~ ")
+pad_chars.extend("_-.:;,'\"\x60()[]{}<>|/\\!?@#$%^&*+=~ ")
 for char in pad_chars:
     oracle_sids.append(char + ORACLE_BASE)
     oracle_sids.append(ORACLE_BASE + char)
     oracle_sids.append(ORACLE_BASE[:4] + char + ORACLE_BASE[4:])
 for open_char, close_char in (("(", ")"), ("<", ">"), ("[", "]"), ("{", "}"),
-                              ("`", "`"), ("'", "'"), ('"', '"')):
+                              ("\x60", "\x60"), ("'", "'"), ('"', '"')):
     oracle_sids.append(open_char + ORACLE_BASE + close_char)
 oracle_sids.append("urn:uuid:" + ORACLE_BASE)
 for separator in (".", "_", ":", " ", "|", "/", "\\", ",", ";", ""):
@@ -645,7 +654,7 @@ for low, high in ((0x2070, 0x209F), (0x2100, 0x214F), (0x2150, 0x218F),
 for index in range(len(ORACLE_BASE)):
     oracle_sids.append(ORACLE_BASE[:index] + ORACLE_BASE[index + 1:])
 # Synthetic canonical-pattern near-misses: a 36-char dashless hex string and
-# an all-dash string are non-canonical; they pin hostile same-`.pattern`
+# an all-dash string are non-canonical; they pin hostile same-'.pattern'
 # matchers that accept a broad hex/dash class behaviorally.
 oracle_sids.append("a" * 36)
 oracle_sids.append("-" * 36)
@@ -691,8 +700,9 @@ if failures:
         "(first %r canonical=%s start_scoped=%s data_key=%s)"
         % (len(failures), len(oracle_sids), sid, canonical, start_scoped, data_key))
 print("oracle=%d cases" % len(oracle_sids))
+print("oracle=ok")
 PY
-)" && [[ "$oracle_out" == "oracle=7707 cases" ]]; then
+)" && [[ "${oracle_out##*$'\n'}" == "oracle=ok" ]]; then
   ok "canonical-sid oracle corpus (generated; no normalization divergence)"
 else
   bad "shipper replica diverged from the canonical-sid oracle corpus or the checker did not run (out: ${oracle_out:-<empty>})"
