@@ -34,9 +34,11 @@
 #       lands; shell/legacy sessions with an end and no tar -> alert
 #       recording-gap; duplicate session.end objects resolve by the newest
 #       LastModified (both mode directions pinned); a malformed mode marker ->
-#       naming-contract; sid-less session.rejected keys are not drift, while a
-#       sid-bearing rejected key (the pre-fold pc-admin shape) is read as a
-#       session with no session.start -> session-start-missing; a
+#       naming-contract; sid-less session.rejected keys are not drift (nor is
+#       the pc-admin #19-sanctioned `unknown` shape for a sid-less
+#       session.data), while a sid-bearing rejected key (the pre-fold pc-admin
+#       shape) is read as a session with no session.start ->
+#       session-start-missing; a
 #       replay-conflict variant key (base + `_<sha256[:16]>`) is absorbed as
 #       the SAME event identity as its base (no sequence-duplicate, no naming
 #       drift) with the base key authoritative for the lifecycle mode, while a
@@ -61,7 +63,7 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ a7035a9; golden strings,
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 3325aeb; golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
 #       the over-long event-type truncation cap with its `_<sha256[:8]>`
@@ -169,8 +171,13 @@ pass=0
 fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
-# Bump it with every intended check.
-MIN_CHECKS=469
+# Bump it with every intended check. The shellcheck lint tooth is skipped when
+# shellcheck is absent (a local run without it must not fail the full floor;
+# CI ships shellcheck and runs the tooth), so the effective floor subtracts
+# the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
+# hard-failed the 474 floor).
+MIN_CHECKS=515
+SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -187,14 +194,16 @@ fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ a7035a9
+# were generated from the real builder at cad0p/pc-admin @ 3325aeb
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key,
-# the full-SHA pin in shipper_keys.py; the grammar-defining point added the
+# the full-SHA pin in shipper_keys.py; the grammar-defining point (pc-admin
+# #19) scoped the sid-less `session.data` sanction onto the documented
+# `unknown` non-session shape, the previous point a7035a9 added the
 # replay-conflict `_<sha256[:16]>` variant keys, and the earlier point 41735ff
 # added the over-long event-type truncation cap with the `_<sha256[:8]>`
-# suffix — both are pinned by the vector matrix below); a pc-admin grammar
-# change must bump the pin, regenerate these and update the witness contract
-# together. Drift fixtures (non-UUID or
+# suffix — all pinned by the vector matrix below); a pc-admin grammar change
+# must bump the pin and regenerate these (a contract-neutral change needs no
+# witness-contract edit). Drift fixtures (non-UUID or
 # sid-less session keys, malformed modes) stay hand-written literals on
 # purpose: the replica now refuses shapes the real shipper never emits, so a
 # fixture request for one is itself a failure (the teeth after the golden).
@@ -216,6 +225,12 @@ is "replica golden session.rejected forced sid-less" \
 is "replica golden session.rejected sid-less (sid dropped, not consumed)" \
   "audit/20260925T100008Z-session.rejected.000005.json" \
   "$(key session.rejected 20260925T100008Z "" 5)"
+# The forced-sid-less rule drops ANY sid, non-UUID included, exactly like the
+# real builder (functional round-10 LOW: the non-UUID check used to precede
+# the forced-sid-less branch and refused the documented key).
+is "replica golden session.rejected with a non-UUID sid (any sid dropped)" \
+  "audit/20260925T100008Z-session.rejected.000005.json" \
+  "$(key session.rejected 20260925T100008Z not-a-uuid 5)"
 is "replica golden non-session key sid-less" \
   "audit/20260925T100008Z-user.login.000006.json" \
   "$(key user.login 20260925T100008Z "" 6)"
@@ -228,6 +243,21 @@ is "replica golden uppercase sid lowercased" \
 is "replica golden multi-segment session.* sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000001.json" \
   "$(key session.foo.bar 20260925T100008Z "" 1)"
+# pc-admin #19 (@ 3325aeb): the exact single-segment `session.data` with no
+# effective strict-UUID sid is sanctioned onto the documented `unknown`
+# non-session shape (v18 port-forward traffic accounting); the expected
+# literal is re-derived from the rule, so a replica that stops mirroring the
+# scoped sanction fails here too (the vector matrix pins the real-builder
+# output).
+is "replica golden sid-less session.data sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000002.json" \
+  "$(key session.data 20260925T100008Z "" 2)"
+# A non-UUID (but string) sid must take the same sanctioned path: the sanction
+# predicate is the *effective* sid, not the raw truthiness — the red-team
+# round-1 ``not effective_sid`` -> ``not sid`` mutant must fail here.
+is "replica golden session.data with a non-UUID sid sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000003.json" \
+  "$(key session.data 20260925T100008Z not-a-uuid 3)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -282,30 +312,146 @@ else
 fi
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
-replica_refuses() { # label + shipper_keys.py args; non-zero = refused
-  if python3 "${HARNESS_DIR}/shipper_keys.py" "$@" >/dev/null 2>&1; then
-    bad "replica accepted an unexpected shape: $*"
+replica_refuses() { # <label> <expected-refusal-reason> + shipper_keys.py args; non-zero = refused
+  # Drop the label AND the expected reason: the CLI signature is
+  # <event-type> <ts> [sid] [seq] [mode]. Passing the label as the event type
+  # made every tooth a no-op (red-team round-1 HIGH on #149) — the CLI died
+  # on the shifted ``ts`` argument. Asserting the refusal *reason* keeps that
+  # fix regression-sensitive: a no-op refusal (wrong argv, CLI dying on an
+  # unrelated argument) fails the tooth instead of counting as this shape
+  # being refused (red-team round-2 LOW).
+  local label="$1" expected="$2" err=""
+  shift 2
+  if err="$(python3 "${HARNESS_DIR}/shipper_keys.py" "$@" 2>&1 >/dev/null)"; then
+    bad "replica accepted an unexpected shape: $label"
+  elif [[ "$err" != *"$expected"* ]]; then
+    bad "replica refused '$label' for the wrong reason (want '$expected'): $err"
   else
-    ok "replica refuses unexpected shape: $*"
+    ok "replica refuses unexpected shape: $label"
   fi
 }
-replica_refuses "session.start non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
-replica_refuses "session.start missing sid and mode" session.start 20260925T100008Z "" 1
-replica_refuses "non-session with sid" user.login 20260925T100008Z "${REPLICA_SID}" 1
-replica_refuses "mode on non-lifecycle event" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
-replica_refuses "mode on non-session event" user.login 20260925T100008Z "" 1 shell
-replica_refuses "lifecycle without the mandatory mode" session.start 20260925T100008Z "${REPLICA_SID}" 1
-replica_refuses "seq zero (legacy hand-written fixture only)" session.data 20260925T100008Z "${REPLICA_SID}" 0
-replica_refuses "seq beyond the witness 18-digit grammar" session.data 20260925T100008Z "${REPLICA_SID}" 1000000000000000000
-replica_refuses "session.start missing sid with mode" session.start 20260925T100008Z "" 1 shell
-replica_refuses "over-long type outside the grammar (real builder sanitizes to unknown)" \
+replica_refuses "session.start non-UUID sid" "non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
+# Non-canonical sid shapes: the replica must NOT normalize (no strip/lstrip/
+# rstrip/partition, no dash/brace/quote/URN unwrapping, no space or
+# separator deletion, no width folding) — the real builder ``fullmatch``es
+# the canonical strict-UUID pattern only. Every shape here takes the
+# sanctioned `unknown` path on the exact single-segment `session.data` and
+# the refusal path on any other session type. The grid pins the per-shape
+# mutants found across lens rounds 2–6 (search/match, strip family and
+# side-specific trims, delimiter/quote/URN wrappers, interior separators,
+# fullwidth/zero-width folding); pattern-arity relaxations are killed
+# outright by the pattern-constant pin below. Uppercase is canonical (the
+# builder lowercases) and is pinned by the vector matrix separately.
+ZWSP="$(printf '\xe2\x80\x8b')"
+SID_SHAPE_SEQ=6
+for sid_shape in \
+  "leading-junk|x${REPLICA_SID}y" \
+  "trailing-junk|${REPLICA_SID}y" \
+  "leading-space| ${REPLICA_SID}" \
+  "trailing-space|${REPLICA_SID} " \
+  "overlong-tail|${REPLICA_SID}f" \
+  "short-tail|${REPLICA_SID%?}" \
+  "no-dash|${REPLICA_SID//-/}" \
+  "braces|{${REPLICA_SID}}" \
+  "urn|urn:uuid:${REPLICA_SID}" \
+  "leading-dash|-${REPLICA_SID}" \
+  "trailing-dash|${REPLICA_SID}-" \
+  "brace-open|{${REPLICA_SID}" \
+  "brace-close|${REPLICA_SID}}" \
+  "double-quoted|\"${REPLICA_SID}\"" \
+  "single-quoted|'${REPLICA_SID}'" \
+  "interior-space|9f8c4b1e -0d2a-4f7e-9c11-2b3d4e5f6a70" \
+  "underscore-separators|9f8c4b1e_0d2a_4f7e_9c11_2b3d4e5f6a70" \
+  "fullwidth-hex|9ｆ8ｃ4ｂ1ｅ-0d2a-4f7e-9c11-2b3d4e5f6a70" \
+  "zero-width-suffix|${REPLICA_SID}${ZWSP}" \
+; do
+  shape_name="${sid_shape%%|*}"; shaped_sid="${sid_shape#*|}"
+  SID_SHAPE_SEQ=$((SID_SHAPE_SEQ + 1))
+  is "replica golden session.data with a ${shape_name} sid sanitized to unknown" \
+    "audit/20260925T100008Z-unknown.$(printf '%06d' "${SID_SHAPE_SEQ}").json" \
+    "$(key session.data 20260925T100008Z "${shaped_sid}" "${SID_SHAPE_SEQ}")"
+  replica_refuses "session.start ${shape_name} sid" "non-UUID sid" session.start 20260925T100008Z "${shaped_sid}" 1 shell
+done
+replica_refuses "session.start missing sid and mode" "mandatory" session.start 20260925T100008Z "" 1
+replica_refuses "non-session with sid" "non-session" user.login 20260925T100008Z "${REPLICA_SID}" 1
+replica_refuses "mode on non-lifecycle event" "only valid" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
+replica_refuses "mode on non-session event" "only valid" user.login 20260925T100008Z "" 1 shell
+replica_refuses "lifecycle without the mandatory mode" "mandatory" session.start 20260925T100008Z "${REPLICA_SID}" 1
+replica_refuses "seq zero (legacy hand-written fixture only)" "seq must be" session.data 20260925T100008Z "${REPLICA_SID}" 0
+replica_refuses "seq beyond the witness 18-digit grammar" "seq must be" session.data 20260925T100008Z "${REPLICA_SID}" 1000000000000000000
+replica_refuses "session.start missing sid with mode" "without a sid" session.start 20260925T100008Z "" 1 shell
+replica_refuses "over-long type outside the grammar (real builder sanitizes to unknown)" "outside the shipper grammar" \
   "$(python3 -c 'print("a" * 128 + "-bad")')" 20260925T100008Z "" 1
+replica_refuses "session.Data case-variant non-UUID sid (the #19 sanction is exact)" "non-UUID sid" \
+  session.Data 20260925T100008Z not-a-uuid 1
+replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exact)" "non-UUID sid" \
+  session.dAtA 20260925T100008Z not-a-uuid 1
+replica_refuses "over-long non-exact session.data type without a sid (capped near-match stays refused)" "without a sid" \
+  "$(python3 -c 'print("session.data" + "q" * 500)')" 20260925T100008Z "" 1
+
+# Direct-API teeth for the sid type (functional round-10 LOWs): the CLI is
+# string-only, so only a direct call can pass a non-string sid. The real
+# builder normalizes a non-string/non-UUID sid to ""; the replica must drop
+# it on session.rejected, sanitize it on the exact session.data, and refuse
+# with ValueError everywhere else — never crash with a TypeError from the
+# regex. Non-string ts/event_type take the same clean ValueError path
+# (functional round-11 INFO). Every replica-importing heredoc runs under
+# `python3 -I` (cwd off sys.path), including this one. The checker prints a
+# sentinel the bash layer asserts, so an import-time exit/panic that skips the
+# whole checker cannot accidentally count as a pass; a replica that deliberately
+# forges the marker is the documented in-process residual (red-team round-11
+# LOW; trust round-12 INFO). Keep the wrapped heredoc bodies backtick-free:
+# bash 3.2's `$()` scanner miscounts them and fails to parse (functional
+# round-12 LOW).
+if teeth_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+import importlib.util
+import os
+import sys
+
+here = sys.argv[1]
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+ts = "20260925T100008Z"
+if replica.audit_key("session.rejected", ts, 123, 5) != "audit/%s-session.rejected.000005.json" % ts:
+    raise SystemExit("session.rejected with a non-string sid must drop the sid")
+if replica.audit_key("session.data", ts, 123, 1) != "audit/%s-unknown.000001.json" % ts:
+    raise SystemExit("session.data with a non-string sid must sanitize to unknown")
+try:
+    replica.audit_key("session.start", ts, 123, 1, "shell")
+except ValueError:
+    pass
+else:
+    raise SystemExit("session.start with a non-string sid must be refused with ValueError")
+try:
+    replica.audit_key("user.login", 1, "", 1)
+except ValueError:
+    pass
+else:
+    raise SystemExit("a non-string ts must be refused with ValueError")
+try:
+    replica.audit_key(1, ts, "", 1)
+except ValueError:
+    pass
+else:
+    raise SystemExit("a non-string event type must be refused with ValueError")
+print("teeth=ok")
+PY
+)" && [[ "$teeth_out" == "teeth=ok" ]]; then
+  ok "replica: non-string sid handling (drop on rejected/data, clean ValueError elsewhere)"
+else
+  bad "replica non-string sid handling diverged or the checker did not run (out: ${teeth_out:-<empty>})"
+fi
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
 # generated from the REAL pc-admin builder at the pinned SHA
 # (generate_shipper_vectors.py); every vector must replay exactly and every
 # refusal must stay refused, or silent replica drift passes the harness.
-if python3 - "${HARNESS_DIR}" <<'PY'
+# The bash layer asserts the exact printed sentinel line (counts + pinned
+# source), so neither a skipped checker nor an appended extra line can read as
+# a pass.
+if matrix_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+import hashlib
 import importlib.util
 import json
 import os
@@ -316,7 +462,13 @@ here = sys.argv[1]
 spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
 replica = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replica)
-vectors = json.load(open(os.path.join(here, "shipper_key_vectors.json"), encoding="utf-8"))
+# Read the matrix bytes ONCE: the content pin and the replay must see the same
+# bytes (a second open lets a FIFO swap feed the digest one file and the
+# replay another — red-team round-3 LOW).
+matrix_path = os.path.join(here, "shipper_key_vectors.json")
+with open(matrix_path, "rb") as matrix_file:
+    matrix_bytes = matrix_file.read()
+vectors = json.loads(matrix_bytes.decode("utf-8"))
 
 
 def replay(args, body=None):
@@ -324,8 +476,8 @@ def replay(args, body=None):
     args[3] = int(args[3])
     key = replica.audit_key(*args)
     if body is not None:
-        # `kind: "variant"` vectors carry the real builder's
-        # `disambiguate_audit_key` output for this body.
+        # 'kind: "variant"' vectors carry the real builder's
+        # 'disambiguate_audit_key' output for this body.
         key = replica.disambiguate_key(key, body)
     return key
 
@@ -334,9 +486,49 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
     raise SystemExit("vector pin %r != shipper_keys pin %r" % (
         vectors.get("pinned_pc_admin_sha"), replica.PINNED_PC_ADMIN_SHA))
 
+# Matrix size pin: a deleted vector/refusal entry must fail loudly instead of
+# shrinking the matrix silently (red-team round-2 LOW M10). Update this pin
+# together with the matrix.
+if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 12:
+    raise SystemExit(
+        "vector matrix size changed: %d vectors / %d refusals (pinned 26/12) - "
+        "update this pin together with the matrix"
+        % (len(vectors["vectors"]), len(vectors["refusals"])))
+
+# Matrix content pin (red-team round-3 LOW): a coherent same-size rewrite
+# (both event.sid and replica_args[2], or an entry swap) must fail loudly.
+# Regenerate the matrix with generate_shipper_vectors.py and bump this sha256
+# together with the file. The digest covers the SAME bytes that are replayed
+# (single read above).
+matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
+MATRIX_SHA256 = "4c7116af9cfa5e02c73924d59bf676cf7281af6f3e176fafc69396746adba7a8"
+if matrix_sha != MATRIX_SHA256:
+    raise SystemExit(
+        "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
+        "generate_shipper_vectors.py and bump this pin" % (matrix_sha, MATRIX_SHA256))
+
+# Pattern-constant pin (red-team round-6 LOW): a finite sid corpus cannot
+# enumerate every possible pattern relaxation (group arity, extra dash
+# classes); pin the literal strict-UUID pattern the replica must use (the
+# same string the pinned pc-admin builder uses).
+CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN:
+    raise SystemExit(
+        "replica UUID_PATTERN %r != pinned canonical pattern %r"
+        % (replica.UUID_PATTERN, CANONICAL_UUID_PATTERN))
+# The compiled matcher is what both call sites actually use: pin its pattern
+# too, or a 're.compile(<other pattern>)' rebind bypasses the constant pin
+# (round-7 MEDIUM — the semantics the constant pin rejects when written on
+# the pattern line stay reachable on the compile line).
+if replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
+    raise SystemExit(
+        "replica UUID_RE.pattern %r != pinned canonical pattern %r"
+        % (replica.UUID_RE.pattern, CANONICAL_UUID_PATTERN))
+
 
 def source_sha_ok(value):
-    # Round-6 F6: exact 40-hex equality. `startswith(pin)` accepted the short
+    # Round-6 F6: exact 40-hex equality. 'startswith(pin)' accepted the short
     # prefix, a prefix plus junk, and any longer prefix-sharing hex string.
     return (isinstance(value, str)
             and re.fullmatch(r"[0-9a-f]{40}", value) is not None
@@ -354,6 +546,19 @@ for hostile in (replica.PINNED_PC_ADMIN_SHA[:7], replica.PINNED_PC_ADMIN_SHA[:7]
     if source_sha_ok(hostile):
         raise SystemExit("source_sha predicate accepted a hostile value: %r" % hostile)
 for vector in vectors["vectors"]:
+    sid_arg = vector["replica_args"][2]
+    if not isinstance(sid_arg, str):
+        raise SystemExit("%s: replica_args sid is not a string: %r" % (vector["name"], sid_arg))
+    event_sid = vector.get("event", {}).get("sid")
+    if isinstance(event_sid, str) and event_sid and replica.UUID_RE.fullmatch(event_sid) is None:
+        # #19 two-sidedness (red-team round-2 LOW M6): a non-UUID sid vector
+        # must pass the RAW sid through — the builder's sanction keys on the
+        # *effective* sid, so rewriting this arg to "" makes the vector
+        # floor-proof against the effective/raw mutant.
+        if sid_arg != event_sid:
+            raise SystemExit(
+                "%s: non-UUID sid %r was rewritten to %r in replica_args"
+                % (vector["name"], event_sid, sid_arg))
     got = replay(vector["replica_args"], vector.get("body"))
     if got != vector["expected"]:
         raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
@@ -366,7 +571,182 @@ for refusal in vectors["refusals"]:
 print("vectors=%d refusals=%d pin=%s source=%s" % (
     len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-then ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"; else bad "shipper replica diverged from the checked-in real-builder vectors"; fi
+)" && [[ "$matrix_out" == "vectors=26 refusals=12 pin=3325aeb848219488168778cbd944fcbf6b7c73bd source=3325aeb84821" ]]; then
+  ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
+else
+  bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
+fi
+
+# Canonical-sid oracle: a literal grid cannot enumerate every normalization
+# mutant of the sid predicate. Assert the replica's acceptance equals an
+# INDEPENDENT canonical oracle over a GENERATED corpus: every Unicode
+# control (Cc), format (Cf), separator (Zs/Zl/Zp) and combining-mark
+# (Mn/Me) codepoint inserted at prefix/suffix/interior, ASCII punctuation
+# insertions and wrapper pairs, separator translations, a
+# confusable/compatibility substitution set (incl. NFKC-foldable forms), and
+# single-char deletions. A mutant that normalizes the sid before matching
+# (strip/trim/replace/translate/normalize) diverges somewhere below; a
+# mutant that rebinds the compiled matcher is killed by the UUID_RE.pattern
+# pin in the vector block. The internal size AND distinctness floors run
+# before the replica import and are re-checked immediately after it; the bash
+# layer asserts the completion marker plus both printed numbers (size and
+# distinct) against the 6500 floor — a post-import replacement of
+# __main__.oracle_sids (truncated, or a same-size repeated literal) would
+# otherwise ship the marker and pass (red-team round-13/round-14 MEDIUMs).
+# The corpus size tracks the interpreter's Unicode DB (7137 on 3.9, 7476 on
+# 3.11, 7602 on 3.12/3.13, 7707 on 3.14), so bash checks the numbers only
+# against the floors, never an exact value: a skipped checker or a corpus
+# below either floor cannot read as a pass (a replacement that clears both
+# floors with substituted content is the documented deliberate-tamper
+# residue).
+oracle_rc=0
+oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+import importlib.util
+import os
+import re
+import sys
+import unicodedata
+
+here = sys.argv[1]
+ORACLE_TS = "20260925T100008Z"
+ORACLE_BASE = "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
+# Independent canonical predicate: same literal as the vector-block pin.
+CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# Build the independent predicate and the generated corpus BEFORE importing
+# the replica, from the pristine primitives: an import-time rebind of
+# 're.compile' / 'unicodedata.category' / '.normalize' — or a mutation of the
+# shared function objects themselves ('re.compile.__code__ = ...', which a
+# by-reference "freeze" cannot stop) — cannot change what the oracle already
+# captured, and the corpus plus both floors are final before any replica code
+# runs (red-team round-10 LOWs). The invocation is 'python3 -I' so the cwd is
+# off sys.path and a shadow 're.py'/'unicodedata.py' cannot load either
+# (red-team round-10 INFO).
+ORACLE_RE = re.compile(CANONICAL_UUID_PATTERN)
+# Capture the floor primitives BEFORE the import: the post-import floor
+# re-check and the printed counts must not see a replica-builtins rebind
+# (red-team round-14 LOW), and a count-preserving corpus replacement must
+# still fail the distinctness floor (round-14 MEDIUM).
+_canonical_len = len
+_canonical_set = set
+
+oracle_sids = [ORACLE_BASE, ORACLE_BASE.upper()]
+pad_chars = []
+for codepoint in range(0x110000):
+    char = chr(codepoint)
+    if unicodedata.category(char) in ("Cc", "Cf", "Zs", "Zl", "Zp", "Mn", "Me"):
+        pad_chars.append(char)
+pad_chars.extend("_-.:;,'\"\x60()[]{}<>|/\\!?@#$%^&*+=~ ")
+for char in pad_chars:
+    oracle_sids.append(char + ORACLE_BASE)
+    oracle_sids.append(ORACLE_BASE + char)
+    oracle_sids.append(ORACLE_BASE[:4] + char + ORACLE_BASE[4:])
+for open_char, close_char in (("(", ")"), ("<", ">"), ("[", "]"), ("{", "}"),
+                              ("\x60", "\x60"), ("'", "'"), ('"', '"')):
+    oracle_sids.append(open_char + ORACLE_BASE + close_char)
+oracle_sids.append("urn:uuid:" + ORACLE_BASE)
+for separator in (".", "_", ":", " ", "|", "/", "\\", ",", ";", ""):
+    oracle_sids.append(ORACLE_BASE.replace("-", separator))
+confusables = {
+    "0": "oOо٠", "1": "lIі١", "2": "zZ٢", "3": "з٣", "4": "٤д", "5": "sS$٥",
+    "6": "gGб٦", "7": "tT۷", "8": "Ȣ٨", "9": "gq٩",
+    "a": "аáα@", "b": "Ьß", "c": "сϲ¢", "d": "ԁդ", "e": "еé€", "f": "ғƒ",
+}
+for index, char in enumerate(ORACLE_BASE):
+    for replacement in confusables.get(char.lower(), ""):
+        oracle_sids.append(ORACLE_BASE[:index] + replacement + ORACLE_BASE[index + 1:])
+for low, high in ((0x2070, 0x209F), (0x2100, 0x214F), (0x2150, 0x218F),
+                  (0x2460, 0x24FF), (0x1D400, 0x1D7FF), (0xFF01, 0xFF5E)):
+    for codepoint in range(low, high + 1):
+        folded = unicodedata.normalize("NFKC", chr(codepoint))
+        if len(folded) == 1 and folded in "0123456789abcdefABCDEF":
+            for index, char in enumerate(ORACLE_BASE):
+                if char == folded.lower():
+                    oracle_sids.append(ORACLE_BASE[:index] + chr(codepoint) + ORACLE_BASE[index + 1:])
+for index in range(len(ORACLE_BASE)):
+    oracle_sids.append(ORACLE_BASE[:index] + ORACLE_BASE[index + 1:])
+# Synthetic canonical-pattern near-misses: a 36-char dashless hex string and
+# an all-dash string are non-canonical; they pin hostile same-'.pattern'
+# matchers that accept a broad hex/dash class behaviorally.
+oracle_sids.append("a" * 36)
+oracle_sids.append("-" * 36)
+if len(oracle_sids) < 6500:
+    raise SystemExit("canonical-sid oracle corpus shrank: %d cases" % len(oracle_sids))
+# A size floor alone passes a degenerate corpus (one literal repeated); require
+# distinct sids too so the corpus cannot be replaced by a repeated literal.
+if len(set(oracle_sids)) < 6500:
+    raise SystemExit("canonical-sid oracle corpus lost distinctness: %d unique sids" % len(set(oracle_sids)))
+
+# Now import the replica and run its checks against the already-frozen corpus
+# and predicate. Re-assert the pattern pins in THIS process too: the
+# vector-block pins run in a separate interpreter, so a per-process rebind
+# would escape them.
+spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
+replica = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replica)
+if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN or replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
+    raise SystemExit("replica UUID pattern pins diverged in the oracle process")
+# Re-enforce both floors on the corpus as it stands AFTER the replica import:
+# a replica can reassign __main__.oracle_sids at import time, and a
+# count-preserving replacement would otherwise mask a divergence while the
+# pre-import floors still vouch for the original corpus (red-team round-14
+# MEDIUM). _canonical_len/_canonical_set are the pre-import captures, so a
+# builtins rebind cannot fabricate these numbers either (round-14 LOW).
+if _canonical_len(oracle_sids) < 6500:
+    raise SystemExit("canonical-sid oracle corpus shrank after import: %d cases" % _canonical_len(oracle_sids))
+if _canonical_len(_canonical_set(oracle_sids)) < 6500:
+    raise SystemExit("canonical-sid oracle corpus lost distinctness after import: %d unique sids" % _canonical_len(_canonical_set(oracle_sids)))
+
+failures = []
+for sid in oracle_sids:
+    canonical = ORACLE_RE.fullmatch(sid) is not None
+    try:
+        data_key = replica.audit_key("session.data", ORACLE_TS, sid, 1)
+    except ValueError:
+        data_key = None
+    try:
+        replica.audit_key("session.start", ORACLE_TS, sid, 1, "shell")
+        start_scoped = True
+    except ValueError:
+        start_scoped = False
+    if canonical:
+        good = start_scoped and data_key == "audit/%s-session.data.%s.000001.json" % (ORACLE_TS, sid.lower())
+    else:
+        good = (not start_scoped) and data_key == "audit/%s-unknown.000001.json" % ORACLE_TS
+    if not good:
+        failures.append((sid, canonical, start_scoped, data_key))
+if failures:
+    sid, canonical, start_scoped, data_key = failures[0]
+    raise SystemExit(
+        "canonical-sid oracle divergence on %d/%d cases "
+        "(first %r canonical=%s start_scoped=%s data_key=%s)"
+        % (len(failures), len(oracle_sids), sid, canonical, start_scoped, data_key))
+print("oracle=%d cases, %d distinct" % (_canonical_len(oracle_sids), _canonical_len(_canonical_set(oracle_sids))))
+print("oracle=ok")
+PY
+)" || oracle_rc=$?
+# Enforce both corpus floors on the printed counts (second-to-last line): the
+# checker's internal floors run before the replica import, so a post-import
+# replacement of __main__.oracle_sids — truncated, or the same-size repeated
+# literal — would otherwise ship the marker and pass (red-team round-13/14
+# MEDIUMs; the checker re-checks the floors too). The count is
+# interpreter-dependent, so only the floors are compared, never an exact
+# value.
+oracle_last="${oracle_out##*$'\n'}"
+oracle_prev="${oracle_out%$'\n'*}"
+oracle_prev="${oracle_prev##*$'\n'}"
+oracle_counts="${oracle_prev#oracle=}"
+oracle_count="${oracle_counts%% cases*}"
+oracle_distinct="${oracle_counts##* cases, }"
+oracle_distinct="${oracle_distinct%% *}"
+if [[ "$oracle_rc" == 0 && "$oracle_last" == "oracle=ok" \
+      && "$oracle_prev" == oracle=*" cases, "*" distinct" \
+      && "$oracle_count" =~ ^[0-9]+$ && "$oracle_distinct" =~ ^[0-9]+$ \
+      && "$oracle_count" -ge 6500 && "$oracle_distinct" -ge 6500 ]]; then
+  ok "canonical-sid oracle corpus (generated; no normalization divergence)"
+else
+  bad "shipper replica diverged from the canonical-sid oracle corpus or the checker did not run (out: ${oracle_out:-<empty>})"
+fi
 
 # The extracted span calls these on-box helpers; stub them in the harness.
 log()  { printf 'harness: %s\n' "$*" >&2; }
@@ -400,6 +780,7 @@ if command -v shellcheck >/dev/null 2>&1; then
   if shellcheck -S warning "${WITNESS}"; then ok "rendered witness passes shellcheck -S warning"; else bad "rendered witness fails shellcheck -S warning"; fi
 else
   printf 'note: shellcheck not installed — lint tooth skipped here (CI runs it)\n'
+  SHELLCHECK_SKIPPED=1
 fi
 
 # ---- (b) rendered units --------------------------------------------------
@@ -694,8 +1075,9 @@ case "${CASE_DETAIL}" in *open-upload-stale*) ok "open-upload detail names open-
 # 30 single-value gaps (seqs 0,2,4,...,60 + end 61): the renderer must cap at
 # 20 ranges + ellipsis and complete fast. The round-1 length assertion was
 # tautological because state.json is clipped server-side; this checks the
-# bounded renderer itself. Keys come from the shipper grammar.
-python3 - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+# bounded renderer itself. Keys come from the shipper grammar (the
+# replica-importing heredocs run `python3 -I`: cwd off sys.path).
+python3 -I - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
 import json
 import sys
 
@@ -746,7 +1128,7 @@ sig_capped_a="$(state_field signature)"
 # missing ranges (an identical detail render) and a different 21st+ remainder
 # -> the signature must move. Pre-fix both hashed the capped render, so the
 # tooth fails on the old code.
-python3 - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+python3 -I - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
 import json
 import sys
 
@@ -1196,13 +1578,14 @@ fixture <<JSON
   {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
   {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
   {"key":"audit/20260925T135300Z-session.rejected.000001.json","ago":297},
+  {"key":"$(key session.data 20260925T135300Z "" 2)","ago":296},
   {"key":"recordings/${SID}.tar","ago":296}],
  "uploads":[]}
 JSON
 start_mock
 run_case
-is "sid-less session.rejected key -> exit 0" "0" "${CASE_RC}"
-is "sid-less session.rejected key -> ok verdict (no naming-contract false positive)" "ok" "${CASE_STATE}"
+is "sid-less session.rejected + sanctioned session.data keys -> exit 0" "0" "${CASE_RC}"
+is "sid-less session.rejected + sanctioned unknown keys -> ok verdict (no naming-contract false positive)" "ok" "${CASE_STATE}"
 
 # Regression punch-through tooth: the pre-fold pc-admin shape (a sid-bearing
 # session.rejected key) must be caught by the witness as a session with no
@@ -4119,8 +4502,8 @@ else
   bad "ci.yml path gate missing tests/recording-witness/"
 fi
 
-if [ "$pass" -lt "${MIN_CHECKS}" ]; then
-  bad "check-count floor: ${pass} passed < ${MIN_CHECKS} pinned"
+if [ "$pass" -lt "$((MIN_CHECKS - SHELLCHECK_SKIPPED))" ]; then
+  bad "check-count floor: ${pass} passed < $((MIN_CHECKS - SHELLCHECK_SKIPPED)) pinned ($((MIN_CHECKS)) minus the shellcheck skip)"
 fi
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

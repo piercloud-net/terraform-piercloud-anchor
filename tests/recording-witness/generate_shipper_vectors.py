@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is a7035a9
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 3325aeb
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex; `--allow-sha-mismatch` only
@@ -19,17 +19,21 @@ variant matrix through `disambiguate_audit_key`, and self-checks that the
 replica in this directory reproduces every vector before writing.
 
 The pin is the **grammar-defining SHA**: the builder grammar last changed at
-a7035a9 (the replay-conflict variant — `disambiguate_audit_key` appends
-`_<sha256[:16]>` to the event type when a rebuilt file replays a taken key
-with different bytes) and is unchanged since. The previous grammar points were
+3325aeb (pc-admin #19: the exact single-segment `session.data` with no
+effective strict-UUID sid is sanctioned onto the documented `unknown`
+non-session shape instead of the sid-less `session.*` drift shape). The
+previous grammar point was a7035a9 (the replay-conflict variant —
+`disambiguate_audit_key` appends `_<sha256[:16]>` to the event type when a
+rebuilt file replays a taken key with different bytes). Earlier points:
 66bd304 (the `session.rejected` sid-less fold), 929d82c (the 128-char
 pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>`
 collision-resistant suffix on the truncated type) and 342a37c (the `10^18-1`
-seq-ceiling clamp in `build_audit_key`). Because the pin
-must name the grammar point, regeneration deliberately requires a checkout at
-exactly that SHA — no head chasing. When pc-admin's grammar changes: bump the
-pin in `shipper_keys.py`, regenerate this file against the new SHA, and update
-the witness contract + goldens in the same breath.
+seq-ceiling clamp in `build_audit_key`). Because the pin must name the
+grammar point, regeneration deliberately requires a checkout at exactly that
+SHA — no head chasing. When pc-admin's grammar changes: bump the pin in
+`shipper_keys.py` and regenerate this file against the new SHA (a
+contract-neutral change needs no witness-contract edit; `unknown` is already
+a documented non-session shape), keeping the goldens in step.
 """
 
 import argparse
@@ -147,6 +151,42 @@ def build_vectors(b2):
         ["session.foo.bar", TS, "", "1"],
         global_seq=0,
     )
+    # pc-admin #19 (@ 3325aeb): the exact single-segment `session.data` with
+    # an effective non-strict-UUID sid is sanctioned onto the documented
+    # `unknown` non-session shape on the global counter (v18 port-forward
+    # traffic accounting); a strict-UUID `session.data` keeps its session key
+    # (the golden above).
+    vector(
+        "sid-less session.data (missing sid) sanitized to unknown",
+        "golden",
+        {"time": EVENT_TIME, "event": "session.data"},
+        ["session.data", TS, "", "1"],
+        global_seq=0,
+    )
+    vector(
+        "sid-less session.data (empty-string sid) sanitized to unknown",
+        "golden",
+        {"time": EVENT_TIME, "event": "session.data", "sid": ""},
+        ["session.data", TS, "", "2"],
+        global_seq=1,
+    )
+    vector(
+        "sid-less session.data (non-string sid) sanitized to unknown",
+        "golden",
+        {"time": EVENT_TIME, "event": "session.data", "sid": 42},
+        ["session.data", TS, "", "3"],
+        global_seq=2,
+    )
+    # The non-UUID (string) case is two-sided: the replica args carry the raw
+    # sid, so a ``not effective_sid`` -> ``not sid`` mutant refuses instead of
+    # sanitizing and the vector replay reddens (red-team round-1 MED on #149).
+    vector(
+        "sid-less session.data (non-UUID sid) sanitized to unknown",
+        "golden",
+        {"time": EVENT_TIME, "event": "session.data", "sid": "not-a-uuid"},
+        ["session.data", TS, "not-a-uuid", "4"],
+        global_seq=3,
+    )
     vector(
         "non-session event with a sid drops the sid",
         "golden",
@@ -218,6 +258,17 @@ def build_vectors(b2):
     assert real_key(b2, {"time": EVENT_TIME, "event": alias_a}, None, 0) != real_key(
         b2, {"time": EVENT_TIME, "event": alias_b}, None, 0), \
         "the real builder aliased two distinct over-long event types"
+    # Scope edge (pc-admin #19): the sanction is an exact match on the RAW
+    # type before the cap, so an over-long non-exact type with a UUID sid is
+    # still a session key (truncated type + `_<sha256[:8]>` suffix), exactly
+    # like the real builder.
+    overlong_session_data = "session.data" + "q" * 500
+    vector(
+        "over-long non-exact session.data with a UUID sid keeps a truncated session key",
+        "boundary",
+        {"time": EVENT_TIME, "event": overlong_session_data, "sid": LSID},
+        [overlong_session_data, TS, LSID, "1"],
+    )
 
     # Cross-repo seed (pc-admin @ a7035a9): a rebuilt audit file that replays a
     # taken key with DIFFERENT bytes ships under `disambiguate_audit_key` — the
@@ -267,9 +318,22 @@ def build_vectors(b2):
         {"name": "seq 10^18 (19 digits, witness naming drift)",
          "replica_args": ["session.data", TS, LSID, str(SEQ_MAX + 1)],
          "why": "the witness accepts [0-9]{1,18}; a 19-digit seq is drift"},
-        {"name": "non-UUID sid on session.*",
+        {"name": "non-UUID sid on session.start (only exact session.data is sanctioned)",
          "replica_args": ["session.start", TS, "not-a-uuid", "1", ""],
-         "why": "the real builder ships a non-UUID sid on the sid-less drift shape"},
+         "why": "the scoped #19 sanction is the exact session.data type only; the "
+                "real builder keeps shipping this on the sid-less drift shape"},
+        {"name": "case-variant session.Data with a non-UUID sid (exact match only)",
+         "replica_args": ["session.Data", TS, "not-a-uuid", "1", ""],
+         "why": "the #19 sanction is case-sensitive on the exact type; the real "
+                "builder ships the sid-less drift shape"},
+        {"name": "case-variant session.dAtA with a non-UUID sid (exact match only)",
+         "replica_args": ["session.dAtA", TS, "not-a-uuid", "1", ""],
+         "why": "the #19 sanction is case-sensitive on the exact type; the real "
+                "builder ships the sid-less drift shape"},
+        {"name": "over-long non-exact session.data type without a sid",
+         "replica_args": ["session.data" + "q" * 500, TS, "", "1"],
+         "why": "the #19 sanction is exact and runs before the truncation cap; "
+                "the capped near-match stays the sid-less drift shape"},
         {"name": "session.start without a sid",
          "replica_args": ["session.start", TS, "", "1", "shell"],
          "why": "a session key needs a strict-UUID sid"},
@@ -299,11 +363,13 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder grammar last changed at a7035a9 (the replay-conflict "
-                        "`_<sha256[:16]>` variant keys from disambiguate_audit_key); "
-                        "unchanged since; previous grammar points 66bd304 (session.rejected "
-                        "sid-less), 929d82c (the 128-char pre-hash event-type truncation cap), "
-                        "41735ff (the `_<sha256[:8]>` suffix on the truncated type) and 342a37c "
+        "grammar_note": "builder grammar last changed at 3325aeb (pc-admin #19: the exact "
+                        "single-segment `session.data` with no effective strict-UUID sid is "
+                        "sanctioned onto the documented `unknown` non-session shape); previous "
+                        "grammar points a7035a9 (the replay-conflict `_<sha256[:16]>` variant "
+                        "keys from disambiguate_audit_key), 66bd304 (session.rejected sid-less), "
+                        "929d82c (the 128-char pre-hash event-type truncation cap), 41735ff "
+                        "(the `_<sha256[:8]>` suffix on the truncated type) and 342a37c "
                         "(the 10^18-1 seq-ceiling clamp in build_audit_key)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
@@ -327,6 +393,19 @@ def main():
         raise SystemExit(
             "pc-admin checkout %s is at %s, not the pinned %s; bump the pin deliberately first "
             "(or pass --allow-sha-mismatch for a debug run)" % (repo, head[:12], PINNED_PC_ADMIN_SHA[:12])
+        )
+    # A checkout at the pin with a dirty b2_client.py still imports UNPINNED
+    # builder bytes while the file would claim the pin (security round-1 LOW
+    # on #149). Refuse unless this is an explicit debug run: the pin is a
+    # provenance claim about the committed blob, not just the commit id.
+    dirty = subprocess.run(
+        ["git", "-C", repo, "status", "--porcelain", "--", "scripts/lib/b2_client.py"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    if dirty and not args.allow_sha_mismatch:
+        raise SystemExit(
+            "pc-admin checkout %s has uncommitted changes in scripts/lib/b2_client.py (%s); "
+            "the vectors must come from the committed blob at the pinned SHA "
+            "(or pass --allow-sha-mismatch for a debug run)" % (repo, dirty.splitlines()[0])
         )
     b2 = load_module(os.path.join(repo, "scripts", "lib", "b2_client.py"), "pcadmin_b2_client")
     payload = build_vectors(b2)
