@@ -171,8 +171,13 @@ pass=0
 fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
-# Bump it with every intended check.
-MIN_CHECKS=474
+# Bump it with every intended check. The shellcheck lint tooth is skipped when
+# shellcheck is absent (a local run without it must not fail the full floor;
+# CI ships shellcheck and runs the tooth), so the effective floor subtracts
+# the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
+# hard-failed the 474 floor).
+MIN_CHECKS=476
+SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -247,6 +252,13 @@ is "replica golden sid-less session.data sanitized to unknown" \
 is "replica golden session.data with a non-UUID sid sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000003.json" \
   "$(key session.data 20260925T100008Z not-a-uuid 3)"
+# A sid that merely CONTAINS a UUID is still not a strict-UUID sid: the
+# predicate is ``fullmatch``. A ``fullmatch`` -> ``search`` mutant (red-team
+# round-2 LOW) would treat "x<uuid>y" as an effective sid and refuse this
+# sanctioned `session.data` (the real builder sanitizes it to `unknown`).
+is "replica golden session.data with a UUID-substring sid sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000004.json" \
+  "$(key session.data 20260925T100008Z "x${REPLICA_SID}y" 4)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -301,32 +313,44 @@ else
 fi
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
-replica_refuses() { # label + shipper_keys.py args; non-zero = refused
-  # Drop the label: the CLI signature is <event-type> <ts> [sid] [seq] [mode].
-  # Passing the label as the event type made every tooth a no-op (red-team
-  # round-1 HIGH on #149) — the CLI died on the shifted ``ts`` argument.
-  if python3 "${HARNESS_DIR}/shipper_keys.py" "${@:2}" >/dev/null 2>&1; then
-    bad "replica accepted an unexpected shape: $*"
+replica_refuses() { # <label> <expected-refusal-reason> + shipper_keys.py args; non-zero = refused
+  # Drop the label AND the expected reason: the CLI signature is
+  # <event-type> <ts> [sid] [seq] [mode]. Passing the label as the event type
+  # made every tooth a no-op (red-team round-1 HIGH on #149) — the CLI died
+  # on the shifted ``ts`` argument. Asserting the refusal *reason* keeps that
+  # fix regression-sensitive: a no-op refusal (wrong argv, CLI dying on an
+  # unrelated argument) fails the tooth instead of counting as this shape
+  # being refused (red-team round-2 LOW).
+  local label="$1" expected="$2" err=""
+  shift 2
+  if err="$(python3 "${HARNESS_DIR}/shipper_keys.py" "$@" 2>&1 >/dev/null)"; then
+    bad "replica accepted an unexpected shape: $label"
+  elif [[ "$err" != *"$expected"* ]]; then
+    bad "replica refused '$label' for the wrong reason (want '$expected'): $err"
   else
-    ok "replica refuses unexpected shape: $*"
+    ok "replica refuses unexpected shape: $label"
   fi
 }
-replica_refuses "session.start non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
-replica_refuses "session.start missing sid and mode" session.start 20260925T100008Z "" 1
-replica_refuses "non-session with sid" user.login 20260925T100008Z "${REPLICA_SID}" 1
-replica_refuses "mode on non-lifecycle event" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
-replica_refuses "mode on non-session event" user.login 20260925T100008Z "" 1 shell
-replica_refuses "lifecycle without the mandatory mode" session.start 20260925T100008Z "${REPLICA_SID}" 1
-replica_refuses "seq zero (legacy hand-written fixture only)" session.data 20260925T100008Z "${REPLICA_SID}" 0
-replica_refuses "seq beyond the witness 18-digit grammar" session.data 20260925T100008Z "${REPLICA_SID}" 1000000000000000000
-replica_refuses "session.start missing sid with mode" session.start 20260925T100008Z "" 1 shell
-replica_refuses "over-long type outside the grammar (real builder sanitizes to unknown)" \
+replica_refuses "session.start non-UUID sid" "non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
+# A UUID-substring sid is still not a strict UUID. A ``fullmatch`` ->
+# ``search`` mutant at the refusal site (red-team round-2 LOW) would accept
+# it and pin a session key the real shipper can never emit.
+replica_refuses "session.start UUID-substring sid" "non-UUID sid" session.start 20260925T100008Z "x${REPLICA_SID}y" 1 shell
+replica_refuses "session.start missing sid and mode" "mandatory" session.start 20260925T100008Z "" 1
+replica_refuses "non-session with sid" "non-session" user.login 20260925T100008Z "${REPLICA_SID}" 1
+replica_refuses "mode on non-lifecycle event" "only valid" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
+replica_refuses "mode on non-session event" "only valid" user.login 20260925T100008Z "" 1 shell
+replica_refuses "lifecycle without the mandatory mode" "mandatory" session.start 20260925T100008Z "${REPLICA_SID}" 1
+replica_refuses "seq zero (legacy hand-written fixture only)" "seq must be" session.data 20260925T100008Z "${REPLICA_SID}" 0
+replica_refuses "seq beyond the witness 18-digit grammar" "seq must be" session.data 20260925T100008Z "${REPLICA_SID}" 1000000000000000000
+replica_refuses "session.start missing sid with mode" "without a sid" session.start 20260925T100008Z "" 1 shell
+replica_refuses "over-long type outside the grammar (real builder sanitizes to unknown)" "outside the shipper grammar" \
   "$(python3 -c 'print("a" * 128 + "-bad")')" 20260925T100008Z "" 1
-replica_refuses "session.Data case-variant non-UUID sid (the #19 sanction is exact)" \
+replica_refuses "session.Data case-variant non-UUID sid (the #19 sanction is exact)" "non-UUID sid" \
   session.Data 20260925T100008Z not-a-uuid 1
-replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exact)" \
+replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exact)" "non-UUID sid" \
   session.dAtA 20260925T100008Z not-a-uuid 1
-replica_refuses "over-long non-exact session.data type without a sid (capped near-match stays refused)" \
+replica_refuses "over-long non-exact session.data type without a sid (capped near-match stays refused)" "without a sid" \
   "$(python3 -c 'print("session.data" + "q" * 500)')" 20260925T100008Z "" 1
 
 # Provenance-checked golden + boundary matrix: shipper_key_vectors.json was
@@ -362,6 +386,15 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
     raise SystemExit("vector pin %r != shipper_keys pin %r" % (
         vectors.get("pinned_pc_admin_sha"), replica.PINNED_PC_ADMIN_SHA))
 
+# Matrix size pin: a deleted vector/refusal entry must fail loudly instead of
+# shrinking the matrix silently (red-team round-2 LOW M10). Update this pin
+# together with the matrix.
+if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 12:
+    raise SystemExit(
+        "vector matrix size changed: %d vectors / %d refusals (pinned 26/12) - "
+        "update this pin together with the matrix"
+        % (len(vectors["vectors"]), len(vectors["refusals"])))
+
 
 def source_sha_ok(value):
     # Round-6 F6: exact 40-hex equality. `startswith(pin)` accepted the short
@@ -382,6 +415,19 @@ for hostile in (replica.PINNED_PC_ADMIN_SHA[:7], replica.PINNED_PC_ADMIN_SHA[:7]
     if source_sha_ok(hostile):
         raise SystemExit("source_sha predicate accepted a hostile value: %r" % hostile)
 for vector in vectors["vectors"]:
+    sid_arg = vector["replica_args"][2]
+    if not isinstance(sid_arg, str):
+        raise SystemExit("%s: replica_args sid is not a string: %r" % (vector["name"], sid_arg))
+    event_sid = vector.get("event", {}).get("sid")
+    if isinstance(event_sid, str) and event_sid and replica.UUID_RE.fullmatch(event_sid) is None:
+        # #19 two-sidedness (red-team round-2 LOW M6): a non-UUID sid vector
+        # must pass the RAW sid through — the builder's sanction keys on the
+        # *effective* sid, so rewriting this arg to "" makes the vector
+        # floor-proof against the effective/raw mutant.
+        if sid_arg != event_sid:
+            raise SystemExit(
+                "%s: non-UUID sid %r was rewritten to %r in replica_args"
+                % (vector["name"], event_sid, sid_arg))
     got = replay(vector["replica_args"], vector.get("body"))
     if got != vector["expected"]:
         raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
@@ -428,6 +474,7 @@ if command -v shellcheck >/dev/null 2>&1; then
   if shellcheck -S warning "${WITNESS}"; then ok "rendered witness passes shellcheck -S warning"; else bad "rendered witness fails shellcheck -S warning"; fi
 else
   printf 'note: shellcheck not installed — lint tooth skipped here (CI runs it)\n'
+  SHELLCHECK_SKIPPED=1
 fi
 
 # ---- (b) rendered units --------------------------------------------------
@@ -4148,8 +4195,8 @@ else
   bad "ci.yml path gate missing tests/recording-witness/"
 fi
 
-if [ "$pass" -lt "${MIN_CHECKS}" ]; then
-  bad "check-count floor: ${pass} passed < ${MIN_CHECKS} pinned"
+if [ "$pass" -lt "$((MIN_CHECKS - SHELLCHECK_SKIPPED))" ]; then
+  bad "check-count floor: ${pass} passed < $((MIN_CHECKS - SHELLCHECK_SKIPPED)) pinned ($((MIN_CHECKS)) minus the shellcheck skip)"
 fi
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
