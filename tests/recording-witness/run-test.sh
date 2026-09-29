@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=492
+MIN_CHECKS=512
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -326,14 +326,17 @@ replica_refuses() { # <label> <expected-refusal-reason> + shipper_keys.py args; 
 }
 replica_refuses "session.start non-UUID sid" "non-UUID sid" session.start 20260925T100008Z not-a-uuid 1
 # Non-canonical sid shapes: the replica must NOT normalize (no strip/lstrip/
-# rstrip, no de-dashing, no brace/URN unwrapping) — the real builder
-# ``fullmatch``es the canonical strict-UUID pattern only. Every shape here
-# takes the sanctioned `unknown` path on the exact single-segment
-# `session.data` and the refusal path on any other session type. The grid
-# pins the per-shape mutants found across lens rounds 2–5 (search/match,
-# leading/trailing junk, strip/lstrip/rstrip/partition, pattern-arity
-# {12,}/{11}, de-dash/brace/URN normalization). Uppercase is canonical (the
+# rstrip/partition, no dash/brace/quote/URN unwrapping, no space or
+# separator deletion, no width folding) — the real builder ``fullmatch``es
+# the canonical strict-UUID pattern only. Every shape here takes the
+# sanctioned `unknown` path on the exact single-segment `session.data` and
+# the refusal path on any other session type. The grid pins the per-shape
+# mutants found across lens rounds 2–6 (search/match, strip family and
+# side-specific trims, delimiter/quote/URN wrappers, interior separators,
+# fullwidth/zero-width folding); pattern-arity relaxations are killed
+# outright by the pattern-constant pin below. Uppercase is canonical (the
 # builder lowercases) and is pinned by the vector matrix separately.
+ZWSP="$(printf '\xe2\x80\x8b')"
 SID_SHAPE_SEQ=6
 for sid_shape in \
   "leading-junk|x${REPLICA_SID}y" \
@@ -345,6 +348,16 @@ for sid_shape in \
   "no-dash|${REPLICA_SID//-/}" \
   "braces|{${REPLICA_SID}}" \
   "urn|urn:uuid:${REPLICA_SID}" \
+  "leading-dash|-${REPLICA_SID}" \
+  "trailing-dash|${REPLICA_SID}-" \
+  "brace-open|{${REPLICA_SID}" \
+  "brace-close|${REPLICA_SID}}" \
+  "double-quoted|\"${REPLICA_SID}\"" \
+  "single-quoted|'${REPLICA_SID}'" \
+  "interior-space|9f8c4b1e -0d2a-4f7e-9c11-2b3d4e5f6a70" \
+  "underscore-separators|9f8c4b1e_0d2a_4f7e_9c11_2b3d4e5f6a70" \
+  "fullwidth-hex|9ｆ8ｃ4ｂ1ｅ-0d2a-4f7e-9c11-2b3d4e5f6a70" \
+  "zero-width-suffix|${REPLICA_SID}${ZWSP}" \
 ; do
   shape_name="${sid_shape%%|*}"; shaped_sid="${sid_shape#*|}"
   SID_SHAPE_SEQ=$((SID_SHAPE_SEQ + 1))
@@ -430,6 +443,17 @@ if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
         "generate_shipper_vectors.py and bump this pin" % (matrix_sha, MATRIX_SHA256))
+
+# Pattern-constant pin (red-team round-6 LOW): a finite sid corpus cannot
+# enumerate every possible pattern relaxation (group arity, extra dash
+# classes); pin the literal strict-UUID pattern the replica must use (the
+# same string the pinned pc-admin builder uses).
+CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+if replica.UUID_PATTERN != CANONICAL_UUID_PATTERN:
+    raise SystemExit(
+        "replica UUID_PATTERN %r != pinned canonical pattern %r"
+        % (replica.UUID_PATTERN, CANONICAL_UUID_PATTERN))
 
 
 def source_sha_ok(value):
