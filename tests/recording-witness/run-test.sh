@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=478
+MIN_CHECKS=480
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -266,6 +266,12 @@ is "replica golden session.data with a UUID-substring sid sanitized to unknown" 
 is "replica golden session.data with a UUID-prefix sid sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000005.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}y" 5)"
+# Whitespace-padded sids are NOT strict UUIDs either: the real builder never
+# strips (red-team round-3 LOW). A leading-space golden pins its ``fullmatch``
+# against a ``fullmatch(sid.strip())`` mutant at the effective-sid site.
+is "replica golden session.data with a leading-space sid sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000006.json" \
+  "$(key session.data 20260925T100008Z " ${REPLICA_SID}" 6)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -346,6 +352,10 @@ replica_refuses "session.start UUID-substring sid" "non-UUID sid" session.start 
 # ``re.match`` at the refusal site would accept a UUID-prefix sid and pin a
 # session key the real shipper can never emit (red-team round-3 LOW).
 replica_refuses "session.start UUID-prefix sid" "non-UUID sid" session.start 20260925T100008Z "${REPLICA_SID}y" 1 shell
+# A trailing-space sid is refused like any non-UUID sid: the real builder does
+# not strip. Pins the refusal site against a ``fullmatch(sid.strip())``
+# mutant (red-team round-3 LOW).
+replica_refuses "session.start trailing-space sid" "non-UUID sid" session.start 20260925T100008Z "${REPLICA_SID} " 1 shell
 replica_refuses "session.start missing sid and mode" "mandatory" session.start 20260925T100008Z "" 1
 replica_refuses "non-session with sid" "non-session" user.login 20260925T100008Z "${REPLICA_SID}" 1
 replica_refuses "mode on non-lifecycle event" "only valid" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
@@ -368,8 +378,8 @@ replica_refuses "over-long non-exact session.data type without a sid (capped nea
 # (generate_shipper_vectors.py); every vector must replay exactly and every
 # refusal must stay refused, or silent replica drift passes the harness.
 if python3 - "${HARNESS_DIR}" <<'PY'
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -379,7 +389,13 @@ here = sys.argv[1]
 spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here, "shipper_keys.py"))
 replica = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replica)
-vectors = json.load(open(os.path.join(here, "shipper_key_vectors.json"), encoding="utf-8"))
+# Read the matrix bytes ONCE: the content pin and the replay must see the same
+# bytes (a second open lets a FIFO swap feed the digest one file and the
+# replay another — red-team round-3 LOW).
+matrix_path = os.path.join(here, "shipper_key_vectors.json")
+with open(matrix_path, "rb") as matrix_file:
+    matrix_bytes = matrix_file.read()
+vectors = json.loads(matrix_bytes.decode("utf-8"))
 
 
 def replay(args, body=None):
@@ -409,9 +425,9 @@ if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 12:
 # Matrix content pin (red-team round-3 LOW): a coherent same-size rewrite
 # (both event.sid and replica_args[2], or an entry swap) must fail loudly.
 # Regenerate the matrix with generate_shipper_vectors.py and bump this sha256
-# together with the file.
-matrix_path = os.path.join(here, "shipper_key_vectors.json")
-matrix_sha = hashlib.sha256(open(matrix_path, "rb").read()).hexdigest()
+# together with the file. The digest covers the SAME bytes that are replayed
+# (single read above).
+matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
 MATRIX_SHA256 = "4c7116af9cfa5e02c73924d59bf676cf7281af6f3e176fafc69396746adba7a8"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
