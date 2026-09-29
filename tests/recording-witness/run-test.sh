@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=525  # 516 (#151 matrix tooth) + 9 trailing-newline teeth (#152)
+MIN_CHECKS=528  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -1927,6 +1927,35 @@ run_case
 is "newline-suffixed recording key -> exit 1" "1" "${CASE_RC}"
 is "newline-suffixed recording key -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *recording-gap*) ok "newline-suffixed tar never satisfies the recording check (recording-gap)" ;; *) bad "newline-suffixed tar detail: ${CASE_DETAIL}" ;; esac
+
+# A newline-suffixed heartbeat key is not a heartbeat: it must not match
+# HEARTBEAT_KEY_RE, so the only heartbeat-shaped object can neither satisfy
+# the freshness check (head detail carries `heartbeat-missing: ...` first)
+# nor dodge drift classification (`contract-mismatch: ...` second). With `$`
+# the key is absorbed as a healthy heartbeat (age 300s) and this fixture stays
+# green: this tooth is what pins HEARTBEAT_KEY_RE's \Z.
+NEWLINE_HEARTBEAT_KEY="audit/heartbeat/20260925T140000Z.json"$'\n'
+python3 - "${NEWLINE_HEARTBEAT_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": sys.argv[1], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed heartbeat key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed heartbeat key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *contract-mismatch*) ok "newline-suffixed heartbeat key alerts contract-mismatch" ;; *) bad "newline-suffixed heartbeat key detail: ${CASE_DETAIL}" ;; esac
+
+# The fifth anchored classifier, CONFLICT_SUFFIX_RE, is provably inert and
+# needs no tooth: its only input is the newline-free `etype` capture from the
+# already-\Z-anchored key classifiers, never a raw key name.
 
 # ---- clock skew: future timestamps must error, never look healthy --------
 
