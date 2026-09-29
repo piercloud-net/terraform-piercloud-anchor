@@ -63,7 +63,7 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 3325aeb; golden strings,
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
 #       the over-long event-type truncation cap with its `_<sha256[:8]>`
@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=515
+MIN_CHECKS=516
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -194,16 +194,18 @@ fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 3325aeb
+# were generated from the real builder at cad0p/pc-admin @ 25f7922
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key,
 # the full-SHA pin in shipper_keys.py; the grammar-defining point (pc-admin
-# #19) scoped the sid-less `session.data` sanction onto the documented
-# `unknown` non-session shape, the previous point a7035a9 added the
-# replay-conflict `_<sha256[:16]>` variant keys, and the earlier point 41735ff
-# added the over-long event-type truncation cap with the `_<sha256[:8]>`
-# suffix — all pinned by the vector matrix below); a pc-admin grammar change
-# must bump the pin and regenerate these (a contract-neutral change needs no
-# witness-contract edit). Drift fixtures (non-UUID or
+# #20) `\Z`-anchored the audit-key type regexes (a trailing-newline type is
+# out of grammar and sanitized to the documented `unknown` non-session shape),
+# the previous point 3325aeb (pc-admin #19) scoped the sid-less `session.data`
+# sanction onto the documented `unknown` non-session shape, then a7035a9 added
+# the replay-conflict `_<sha256[:16]>` variant keys, and the earlier point
+# 41735ff added the over-long event-type truncation cap with the
+# `_<sha256[:8]>` suffix — all pinned by the vector matrix below); a pc-admin
+# grammar change must bump the pin and regenerate these (a contract-neutral
+# change needs no witness-contract edit). Drift fixtures (non-UUID or
 # sid-less session keys, malformed modes) stay hand-written literals on
 # purpose: the replica now refuses shapes the real shipper never emits, so a
 # fixture request for one is itself a failure (the teeth after the golden).
@@ -388,6 +390,13 @@ replica_refuses "session.dAtA case-variant non-UUID sid (the #19 sanction is exa
   session.dAtA 20260925T100008Z not-a-uuid 1
 replica_refuses "over-long non-exact session.data type without a sid (capped near-match stays refused)" "without a sid" \
   "$(python3 -c 'print("session.data" + "q" * 500)')" 20260925T100008Z "" 1
+# pc-admin #20: the type regexes are `\Z`-anchored, so a trailing newline is
+# outside the grammar. The bash `$'…'` form carries a REAL newline (a plain
+# "session.data\n" would be a literal backslash-n and pass vacuously), and
+# the reason assert makes the tooth anchor-sensitive: under a `$` mutant the
+# same argv would reach the sid-less-session refusal instead.
+replica_refuses "trailing-newline type (real newline, \Z grammar)" "outside the shipper grammar" \
+  $'session.data\n' 20260925T100008Z "" 1
 
 # Direct-API teeth for the sid type (functional round-10 LOWs): the CLI is
 # string-only, so only a direct call can pass a non-string sid. The real
@@ -489,9 +498,9 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
 # Matrix size pin: a deleted vector/refusal entry must fail loudly instead of
 # shrinking the matrix silently (red-team round-2 LOW M10). Update this pin
 # together with the matrix.
-if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 12:
+if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 17:
     raise SystemExit(
-        "vector matrix size changed: %d vectors / %d refusals (pinned 26/12) - "
+        "vector matrix size changed: %d vectors / %d refusals (pinned 26/17) - "
         "update this pin together with the matrix"
         % (len(vectors["vectors"]), len(vectors["refusals"])))
 
@@ -501,7 +510,7 @@ if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 12:
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "4c7116af9cfa5e02c73924d59bf676cf7281af6f3e176fafc69396746adba7a8"
+MATRIX_SHA256 = "cc364752764aacc6cb8d464382d8830df813991e305eba202491cbe17b6dd154"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -571,7 +580,7 @@ for refusal in vectors["refusals"]:
 print("vectors=%d refusals=%d pin=%s source=%s" % (
     len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=26 refusals=12 pin=3325aeb848219488168778cbd944fcbf6b7c73bd source=3325aeb84821" ]]; then
+)" && [[ "$matrix_out" == "vectors=26 refusals=17 pin=25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 source=25f79223cadd" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
