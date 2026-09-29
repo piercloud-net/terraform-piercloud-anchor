@@ -535,7 +535,7 @@ ORACLE_BASE = "9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
 # Independent canonical predicate: same literal as the vector-block pin.
 CANONICAL_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-# Snapshot the predicate primitives BEFORE importing the replica: an import
+# Freeze the predicate primitives BEFORE importing the replica: an import
 # could otherwise rebind re.compile / unicodedata.category / .normalize and
 # make this oracle agree with a relaxed matcher while the CLI and vector
 # processes stay strict (red-team round-9 LOW).
