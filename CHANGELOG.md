@@ -65,6 +65,7 @@ All notable changes to this project will be documented in this file.
 - Unset-safe NTFY_TOKEN guard for hand runs (closes #137)
 - *(verification-browser)* Shared base CfT (~/.cft) + CFT_SKIP_FETCH rebuild knob (closes #139) ([#140](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/140))
 - Refresh the shipper-key replica for the pc-admin#19 grammar (sid-less `session.data` → `unknown`) (closes #149)
+- Refresh the shipper-key replica for the pc-admin#20 \Z grammar (trailing-newline type regexes) (closes #151)
 
 ### 📚 Documentation
 
