@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=476
+MIN_CHECKS=478
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -259,6 +259,13 @@ is "replica golden session.data with a non-UUID sid sanitized to unknown" \
 is "replica golden session.data with a UUID-substring sid sanitized to unknown" \
   "audit/20260925T100008Z-unknown.000004.json" \
   "$(key session.data 20260925T100008Z "x${REPLICA_SID}y" 4)"
+# A UUID PREFIX with trailing junk is also not a strict-UUID sid. The
+# ``search``/``match`` checks use leading junk; ``re.match`` (anchored at the
+# start, not the end) would accept this shape and diverge from the real
+# builder — red-team round-3 LOW.
+is "replica golden session.data with a UUID-prefix sid sanitized to unknown" \
+  "audit/20260925T100008Z-unknown.000005.json" \
+  "$(key session.data 20260925T100008Z "${REPLICA_SID}y" 5)"
 is "replica golden seq 10^6 (seven digits, past the old ceiling)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.1000000.json" \
   "$(key session.data 20260925T100008Z "${REPLICA_SID}" 1000000)"
@@ -336,6 +343,9 @@ replica_refuses "session.start non-UUID sid" "non-UUID sid" session.start 202609
 # ``search`` mutant at the refusal site (red-team round-2 LOW) would accept
 # it and pin a session key the real shipper can never emit.
 replica_refuses "session.start UUID-substring sid" "non-UUID sid" session.start 20260925T100008Z "x${REPLICA_SID}y" 1 shell
+# ``re.match`` at the refusal site would accept a UUID-prefix sid and pin a
+# session key the real shipper can never emit (red-team round-3 LOW).
+replica_refuses "session.start UUID-prefix sid" "non-UUID sid" session.start 20260925T100008Z "${REPLICA_SID}y" 1 shell
 replica_refuses "session.start missing sid and mode" "mandatory" session.start 20260925T100008Z "" 1
 replica_refuses "non-session with sid" "non-session" user.login 20260925T100008Z "${REPLICA_SID}" 1
 replica_refuses "mode on non-lifecycle event" "only valid" session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
@@ -359,6 +369,7 @@ replica_refuses "over-long non-exact session.data type without a sid (capped nea
 # refusal must stay refused, or silent replica drift passes the harness.
 if python3 - "${HARNESS_DIR}" <<'PY'
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -394,6 +405,18 @@ if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 12:
         "vector matrix size changed: %d vectors / %d refusals (pinned 26/12) - "
         "update this pin together with the matrix"
         % (len(vectors["vectors"]), len(vectors["refusals"])))
+
+# Matrix content pin (red-team round-3 LOW): a coherent same-size rewrite
+# (both event.sid and replica_args[2], or an entry swap) must fail loudly.
+# Regenerate the matrix with generate_shipper_vectors.py and bump this sha256
+# together with the file.
+matrix_path = os.path.join(here, "shipper_key_vectors.json")
+matrix_sha = hashlib.sha256(open(matrix_path, "rb").read()).hexdigest()
+MATRIX_SHA256 = "4c7116af9cfa5e02c73924d59bf676cf7281af6f3e176fafc69396746adba7a8"
+if matrix_sha != MATRIX_SHA256:
+    raise SystemExit(
+        "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
+        "generate_shipper_vectors.py and bump this pin" % (matrix_sha, MATRIX_SHA256))
 
 
 def source_sha_ok(value):
