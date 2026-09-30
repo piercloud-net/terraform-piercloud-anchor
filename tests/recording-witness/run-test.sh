@@ -3778,14 +3778,17 @@ fi
 # 1`) or shadowed by a `sleep` function. Pin the executed line: the drain
 # loop (the `for ((attempt...))` header) must end — at depth 0, so nested
 # decoy loops cannot latch — in a foreground `sleep 1` (a trailing comment is
-# fine); and no `sleep` function may exist in plain code (`sleep()` or
+# fine); exactly one such header may match — a second exact header (a decoy
+# loop after the real one) fails instead of overwriting the remembered body —
+# and no `sleep` function may exist in plain code (`sleep()` or
 # `function sleep`, same-line or brace-on-next-line; comments and quoted
 # spans ignored). Residual (intentional-crafting class, disclosed): `eval`/
 # `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
 # forms are not detected (fail-closed by design).
 if awk '
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
-    seen_loop = 1; in_loop = 1; depth = 0; prev = ""; next
+    headers++; header_lines = header_lines (header_lines == "" ? "" : ", ") NR
+    in_loop = 1; depth = 0; prev = ""; next
   }
   in_loop {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
@@ -3798,11 +3801,17 @@ if awk '
     if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
     prev = $0
   }
-  END { exit (seen_loop && loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1 }
+  END {
+    if (headers != 1) {
+      print "drain-loop header matches " headers " (expected exactly 1): line(s) " header_lines > "/dev/stderr"
+      exit 1
+    }
+    exit (loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1
+  }
 ' "${PROVISION}"; then
   ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
 else
-  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, or a second decoy loop header matched (issue #143)"
 fi
 # Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
 # wall-clock early exit keeps every count green while the effective bound
@@ -3817,11 +3826,15 @@ fi
 # scanned. Replace the denylist with an exact ALLOWLIST of the four intended
 # body forms (the drain check, its `return 0`, its `fi` and the `sleep 1`),
 # tolerant of leading whitespace and a trailing `#` comment: any other line —
-# the printf clock, the heredoc opener — fails the tooth regardless of any
-# scanner desync. Residual (intentional-crafting class, disclosed): an early
-# exit moved outside the rendered loop body (e.g. into a helper) stays
-# heuristic; the state pins above and the on-box wall-clock behavior remain
-# the backstop.
+# the printf clock, the heredoc opener — fails the tooth, and the accumulator
+# is latched across every matched body instead of being reset per header. A
+# second exact header match (a decoy loop carrying the four pinned forms,
+# appended after the real one) also fails the tooth, so the last matching body
+# can no longer become authoritative (r3 MED). Residual (intentional-crafting
+# class, disclosed): an early exit moved outside the rendered loop body (e.g.
+# into a helper) and any non-header scanner desync whose opener is not itself
+# an unpinned body line stay heuristic; the state pins above and the on-box
+# wall-clock behavior remain the backstop.
 if awk '
   function pinned(line) {
     sub(/[[:space:]]+#.*$/, "", line)
@@ -3833,7 +3846,8 @@ if awk '
             line == "sleep 1")
   }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
-    seen_loop = 1; in_loop = 1; depth = 0; unpinned = ""; next
+    headers++; header_lines = header_lines (header_lines == "" ? "" : ", ") NR
+    in_loop = 1; depth = 0; next
   }
   in_loop {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
@@ -3842,16 +3856,17 @@ if awk '
       depth--
     }
     if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
-    if (!pinned($0)) unpinned = unpinned (unpinned == "" ? "" : " | ") $0
+    if (!pinned($0)) unpinned = unpinned (unpinned == "" ? "" : " | ") "line " NR ": " $0
   }
   END {
+    if (headers != 1) print "drain-loop header matches " headers " (expected exactly 1): line(s) " header_lines > "/dev/stderr"
     if (unpinned != "") print "unpinned drain-loop line(s): " unpinned > "/dev/stderr"
-    exit (seen_loop && unpinned == "") ? 0 : 1
+    exit (headers == 1 && unpinned == "") ? 0 : 1
   }
 ' "${PROVISION}"; then
   ok "run-once: every drain loop body line is one of the four pinned forms (issue #143)"
 else
-  bad "run-once: the drain loop body carries a line outside the pinned allowlist (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
+  bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second decoy loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
 fi
 if awk -v q="'" '
   {
