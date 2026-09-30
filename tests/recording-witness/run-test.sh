@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=535  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 7 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal)
+MIN_CHECKS=536  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 8 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3795,7 +3795,9 @@ fi
 # any body form (r9 red-team HIGH: a compound-bodied `sleep () ( : )` before
 # the witness span ran the whole suite 535/0 while every drain call no-opped
 # and the 3600s bound collapsed to ~2s; the old tooth only matched `{`-body
-# forms), on both the raw and the continuation-joined view.
+# forms; r10 broadened the same any-body refusal to `systemctl` and made a
+# non-identifier `function`-keyword name fail — see below), on both the raw
+# and the continuation-joined view.
 #
 # r6 red-team F1/F2 + r7 trust HIGH: the old continuation tooth scanned a
 # wait-idle span extracted by the first column-0 `}`; a multi-line quoted
@@ -3821,12 +3823,42 @@ fi
 # `command sleep 1` was bypassable (`command` is not a special builtin; a
 # `command () { :; }` definition made `command sleep 0.2` return in 0.000s) —
 # while the broadened static tooth refuses definition-shaped text for those
-# names outright (any body form, both the raw and joined views). Residual
-# (intentional-crafting class, disclosed): a dynamically constructed
-# `eval`/`alias`+`expand_aliases`/sourced shadow is not statically detectable
-# — behaviorally neutralized by the absolute `/usr/bin/env` for the drain
-# sleep — a shadowing binary on PATH stays root-controlled, and
-# blocking-equivalent loop forms remain heuristic (fail-closed by design).
+# names outright (any body form, both the raw and joined views).
+#
+# r10 red-team: the crafted-definition class is a regression detector for the
+# drain path's FINITE NAME SURFACE, not a sandbox. The surface: the helpers
+# `recording_witness_service_drained` and `recording_witness_wait_idle`, the
+# fail-closed `die`, the `systemctl` query inside the check (and its at-bound
+# repeat), the `/usr/bin/env sleep` loop sleep, and the loop/builtins.
+# Reproduced misses, each suite-green before this fold: a `function
+# /usr/bin/env { :; }` (or `function /bin/sleep { :; }`) path-name keyword
+# definition shadowed the absolute-path invocation — the POSIX `/usr/bin/env
+# ()` form was already caught by the basename pattern, the keyword form was
+# not; a second `recording_witness_service_drained`, a `systemctl` function
+# lying about ActiveState, a second `recording_witness_wait_idle`, and a
+# `die () { :; }` override each neutralized one link of the drain path
+# (fail-open at poll 0, or a silenced at-bound abort) while every static
+# tooth stayed green. The closure: (1) a `function <name>` definition must
+# carry a plain identifier name (`[A-Za-z_][A-Za-z0-9_]*`) — a decorated path
+# name fails; (2) `systemctl` definitions are refused outright (the script
+# only ever invokes it), like the existing sleep/command/builtin/env names;
+# (3) each of the three drain-path functions — `die` included — is pinned to
+# EXACTLY ONE definition on both views: a second definition anywhere in the
+# script fails. The real script's single definitions and every invocation
+# stay green.
+#
+# Boundary (disclosed): the teeth are a regression detector for the drain
+# path's finite name surface (definitions of sleep/command/builtin/env/
+# systemctl; `die` plus the two drain-path helpers pinned to a single
+# definition each; non-identifier `function` names) — not a sandbox: an
+# adversary who can edit the provision script can also edit this harness, so
+# arbitrary crafted edits outside that surface (and harness self-edits) are
+# out of scope by construction. Residual (intentional-crafting class,
+# disclosed): a dynamically constructed `eval`/`alias`+`expand_aliases`/
+# sourced shadow is not statically detectable — behaviorally neutralized by
+# the absolute `/usr/bin/env` for the drain sleep — a shadowing binary on
+# PATH stays root-controlled, and blocking-equivalent loop forms remain
+# heuristic (fail-closed by design).
 PROVISION_JOINED="${WORK}/provision-joined.sh"
 if awk -v q="'" '
   {
@@ -3989,25 +4021,33 @@ else
   bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second C-style loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
 fi
 if awk -v q="'" '
-  # r9 red-team HIGH + the command-shadow strengthening: refuse ANY definition
-  # spelling of the sleep utility — and of `command`, `builtin` and `env`,
-  # which an earlier `command sleep 1` fix left shadowable (`command` is not
-  # a special builtin; `builtin` shadows the same way; `env` is a plain
-  # external) — whatever the body form, on both the raw file and the
-  # continuation-joined copy. Every valid bash definition has
-  # `name ()`/`name()` or `function name` on one (post-join) line (a
-  # backslash-split `name \` + `()` is rejoined by PROVISION_JOINED; the
-  # bare-newline split is a syntax error), so a definition-shaped match
+  # r9 red-team HIGH + the command-shadow strengthening + r10 red-team:
+  # refuse ANY definition spelling of the sleep utility — and of `command`,
+  # `builtin`, `env` and `systemctl`, which an earlier `command sleep 1` fix
+  # left shadowable (`command` is not a special builtin; `builtin` shadows the
+  # same way; `env` is a plain external; a `systemctl` function lying
+  # `inactive` fail-opens the drain check at poll 0) — whatever the body form,
+  # on both the raw file and the continuation-joined copy. Every valid bash
+  # definition has `name ()`/`name()` or `function name` on one (post-join)
+  # line (a backslash-split `name \` + `()` is rejoined by PROVISION_JOINED;
+  # the bare-newline split is a syntax error), so a definition-shaped match
   # anywhere in code is refused. Comments are stripped first; quoted spans are
-  # stripped for `sleep` (so literal prose/strings stay green by design),
-  # while `command`/`builtin`/`env` are matched on the raw line: a quoted or
-  # escaped spelling of those identifiers is not a valid bash function name
-  # (`e"nv" () { :; }` is `not a valid identifier`), but real code passes
-  # strings to `env` (`env("RECORDING_WITNESS_ENDPOINT")`), and stripping the
-  # quotes would turn those calls into `env()` and refuse the shipped script.
-  # Invocations (`command -v …`, `env NAME=… …`) and the `#!/usr/bin/env
-  # bash` shebang (a comment) stay green; the brace-body/pending logic is
-  # gone.
+  # stripped for `sleep`/`systemctl` (so literal prose/strings stay green by
+  # design), while `command`/`builtin`/`env` are matched on the raw line: a
+  # quoted or escaped spelling of those identifiers is not a valid bash
+  # function name (`e"nv" () { :; }` is `not a valid identifier`), but real
+  # code passes strings to `env` (`env("RECORDING_WITNESS_ENDPOINT")`), and
+  # stripping the quotes would turn those calls into `env()` and refuse the
+  # shipped script. Invocations (`command -v …`, `env NAME=… …`) and the
+  # `#!/usr/bin/env bash` shebang (a comment) stay green; the
+  # brace-body/pending logic is gone.
+  #
+  # r10 trust: the `function` KEYWORD form accepts a non-identifier name
+  # (`function /usr/bin/env { :; }` defines a function that shadows the
+  # absolute-path invocation `time /usr/bin/env sleep 0.2` → 0.002s), which
+  # the basename patterns cannot see; refuse any `function <name>` whose name
+  # token is not a plain identifier ([A-Za-z_][A-Za-z0-9_]*). The POSIX
+  # `/usr/bin/env ()` form is matched by the `env` basename clause above.
   {
     line = $0
     sub(/^[[:space:]]*#.*/, "", line)
@@ -4022,16 +4062,86 @@ if awk -v q="'" '
         raw ~ /(^|[^[:alnum:]_])command[[:space:]]*\([[:space:]]*\)/ ||
         raw ~ /(^|[^[:alnum:]_])builtin[[:space:]]*\([[:space:]]*\)/ ||
         raw ~ /(^|[^[:alnum:]_])env[[:space:]]*\([[:space:]]*\)/ ||
-        raw ~ /(^|[^[:alnum:]_])function[[:space:]]+(command|builtin|env)([^[:alnum:]_]|$)/) {
+        raw ~ /(^|[^[:alnum:]_])function[[:space:]]+(command|builtin|env)([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])systemctl[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_])function[[:space:]]+systemctl([^[:alnum:]_]|$)/) {
       shadow = 1
       print FILENAME ":" FNR ": " $0 > "/dev/stderr"
+    }
+    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]/) {
+      rest = line
+      sub(/^.*function[[:space:]]+/, "", rest)
+      sub(/[[:space:]].*$/, "", rest)
+      gsub(/[()]/, "", rest)
+      if (rest !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+        shadow = 1
+        print FILENAME ":" FNR ": non-identifier function name: " $0 > "/dev/stderr"
+      }
     }
   }
   END { exit shadow ? 1 : 0 }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`sleep\`/\`command\`/\`builtin\`/\`env\` definition shadows the drain sleep (any body form, issue #143)"
+  ok "run-once: no \`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\` definition and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
 else
-  bad "run-once: a \`sleep\`/\`command\`/\`builtin\`/\`env\` definition shadows the drain sleep (any body form, issue #143)"
+  bad "run-once: a \`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\` definition or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+fi
+# r10 red-team: the drain path resolves its two helpers and the fail-closed
+# `die` by name at call time, so any definition AFTER the real one overrides
+# it: a second `recording_witness_service_drained` returning 0 declared
+# "drained" at poll 0 with the unit active (suite 535/0), a second `die`
+# silenced the at-bound abort, and a second `recording_witness_wait_idle`
+# replaced the bounded loop (all reproduced; the residual bullet disclosed
+# the second-wait_idle spelling but nothing enforced it). Pin each of the
+# three to EXACTLY ONE definition, per view (raw and continuation-joined),
+# with comments and quoted spans stripped and invocations (no definition
+# parens) naturally excluded. The real script defines each once.
+if awk -v q="'" '
+  function isdef(line, name) {
+    if (line ~ ("function[[:space:]]+" name "([^[:alnum:]_]|$)")) return 1
+    if (line ~ ("(^|[^[:alnum:]_])" name "[[:space:]]*\\([[:space:]]*\\)")) return 1
+    return 0
+  }
+  FNR == 1 { file = FILENAME; seen[file] = 1 }
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
+    sub(/[[:space:]]#.*$/, "", line)
+    if (line ~ /^[[:space:]]*$/) next
+    if (isdef(line, "recording_witness_service_drained")) {
+      c[file, "recording_witness_service_drained"]++
+      if (c[file, "recording_witness_service_drained"] == 2)
+        print file ":" FNR ": second definition of recording_witness_service_drained: " $0 > "/dev/stderr"
+    }
+    if (isdef(line, "recording_witness_wait_idle")) {
+      c[file, "recording_witness_wait_idle"]++
+      if (c[file, "recording_witness_wait_idle"] == 2)
+        print file ":" FNR ": second definition of recording_witness_wait_idle: " $0 > "/dev/stderr"
+    }
+    if (isdef(line, "die")) {
+      c[file, "die"]++
+      if (c[file, "die"] == 2)
+        print file ":" FNR ": second definition of die: " $0 > "/dev/stderr"
+    }
+  }
+  END {
+    bad = 0
+    n = split("recording_witness_service_drained recording_witness_wait_idle die", names, " ")
+    for (f in seen) {
+      for (i = 1; i <= n; i++) {
+        if (c[f, names[i]] != 1) {
+          printf "%s: expected exactly 1 definition of %s, found %d\n", f, names[i], c[f, names[i]] + 0 > "/dev/stderr"
+          bad = 1
+        }
+      }
+    }
+    exit bad ? 1 : 0
+  }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\` and \`die\` are each defined exactly once (issue #143)"
+else
+  bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times — a second definition overrides the scanned one (issue #143)"
 fi
 case "${runonce_out}" in
   *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
