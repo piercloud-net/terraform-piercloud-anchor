@@ -334,11 +334,12 @@ jobs:
           # and fail on anything else netcup-shaped in the CI-called surface
           # (provision.yml + .github/scripts). Permitted today:
           #   URLs: the SCP REST base, the two A1 egress-IP endpoints, ntfy,
-          #   and the Cloudflare DNS API (anchor A-record upsert + verify).
+          #   the Cloudflare DNS API (anchor A-record upsert + verify), and
+          #   the Gcore DNS API (A2 writer; the `.net` provider switch is B).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com|api\.gcore\.com)(/|$)'
           # Passwordless bootstrap (issue #50) extends the surface with task
           # polling (/tasks) and the approver guard (/users/{id}); the
           # provisioning-only stems above stay intact (sanity check enforces).
