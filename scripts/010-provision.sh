@@ -2841,10 +2841,12 @@ recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation 
   # `command () { :; }` collapsed it identically (0.000s) and `builtin`
   # shadows the same way. PATH lookup of `sleep` is preserved (`/usr/bin/env`
   # resolves it through PATH), so the harness's fake-sleep seam still counts
-  # and interleaves the calls; a shadowing binary on PATH needs root write
-  # access to the root-controlled PATH and /usr/bin/env, like every other
-  # command this script runs (the harness also refuses definition-shaped text
-  # for sleep/command/builtin/env, defense-in-depth).
+  # and interleaves the calls; a PATH-prepended shadow binary is refused by
+  # the harness teeth (r13: no `PATH` assignment/export/unset, no
+  # command-position `builtin`/`enable`/`trap`/`hash`, no `$'` quoting in
+  # code), which are a regression detector for the pinned source, not a
+  # sandbox; definition-shaped text for sleep/command/builtin/env is refused
+  # too, defense-in-depth.
   local attempt active
   for ((attempt = 0; attempt < 3600; attempt++)); do
     if recording_witness_service_drained; then

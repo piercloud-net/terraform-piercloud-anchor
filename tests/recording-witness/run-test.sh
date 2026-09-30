@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=538  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — so the count is unchanged)
+MIN_CHECKS=540  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3847,27 +3847,52 @@ fi
 # script fails. The real script's single definitions and every invocation
 # stay green.
 #
+# r13 red-team: three HIGHs plus a MED stayed suite-green (538/0) while the
+# on-box arm failed open. (1) `x=; h${x}ash -p /usr/bin/true systemctl`
+# rebuilt the `hash` token with a parameter expansion; the joined view kept
+# `h{x}ash` (it stripped only `$`), so the command-position match missed.
+# (2) `enable -n exit` (with a `command_not_found_handle` definition)
+# disabled the `exit` builtin, so the at-bound `die`'s `exit 1` hit the
+# handler and returned 0; `builtin enable -n exit` is the same. (3)
+# `trap 'exit 0' EXIT` rewrote the process rc. (4) a PATH-prepended shadow
+# `systemctl` misreported state; the r12 wording claimed that needs a
+# root-level PATH write — false, the script edits itself as root. The
+# closure: strip parameter expansions (`${...}` and `$name`) from the joined
+# view before the command-position match (`h${x}ash` -> `hash`), add `!` to
+# the command-position class, refuse ANSI-C `$'` quoting in code (0
+# occurrences in the script), refuse command-position `builtin`/`enable`/
+# `trap` invocations (the script's only `enable` occurrences are `systemctl
+# enable --now …` subcommands), add `command_not_found_handle` to the
+# refused-definition name set, and refuse `PATH=`/`PATH+=`/`export PATH`/
+# `unset PATH` in code (0 occurrences). Each refusal is a deliberate
+# over-refusal: the shipped script never uses these forms.
+#
 # Boundary (disclosed): the teeth are a regression detector for the drain
 # path's pinned source (any definition of the utilities/builtins
 # sleep/command/builtin/env/systemctl and of the rc-path exit/return plus
-# printf/local/true; `die` plus the two drain-path helpers pinned to a single
-# definition occurrence each, with the `die` definition pinned to the EXACT
-# shipped line — a dead, quoted, subshell or multiline rewrite fails closed;
-# the `recording_witness_service_drained` body and the at-bound `die`
+# printf/local/true plus the `command_not_found_handle` hook; `die` plus the
+# two drain-path helpers pinned to a single definition occurrence each, with
+# the `die` definition pinned to the EXACT shipped line — a dead, quoted,
+# subshell or multiline rewrite fails closed; the
+# `recording_witness_service_drained` body and the at-bound `die`
 # invocation pinned to the shipped source lines; `hash` refused as a word and
-# in the quote-joined view at a command position, including `builtin`/`command
-# hash`; non-identifier `function` names) — not a sandbox: an adversary who
-# can edit the provision script can also edit this harness, so crafted edits
-# outside that pinned source (and harness self-edits) are out of scope by
-# construction. Deliberate over-refusals (fail-closed): a `die` spelling that
-# deviates from the exact shipped line (`exit "1"`, multiline, tab-indented)
-# and any `hash` spelling at a command position. Residual
-# (intentional-crafting class, disclosed): a
-# dynamically constructed `eval`/`alias`+`expand_aliases`/sourced shadow is
-# not statically detectable — behaviorally neutralized by the absolute
-# `/usr/bin/env` for the drain sleep — blocking-equivalent loop forms stay
-# heuristic (state pins + on-box wall-clock backstop), and a shadowing
-# binary requires a root-level PATH write (out of scope by construction).
+# in the quote-joined/expansion-stripped view at a command position,
+# including `builtin`/`command hash`; command-position `builtin`/`enable`/
+# `trap` invocations and `PATH` assignments/exports/unsets refused; any
+# ANSI-C `$'` quoting in code refused; non-identifier `function` names) — not
+# a sandbox: an adversary who can edit the provision script can also edit
+# this harness, so crafted edits outside that pinned source (and harness
+# self-edits) are out of scope by construction. Deliberate over-refusals
+# (fail-closed): a `die` spelling that deviates from the exact shipped line
+# (`exit "1"`, multiline, tab-indented), any `hash` spelling at a command
+# position, any `$'` quoting in code, and any `PATH` assignment/export/unset.
+# Residual (intentional-crafting class, disclosed): a dynamically constructed
+# `eval`/`alias`+`expand_aliases`/sourced shadow is not statically detectable
+# — behaviorally neutralized by the absolute `/usr/bin/env` for the drain
+# sleep — blocking-equivalent loop forms stay heuristic (state pins + on-box
+# wall-clock backstop), a refused word rebuilt from a non-empty parameter
+# expansion (`${x:-a}`) stays in the crafted-edit class, and any other such
+# crafted edit outside the pinned source is out of scope by construction.
 PROVISION_JOINED="${WORK}/provision-joined.sh"
 if awk -v q="'" '
   {
@@ -4065,7 +4090,10 @@ if awk -v q="'" '
   # not drained, yet run_once proceeded), and `return() { :; }` made the drain
   # check report "drained" at poll 0. `printf` (the die message), `local` (the
   # helper scratch) and `true` (`|| true` on the systemctl query) are
-  # refused for the same class closure. Tested: bash accepts ONLY the plain
+  # refused for the same class closure; `command_not_found_handle` (the
+  # command-not-found hook — with `enable -n exit` it swallowed the at-bound
+  # `die` call, whose `exit 1` returned 0) joins the set by the same rule.
+  # Tested: bash accepts ONLY the plain
   # `name()`/`name ()` and `function name` spellings for these names — every
   # quoted or escaped spelling (`ex"it"()`, `ex\it()`, `$'exit'()`,
   # `function "exit"`) is a `not a valid identifier` syntax error — so these
@@ -4090,8 +4118,8 @@ if awk -v q="'" '
         raw ~ /(^|[^[:alnum:]_])function[[:space:]]+(command|builtin|env)([^[:alnum:]_]|$)/ ||
         line ~ /(^|[^[:alnum:]_])systemctl[[:space:]]*\([[:space:]]*\)/ ||
         raw ~ /(^|[^[:alnum:]_])function[[:space:]]+systemctl([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[^[:alnum:]_])(exit|return|printf|local|true)[[:space:]]*\([[:space:]]*\)/ ||
-        line ~ /(^|[^[:alnum:]_])function[[:space:]]+(exit|return|printf|local|true)([^[:alnum:]_]|$)/) {
+        line ~ /(^|[^[:alnum:]_])(exit|return|printf|local|true|command_not_found_handle)[[:space:]]*\([[:space:]]*\)/ ||
+        line ~ /(^|[^[:alnum:]_])function[[:space:]]+(exit|return|printf|local|true|command_not_found_handle)([^[:alnum:]_]|$)/) {
       shadow = 1
       print FILENAME ":" FNR ": " $0 > "/dev/stderr"
     }
@@ -4112,9 +4140,9 @@ if awk -v q="'" '
   }
   END { exit shadow ? 1 : 0 }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`) and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+  ok "run-once: no drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`/\`command_not_found_handle\`) and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
 else
-  bad "run-once: a drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`) or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+  bad "run-once: a drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`/\`command_not_found_handle\`) or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
 fi
 # r10 red-team: the drain path resolves its two helpers and the fail-closed
 # `die` by name at call time, so any definition AFTER the real one overrides
@@ -4218,7 +4246,14 @@ fi
 # green: `die "cannot hash …"` (515/551/573), `log "… cert hash recorded …"`
 # (1108), `origin_ca_write_hash`/`origin_ca_cert_hash` identifiers,
 # `hashlib`/`hashed`/`_<hash16>` (none is at a command position). The script
-# has no legitimate `hash` call.
+# has no legitimate `hash` call. r13 red-team HIGH: the token was rebuilt
+# with a parameter expansion (`x=` + `h${x}ash -p …`; the joined view had
+# stripped only `$` and kept `h{x}ash`), which also left `en${x}able`-style
+# spellings open. The closure also strips parameter expansions (`${…}` and
+# `$name`) from the joined view before the command-position match, adds `!`
+# to the command-position class, and refuses any ANSI-C `$'` quoting in code
+# (the script has 0) so `$'\x68…'`/`$'hash'` cannot smuggle a command word;
+# the next tooth refuses command-position `builtin`/`enable`/`trap`.
 if awk -v q="'" '
   {
     line = $0
@@ -4229,11 +4264,15 @@ if awk -v q="'" '
     joined = $0
     sub(/^[[:space:]]*#.*/, "", joined)
     sub(/[[:space:]]#.*$/, "", joined)
+    ansic = (index(joined, "$" q) > 0)
+    gsub(/\$\{[^}]*\}/, "", joined)
+    gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", joined)
     gsub(/[$"]/, "", joined)
     gsub(q, "", joined)
     gsub(/\\/, "", joined)
-    if (line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
-        joined ~ /(^|[;&|()])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
+    if (ansic ||
+        line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
+        joined ~ /(^|[;&|()!])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
         joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": hash invocation: " $0 > "/dev/stderr"
       bad = 1
@@ -4241,9 +4280,66 @@ if awk -v q="'" '
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`hash\` command-lookup poisoning (plain or quote-joined/escaped spelling at a command position, incl. \`builtin\`/\`command hash\`) in the provision script (issue #143)"
+  ok "run-once: no \`hash\` command-lookup poisoning (plain, parameter-expansion-rebuilt or quote-joined/ANSI-C/escaped spelling at a command position, incl. \`builtin\`/\`command hash\`) in the provision script (issue #143)"
 else
-  bad "run-once: a \`hash\` command-lookup poisoning spelling appeared in the provision script — plain, quote-concatenated/ANSI-C/escaped at a command position, or \`builtin\`/\`command hash\`; the script has no legitimate \`hash\` call (issue #143)"
+  bad "run-once: a \`hash\` command-lookup poisoning spelling appeared in the provision script — plain, parameter-expansion-rebuilt, quote-concatenated/ANSI-C/escaped at a command position, or \`builtin\`/\`command hash\`; the script has no legitimate \`hash\` call (issue #143)"
+fi
+# r13 red-team HIGH 2/3: `enable -n exit` disables the `exit` builtin — with
+# a `command_not_found_handle` definition the at-bound `die`'s `exit 1` hit
+# the handler and returned 0, so `wait_idle` declared a live unit drained;
+# `builtin enable -n exit` and `command enable -n exit` reach the same builtin
+# and `trap 'exit 0' EXIT` rewrites the process rc. The shipped script never
+# invokes `enable` at a command position (its `enable` occurrences are
+# `systemctl enable --now …` subcommands — `enable` sits after `systemctl`),
+# never invokes `trap`, and never invokes `builtin`; refuse all three (plus
+# `command`-prefixed spellings) at a command position on the
+# expansion-stripped joined view, so `en${x}able`/`builtin h${x}ash` are
+# caught too. Deliberate over-refusal (fail-closed).
+if awk -v q="'" '
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    sub(/[[:space:]]#.*$/, "", line)
+    gsub(/\$\{[^}]*\}/, "", line)
+    gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
+    gsub(/[$"]/, "", line)
+    gsub(q, "", line)
+    gsub(/\\/, "", line)
+    if (line ~ /(^|[;&|()!])[[:space:]]*(builtin|enable|trap)([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|()!])[[:space:]]*command[[:space:]]+(builtin|enable|trap)([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": command-position builtin/enable/trap invocation: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: no command-position \`builtin\`/\`enable\`/\`trap\` invocation in the provision script (the rc-path builtins stay reachable, issue #143)"
+else
+  bad "run-once: a command-position \`builtin\`/\`enable\`/\`trap\` invocation appeared in the provision script — it could disable the \`exit\` builtin or rewrite the process rc (issue #143)"
+fi
+# r13 red-team MED: the script runs as root and can prepend a shadow dir to
+# `PATH`, planting a `systemctl` (or `sleep`) binary that misreports state —
+# the r12 wording claimed that needs "a root-level PATH write (out of scope)",
+# false for a self-editing root script. The shipped script never assigns,
+# exports or unsets `PATH` (the word appears in comments only); refuse
+# `PATH=`, `PATH+=`, `export PATH` and `unset PATH` in code.
+if awk '
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    sub(/[[:space:]]#.*$/, "", line)
+    if (line ~ /(^|[^[:alnum:]_])PATH\+?=/ ||
+        line ~ /(^|[^[:alnum:]_])export[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])unset[[:space:]]+PATH([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": PATH assignment/export/unset: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: no \`PATH\` assignment/export/unset in the provision script (issue #143)"
+else
+  bad "run-once: a \`PATH\` assignment/export/unset appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V4/V5): a command-word substitution redirected a drain
 # path invocation with no definition to count: `WITNESS_SYSTEMCTL=/bin/true`
