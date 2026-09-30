@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=538  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth)
+MIN_CHECKS=538  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — so the count is unchanged)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3848,15 +3848,21 @@ fi
 # stay green.
 #
 # Boundary (disclosed): the teeth are a regression detector for the drain
-# path's pinned source (definitions of sleep/command/builtin/env/systemctl;
-# `die` plus the two drain-path helpers pinned to a single definition
-# occurrence each, with the `die` body pinned to `exit 1`; the
-# `recording_witness_service_drained` body and the at-bound `die` invocation
-# pinned to the shipped source lines; any `hash` invocation refused;
-# non-identifier `function` names) — not a sandbox: an adversary who can
-# edit the provision script can also edit this harness, so crafted edits
+# path's pinned source (any definition of the utilities/builtins
+# sleep/command/builtin/env/systemctl and of the rc-path exit/return plus
+# printf/local/true; `die` plus the two drain-path helpers pinned to a single
+# definition occurrence each, with the `die` definition pinned to the EXACT
+# shipped line — a dead, quoted, subshell or multiline rewrite fails closed;
+# the `recording_witness_service_drained` body and the at-bound `die`
+# invocation pinned to the shipped source lines; `hash` refused as a word and
+# in the quote-joined view at a command position, including `builtin`/`command
+# hash`; non-identifier `function` names) — not a sandbox: an adversary who
+# can edit the provision script can also edit this harness, so crafted edits
 # outside that pinned source (and harness self-edits) are out of scope by
-# construction. Residual (intentional-crafting class, disclosed): a
+# construction. Deliberate over-refusals (fail-closed): a `die` spelling that
+# deviates from the exact shipped line (`exit "1"`, multiline, tab-indented)
+# and any `hash` spelling at a command position. Residual
+# (intentional-crafting class, disclosed): a
 # dynamically constructed `eval`/`alias`+`expand_aliases`/sourced shadow is
 # not statically detectable — behaviorally neutralized by the absolute
 # `/usr/bin/env` for the drain sleep — blocking-equivalent loop forms stay
@@ -4051,6 +4057,22 @@ if awk -v q="'" '
   # the basename patterns cannot see; refuse any `function <name>` whose name
   # token is not a plain identifier ([A-Za-z_][A-Za-z0-9_]*). The POSIX
   # `/usr/bin/env ()` form is matched by the `env` basename clause above.
+  #
+  # r12 red-team HIGH: the drain path and `die` also depend on the `exit`
+  # (the fail-closed rc) and `return` (the helper state decision) BUILTINS,
+  # which bash lets a function shadow with a plain definition — `exit() { :; }`
+  # after the `die` definition made the at-bound abort return 0 (the unit had
+  # not drained, yet run_once proceeded), and `return() { :; }` made the drain
+  # check report "drained" at poll 0. `printf` (the die message), `local` (the
+  # helper scratch) and `true` (`|| true` on the systemctl query) are
+  # refused for the same class closure. Tested: bash accepts ONLY the plain
+  # `name()`/`name ()` and `function name` spellings for these names — every
+  # quoted or escaped spelling (`ex"it"()`, `ex\it()`, `$'exit'()`,
+  # `function "exit"`) is a `not a valid identifier` syntax error — so these
+  # plain patterns on both views are the complete accepted set (the joined
+  # view also catches a backslash-newline split rejoined to a plain name).
+  # Invocations (`exit 1`, `return 0`, `printf …`, `local active`, `true`)
+  # stay green.
   {
     line = $0
     sub(/^[[:space:]]*#.*/, "", line)
@@ -4067,7 +4089,9 @@ if awk -v q="'" '
         raw ~ /(^|[^[:alnum:]_])env[[:space:]]*\([[:space:]]*\)/ ||
         raw ~ /(^|[^[:alnum:]_])function[[:space:]]+(command|builtin|env)([^[:alnum:]_]|$)/ ||
         line ~ /(^|[^[:alnum:]_])systemctl[[:space:]]*\([[:space:]]*\)/ ||
-        raw ~ /(^|[^[:alnum:]_])function[[:space:]]+systemctl([^[:alnum:]_]|$)/) {
+        raw ~ /(^|[^[:alnum:]_])function[[:space:]]+systemctl([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])(exit|return|printf|local|true)[[:space:]]*\([[:space:]]*\)/ ||
+        line ~ /(^|[^[:alnum:]_])function[[:space:]]+(exit|return|printf|local|true)([^[:alnum:]_]|$)/) {
       shadow = 1
       print FILENAME ":" FNR ": " $0 > "/dev/stderr"
     }
@@ -4088,9 +4112,9 @@ if awk -v q="'" '
   }
   END { exit shadow ? 1 : 0 }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\` definition and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+  ok "run-once: no drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`) and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
 else
-  bad "run-once: a \`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\` definition or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+  bad "run-once: a drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`) or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
 fi
 # r10 red-team: the drain path resolves its two helpers and the fail-closed
 # `die` by name at call time, so any definition AFTER the real one overrides
@@ -4111,6 +4135,16 @@ fi
 # definition must carry `exit 1` inside its brace body — an `exit 1`
 # elsewhere on the line, or a `die` spelled with the `function` keyword form
 # (no paren form to pin), fails closed.
+#
+# r12 red-team HIGH: that textual `exit 1` check accepted an UNREACHABLE
+# `exit 1` — `die()  { …; if false; then exit 1; fi; }`, `(exit 1)` and
+# `true || exit 1` all kept the suite green while the on-box refusal returned
+# 0 and run_once proceeded into the #143 merged-run path. Replace the textual
+# check with an exact-line pin of the shipped definition
+# (scripts/010-provision.sh:48) on both views: any other line — a dead,
+# quoted, subshell or multiline `exit 1`, a tab-indented or trailing-comment
+# rewrite — fails closed. The `exit "1"` rewrite is a DELIBERATE
+# over-refusal (a valid fail-closed body that no longer matches the pin).
 if awk -v q="'" '
   function keyword_defs(line, name) {
     return gsub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", line)
@@ -4126,7 +4160,10 @@ if awk -v q="'" '
     sub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", s)
     return keyword_defs(line, name) + paren_defs(s, name)
   }
-  BEGIN { n = split("recording_witness_service_drained recording_witness_wait_idle die", names, " ") }
+  BEGIN {
+    n = split("recording_witness_service_drained recording_witness_wait_idle die", names, " ")
+    die_line = "die()  { printf " q "\\n\\033[1;31mFAIL:\\033[0m %s\\n" q " \"$*\" >&2; exit 1; }"
+  }
   FNR == 1 { file = FILENAME; seen[file] = 1 }
   {
     line = $0
@@ -4141,8 +4178,8 @@ if awk -v q="'" '
       c[file, names[i]] += k
       if (c[file, names[i]] - k < 2 && c[file, names[i]] > 1)
         print file ":" FNR ": multiple definition occurrences of " names[i] ": " $0 > "/dev/stderr"
-      if (names[i] == "die" && line !~ /die[[:space:]]*[(][[:space:]]*[)][[:space:]]*[{][^}]*exit[[:space:]]+1/) {
-        print file ":" FNR ": die definition without an `exit 1` in its body: " $0 > "/dev/stderr"
+      if (names[i] == "die" && $0 != die_line) {
+        print file ":" FNR ": die definition diverges from the pinned shipped line: " $0 > "/dev/stderr"
         die_body_bad = 1
       }
     }
@@ -4160,20 +4197,28 @@ if awk -v q="'" '
     exit bad ? 1 : 0
   }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\` and \`die\` are each defined exactly once (occurrence-counted) and the \`die\` body carries \`exit 1\` (issue #143)"
+  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\` and \`die\` are each defined exactly once (occurrence-counted) and the \`die\` definition is the exact shipped fail-closed line (issue #143)"
 else
-  bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times (per occurrence) or its \`die\` body lost the \`exit 1\` fail-closed exit (issue #143)"
+  bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times (per occurrence) or the \`die\` definition is not the exact shipped line (a dead, quoted, subshell or multiline rewrite fails closed; issue #143)"
 fi
-# r11 red-team HIGH (V1): `hash -p /bin/true systemctl` (one line before the
-# witness span) poisoned command lookup for every later `systemctl` call with
-# no definition and no edit inside the rendered span: the suite stayed 536/0
-# while a fake systemctl reported the unit active and the drain returned
-# "drained" at poll 0 (issue #143 fail-open). The provision script has no
-# legitimate `hash` call (its only spellings are identifier suffixes like
-# `origin_ca_write_hash` and stripped prose/comments), so refuse any
-# standalone `hash` word in code — definitions (`hash ()`), invocations
-# (`hash -r`, `hash -p ...`) and `command hash` are all refused; quoted
-# strings and comments are stripped first, so shipped prose stays green.
+# r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
+# (one line before the witness span) poisoned command lookup for every later
+# `systemctl` call with no definition and no edit inside the rendered span:
+# the suite stayed 536/0 while a fake systemctl reported the unit active and
+# the drain returned "drained" at poll 0 (issue #143 fail-open). The first
+# tooth matched the word `hash` only on the quote-stripped view, so the
+# quote-concatenated / ANSI-C / escaped spellings bash joins before command
+# lookup (`"ha""sh" -p …`, `$'hash' -p …`, `h\ash -p …`,
+# `builtin h$'ash' …`) stayed suite-green (538/0). The closure: keep the
+# stripped-view word match (plain `hash`, `hash ()`), and ADD a quote-joined
+# view — remove the quote characters (`$'`/`$"` prefixes included) and
+# backslashes — refusing `hash` at a command position
+# (`(^|[;&|()])[[:space:]]*hash([^[:alnum:]_]|$)`) plus `builtin hash` /
+# `command hash` (no such invocation exists in the script). Prose stays
+# green: `die "cannot hash …"` (515/551/573), `log "… cert hash recorded …"`
+# (1108), `origin_ca_write_hash`/`origin_ca_cert_hash` identifiers,
+# `hashlib`/`hashed`/`_<hash16>` (none is at a command position). The script
+# has no legitimate `hash` call.
 if awk -v q="'" '
   {
     line = $0
@@ -4181,16 +4226,24 @@ if awk -v q="'" '
     gsub(/"[^"]*"/, "", line)
     gsub(q "[^" q "]*" q, "", line)
     sub(/[[:space:]]#.*$/, "", line)
-    if (line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/) {
+    joined = $0
+    sub(/^[[:space:]]*#.*/, "", joined)
+    sub(/[[:space:]]#.*$/, "", joined)
+    gsub(/[$"]/, "", joined)
+    gsub(q, "", joined)
+    gsub(/\\/, "", joined)
+    if (line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
+        joined ~ /(^|[;&|()])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
+        joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": hash invocation: " $0 > "/dev/stderr"
       bad = 1
     }
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`hash\` invocation redirects command lookup in the provision script (issue #143)"
+  ok "run-once: no \`hash\` command-lookup poisoning (plain or quote-joined/escaped spelling at a command position, incl. \`builtin\`/\`command hash\`) in the provision script (issue #143)"
 else
-  bad "run-once: a \`hash\` invocation (lookup poisoning) appeared in the provision script — the script has no legitimate \`hash\` call (issue #143)"
+  bad "run-once: a \`hash\` command-lookup poisoning spelling appeared in the provision script — plain, quote-concatenated/ANSI-C/escaped at a command position, or \`builtin\`/\`command hash\`; the script has no legitimate \`hash\` call (issue #143)"
 fi
 # r11 red-team HIGH (V4/V5): a command-word substitution redirected a drain
 # path invocation with no definition to count: `WITNESS_SYSTEMCTL=/bin/true`
