@@ -3771,33 +3771,44 @@ if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
 else
   bad "run-once: drain polls and sleeps are not interleaved (issue #143): $(tr '\n' ' ' <"${WORK}/no-drain-poll-sleeps")"
 fi
-# Issue #143 red-team F2 (+ rounds 4-6 F1): counters cannot prove the sleep
-# blocks — a backgrounded `sleep 1 &` keeps them all green while the bounded
-# wait stops waiting, and a bare `sleep 1` elsewhere keeps a presence-only
-# tooth green while the executed loop sleep is shortened (`timeout 0.5 sleep
-# 1`) or shadowed by a `sleep` function. Pin the executed line: the drain
-# loop (the `for ((attempt...))` header) must end — at depth 0, so nested
-# decoy loops cannot latch — in a foreground `sleep 1` (a trailing comment is
-# fine); exactly one such header may match — a second exact header (a decoy
-# loop after the real one) fails instead of overwriting the remembered body —
-# and the executed drain loop must be the only C-style `for ((` loop in the
-# script (r4 red-team mutF: a respelled executed header plus a sacrificial
-# exact-header decoy otherwise nullifies the exactly-one rule while the
-# unscanned respelled loop carries the clock early-exit; r5 red-team candB:
-# a same-line prefix — `:; for (( …` — is matched by the non-anchored
-# alternation) — the wait-idle span may contain no backslash
-# line-continuation (r5 red-team candA/candC: `for \` + newline + `(( …`,
-# or the mid-token `fo\` + newline + `r (( …`, lets bash form the loop
-# while the line-based scan sees neither half) — and no `sleep`
-# function may exist in plain code (`sleep()` or
-# `function sleep`, same-line or brace-on-next-line; comments and quoted
-# spans ignored). Residual (intentional-crafting class, disclosed): `eval`/
-# `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
-# forms are not detected (fail-closed by design).
+# Issue #143 red-team F2 (+ rounds 4-6 F1, r6 F1/F2): counters cannot prove
+# the sleep blocks — a backgrounded `sleep 1 &` keeps them all green while
+# the bounded wait stops waiting, and a bare `sleep 1` elsewhere keeps a
+# presence-only tooth green while the executed loop sleep is shortened
+# (`timeout 0.5 sleep 1`) or shadowed by a `sleep` function. Pin the executed
+# line: the drain loop (the `for ((attempt...))` header) must end — at depth
+# 0, so nested decoy loops cannot latch — in a foreground `sleep 1` (a
+# trailing comment is fine); exactly one such header may match — a second
+# exact header (a decoy loop after the real one) fails instead of overwriting
+# the remembered body — and the executed drain loop must be the only C-style
+# `for ((` loop in the script (r4 red-team mutF: a respelled executed header
+# plus a sacrificial exact-header decoy otherwise nullifies the exactly-one
+# rule while the unscanned respelled loop carries the clock early-exit; r5
+# red-team candB: a same-line prefix — `:; for (( …` — is matched by the
+# non-anchored alternation; r5 candA/candC: `for \` + newline + `(( …`, or
+# the mid-token `fo\` + newline + `r (( …`, lets bash form the loop while the
+# line-based scan sees neither half) — and no `sleep` function may exist in
+# plain code (`sleep()` or `function sleep`, same-line or brace-on-next-line;
+# comments and quoted spans ignored).
+#
+# r6 red-team F1/F2: the old continuation tooth scanned a wait-idle span
+# extracted by the first column-0 `}`; a multi-line quoted string could close
+# that span early (a quoted `}` line) and the opener regex missed valid bash
+# spellings (`name () {`, `function name {`, indented), so a split
+# `for \` + `(( …` header could hide between lines while both count teeth
+# stayed green (533/0 with the bound collapsed to 300s). Both teeth (and the
+# sleep-shadow tooth) now run against a continuation-joined copy of the
+# script: bash joins an unquoted/double-quoted backslash-newline before
+# tokenizing, and over-joining inside single quotes is fail-closed — the
+# checks can only see more code than bash executes, never less. A split
+# header therefore joins into the counted `for ((` forms and the exactly-one
+# rule sees it; no span extraction remains. Residual (intentional-crafting
+# class, disclosed): `eval`/`alias`+`expand_aliases`/sourced-file shadows and
+# blocking-equivalent loop forms are not detected (fail-closed by design).
+PROVISION_JOINED="${WORK}/provision-joined.sh"
+awk '{ if ($0 ~ /\\$/) { sub(/\\$/, ""); printf "%s", $0 } else print }' \
+  "${PROVISION}" >"${PROVISION_JOINED}"
 if awk '
-  /^recording_witness_wait_idle\(\)[[:space:]]*\{/ { in_fn = 1; next }
-  in_fn && /^\}/ { in_fn = 0; next }
-  in_fn && /\\[[:space:]]*(#.*)?$/ { cont_line = NR; cont = 1 }
   /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
     c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
   }
@@ -3817,20 +3828,16 @@ if awk '
     prev = $0
   }
   END {
-    if (cont) {
-      print "backslash line-continuation inside recording_witness_wait_idle at line " cont_line " (a split loop header can hide from the line-based scan)" > "/dev/stderr"
-      exit 1
-    }
     if (headers != 1 || c_headers != 1) {
       print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
       exit 1
     }
     exit (loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1
   }
-' "${PROVISION}"; then
+' "${PROVISION_JOINED}"; then
   ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
 else
-  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, a second C-style loop header matched, or the wait-idle span carries a backslash line-continuation (issue #143)"
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, a second C-style loop header matched, or a continuation-split header joined into an extra counted loop (issue #143)"
 fi
 # Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
 # wall-clock early exit keeps every count green while the effective bound
@@ -3857,17 +3864,14 @@ fi
 # early-exit). r5 red-team: the general match is non-anchored (`:; for (( …`
 # counts too), any `for ((` occurrence anywhere in the script — including
 # inert text/heredocs — fails closed (deliberate over-refusal: the script
-# ships exactly one C-style loop), and the sleep-last tooth also refuses a
-# backslash line-continuation inside the wait-idle span (`for \` + newline +
-# `(( …`, or the mid-token split), which bash joins before tokenizing while
-# the line-based scan sees neither half. Residual (intentional-crafting
-# class, disclosed): an early exit moved outside the rendered loop body (e.g.
-# into a helper), a non-C-style loop construct (`while`/`until`) replacing
-# the drain loop together with a sacrificial exact-header decoy, a second
-# `recording_witness_wait_idle` definition overriding the scanned one, and
-# any other non-header scanner desync whose opener is not itself an unpinned
-# body line stay heuristic; the state pins above and the on-box wall-clock
-# behavior remain the backstop.
+# ships exactly one C-style loop), and the r6 joined view (both teeth run on
+# `PROVISION_JOINED`) turns a `for \` + newline + `(( …` (or the mid-token
+# split) into the counted forms instead of letting bash join it past a
+# line-based scan. Residual (intentional-crafting class, disclosed): an early
+# exit moved outside the rendered loop body (e.g. into a helper) and a
+# non-C-style loop construct (`while`/`until`) replacing the drain loop
+# together with a sacrificial exact-header decoy stay heuristic; the state
+# pins above and the on-box wall-clock behavior remain the backstop.
 if awk '
   function pinned(line) {
     sub(/[[:space:]]+#.*$/, "", line)
@@ -3899,7 +3903,7 @@ if awk '
     if (unpinned != "") print "unpinned drain-loop line(s): " unpinned > "/dev/stderr"
     exit (headers == 1 && c_headers == 1 && unpinned == "") ? 0 : 1
   }
-' "${PROVISION}"; then
+' "${PROVISION_JOINED}"; then
   ok "run-once: every drain loop body line is one of the four pinned forms (issue #143)"
 else
   bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second C-style loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
@@ -3918,7 +3922,7 @@ if awk -v q="'" '
     if (pending) { if (line ~ /^[[:space:]]*\{/) shadow = 1; pending = 0 }
   }
   END { exit shadow ? 1 : 0 }
-' "${PROVISION}"; then
+' "${PROVISION_JOINED}"; then
   ok "run-once: no \`sleep\` function shadows the drain sleep (issue #143)"
 else
   bad "run-once: a \`sleep\` function shadows the drain sleep (issue #143)"
