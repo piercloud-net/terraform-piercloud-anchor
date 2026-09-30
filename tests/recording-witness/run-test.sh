@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=542  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth + 2 r13 teeth + 1 r15 tooth + 1 r16 tooth = 542 (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms; the r15 fold widened the hash/PATH/builtin-enable-trap/definition teeth in place again — `if`/`while`/`until` command-position prefixes, `BASH_CMDS`, `eval`, the nameref/`-v`/joined PATH forms — and added 1 new tooth: a no-quote-strip definition scan for the multi-line single-quote desync class; the r16 fold widens the hash tooth (`declare -A` associative-array refusal — the rebuilt `BASH_CMDS` vector) and the no-quote-strip definition tooth (any `function NAME` keyword form refused; the two drain helpers counted exactly once), and adds 1 new tooth: a command-position PATH scan on the no-quote-strip view (quoted tokens, `unset -- PATH`, `declare -x PATH=…`, desync-hidden assignments); 541 → 542)
+MIN_CHECKS=542  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth + 2 r13 teeth + 1 r15 tooth + 1 r16 tooth = 542 (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms; the r15 fold widened the hash/PATH/builtin-enable-trap/definition teeth in place again — `if`/`while`/`until` command-position prefixes, `BASH_CMDS`, `eval`, the nameref/`-v`/joined PATH forms — and added 1 new tooth: a no-quote-strip definition scan for the multi-line single-quote desync class; the r16 fold widens the hash tooth (`declare -A` associative-array refusal — the rebuilt `BASH_CMDS` vector) and the no-quote-strip definition tooth (any `function NAME` keyword form refused; the two drain helpers counted exactly once), and adds 1 new tooth: a command-position PATH scan on the no-quote-strip view (quoted tokens, `unset -- PATH`, `declare -x PATH=…`, desync-hidden assignments); the r17 fold widens that no-quote-strip PATH tooth in place — `builtin`/`command` prefixes (plain or parameter-expansion-rebuilt), reserved-word/`!` command positions, and the `mapfile`/`readarray` array-writing builtins can no longer push the verb off the position class, and the hash tooth's `declare -A` clause also reads the quote/expansion-stripped joined view (the r16 composition gaps); 541 → 542)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4349,26 +4349,65 @@ fi
 # and desync spellings are refused. `unset -- PATH` is covered by the option
 # class; associative-array declarations (`declare -A` — the rebuilt
 # `BASH_CMDS` vector) are refused in the hash tooth (the script has zero).
+#
+# r17 functional HIGH: a `command`/`builtin` prefix (plain or
+# parameter-expansion-rebuilt) composed with a quoted-token PATH write
+# (`command export "PATH=…"`, `command printf -v PATH …`,
+# `command declare -x "PATH=…"`, `command unset -- PATH`,
+# `builtin export "PATH=…"`, `comm${x}and export …`) evaded every branch:
+# the prefix pushed the verb off the position class. Strip parameter
+# expansions so a rebuilt prefix word joins, then drop `builtin`/`command`
+# prefixes (with their options) at a command position so the verb lands
+# where the branches match. (A prefix whose separator is itself a parameter
+# expansion — `command${IFS}export` — stays in the crafted-edit class like
+# the other non-statically-resolvable spellings.)
+#
+# r17 red-team HIGHs: three composition gaps closed in the same view.
+# (a) The command-position class lacked the reserved-word separators and
+# `!` (`if true; then PATH=…`, `! PATH=…`, `do PATH=…`) that the r14
+# normalizer already handles for the hash/builtin teeth — the view now runs
+# the same reserved-word normalizer and the class carries `!`.
+# (b) Array-writing builtins that rewrite `PATH` (`mapfile -t PATH`,
+# `readarray -t PATH`) were outside every branch (the script has zero).
+# (c) The `declare -A` clause lives in the hash tooth on the quote-span-
+# stripped view, so a quoted option/name (`declare "-A" "${b}SH_CMDS[…]"`
+# rebuilding `BASH_CMDS`) hid from it — the hash tooth now also reads its
+# quote/expansion-stripped joined view for that clause.
 if awk -v q="'" '
+  function normalize_cmdpos(s,   prev) {
+    do {
+      prev = s
+      gsub(/(^|[;&|()!{}])[[:space:]]*(if|then|do|else|elif|while|until)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
+    } while (s != prev)
+    return s
+  }
   {
     line = $0
     gsub(/\"/, "", line)
     gsub(q, "", line)
     gsub(/\\/, "", line)
-    if (line ~ /(^|[;&|(){}])[[:space:]]*PATH\+?=/ ||
-        line ~ /(^|[;&|(){}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|(){}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|(){}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|(){}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
+    gsub(/\$\{[^}]*\}/, "", line)
+    gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
+    gsub(/(^|[;&|(){}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
+    line = normalize_cmdpos(line)
+    if (line ~ /(^|[;&|()!{}])[[:space:]]*PATH\+?=/ ||
+        line ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|()!{}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": command-position PATH write on the no-quote-strip view: " $0 > "/dev/stderr"
       bad = 1
     }
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no command-position PATH write is hidden behind quoted tokens or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a reserved-word/\`!\` position, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
 else
-  bad "run-once: a command-position PATH write (quoted token, \`unset -- PATH\`, \`declare -x PATH=…\`, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a reserved-word/\`!\` position, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
@@ -4433,6 +4472,7 @@ if awk -v q="'" '
         line ~ /BASH_CMDS/ ||
         joined ~ /BASH_CMDS/ ||
         line ~ /(^|[^[:alnum:]_])(declare|typeset|local)[[:space:]]+-[A-Za-z]*A[A-Za-z]*([^[:alnum:]_]|$)/ ||
+        joined ~ /(^|[^[:alnum:]_])(declare|typeset|local)[[:space:]]+-[A-Za-z]*A[A-Za-z]*([^[:alnum:]_]|$)/ ||
         line ~ /\{[^{}]*\.\.[^{}]*\}/ ||
         joined ~ /(^|[;&|()!])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
         joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
