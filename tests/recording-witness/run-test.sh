@@ -3728,7 +3728,7 @@ unset FAKE_ACTIVE_STATE
 # either way). FAKE_SLEEP_NOWAIT keeps the 3600 iterations but removes their
 # wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
 # FAKE_ACTIVE_POLL_FILE pins the iteration count (3600 loop polls + the final
-# ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
+# ActiveState read for the die message = 3601), FAKE_SLEEP_COUNT_FILE pins
 # the sleeps (3600) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
 # bound regression fails whether it changes the poll count, the sleep count
 # or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
@@ -3780,12 +3780,19 @@ fi
 # decoy loops cannot latch — in a foreground `sleep 1` (a trailing comment is
 # fine); exactly one such header may match — a second exact header (a decoy
 # loop after the real one) fails instead of overwriting the remembered body —
-# and no `sleep` function may exist in plain code (`sleep()` or
+# and the executed drain loop must be the only C-style `for ((` loop in the
+# script (r4 red-team mutF: a respelled executed header plus a sacrificial
+# exact-header decoy otherwise nullifies the exactly-one rule while the
+# unscanned respelled loop carries the clock early-exit) — and no `sleep`
+# function may exist in plain code (`sleep()` or
 # `function sleep`, same-line or brace-on-next-line; comments and quoted
 # spans ignored). Residual (intentional-crafting class, disclosed): `eval`/
 # `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
 # forms are not detected (fail-closed by design).
 if awk '
+  /^[[:space:]]*for[[:space:]]*\(\(/ {
+    c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
+  }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
     headers++; header_lines = header_lines (header_lines == "" ? "" : ", ") NR
     in_loop = 1; depth = 0; prev = ""; next
@@ -3802,8 +3809,8 @@ if awk '
     prev = $0
   }
   END {
-    if (headers != 1) {
-      print "drain-loop header matches " headers " (expected exactly 1): line(s) " header_lines > "/dev/stderr"
+    if (headers != 1 || c_headers != 1) {
+      print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
       exit 1
     }
     exit (loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1
@@ -3811,7 +3818,7 @@ if awk '
 ' "${PROVISION}"; then
   ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
 else
-  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, or a second decoy loop header matched (issue #143)"
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, or a second C-style loop header matched (issue #143)"
 fi
 # Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
 # wall-clock early exit keeps every count green while the effective bound
@@ -3830,11 +3837,18 @@ fi
 # is latched across every matched body instead of being reset per header. A
 # second exact header match (a decoy loop carrying the four pinned forms,
 # appended after the real one) also fails the tooth, so the last matching body
-# can no longer become authoritative (r3 MED). Residual (intentional-crafting
-# class, disclosed): an early exit moved outside the rendered loop body (e.g.
-# into a helper) and any non-header scanner desync whose opener is not itself
-# an unpinned body line stay heuristic; the state pins above and the on-box
-# wall-clock behavior remain the backstop.
+# can no longer become authoritative (r3 MED), and the general C-style
+# `for ((` count is pinned to 1 (r4 red-team mutF: the executed header
+# respelled — `for (( attempt …` — so the anchored regex misses it, plus a
+# never-called exact-header decoy satisfying the exactly-one rule, kept the
+# suite at 533/0 while the unscanned respelled loop carried the clock
+# early-exit). Residual (intentional-crafting class, disclosed): an early exit
+# moved outside the rendered loop body (e.g. into a helper), a non-C-style
+# loop construct (`while`/`until`) replacing the drain loop together with a
+# sacrificial exact-header decoy, a second `recording_witness_wait_idle`
+# definition overriding the scanned one, and any other non-header scanner
+# desync whose opener is not itself an unpinned body line stay heuristic; the
+# state pins above and the on-box wall-clock behavior remain the backstop.
 if awk '
   function pinned(line) {
     sub(/[[:space:]]+#.*$/, "", line)
@@ -3844,6 +3858,9 @@ if awk '
             line == "return 0" ||
             line == "fi" ||
             line == "sleep 1")
+  }
+  /^[[:space:]]*for[[:space:]]*\(\(/ {
+    c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
   }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
     headers++; header_lines = header_lines (header_lines == "" ? "" : ", ") NR
@@ -3859,14 +3876,14 @@ if awk '
     if (!pinned($0)) unpinned = unpinned (unpinned == "" ? "" : " | ") "line " NR ": " $0
   }
   END {
-    if (headers != 1) print "drain-loop header matches " headers " (expected exactly 1): line(s) " header_lines > "/dev/stderr"
+    if (headers != 1 || c_headers != 1) print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
     if (unpinned != "") print "unpinned drain-loop line(s): " unpinned > "/dev/stderr"
-    exit (headers == 1 && unpinned == "") ? 0 : 1
+    exit (headers == 1 && c_headers == 1 && unpinned == "") ? 0 : 1
   }
 ' "${PROVISION}"; then
   ok "run-once: every drain loop body line is one of the four pinned forms (issue #143)"
 else
-  bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second decoy loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
+  bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second C-style loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
 fi
 if awk -v q="'" '
   {
