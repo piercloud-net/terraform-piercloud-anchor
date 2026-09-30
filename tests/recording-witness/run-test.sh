@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=533  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 5 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins)
+MIN_CHECKS=534  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 6 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3791,23 +3791,64 @@ fi
 # plain code (`sleep()` or `function sleep`, same-line or brace-on-next-line;
 # comments and quoted spans ignored).
 #
-# r6 red-team F1/F2: the old continuation tooth scanned a wait-idle span
-# extracted by the first column-0 `}`; a multi-line quoted string could close
-# that span early (a quoted `}` line) and the opener regex missed valid bash
-# spellings (`name () {`, `function name {`, indented), so a split
-# `for \` + `(( …` header could hide between lines while both count teeth
-# stayed green (533/0 with the bound collapsed to 300s). Both teeth (and the
-# sleep-shadow tooth) now run against a continuation-joined copy of the
-# script: bash joins an unquoted/double-quoted backslash-newline before
-# tokenizing, and over-joining inside single quotes is fail-closed — the
-# checks can only see more code than bash executes, never less. A split
-# header therefore joins into the counted `for ((` forms and the exactly-one
-# rule sees it; no span extraction remains. Residual (intentional-crafting
-# class, disclosed): `eval`/`alias`+`expand_aliases`/sourced-file shadows and
-# blocking-equivalent loop forms are not detected (fail-closed by design).
+# r6 red-team F1/F2 + r7 trust HIGH: the old continuation tooth scanned a
+# wait-idle span extracted by the first column-0 `}`; a multi-line quoted
+# string could close that span early (a quoted `}` line) and the opener regex
+# missed valid bash spellings (`name () {`, `function name {`, indented), so
+# a split `for \` + `(( …` header could hide between lines while both count
+# teeth stayed green (533/0 with the bound collapsed to 300s). Both teeth
+# (and the sleep-shadow tooth) now run against a continuation-joined copy:
+# the join is quote/comment-state aware (single/double quotes persist across
+# lines; `#` starts a comment only at a word boundary), so a real
+# continuation joins into the counted forms, while a backslash that is NOT a
+# bash continuation (comment, single-quoted, escaped) does not merge — a
+# naive text join merged `# comment \` with the next (executed) line into
+# one comment line every scanner skips (the r7 trust HIGH), so any such
+# trailing backslash fails the check fail-closed instead. No wait-idle span
+# extraction remains (the marker-span extraction for the install span is
+# unrelated). Residual (intentional-crafting class, disclosed): `eval`/
+# `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
+# forms are not detected (fail-closed by design).
 PROVISION_JOINED="${WORK}/provision-joined.sh"
-awk '{ if ($0 ~ /\\$/) { sub(/\\$/, ""); printf "%s", $0 } else print }' \
-  "${PROVISION}" >"${PROVISION_JOINED}"
+if awk -v q="'" '
+  {
+    line = $0
+    n = length(line)
+    esc = 0
+    for (i = 1; i <= n; i++) {
+      c = substr(line, i, 1)
+      if (com) break
+      if (sq) { if (c == q) sq = 0; continue }
+      if (dq) {
+        if (esc) { esc = 0; continue }
+        if (c == "\\") { esc = 1; continue }
+        if (c == "\"") { dq = 0; continue }
+        continue
+      }
+      if (esc) { esc = 0; continue }
+      if (c == "\\") { esc = 1; continue }
+      if (c == q) { sq = 1; continue }
+      if (c == "\"") { dq = 1; continue }
+      if (c == "#" && (i == 1 || substr(line, i-1, 1) ~ /[[:space:];&|()]/)) { com = 1; break }
+    }
+    cont = (esc == 1 && !com && !sq)
+    if (cont) {
+      printf "%s", substr(line, 1, n-1)
+    } else {
+      print
+      if (n > 0 && substr(line, n, 1) == "\\") {
+        print "trailing backslash at line " NR " is not a bash continuation (comment, single-quoted, or escaped) — refused fail-closed" > "/dev/stderr"
+        bad = 1
+      }
+    }
+    com = 0
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION}" >"${PROVISION_JOINED}"; then
+  ok "run-once: the joined view consumes every real continuation (no comment/quoted trailing backslash)"
+else
+  bad "run-once: a trailing backslash is not a bash continuation (comment/single-quoted/escaped) — refused fail-closed (issue #143)"
+fi
 if awk '
   /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
     c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
