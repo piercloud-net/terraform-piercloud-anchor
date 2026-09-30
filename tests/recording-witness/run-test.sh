@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=541  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth + 2 r13 teeth + 1 r15 tooth = 541 (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms; the r15 fold widened the hash/PATH/builtin-enable-trap/definition teeth in place again — `if`/`while`/`until` command-position prefixes, `BASH_CMDS`, `eval`, the nameref/`-v`/joined PATH forms — and added 1 new tooth: a no-quote-strip definition scan for the multi-line single-quote desync class; 540 → 541)
+MIN_CHECKS=542  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth + 2 r13 teeth + 1 r15 tooth + 1 r16 tooth = 542 (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms; the r15 fold widened the hash/PATH/builtin-enable-trap/definition teeth in place again — `if`/`while`/`until` command-position prefixes, `BASH_CMDS`, `eval`, the nameref/`-v`/joined PATH forms — and added 1 new tooth: a no-quote-strip definition scan for the multi-line single-quote desync class; the r16 fold widens the hash tooth (`declare -A` associative-array refusal — the rebuilt `BASH_CMDS` vector) and the no-quote-strip definition tooth (any `function NAME` keyword form refused; the two drain helpers counted exactly once), and adds 1 new tooth: a command-position PATH scan on the no-quote-strip view (quoted tokens, `unset -- PATH`, `declare -x PATH=…`, desync-hidden assignments); 541 → 542)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4296,8 +4296,14 @@ if awk -v q="'" '
   }
   {
     line = $0
+    # F1 (r16): ANY `function NAME` keyword form on the no-quote-strip view is
+    # refused — the script has zero keyword-form definitions (paren form only),
+    # so a desync-hidden keyword override of the drain helpers cannot slip.
+    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]/) {
+      print FILENAME ":" FNR ": a keyword-form definition on the no-quote-strip view: " $0 > "/dev/stderr"
+      bad = 1
+    }
     n = gsub(/(^|[^[:alnum:]_])die[[:space:]]*\([[:space:]]*\)/, "F", line)
-    n += gsub(/(^|[^[:alnum:]_])function[[:space:]]+die([^[:alnum:]_]|$)/, "F", line)
     if (n > 0) {
       c += n
       if ($0 != die_line) {
@@ -4305,8 +4311,14 @@ if awk -v q="'" '
         bad = 1
       }
     }
-    if (line ~ /(^|[^[:alnum:]_])(sleep|command|builtin|env|systemctl|exit|return|printf|local|true|command_not_found_handle)[[:space:]]*\([[:space:]]*\)/ ||
-        line ~ /(^|[^[:alnum:]_])function[[:space:]]+(sleep|command|builtin|env|systemctl|exit|return|printf|local|true|command_not_found_handle)([^[:alnum:]_]|$)/) {
+    # F1 (r16): the two drain helpers are each defined exactly once in the
+    # script (the span paren-form definitions); a desync-hidden second
+    # definition would override them (the r10 pin runs on quote-stripped views).
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_service_drained[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hd += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_wait_idle[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hi += h
+    if (line ~ /(^|[^[:alnum:]_])(sleep|command|builtin|env|systemctl|exit|return|printf|local|true|command_not_found_handle)[[:space:]]*\([[:space:]]*\)/) {
       print FILENAME ":" FNR ": a load-bearing definition visible only without quote stripping: " $0 > "/dev/stderr"
       bad = 1
     }
@@ -4316,12 +4328,47 @@ if awk -v q="'" '
       print "die definitions in the no-quote-strip view: " c " (expected exactly 1, the pinned shipped line)" > "/dev/stderr"
       bad = 1
     }
+    if (hd != 1 || hi != 1) {
+      print "drain-helper definitions in the no-quote-strip view: service_drained=" hd " wait_idle=" hi " (expected exactly 1 each)" > "/dev/stderr"
+      bad = 1
+    }
     exit bad ? 1 : 0
   }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no load-bearing definition spelling is hidden behind a multi-line quote desync (a definition scan without quote stripping finds only the pinned \`die\`, issue #143)"
+  ok "run-once: no load-bearing definition spelling is hidden behind a multi-line quote desync (a definition scan without quote stripping finds only the pinned \`die\` + the two drain helpers, and no keyword-form definition, issue #143)"
 else
-  bad "run-once: a load-bearing definition spelling appears in code only when quote stripping is skipped — a multi-line quote desync can execute a definition the per-line scanners hide (issue #143)"
+  bad "run-once: a load-bearing definition spelling (incl. the drain helpers or any \`function NAME\` keyword form) appears in code only when quote stripping is skipped — a multi-line quote desync can execute a definition the per-line scanners hide (issue #143)"
+fi
+# r16 red-team HIGH: the PATH tooth strips quoted spans, so a quoted token
+# (`printf -v 'PATH'`, `declare -x "PATH=…"`, `unset -v 'PATH'`,
+# `read -r "PATH"`) or a desync-hidden assignment (`s='` / `' ; PATH=… ; : '`)
+# evaded it. This second view strips only quote CHARACTERS/backslashes (no
+# span stripping) and requires every PATH write to sit at a command position
+# (`^`/`;`/`&`/`|`/`(`/`)`/`{`/`}`), so quoted prose (`log "PATH=${PATH}"`,
+# `log "export PATH and unset PATH here"`) stays green while the quoted-token
+# and desync spellings are refused. `unset -- PATH` is covered by the option
+# class; associative-array declarations (`declare -A` — the rebuilt
+# `BASH_CMDS` vector) are refused in the hash tooth (the script has zero).
+if awk -v q="'" '
+  {
+    line = $0
+    gsub(/\"/, "", line)
+    gsub(q, "", line)
+    gsub(/\\/, "", line)
+    if (line ~ /(^|[;&|(){}])[[:space:]]*PATH\+?=/ ||
+        line ~ /(^|[;&|(){}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|(){}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|(){}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|(){}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": command-position PATH write on the no-quote-strip view: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+else
+  bad "run-once: a command-position PATH write (quoted token, \`unset -- PATH\`, \`declare -x PATH=…\`, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
@@ -4385,6 +4432,7 @@ if awk -v q="'" '
         line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
         line ~ /BASH_CMDS/ ||
         joined ~ /BASH_CMDS/ ||
+        line ~ /(^|[^[:alnum:]_])(declare|typeset|local)[[:space:]]+-[A-Za-z]*A[A-Za-z]*([^[:alnum:]_]|$)/ ||
         line ~ /\{[^{}]*\.\.[^{}]*\}/ ||
         joined ~ /(^|[;&|()!])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
         joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
