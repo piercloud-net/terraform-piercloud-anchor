@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=540  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth + 2 r13 teeth = 540 (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms — so the count stays 540)
+MIN_CHECKS=541  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth + 2 r13 teeth + 1 r15 tooth = 541 (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms; the r15 fold widened the hash/PATH/builtin-enable-trap/definition teeth in place again — `if`/`while`/`until` command-position prefixes, `BASH_CMDS`, `eval`, the nameref/`-v`/joined PATH forms — and added 1 new tooth: a no-quote-strip definition scan for the multi-line single-quote desync class; 540 → 541)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4279,6 +4279,50 @@ if awk -v q="'" '
 else
   bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times (per occurrence) or the \`die\` definition is not the exact shipped line (a dead, quoted, subshell or multiline rewrite fails closed; issue #143)"
 fi
+# r15 red-team HIGH: the multi-line single-quote desync. `s='` on one line,
+# then `' ; die() { :; } ; : '`, then `'` — bash pairs the quotes ACROSS the
+# lines, so the `die()`/`systemctl()` definition between them EXECUTES, while
+# every per-line quote-stripping view hides it (each view strips the `' … '`
+# span on its own line) and the suite stayed 540/0. The closure is a
+# definition scan on the comment-stripped code view WITHOUT quote stripping:
+# the provision script has no legitimate definition-like string (comments are
+# already stripped), so any `name()`/`function name` spelling of the
+# load-bearing names — quoted or not — is refused; the one legitimate `die`
+# definition must still be exactly the pinned shipped line, so a
+# desync-hidden rewrite of it also fails closed.
+if awk -v q="'" '
+  BEGIN {
+    die_line = "die()  { printf " q "\\n\\033[1;31mFAIL:\\033[0m %s\\n" q " \"$*\" >&2; exit 1; }"
+  }
+  {
+    line = $0
+    n = gsub(/(^|[^[:alnum:]_])die[[:space:]]*\([[:space:]]*\)/, "F", line)
+    n += gsub(/(^|[^[:alnum:]_])function[[:space:]]+die([^[:alnum:]_]|$)/, "F", line)
+    if (n > 0) {
+      c += n
+      if ($0 != die_line) {
+        print FILENAME ":" FNR ": a die definition outside the pinned shipped line (a multi-line quote desync hides it from the stripped views): " $0 > "/dev/stderr"
+        bad = 1
+      }
+    }
+    if (line ~ /(^|[^[:alnum:]_])(sleep|command|builtin|env|systemctl|exit|return|printf|local|true|command_not_found_handle)[[:space:]]*\([[:space:]]*\)/ ||
+        line ~ /(^|[^[:alnum:]_])function[[:space:]]+(sleep|command|builtin|env|systemctl|exit|return|printf|local|true|command_not_found_handle)([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": a load-bearing definition visible only without quote stripping: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END {
+    if (c != 1) {
+      print "die definitions in the no-quote-strip view: " c " (expected exactly 1, the pinned shipped line)" > "/dev/stderr"
+      bad = 1
+    }
+    exit bad ? 1 : 0
+  }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no load-bearing definition spelling is hidden behind a multi-line quote desync (a definition scan without quote stripping finds only the pinned \`die\`, issue #143)"
+else
+  bad "run-once: a load-bearing definition spelling appears in code only when quote stripping is skipped — a multi-line quote desync can execute a definition the per-line scanners hide (issue #143)"
+fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
 # `systemctl` call with no definition and no edit inside the rendered span:
@@ -4318,7 +4362,7 @@ if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
       prev = s
-      gsub(/(^|[;&|()!{}])[[:space:]]*(then|do|else|elif)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*(if|then|do|else|elif|while|until)([[:space:]]+)/, "; ", s)
       gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
       gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
       gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
@@ -4339,6 +4383,8 @@ if awk -v q="'" '
     joined = normalize_cmdpos(joined)
     if (ansic ||
         line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
+        line ~ /BASH_CMDS/ ||
+        joined ~ /BASH_CMDS/ ||
         line ~ /\{[^{}]*\.\.[^{}]*\}/ ||
         joined ~ /(^|[;&|()!])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
         joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
@@ -4374,7 +4420,7 @@ if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
       prev = s
-      gsub(/(^|[;&|()!{}])[[:space:]]*(then|do|else|elif)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*(if|then|do|else|elif|while|until)([[:space:]]+)/, "; ", s)
       gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
       gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
       gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
@@ -4389,17 +4435,17 @@ if awk -v q="'" '
     gsub(q, "", line)
     gsub(/\\/, "", line)
     line = normalize_cmdpos(line)
-    if (line ~ /(^|[;&|()!])[[:space:]]*(builtin|enable|trap)([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|()!])[[:space:]]*command[[:space:]]+(builtin|enable|trap)([^[:alnum:]_]|$)/) {
-      print FILENAME ":" FNR ": command-position builtin/enable/trap invocation: " $0 > "/dev/stderr"
+    if (line ~ /(^|[;&|()!])[[:space:]]*(builtin|enable|trap|eval)([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[;&|()!])[[:space:]]*command[[:space:]]+(builtin|enable|trap|eval)([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": command-position builtin/enable/trap/eval invocation: " $0 > "/dev/stderr"
       bad = 1
     }
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no command-position \`builtin\`/\`enable\`/\`trap\` invocation (incl. after reserved-word separators) in the provision script (the rc-path builtins stay reachable, issue #143)"
+  ok "run-once: no command-position \`builtin\`/\`enable\`/\`trap\`/\`eval\` invocation (incl. after reserved-word separators) in the provision script (the rc-path builtins stay reachable, issue #143)"
 else
-  bad "run-once: a command-position \`builtin\`/\`enable\`/\`trap\` invocation (incl. after a reserved-word separator) appeared in the provision script — it could disable the \`exit\` builtin or rewrite the process rc (issue #143)"
+  bad "run-once: a command-position \`builtin\`/\`enable\`/\`trap\`/\`eval\` invocation (incl. after a reserved-word separator) appeared in the provision script — it could disable the \`exit\` builtin, rewrite the process rc, or eval a shadow definition (issue #143)"
 fi
 # r13 red-team MED: the script runs as root and can prepend a shadow dir to
 # `PATH`, planting a `systemctl` (or `sleep`) binary that misreports state —
@@ -4422,8 +4468,9 @@ if awk -v q="'" '
     gsub(q "[^" q "]*" q, "", line)
     if (line ~ /(^|[^[:alnum:]_])PATH\+?=/ ||
         line ~ /(^|[^[:alnum:]_])export[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[^[:alnum:]_])unset[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[^[:alnum:]_])printf[[:space:]]+-v[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])unset([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+-[A-Za-z]*n[A-Za-z]*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
         line ~ /(^|[^[:alnum:]_])read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": PATH assignment/export/unset: " $0 > "/dev/stderr"
       bad = 1
@@ -4431,9 +4478,9 @@ if awk -v q="'" '
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no \`PATH\` assignment/export/unset (incl. \`printf -v PATH\`/\`read … PATH\`) in the provision script (issue #143)"
+  ok "run-once: no \`PATH\` assignment/export/unset (incl. \`printf -v PATH\`/\`printf -vPATH\`/\`read … PATH\`/nameref/\`unset -v PATH\` forms) in the provision script (issue #143)"
 else
-  bad "run-once: a \`PATH\` assignment/export/unset or builtin assignment (\`printf -v PATH\`/\`read … PATH\`) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a \`PATH\` assignment/export/unset or builtin/nameref assignment (\`printf -v PATH\`/\`printf -vPATH\`/\`read … PATH\`/\`declare -n PATH\`/\`unset -v PATH\`) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V4/V5): a command-word substitution redirected a drain
 # path invocation with no definition to count: `WITNESS_SYSTEMCTL=/bin/true`
