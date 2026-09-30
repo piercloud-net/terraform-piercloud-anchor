@@ -2818,21 +2818,24 @@ recording_witness_service_drained() { # no witness invocation in flight right no
 }
 
 recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation to finish
-  # 900s, not 100s: a witness run re-lists both watched prefixes in full
+  # 3600s, not 100s: a witness run re-lists both watched prefixes in full
   # (objects + versions + multipart), so its duration grows with the bucket
-  # (48k audit objects on 2026-09-30, a run of minutes) and the old 100s bound
-  # failed a healthy in-flight run closed on every dispatch. Keep the bound
-  # above a legitimate full-sweep duration; issue #153 cuts the per-run
-  # listing cost (delta listings + slower full sweeps) and can shrink it.
+  # (~48k audit objects on 2026-09-30; historical install->verdict phases at
+  # ~3.5k keys took 80-182s and no on-box measurement exists at the current
+  # size) and the old 100s bound failed a healthy in-flight run closed on
+  # every dispatch (runs 36658506403/36662210599/36662866976). The bound is a
+  # cap above every plausible run, not added latency: a drain normally returns
+  # as soon as the in-flight run ends. Issue #153 cuts the per-run listing
+  # cost (delta listings + slower full sweeps) and can shrink the bound again.
   local attempt active
-  for ((attempt = 0; attempt < 900; attempt++)); do
+  for ((attempt = 0; attempt < 3600; attempt++)); do
     if recording_witness_service_drained; then
       return 0
     fi
     sleep 1
   done
   active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
-  die "witness unit did not drain within 900s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+  die "witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict

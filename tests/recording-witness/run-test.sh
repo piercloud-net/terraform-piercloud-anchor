@@ -99,7 +99,7 @@
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
 #       InvocationID did not advance); the timer's immediate first fire on a
-#       long-up box (issue #143) is drained (bounded, 900 polls) before the
+#       long-up box (issue #143) is drained (bounded, 3600 polls) before the
 #       capture and retried exactly once if a start still merged with it, so a
 #       merged timer-triggered invocation is never mis-filed as a stale start
 #       (a merged write followed by a failed retry write dies on the
@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=528  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152)
+MIN_CHECKS=531  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 3 drain-guard teeth (early-exit + activating/failed state pins)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3393,7 +3393,7 @@ esac
 exit 0
 FAKE
 chmod +x "${FAKEBIN}/systemctl"
-# The drain-bound tooth drives all 900 wait-idle polls; FAKE_SLEEP_NOWAIT
+# The drain-bound tooth drives all 3600 wait-idle polls; FAKE_SLEEP_NOWAIT
 # removes the wall-clock cost while keeping the iteration count (and with it
 # the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
 # the sleep count and its argument (`sleep 1`) so a bound regression that
@@ -3688,18 +3688,36 @@ esac
 is "run-once: drained the unit (active poll then inactive) before starting" "2" "$(cat "${WORK}/active-polls")"
 unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 
+# Red-team LOW: the drain matcher's state set was unpinned — adding
+# `activating` (the in-flight oneshot state) or dropping `failed` (the
+# post-alert/error oneshot state) kept every check green. Pin both ends
+# directly against the sourced span function and the fake systemctl.
+export FAKE_ACTIVE_STATE=activating
+if recording_witness_service_drained; then
+  bad "run-once: \`activating\` must not count as drained (issue #143)"
+else
+  ok "run-once: \`activating\` (in-flight oneshot) does not count as drained (issue #143)"
+fi
+export FAKE_ACTIVE_STATE=failed
+if recording_witness_service_drained; then
+  ok "run-once: \`failed\` (post-alert/error oneshot) counts as drained (issue #143)"
+else
+  bad "run-once: \`failed\` must count as drained or every post-alert dispatch burns the bound (issue #143)"
+fi
+unset FAKE_ACTIVE_STATE
+
 # Retry/drain bound (red-team INFO-2): a unit that never reports drained must
-# die fail-closed at the bounded 900-poll wait BEFORE any `systemctl start` —
+# die fail-closed at the bounded 3600-poll wait BEFORE any `systemctl start` —
 # zero starts for this pre-start drain, never a start-then-retry loop (the
 # retry-path drain can fire after a merged start already ran — fail-closed
-# either way). FAKE_SLEEP_NOWAIT keeps the 900 iterations but removes their
+# either way). FAKE_SLEEP_NOWAIT keeps the 3600 iterations but removes their
 # wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
-# FAKE_ACTIVE_POLL_FILE pins the iteration count (900 loop polls + the final
+# FAKE_ACTIVE_POLL_FILE pins the iteration count (3600 loop polls + the final
 # ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
-# the sleeps (900) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
+# the sleeps (3600) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
 # bound regression fails whether it changes the poll count, the sleep count
 # or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
-# break) instead of shipping with a stale "900s" message. The count/arg
+# break) instead of shipping with a stale "3600s" message. The count/arg
 # teeth pin volume, not the shape: FAKE_ACTIVE_POLL_SLEEP_FILE records the
 # sleep count observed at every poll so the interleaving tooth (poll N must
 # see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
@@ -3722,15 +3740,15 @@ export FAKE_EXEC_STATUS=0
 run_once_call
 is "run-once: a unit that never drains dies fail-closed (issue #143)" "1" "${runonce_rc}"
 case "${runonce_out}" in
-  *"did not drain within 900s"*) ok "run-once names the bounded drain failure" ;;
+  *"did not drain within 3600s"*) ok "run-once names the bounded drain failure" ;;
   *) bad "run-once non-drain output: ${runonce_out}" ;;
 esac
 is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
-is "run-once: a non-draining unit polls the bounded 900-iteration wait (900 + the final read)" "901" "$(cat "${WORK}/no-drain-polls")"
-is "run-once: a non-draining unit sleeps the bounded 900 iterations" "900" "$(cat "${WORK}/no-drain-sleeps")"
+is "run-once: a non-draining unit polls the bounded 3600-iteration wait (3600 + the final read)" "3601" "$(cat "${WORK}/no-drain-polls")"
+is "run-once: a non-draining unit sleeps the bounded 3600 iterations" "3600" "$(cat "${WORK}/no-drain-sleeps")"
 is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
-# Issue #143 red-team F1: poll N must observe N-1 sleeps (0..100 for the
-# shipped loop; the die path's final ActiveState read is poll 101). Moving
+# Issue #143 red-team F1: poll N must observe N-1 sleeps (0..3600 for the
+# shipped loop; the die path's final ActiveState read is poll 3601). Moving
 # the sleeps out of the poll body keeps every volume counter green but
 # collapses the bounded wait to a busy poll — this fails it.
 if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
@@ -3751,7 +3769,7 @@ fi
 # `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
 # forms are not detected (fail-closed by design).
 if awk '
-  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*900;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
+  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
     seen_loop = 1; in_loop = 1; depth = 0; prev = ""; next
   }
   in_loop {
@@ -3770,6 +3788,36 @@ if awk '
   ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
 else
   bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
+fi
+# Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
+# wall-clock early exit (e.g. a `SECONDS`/`date`-based `break`) keeps every
+# count green while the effective bound collapses (reproduced: a stealth
+# `SECONDS` break passes all checks but dies at 100 s in production). Pin the
+# absence of a break/`continue` and of clock reads inside the drain loop body
+# (denylist; crafted-equivalent classes stay a disclosed residual).
+if awk '
+  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
+    seen_loop = 1; in_loop = 1; depth = 0; body = ""; next
+  }
+  in_loop {
+    if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
+    if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) {
+      if (depth == 0) { in_loop = 0; next }
+      depth--
+      body = body " " $0
+      next
+    }
+    if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
+    body = body " " $0
+  }
+  END {
+    forbidden = (body ~ /(^|[^[:alnum:]_])(break|continue|SECONDS|EPOCHREALTIME|EPOCHSECONDS)([^[:alnum:]_]|$)/ || body ~ /(^|[^[:alnum:]_])date([^[:alnum:]_]|$)/)
+    exit (seen_loop && !forbidden) ? 0 : 1
+  }
+' "${PROVISION}"; then
+  ok "run-once: the drain loop has no break/time-based early exit (issue #143)"
+else
+  bad "run-once: the drain loop carries a break or a time/clock-based early exit (the bound would not be wall-clock-pinned) (issue #143)"
 fi
 if awk -v q="'" '
   {
