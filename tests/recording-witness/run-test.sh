@@ -3396,8 +3396,8 @@ chmod +x "${FAKEBIN}/systemctl"
 # The drain-bound tooth drives all 3600 wait-idle polls; FAKE_SLEEP_NOWAIT
 # removes the wall-clock cost while keeping the iteration count (and with it
 # the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
-# the sleep count and its argument (`command sleep 1`) so a bound regression that
-# keeps the poll count (a deleted `command sleep 1`, a shortened sleep, fewer
+# the sleep count and its argument (`/usr/bin/env sleep 1`) so a bound
+# regression that keeps the poll count (a deleted `/usr/bin/env sleep 1`, a shortened sleep, fewer
 # iterations with an early break) still fails. Every other test sleeps for real.
 cat >"${FAKEBIN}/sleep" <<'FAKESLEEP'
 #!/usr/bin/env bash
@@ -3738,9 +3738,11 @@ unset FAKE_ACTIVE_STATE
 # see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
 # (a busy poll with identical counters), and two static teeth pin the
 # executed drain sleep (the last statement before the loop's `done` must be
-# a foreground `command sleep 1` — catches a backgrounded or shortened sleep
-# or a reverted `command` — and no `sleep` definition may exist: `command`
-# bypasses function/alias lookup, so the bound survives any shadow spelling).
+# a foreground `/usr/bin/env sleep 1` — catches a backgrounded or shortened
+# sleep or a reverted absolute path — and no sleep/command/builtin/env
+# definition may exist: the absolute `/usr/bin/env` cannot itself be
+# shadowed and execs the real sleep, so the bound survives any shadow
+# spelling).
 # A regression that
 # starts before the drain, or retries beyond the bound, moves the start
 # counter off 0; one that loops without the bound hangs this check instead of
@@ -3779,7 +3781,7 @@ fi
 # presence-only tooth green while the executed loop sleep is shortened
 # (`timeout 0.5 sleep 1`) or shadowed by a `sleep` function. Pin the executed
 # line: the drain loop (the `for ((attempt...))` header) must end — at depth
-# 0, so nested decoy loops cannot latch — in a foreground `command sleep 1`
+# 0, so nested decoy loops cannot latch — in a foreground `/usr/bin/env sleep 1`
 # (a trailing comment is fine); exactly one such header may match — a second
 # exact header (a decoy loop after the real one) fails instead of overwriting
 # the remembered body — and the executed drain loop must be the only C-style
@@ -3812,15 +3814,19 @@ fi
 # extraction remains (the marker-span extraction for the install span is
 # unrelated). r9 red-team HIGH: a compound-bodied command definition named
 # after the sleep utility evaded the old brace-body tooth (535/0 while the
-# drain bound collapsed to ~2s). The drain loop now calls `command sleep 1`:
-# `command` bypasses function and alias lookup, so the bound's wall clock is
-# immune to ANY shadow spelling, while the broadened static tooth refuses the
-# definition-shaped text outright (any body form, both the raw and joined
-# views). Residual (intentional-crafting class, disclosed): a dynamically
-# constructed `eval`/`alias`+`expand_aliases`/sourced shadow is not statically
-# detectable — behaviorally neutralized by `command` for the drain sleep — a
-# shadowing binary on PATH stays root-controlled, and blocking-equivalent
-# loop forms remain heuristic (fail-closed by design).
+# drain bound collapsed to ~2s). The drain loop calls `/usr/bin/env sleep 1`:
+# `/usr/bin/env` at an absolute path cannot itself be function/alias-shadowed
+# and execs the real sleep binary, so the bound's wall clock is immune to ANY
+# shadow spelling of sleep, command, builtin or env — the first r9 fold's
+# `command sleep 1` was bypassable (`command` is not a special builtin; a
+# `command () { :; }` definition made `command sleep 0.2` return in 0.000s) —
+# while the broadened static tooth refuses definition-shaped text for those
+# names outright (any body form, both the raw and joined views). Residual
+# (intentional-crafting class, disclosed): a dynamically constructed
+# `eval`/`alias`+`expand_aliases`/sourced shadow is not statically detectable
+# — behaviorally neutralized by the absolute `/usr/bin/env` for the drain
+# sleep — a shadowing binary on PATH stays root-controlled, and
+# blocking-equivalent loop forms remain heuristic (fail-closed by design).
 PROVISION_JOINED="${WORK}/provision-joined.sh"
 if awk -v q="'" '
   {
@@ -3905,12 +3911,12 @@ if awk '
       print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
       exit 1
     }
-    exit (loop_prev ~ /^[[:space:]]*command[[:space:]]+sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1
+    exit (loop_prev ~ /^[[:space:]]*\/usr\/bin\/env[[:space:]]+sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1
   }
 ' "${PROVISION_JOINED}"; then
-  ok "run-once: the drain loop ends in a foreground \`command sleep 1\` (issue #143)"
+  ok "run-once: the drain loop ends in a foreground \`/usr/bin/env sleep 1\` (issue #143)"
 else
-  bad "run-once: the drain loop sleep is missing, backgrounded, shortened, not last or not `command sleep 1`, a second C-style loop header matched, or a continuation-split header joined into an extra counted loop (issue #143)"
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened, not last or not `/usr/bin/env sleep 1`, a second C-style loop header matched, or a continuation-split header joined into an extra counted loop (issue #143)"
 fi
 # Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
 # wall-clock early exit keeps every count green while the effective bound
@@ -3924,7 +3930,7 @@ fi
 # `if (( SECONDS >= deadline )); then break; fi` (300) after it was never
 # scanned. Replace the denylist with an exact ALLOWLIST of the four intended
 # body forms (the drain check, its `return 0`, its `fi` and the
-# `command sleep 1`),
+# `/usr/bin/env sleep 1`),
 # tolerant of leading whitespace and a trailing `#` comment: any other line —
 # the printf clock, the heredoc opener — fails the tooth, and the accumulator
 # is latched across every matched body instead of being reset per header. A
@@ -3954,7 +3960,7 @@ if awk '
     return (line == "if recording_witness_service_drained; then" ||
             line == "return 0" ||
             line == "fi" ||
-            line == "command sleep 1")
+            line == "/usr/bin/env sleep 1")
   }
   /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
     c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
@@ -3983,32 +3989,49 @@ else
   bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second C-style loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
 fi
 if awk -v q="'" '
-  # r9 red-team HIGH: refuse ANY definition spelling of the sleep utility,
-  # whatever the body form, on both the raw file and the continuation-joined
-  # copy. Every valid bash definition has `sleep ()`/`sleep()` or
-  # `function sleep` on one (post-join) line (a backslash-split `sleep \` +
-  # `()` is rejoined by PROVISION_JOINED; the bare-newline split is a syntax
-  # error), so a definition-shaped match anywhere in code is refused. Comments
-  # and quoted spans are stripped first, so prose and strings do not refuse;
-  # the brace-body/pending logic is gone.
+  # r9 red-team HIGH + the command-shadow strengthening: refuse ANY definition
+  # spelling of the sleep utility — and of `command`, `builtin` and `env`,
+  # which an earlier `command sleep 1` fix left shadowable (`command` is not
+  # a special builtin; `builtin` shadows the same way; `env` is a plain
+  # external) — whatever the body form, on both the raw file and the
+  # continuation-joined copy. Every valid bash definition has
+  # `name ()`/`name()` or `function name` on one (post-join) line (a
+  # backslash-split `name \` + `()` is rejoined by PROVISION_JOINED; the
+  # bare-newline split is a syntax error), so a definition-shaped match
+  # anywhere in code is refused. Comments are stripped first; quoted spans are
+  # stripped for `sleep` (so literal prose/strings stay green by design),
+  # while `command`/`builtin`/`env` are matched on the raw line: a quoted or
+  # escaped spelling of those identifiers is not a valid bash function name
+  # (`e"nv" () { :; }` is `not a valid identifier`), but real code passes
+  # strings to `env` (`env("RECORDING_WITNESS_ENDPOINT")`), and stripping the
+  # quotes would turn those calls into `env()` and refuse the shipped script.
+  # Invocations (`command -v …`, `env NAME=… …`) and the `#!/usr/bin/env
+  # bash` shebang (a comment) stay green; the brace-body/pending logic is
+  # gone.
   {
     line = $0
     sub(/^[[:space:]]*#.*/, "", line)
+    raw = line
     gsub(/"[^"]*"/, "", line)
     gsub(q "[^" q "]*" q, "", line)
     sub(/[[:space:]]#.*$/, "", line)
+    sub(/[[:space:]]#.*$/, "", raw)
     if (line ~ /^[[:space:]]*$/) next
     if (line ~ /(^|[^[:alnum:]_])sleep[[:space:]]*\([[:space:]]*\)/ ||
-        line ~ /(^|[^[:alnum:]_])function[[:space:]]+sleep([^[:alnum:]_]|$)/) {
+        line ~ /(^|[^[:alnum:]_])function[[:space:]]+sleep([^[:alnum:]_]|$)/ ||
+        raw ~ /(^|[^[:alnum:]_])command[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_])builtin[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_])env[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_])function[[:space:]]+(command|builtin|env)([^[:alnum:]_]|$)/) {
       shadow = 1
       print FILENAME ":" FNR ": " $0 > "/dev/stderr"
     }
   }
   END { exit shadow ? 1 : 0 }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`sleep\` definition shadows the drain sleep (any body form, issue #143)"
+  ok "run-once: no \`sleep\`/\`command\`/\`builtin\`/\`env\` definition shadows the drain sleep (any body form, issue #143)"
 else
-  bad "run-once: a \`sleep\` definition shadows the drain sleep (any body form, issue #143)"
+  bad "run-once: a \`sleep\`/\`command\`/\`builtin\`/\`env\` definition shadows the drain sleep (any body form, issue #143)"
 fi
 case "${runonce_out}" in
   *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
