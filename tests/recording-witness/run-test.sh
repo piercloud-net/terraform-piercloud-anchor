@@ -99,7 +99,7 @@
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
 #       InvocationID did not advance); the timer's immediate first fire on a
-#       long-up box (issue #143) is drained (bounded, 100 polls) before the
+#       long-up box (issue #143) is drained (bounded, 900 polls) before the
 #       capture and retried exactly once if a start still merged with it, so a
 #       merged timer-triggered invocation is never mis-filed as a stale start
 #       (a merged write followed by a failed retry write dies on the
@@ -3393,7 +3393,7 @@ esac
 exit 0
 FAKE
 chmod +x "${FAKEBIN}/systemctl"
-# The drain-bound tooth drives all 100 wait-idle polls; FAKE_SLEEP_NOWAIT
+# The drain-bound tooth drives all 900 wait-idle polls; FAKE_SLEEP_NOWAIT
 # removes the wall-clock cost while keeping the iteration count (and with it
 # the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
 # the sleep count and its argument (`sleep 1`) so a bound regression that
@@ -3689,17 +3689,17 @@ is "run-once: drained the unit (active poll then inactive) before starting" "2" 
 unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 
 # Retry/drain bound (red-team INFO-2): a unit that never reports drained must
-# die fail-closed at the bounded 100-poll wait BEFORE any `systemctl start` —
+# die fail-closed at the bounded 900-poll wait BEFORE any `systemctl start` —
 # zero starts for this pre-start drain, never a start-then-retry loop (the
 # retry-path drain can fire after a merged start already ran — fail-closed
-# either way). FAKE_SLEEP_NOWAIT keeps the 100 iterations but removes their
+# either way). FAKE_SLEEP_NOWAIT keeps the 900 iterations but removes their
 # wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
-# FAKE_ACTIVE_POLL_FILE pins the iteration count (100 loop polls + the final
+# FAKE_ACTIVE_POLL_FILE pins the iteration count (900 loop polls + the final
 # ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
-# the sleeps (100) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
+# the sleeps (900) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
 # bound regression fails whether it changes the poll count, the sleep count
 # or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
-# break) instead of shipping with a stale "100s" message. The count/arg
+# break) instead of shipping with a stale "900s" message. The count/arg
 # teeth pin volume, not the shape: FAKE_ACTIVE_POLL_SLEEP_FILE records the
 # sleep count observed at every poll so the interleaving tooth (poll N must
 # see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
@@ -3722,12 +3722,12 @@ export FAKE_EXEC_STATUS=0
 run_once_call
 is "run-once: a unit that never drains dies fail-closed (issue #143)" "1" "${runonce_rc}"
 case "${runonce_out}" in
-  *"did not drain within 100s"*) ok "run-once names the bounded drain failure" ;;
+  *"did not drain within 900s"*) ok "run-once names the bounded drain failure" ;;
   *) bad "run-once non-drain output: ${runonce_out}" ;;
 esac
 is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
-is "run-once: a non-draining unit polls the bounded 100-iteration wait (100 + the final read)" "101" "$(cat "${WORK}/no-drain-polls")"
-is "run-once: a non-draining unit sleeps the bounded 100 iterations" "100" "$(cat "${WORK}/no-drain-sleeps")"
+is "run-once: a non-draining unit polls the bounded 900-iteration wait (900 + the final read)" "901" "$(cat "${WORK}/no-drain-polls")"
+is "run-once: a non-draining unit sleeps the bounded 900 iterations" "900" "$(cat "${WORK}/no-drain-sleeps")"
 is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
 # Issue #143 red-team F1: poll N must observe N-1 sleeps (0..100 for the
 # shipped loop; the die path's final ActiveState read is poll 101). Moving
@@ -3751,7 +3751,7 @@ fi
 # `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
 # forms are not detected (fail-closed by design).
 if awk '
-  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*100;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
+  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*900;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
     seen_loop = 1; in_loop = 1; depth = 0; prev = ""; next
   }
   in_loop {
