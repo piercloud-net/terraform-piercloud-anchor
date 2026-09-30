@@ -3783,14 +3783,22 @@ fi
 # and the executed drain loop must be the only C-style `for ((` loop in the
 # script (r4 red-team mutF: a respelled executed header plus a sacrificial
 # exact-header decoy otherwise nullifies the exactly-one rule while the
-# unscanned respelled loop carries the clock early-exit) — and no `sleep`
+# unscanned respelled loop carries the clock early-exit; r5 red-team candB:
+# a same-line prefix — `:; for (( …` — is matched by the non-anchored
+# alternation) — the wait-idle span may contain no backslash
+# line-continuation (r5 red-team candA/candC: `for \` + newline + `(( …`,
+# or the mid-token `fo\` + newline + `r (( …`, lets bash form the loop
+# while the line-based scan sees neither half) — and no `sleep`
 # function may exist in plain code (`sleep()` or
 # `function sleep`, same-line or brace-on-next-line; comments and quoted
 # spans ignored). Residual (intentional-crafting class, disclosed): `eval`/
 # `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
 # forms are not detected (fail-closed by design).
 if awk '
-  /^[[:space:]]*for[[:space:]]*\(\(/ {
+  /^recording_witness_wait_idle\(\)[[:space:]]*\{/ { in_fn = 1; next }
+  in_fn && /^\}/ { in_fn = 0; next }
+  in_fn && /\\[[:space:]]*(#.*)?$/ { cont_line = NR; cont = 1 }
+  /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
     c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
   }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
@@ -3809,6 +3817,10 @@ if awk '
     prev = $0
   }
   END {
+    if (cont) {
+      print "backslash line-continuation inside recording_witness_wait_idle at line " cont_line " (a split loop header can hide from the line-based scan)" > "/dev/stderr"
+      exit 1
+    }
     if (headers != 1 || c_headers != 1) {
       print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
       exit 1
@@ -3818,7 +3830,7 @@ if awk '
 ' "${PROVISION}"; then
   ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
 else
-  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, or a second C-style loop header matched (issue #143)"
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last, a second C-style loop header matched, or the wait-idle span carries a backslash line-continuation (issue #143)"
 fi
 # Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
 # wall-clock early exit keeps every count green while the effective bound
@@ -3842,13 +3854,20 @@ fi
 # respelled — `for (( attempt …` — so the anchored regex misses it, plus a
 # never-called exact-header decoy satisfying the exactly-one rule, kept the
 # suite at 533/0 while the unscanned respelled loop carried the clock
-# early-exit). Residual (intentional-crafting class, disclosed): an early exit
-# moved outside the rendered loop body (e.g. into a helper), a non-C-style
-# loop construct (`while`/`until`) replacing the drain loop together with a
-# sacrificial exact-header decoy, a second `recording_witness_wait_idle`
-# definition overriding the scanned one, and any other non-header scanner
-# desync whose opener is not itself an unpinned body line stay heuristic; the
-# state pins above and the on-box wall-clock behavior remain the backstop.
+# early-exit). r5 red-team: the general match is non-anchored (`:; for (( …`
+# counts too), any `for ((` occurrence anywhere in the script — including
+# inert text/heredocs — fails closed (deliberate over-refusal: the script
+# ships exactly one C-style loop), and the sleep-last tooth also refuses a
+# backslash line-continuation inside the wait-idle span (`for \` + newline +
+# `(( …`, or the mid-token split), which bash joins before tokenizing while
+# the line-based scan sees neither half. Residual (intentional-crafting
+# class, disclosed): an early exit moved outside the rendered loop body (e.g.
+# into a helper), a non-C-style loop construct (`while`/`until`) replacing
+# the drain loop together with a sacrificial exact-header decoy, a second
+# `recording_witness_wait_idle` definition overriding the scanned one, and
+# any other non-header scanner desync whose opener is not itself an unpinned
+# body line stay heuristic; the state pins above and the on-box wall-clock
+# behavior remain the backstop.
 if awk '
   function pinned(line) {
     sub(/[[:space:]]+#.*$/, "", line)
@@ -3859,7 +3878,7 @@ if awk '
             line == "fi" ||
             line == "sleep 1")
   }
-  /^[[:space:]]*for[[:space:]]*\(\(/ {
+  /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
     c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
   }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
