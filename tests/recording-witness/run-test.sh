@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=536  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 8 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin)
+MIN_CHECKS=538  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3848,17 +3848,20 @@ fi
 # stay green.
 #
 # Boundary (disclosed): the teeth are a regression detector for the drain
-# path's finite name surface (definitions of sleep/command/builtin/env/
-# systemctl; `die` plus the two drain-path helpers pinned to a single
-# definition each; non-identifier `function` names) — not a sandbox: an
-# adversary who can edit the provision script can also edit this harness, so
-# arbitrary crafted edits outside that surface (and harness self-edits) are
-# out of scope by construction. Residual (intentional-crafting class,
-# disclosed): a dynamically constructed `eval`/`alias`+`expand_aliases`/
-# sourced shadow is not statically detectable — behaviorally neutralized by
-# the absolute `/usr/bin/env` for the drain sleep — a shadowing binary on
-# PATH stays root-controlled, and blocking-equivalent loop forms remain
-# heuristic (fail-closed by design).
+# path's pinned source (definitions of sleep/command/builtin/env/systemctl;
+# `die` plus the two drain-path helpers pinned to a single definition
+# occurrence each, with the `die` body pinned to `exit 1`; the
+# `recording_witness_service_drained` body and the at-bound `die` invocation
+# pinned to the shipped source lines; any `hash` invocation refused;
+# non-identifier `function` names) — not a sandbox: an adversary who can
+# edit the provision script can also edit this harness, so crafted edits
+# outside that pinned source (and harness self-edits) are out of scope by
+# construction. Residual (intentional-crafting class, disclosed): a
+# dynamically constructed `eval`/`alias`+`expand_aliases`/sourced shadow is
+# not statically detectable — behaviorally neutralized by the absolute
+# `/usr/bin/env` for the drain sleep — blocking-equivalent loop forms stay
+# heuristic (state pins + on-box wall-clock backstop), and a shadowing
+# binary requires a root-level PATH write (out of scope by construction).
 PROVISION_JOINED="${WORK}/provision-joined.sh"
 if awk -v q="'" '
   {
@@ -4072,7 +4075,11 @@ if awk -v q="'" '
       rest = line
       sub(/^.*function[[:space:]]+/, "", rest)
       sub(/[[:space:]].*$/, "", rest)
-      gsub(/[()]/, "", rest)
+      # r11 functional LOW: strip an extracted token of its trailing
+      # `(){`/`{` suffix before the identifier test — `function zzz(){ :; }`
+      # left `zzz{` and false-positived; a decorated path name keeps its
+      # slash (`function /usr/bin/env{ :; }`) and still fails.
+      sub(/[({].*$/, "", rest)
       if (rest !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
         shadow = 1
         print FILENAME ":" FNR ": non-identifier function name: " $0 > "/dev/stderr"
@@ -4095,12 +4102,31 @@ fi
 # three to EXACTLY ONE definition, per view (raw and continuation-joined),
 # with comments and quoted spans stripped and invocations (no definition
 # parens) naturally excluded. The real script defines each once.
+#
+# r11 red-team MED: the r10 pin counted definition LINES, not definitions —
+# `die() { ...; exit 1; }; die() { :; }` on one line passed (count 1) and an
+# in-place no-op `die` body passed with the count untouched, both
+# suite-green (the override silences every later `die` gate). The count now
+# accumulates definition OCCURRENCES per line, and the single `die`
+# definition must carry `exit 1` inside its brace body — an `exit 1`
+# elsewhere on the line, or a `die` spelled with the `function` keyword form
+# (no paren form to pin), fails closed.
 if awk -v q="'" '
-  function isdef(line, name) {
-    if (line ~ ("function[[:space:]]+" name "([^[:alnum:]_]|$)")) return 1
-    if (line ~ ("(^|[^[:alnum:]_])" name "[[:space:]]*\\([[:space:]]*\\)")) return 1
-    return 0
+  function keyword_defs(line, name) {
+    return gsub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", line)
   }
+  function paren_defs(line, name) {
+    return gsub("(^|[^[:alnum:]_])" name "[[:space:]]*[(][[:space:]]*[)]", "F", line)
+  }
+  function defs(line, name,   s) {
+    s = line
+    # Remove one `function NAME` occurrence before counting the POSIX forms,
+    # so `function NAME()` is not counted twice (keyword_defs counts every
+    # keyword occurrence, and a leftover second one still gets counted).
+    sub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", s)
+    return keyword_defs(line, name) + paren_defs(s, name)
+  }
+  BEGIN { n = split("recording_witness_service_drained recording_witness_wait_idle die", names, " ") }
   FNR == 1 { file = FILENAME; seen[file] = 1 }
   {
     line = $0
@@ -4109,29 +4135,24 @@ if awk -v q="'" '
     gsub(q "[^" q "]*" q, "", line)
     sub(/[[:space:]]#.*$/, "", line)
     if (line ~ /^[[:space:]]*$/) next
-    if (isdef(line, "recording_witness_service_drained")) {
-      c[file, "recording_witness_service_drained"]++
-      if (c[file, "recording_witness_service_drained"] == 2)
-        print file ":" FNR ": second definition of recording_witness_service_drained: " $0 > "/dev/stderr"
-    }
-    if (isdef(line, "recording_witness_wait_idle")) {
-      c[file, "recording_witness_wait_idle"]++
-      if (c[file, "recording_witness_wait_idle"] == 2)
-        print file ":" FNR ": second definition of recording_witness_wait_idle: " $0 > "/dev/stderr"
-    }
-    if (isdef(line, "die")) {
-      c[file, "die"]++
-      if (c[file, "die"] == 2)
-        print file ":" FNR ": second definition of die: " $0 > "/dev/stderr"
+    for (i = 1; i <= n; i++) {
+      k = defs(line, names[i])
+      if (k == 0) continue
+      c[file, names[i]] += k
+      if (c[file, names[i]] - k < 2 && c[file, names[i]] > 1)
+        print file ":" FNR ": multiple definition occurrences of " names[i] ": " $0 > "/dev/stderr"
+      if (names[i] == "die" && line !~ /die[[:space:]]*[(][[:space:]]*[)][[:space:]]*[{][^}]*exit[[:space:]]+1/) {
+        print file ":" FNR ": die definition without an `exit 1` in its body: " $0 > "/dev/stderr"
+        die_body_bad = 1
+      }
     }
   }
   END {
-    bad = 0
-    n = split("recording_witness_service_drained recording_witness_wait_idle die", names, " ")
+    bad = die_body_bad ? 1 : 0
     for (f in seen) {
       for (i = 1; i <= n; i++) {
         if (c[f, names[i]] != 1) {
-          printf "%s: expected exactly 1 definition of %s, found %d\n", f, names[i], c[f, names[i]] + 0 > "/dev/stderr"
+          printf "%s: expected exactly 1 definition occurrence of %s, found %d\n", f, names[i], c[f, names[i]] + 0 > "/dev/stderr"
           bad = 1
         }
       }
@@ -4139,9 +4160,99 @@ if awk -v q="'" '
     exit bad ? 1 : 0
   }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\` and \`die\` are each defined exactly once (issue #143)"
+  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\` and \`die\` are each defined exactly once (occurrence-counted) and the \`die\` body carries \`exit 1\` (issue #143)"
 else
-  bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times — a second definition overrides the scanned one (issue #143)"
+  bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times (per occurrence) or its \`die\` body lost the \`exit 1\` fail-closed exit (issue #143)"
+fi
+# r11 red-team HIGH (V1): `hash -p /bin/true systemctl` (one line before the
+# witness span) poisoned command lookup for every later `systemctl` call with
+# no definition and no edit inside the rendered span: the suite stayed 536/0
+# while a fake systemctl reported the unit active and the drain returned
+# "drained" at poll 0 (issue #143 fail-open). The provision script has no
+# legitimate `hash` call (its only spellings are identifier suffixes like
+# `origin_ca_write_hash` and stripped prose/comments), so refuse any
+# standalone `hash` word in code — definitions (`hash ()`), invocations
+# (`hash -r`, `hash -p ...`) and `command hash` are all refused; quoted
+# strings and comments are stripped first, so shipped prose stays green.
+if awk -v q="'" '
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
+    sub(/[[:space:]]#.*$/, "", line)
+    if (line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": hash invocation: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: no \`hash\` invocation redirects command lookup in the provision script (issue #143)"
+else
+  bad "run-once: a \`hash\` invocation (lookup poisoning) appeared in the provision script — the script has no legitimate \`hash\` call (issue #143)"
+fi
+# r11 red-team HIGH (V4/V5): a command-word substitution redirected a drain
+# path invocation with no definition to count: `WITNESS_SYSTEMCTL=/bin/true`
+# plus `"${WITNESS_SYSTEMCTL:-systemctl}"` in
+# recording_witness_service_drained, and `WITNESS_DIE=:` plus
+# `"${WITNESS_DIE:-die}"` at the at-bound call — both suite-green (536/0)
+# with the unit active (issue #143 fail-open). Pin the shipped source of both
+# invocations exactly: the six body lines of recording_witness_service_drained
+# (the local, the systemctl query, the case decision and its arms) and the
+# at-bound die line; the paren-form header must appear exactly once, so a
+# header respelling (e.g. the `function NAME` keyword form) is refused too.
+# Any intended edit to these lines must update this pin (the shipped source
+# is the spec); fail-closed over-refusal is deliberate.
+if awk '
+  BEGIN {
+    want[1] = "  local active"
+    want[2] = "  active=\"$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)\""
+    want[3] = "  case \"${active}\" in"
+    want[4] = "    \"\"|inactive|failed) return 0 ;;"
+    want[5] = "    *) return 1 ;;"
+    want[6] = "  esac"
+    want[7] = "}"
+    nwant = 7
+    die_line = "  die \"witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run\""
+  }
+  FNR == 1 {
+    if (in_body) {
+      print file ": recording_witness_service_drained body not terminated by the pinned `}`" > "/dev/stderr"
+      badfile[file] = 1
+    }
+    file = FILENAME; seen[file] = 1; in_body = 0; i = 0
+  }
+  {
+    if (in_body) {
+      i++
+      if (i > nwant || $0 != want[i]) {
+        print file ":" FNR ": drain-path body diverges from the pinned source at line " i ": " $0 > "/dev/stderr"
+        badfile[file] = 1
+      }
+      if (i >= nwant) in_body = 0
+      next
+    }
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    if (line ~ /(^|[^[:alnum:]_])recording_witness_service_drained[[:space:]]*[(][[:space:]]*[)][[:space:]]*[{]/) {
+      h[file]++; in_body = 1; i = 0; next
+    }
+    if ($0 == die_line) d[file]++
+  }
+  END {
+    bad = 0
+    for (f in seen) {
+      if (h[f] != 1) { print f ": recording_witness_service_drained paren-form headers: " h[f] + 0 " (expected 1)" > "/dev/stderr"; bad = 1 }
+      if (badfile[f]) bad = 1
+      if (d[f] != 1) { print f ": at-bound die invocation lines: " d[f] + 0 " (expected 1)" > "/dev/stderr"; bad = 1 }
+    }
+    exit bad ? 1 : 0
+  }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: the \`recording_witness_service_drained\` body and the at-bound \`die\` invocation match the pinned drain-path source (issue #143)"
+else
+  bad "run-once: a drain-path invocation was redirected (systemctl query, state decision, or the at-bound die call) or the pinned source diverged — an intended edit must update the pin (issue #143)"
 fi
 case "${runonce_out}" in
   *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
