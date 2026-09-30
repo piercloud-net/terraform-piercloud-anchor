@@ -2827,12 +2827,23 @@ recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation 
   # cap above every plausible run, not added latency: a drain normally returns
   # as soon as the in-flight run ends. Issue #153 cuts the per-run listing
   # cost (delta listings + slower full sweeps) and can shrink the bound again.
+  # The drain sleep is `command sleep 1`, not a bare `sleep 1`: `command`
+  # bypasses function and alias lookup, so a command definition named after
+  # the sleep utility, whatever its body spelling — `{ … }`, `( : )`,
+  # `(( 0 ))`, `if …; then …; fi`, … — cannot turn the loop into a busy poll
+  # and collapse the 3600s bound. r9 red-team HIGH: a crafted compound-bodied
+  # definition before this span ran the harness 535/0 while all 3600 calls
+  # no-opped and the bound collapsed to ~2s; `command` closes the class
+  # instead of chasing body spellings (the harness also refuses any
+  # definition-shaped text for defense-in-depth). PATH lookup is unchanged: a
+  # shadowing binary needs root write access, like every other command this
+  # script runs.
   local attempt active
   for ((attempt = 0; attempt < 3600; attempt++)); do
     if recording_witness_service_drained; then
       return 0
     fi
-    sleep 1
+    command sleep 1
   done
   active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
   die "witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
