@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=531  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 3 drain-guard teeth (early-exit + activating/failed state pins)
+MIN_CHECKS=533  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 5 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3692,6 +3692,9 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 # `activating` (the in-flight oneshot state) or dropping `failed` (the
 # post-alert/error oneshot state) kept every check green. Pin both ends
 # directly against the sourced span function and the fake systemctl.
+# Red-team LOW (round 2): the set was still open — adding `deactivating` (a
+# stop still winding down) or `reloading` (a reload in progress) also kept
+# the suite green, so those two must-not-drain states are pinned the same way.
 export FAKE_ACTIVE_STATE=activating
 if recording_witness_service_drained; then
   bad "run-once: \`activating\` must not count as drained (issue #143)"
@@ -3703,6 +3706,18 @@ if recording_witness_service_drained; then
   ok "run-once: \`failed\` (post-alert/error oneshot) counts as drained (issue #143)"
 else
   bad "run-once: \`failed\` must count as drained or every post-alert dispatch burns the bound (issue #143)"
+fi
+export FAKE_ACTIVE_STATE=deactivating
+if recording_witness_service_drained; then
+  bad "run-once: \`deactivating\` must not count as drained (issue #143)"
+else
+  ok "run-once: \`deactivating\` (a stop still winding down) does not count as drained (issue #143)"
+fi
+export FAKE_ACTIVE_STATE=reloading
+if recording_witness_service_drained; then
+  bad "run-once: \`reloading\` must not count as drained (issue #143)"
+else
+  ok "run-once: \`reloading\` (a reload in progress) does not count as drained (issue #143)"
 fi
 unset FAKE_ACTIVE_STATE
 
@@ -3790,34 +3805,53 @@ else
   bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
 fi
 # Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
-# wall-clock early exit (e.g. a `SECONDS`/`date`-based `break`) keeps every
-# count green while the effective bound collapses (reproduced: a stealth
-# `SECONDS` break passes all checks but dies at 100 s in production). Pin the
-# absence of a break/`continue` and of clock reads inside the drain loop body
-# (denylist; crafted-equivalent classes stay a disclosed residual).
+# wall-clock early exit keeps every count green while the effective bound
+# collapses. The first cut was a denylist over the extracted body
+# (`break`/`continue`/`SECONDS`/`date`/...); two mutants evaded it with the
+# suite at 531/0 (round 2): (1) a `printf -v now '%(%s)T' -1` clock read in
+# the body plus a `return 0` once `now >= entry+300` (fail-open: `wait_idle`
+# declares "drained" with a live invocation while the die message still
+# claims 3600s), and (2) a `: <<'MARKER'` heredoc whose body contains `sleep
+# 1` then a bare `done`, which terminates both body scanners early — the real
+# `if (( SECONDS >= deadline )); then break; fi` (300) after it was never
+# scanned. Replace the denylist with an exact ALLOWLIST of the four intended
+# body forms (the drain check, its `return 0`, its `fi` and the `sleep 1`),
+# tolerant of leading whitespace and a trailing `#` comment: any other line —
+# the printf clock, the heredoc opener — fails the tooth regardless of any
+# scanner desync. Residual (intentional-crafting class, disclosed): an early
+# exit moved outside the rendered loop body (e.g. into a helper) stays
+# heuristic; the state pins above and the on-box wall-clock behavior remain
+# the backstop.
 if awk '
+  function pinned(line) {
+    sub(/[[:space:]]+#.*$/, "", line)
+    sub(/[[:space:]]+$/, "", line)
+    sub(/^[[:space:]]+/, "", line)
+    return (line == "if recording_witness_service_drained; then" ||
+            line == "return 0" ||
+            line == "fi" ||
+            line == "sleep 1")
+  }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
-    seen_loop = 1; in_loop = 1; depth = 0; body = ""; next
+    seen_loop = 1; in_loop = 1; depth = 0; unpinned = ""; next
   }
   in_loop {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
     if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) {
       if (depth == 0) { in_loop = 0; next }
       depth--
-      body = body " " $0
-      next
     }
     if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
-    body = body " " $0
+    if (!pinned($0)) unpinned = unpinned (unpinned == "" ? "" : " | ") $0
   }
   END {
-    forbidden = (body ~ /(^|[^[:alnum:]_])(break|continue|SECONDS|EPOCHREALTIME|EPOCHSECONDS)([^[:alnum:]_]|$)/ || body ~ /(^|[^[:alnum:]_])date([^[:alnum:]_]|$)/)
-    exit (seen_loop && !forbidden) ? 0 : 1
+    if (unpinned != "") print "unpinned drain-loop line(s): " unpinned > "/dev/stderr"
+    exit (seen_loop && unpinned == "") ? 0 : 1
   }
 ' "${PROVISION}"; then
-  ok "run-once: the drain loop has no break/time-based early exit (issue #143)"
+  ok "run-once: every drain loop body line is one of the four pinned forms (issue #143)"
 else
-  bad "run-once: the drain loop carries a break or a time/clock-based early exit (the bound would not be wall-clock-pinned) (issue #143)"
+  bad "run-once: the drain loop body carries a line outside the pinned allowlist (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
 fi
 if awk -v q="'" '
   {
