@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=540  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal)
+MIN_CHECKS=540  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 10 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal + the r10 drain-path single-definition pin + the r11 pinned drain-path source + hash-refusal teeth; the r12 fold widened three of these teeth in place — exact die-line pin, exit/return/printf/local/true definition refusal, quote-joined hash closure — and the r13 fold widened the hash/definition teeth in place again — parameter-expansion stripping, ANSI-C refusal, command_not_found_handle definition refusal — plus 2 new teeth: the command-position builtin/enable/trap refusal and the PATH assignment/export/unset refusal; the r14 fold widened the hash/definition/builtin-enable-trap/PATH teeth in place again — a quote-aware comment-stripped continuation-joined view, reserved-word separators in the command-position class, the brace-sequence refusal, and the `printf -v PATH`/`read … PATH` builtin assignment forms — so the count stays 540)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3867,6 +3867,31 @@ fi
 # `unset PATH` in code (0 occurrences). Each refusal is a deliberate
 # over-refusal: the shipped script never uses these forms.
 #
+# r14 red-team/functional: every closure above (and the r7/r8 definition
+# scan) stripped comments with a per-line `sub(/[[:space:]]#.*$/, …)` BEFORE
+# its quote handling, so a `#` inside a quoted span (`echo " # " ; <payload>`)
+# truncated the scanned view and the payload became invisible — six repros,
+# each suite-green with the payload executing on-box: a parameter-rebuilt
+# `h${x}ash`, an ANSI-C `$'\x68…'`, a command-position `builtin … hash`,
+# `trap 'exit 0' EXIT`, `enable -n exit`, `PATH="/tmp/shad:${PATH}"`; the
+# command-position class also missed the reserved-word separators (`if true;
+# then trap …; fi`, `{ trap …; }`, `time trap …`, `if true; then h${x}ash …;
+# fi`), a brace-sequence spelling (`{h..h}ash -p …`) slipped past the
+# literal-token match, the quote-blind `line` view falsely refused the shipped
+# prose (`log "PATH=${PATH}"`, `log "export PATH and unset PATH here"`), and
+# the PATH tooth missed the builtin assignment forms (`printf -v PATH …`,
+# `read -r PATH …`). The closure: the join scanner now also emits a
+# quote-aware-comment-stripped continuation-joined copy (`PROVISION_CODE`)
+# and the closure teeth read it instead of re-stripping comments; the
+# command-position match is preceded by a reserved-word normalizer
+# (`then`/`do`/`else`/`elif`/`time`/`{`/`}` rewritten to `;`, iterated); any
+# brace sequence (`{…..…}`) in code is refused (the script has zero); the
+# PATH tooth strips quoted spans (so quoted prose stays green) and also
+# refuses `printf -v PATH` / `read … PATH`; the ANSI-C refusal now sees a
+# `$'` even behind a quoted `#` decoy. Deliberate over-refusals: the
+# reserved-word normalizer and the brace-sequence refusal (fail-closed; the
+# shipped script uses neither form).
+#
 # Boundary (disclosed): the teeth are a regression detector for the drain
 # path's pinned source (any definition of the utilities/builtins
 # sleep/command/builtin/env/systemctl and of the rc-path exit/return plus
@@ -3877,28 +3902,50 @@ fi
 # `recording_witness_service_drained` body and the at-bound `die`
 # invocation pinned to the shipped source lines; `hash` refused as a word and
 # in the quote-joined/expansion-stripped view at a command position,
-# including `builtin`/`command hash`; command-position `builtin`/`enable`/
-# `trap` invocations and `PATH` assignments/exports/unsets refused; any
-# ANSI-C `$'` quoting in code refused; non-identifier `function` names) — not
-# a sandbox: an adversary who can edit the provision script can also edit
+# including `builtin`/`command hash`, and any brace sequence
+# (`{…..…}`) refused; command-position `builtin`/`enable`/`trap` invocations
+# refused after the reserved-word normalizer
+# (`then`/`do`/`else`/`elif`/`time`/`{`/`}`); `PATH` assignment/export/unset
+# plus the builtin assignment forms `printf -v PATH` / `read … PATH` refused;
+# any ANSI-C `$'` quoting in code refused; non-identifier `function` names) —
+# the comment-stripping teeth read a quote-aware-comment-stripped
+# continuation-joined view, so a `#` inside a quoted span cannot truncate the
+# scan; not a sandbox: an adversary who can edit the provision script can
+# also edit
 # this harness, so crafted edits outside that pinned source (and harness
 # self-edits) are out of scope by construction. Deliberate over-refusals
 # (fail-closed): a `die` spelling that deviates from the exact shipped line
 # (`exit "1"`, multiline, tab-indented), any `hash` spelling at a command
-# position, any `$'` quoting in code, and any `PATH` assignment/export/unset.
+# position, any `$'` quoting in code, any brace sequence in code, and any
+# `PATH` assignment/export/unset (incl. `printf -v PATH`/`read … PATH`).
 # Residual (intentional-crafting class, disclosed): a dynamically constructed
 # `eval`/`alias`+`expand_aliases`/sourced shadow is not statically detectable
 # — behaviorally neutralized by the absolute `/usr/bin/env` for the drain
-# sleep — blocking-equivalent loop forms stay heuristic (state pins + on-box
-# wall-clock backstop), a refused word rebuilt from a non-empty parameter
-# expansion (`${x:-a}`) stays in the crafted-edit class, and any other such
-# crafted edit outside the pinned source is out of scope by construction.
+# sleep — a command-substitution-rebuilt word (`ha$(printf s)h -p …`) and a
+# refused word rebuilt from a non-empty parameter expansion (`${x:-a}`) are
+# not statically resolvable and stay in the crafted-edit class,
+# blocking-equivalent loop forms stay heuristic (state pins + on-box
+# wall-clock backstop), and any other such crafted edit outside the pinned
+# source is out of scope by construction.
 PROVISION_JOINED="${WORK}/provision-joined.sh"
-if awk -v q="'" '
+PROVISION_CODE="${WORK}/provision-code.sh"
+# The same scanner also emits a comment-stripped copy (`PROVISION_CODE`):
+# r14 red-team/functional HIGH — a `#` inside a quoted span (`echo " # " ;
+# <payload>`) made the per-tooth `sub(/[[:space:]]#.*$/, …)` truncate the
+# scanned view before the closure transforms, so a parameter-expansion-
+# rebuilt `hash`, an ANSI-C `$'…'`, a command-position `builtin`/`enable`/
+# `trap` or a `PATH=` assignment after the decoy was invisible while the
+# payload executed on-box. The scanner already tracks quote state (single/
+# double/ANSI-C) for the continuation decision, so it also records where a
+# true comment starts and emits the quote-aware-comment-stripped, still
+# continuation-joined copy; the closure teeth below read it instead of
+# re-stripping comments naively.
+if awk -v q="'" -v code_out="${PROVISION_CODE}" '
   {
     line = $0
     n = length(line)
     esc = 0
+    com_at = 0
     for (i = 1; i <= n; i++) {
       c = substr(line, i, 1)
       if (com) break
@@ -3920,13 +3967,16 @@ if awk -v q="'" '
       if (c == "$" && substr(line, i+1, 1) == q) { ansic = 1; i++; continue }
       if (c == q) { sq = 1; continue }
       if (c == "\"") { dq = 1; continue }
-      if (c == "#" && (i == 1 || substr(line, i-1, 1) ~ /[[:space:];&|()]/)) { com = 1; break }
+      if (c == "#" && (i == 1 || substr(line, i-1, 1) ~ /[[:space:];&|()]/)) { com = 1; com_at = i; break }
     }
+    code_line = (com_at > 0) ? substr(line, 1, com_at-1) : line
     cont = (esc == 1 && !com && !sq)
     if (cont) {
       printf "%s", substr(line, 1, n-1)
+      printf "%s", substr(code_line, 1, n-1) > code_out
     } else {
       print
+      print code_line > code_out
       if (n > 0 && substr(line, n, 1) == "\\") {
         print "trailing backslash at line " NR " is not a bash continuation (comment, single-quoted, or escaped) — refused fail-closed" > "/dev/stderr"
         bad = 1
@@ -3936,7 +3986,7 @@ if awk -v q="'" '
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION}" >"${PROVISION_JOINED}"; then
-  ok "run-once: the joined view consumes every real continuation (no comment/quoted trailing backslash)"
+  ok "run-once: the joined view consumes every real continuation (no comment/quoted trailing backslash; the quote-aware-comment-stripped code view is emitted)"
 else
   bad "run-once: a trailing backslash is not a bash continuation (comment/single-quoted/escaped) — refused fail-closed (issue #143)"
 fi
@@ -4061,13 +4111,16 @@ if awk -v q="'" '
   # left shadowable (`command` is not a special builtin; `builtin` shadows the
   # same way; `env` is a plain external; a `systemctl` function lying
   # `inactive` fail-opens the drain check at poll 0) — whatever the body form,
-  # on both the raw file and the continuation-joined copy. Every valid bash
+  # on the quote-aware-comment-stripped continuation-joined copy
+  # (PROVISION_CODE; r14: a quoted `#` decoy must not truncate the scan).
+  # Every valid bash
   # definition has `name ()`/`name()` or `function name` on one (post-join)
-  # line (a backslash-split `name \` + `()` is rejoined by PROVISION_JOINED;
+  # line (a backslash-split `name \` + `()` is rejoined by the join scanner;
   # the bare-newline split is a syntax error), so a definition-shaped match
-  # anywhere in code is refused. Comments are stripped first; quoted spans are
-  # stripped for `sleep`/`systemctl` (so literal prose/strings stay green by
-  # design), while `command`/`builtin`/`env` are matched on the raw line: a
+  # anywhere in code is refused. Comments are already stripped; quoted spans
+  # are stripped for `sleep`/`systemctl` (so literal prose/strings stay green
+  # by design), while `command`/`builtin`/`env` are matched on the
+  # quote-preserved line: a
   # quoted or escaped spelling of those identifiers is not a valid bash
   # function name (`e"nv" () { :; }` is `not a valid identifier`), but real
   # code passes strings to `env` (`env("RECORDING_WITNESS_ENDPOINT")`), and
@@ -4103,12 +4156,9 @@ if awk -v q="'" '
   # stay green.
   {
     line = $0
-    sub(/^[[:space:]]*#.*/, "", line)
     raw = line
     gsub(/"[^"]*"/, "", line)
     gsub(q "[^" q "]*" q, "", line)
-    sub(/[[:space:]]#.*$/, "", line)
-    sub(/[[:space:]]#.*$/, "", raw)
     if (line ~ /^[[:space:]]*$/) next
     if (line ~ /(^|[^[:alnum:]_])sleep[[:space:]]*\([[:space:]]*\)/ ||
         line ~ /(^|[^[:alnum:]_])function[[:space:]]+sleep([^[:alnum:]_]|$)/ ||
@@ -4139,7 +4189,7 @@ if awk -v q="'" '
     }
   }
   END { exit shadow ? 1 : 0 }
-' "${PROVISION}" "${PROVISION_JOINED}"; then
+' "${PROVISION_CODE}"; then
   ok "run-once: no drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`/\`command_not_found_handle\`) and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
 else
   bad "run-once: a drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`/\`command_not_found_handle\`) or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
@@ -4254,24 +4304,42 @@ fi
 # to the command-position class, and refuses any ANSI-C `$'` quoting in code
 # (the script has 0) so `$'\x68…'`/`$'hash'` cannot smuggle a command word;
 # the next tooth refuses command-position `builtin`/`enable`/`trap`.
+#
+# r14 red-team/functional: the `joined` view stripped comments naively on
+# the raw line, so `echo " # " ; $'\x68\x61\x73\x68' …` (and every other
+# quoted-# decoy) truncated the `ansic` detection and left the joined match
+# seeing `echo "`. The tooth now reads PROVISION_CODE (quote-aware comment
+# stripping) and also refuses a `{…..…}` brace sequence in code
+# (`{h..h}ash -p …` built the token with bash brace expansion) and
+# normalizes the reserved-word separators before the command-position match
+# (`if true; then h${x}ash …`; `time h\ash …` — the backslash-joined
+# spelling rides the same class).
 if awk -v q="'" '
+  function normalize_cmdpos(s,   prev) {
+    do {
+      prev = s
+      gsub(/(^|[;&|()!{}])[[:space:]]*(then|do|else|elif)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
+    } while (s != prev)
+    return s
+  }
   {
     line = $0
-    sub(/^[[:space:]]*#.*/, "", line)
     gsub(/"[^"]*"/, "", line)
     gsub(q "[^" q "]*" q, "", line)
-    sub(/[[:space:]]#.*$/, "", line)
     joined = $0
-    sub(/^[[:space:]]*#.*/, "", joined)
-    sub(/[[:space:]]#.*$/, "", joined)
     ansic = (index(joined, "$" q) > 0)
     gsub(/\$\{[^}]*\}/, "", joined)
     gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", joined)
     gsub(/[$"]/, "", joined)
     gsub(q, "", joined)
     gsub(/\\/, "", joined)
+    joined = normalize_cmdpos(joined)
     if (ansic ||
         line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
+        line ~ /\{[^{}]*\.\.[^{}]*\}/ ||
         joined ~ /(^|[;&|()!])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
         joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": hash invocation: " $0 > "/dev/stderr"
@@ -4279,10 +4347,10 @@ if awk -v q="'" '
     }
   }
   END { exit bad ? 1 : 0 }
-' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`hash\` command-lookup poisoning (plain, parameter-expansion-rebuilt or quote-joined/ANSI-C/escaped spelling at a command position, incl. \`builtin\`/\`command hash\`) in the provision script (issue #143)"
+' "${PROVISION_CODE}"; then
+  ok "run-once: no \`hash\` command-lookup poisoning (plain, parameter-expansion-rebuilt, brace-sequence, reserved-word-separated or quote-joined/ANSI-C/escaped spelling at a command position, incl. \`builtin\`/\`command hash\`) in the provision script (issue #143)"
 else
-  bad "run-once: a \`hash\` command-lookup poisoning spelling appeared in the provision script — plain, parameter-expansion-rebuilt, quote-concatenated/ANSI-C/escaped at a command position, or \`builtin\`/\`command hash\`; the script has no legitimate \`hash\` call (issue #143)"
+  bad "run-once: a \`hash\` command-lookup poisoning spelling appeared in the provision script — plain, parameter-expansion-rebuilt, brace-sequence, reserved-word-separated, quote-concatenated/ANSI-C/escaped at a command position, or \`builtin\`/\`command hash\`; the script has no legitimate \`hash\` call (issue #143)"
 fi
 # r13 red-team HIGH 2/3: `enable -n exit` disables the `exit` builtin — with
 # a `command_not_found_handle` definition the at-bound `die`'s `exit 1` hit
@@ -4295,16 +4363,32 @@ fi
 # `command`-prefixed spellings) at a command position on the
 # expansion-stripped joined view, so `en${x}able`/`builtin h${x}ash` are
 # caught too. Deliberate over-refusal (fail-closed).
+#
+# r14 red-team: the same quoted-# decoy (`echo " # " ; trap …`) truncated
+# this view before the match, and the position class missed a command after
+# a reserved-word separator (`if true; then trap …`, `{ trap …; }`,
+# `time trap …`). The tooth now reads PROVISION_CODE (quote-aware comment
+# stripping) and runs the reserved-word normalizer before the match, so
+# `then`/`do`/`else`/`elif`/`time`/`{`/`}` all count as command positions.
 if awk -v q="'" '
+  function normalize_cmdpos(s,   prev) {
+    do {
+      prev = s
+      gsub(/(^|[;&|()!{}])[[:space:]]*(then|do|else|elif)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
+    } while (s != prev)
+    return s
+  }
   {
     line = $0
-    sub(/^[[:space:]]*#.*/, "", line)
-    sub(/[[:space:]]#.*$/, "", line)
     gsub(/\$\{[^}]*\}/, "", line)
     gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
     gsub(/[$"]/, "", line)
     gsub(q, "", line)
     gsub(/\\/, "", line)
+    line = normalize_cmdpos(line)
     if (line ~ /(^|[;&|()!])[[:space:]]*(builtin|enable|trap)([^[:alnum:]_]|$)/ ||
         line ~ /(^|[;&|()!])[[:space:]]*command[[:space:]]+(builtin|enable|trap)([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": command-position builtin/enable/trap invocation: " $0 > "/dev/stderr"
@@ -4312,10 +4396,10 @@ if awk -v q="'" '
     }
   }
   END { exit bad ? 1 : 0 }
-' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no command-position \`builtin\`/\`enable\`/\`trap\` invocation in the provision script (the rc-path builtins stay reachable, issue #143)"
+' "${PROVISION_CODE}"; then
+  ok "run-once: no command-position \`builtin\`/\`enable\`/\`trap\` invocation (incl. after reserved-word separators) in the provision script (the rc-path builtins stay reachable, issue #143)"
 else
-  bad "run-once: a command-position \`builtin\`/\`enable\`/\`trap\` invocation appeared in the provision script — it could disable the \`exit\` builtin or rewrite the process rc (issue #143)"
+  bad "run-once: a command-position \`builtin\`/\`enable\`/\`trap\` invocation (incl. after a reserved-word separator) appeared in the provision script — it could disable the \`exit\` builtin or rewrite the process rc (issue #143)"
 fi
 # r13 red-team MED: the script runs as root and can prepend a shadow dir to
 # `PATH`, planting a `systemctl` (or `sleep`) binary that misreports state —
@@ -4323,23 +4407,33 @@ fi
 # false for a self-editing root script. The shipped script never assigns,
 # exports or unsets `PATH` (the word appears in comments only); refuse
 # `PATH=`, `PATH+=`, `export PATH` and `unset PATH` in code.
-if awk '
+#
+# r14 red-team/functional: the same quoted-# decoy hid a `PATH=` assignment,
+# the quote-blind view falsely refused the shipped prose (`log
+# "PATH=${PATH}"`, `log "export PATH and unset PATH here"`), and the builtin
+# assignment forms (`printf -v PATH …`, `read -r PATH …`) slipped through.
+# The tooth now reads PROVISION_CODE (quote-aware comment stripping), drops
+# quoted spans (so quoted prose is not code), and adds the `printf -v PATH`
+# and `read … PATH` forms.
+if awk -v q="'" '
   {
     line = $0
-    sub(/^[[:space:]]*#.*/, "", line)
-    sub(/[[:space:]]#.*$/, "", line)
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
     if (line ~ /(^|[^[:alnum:]_])PATH\+?=/ ||
         line ~ /(^|[^[:alnum:]_])export[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[^[:alnum:]_])unset[[:space:]]+PATH([^[:alnum:]_]|$)/) {
+        line ~ /(^|[^[:alnum:]_])unset[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])printf[[:space:]]+-v[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": PATH assignment/export/unset: " $0 > "/dev/stderr"
       bad = 1
     }
   }
   END { exit bad ? 1 : 0 }
-' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: no \`PATH\` assignment/export/unset in the provision script (issue #143)"
+' "${PROVISION_CODE}"; then
+  ok "run-once: no \`PATH\` assignment/export/unset (incl. \`printf -v PATH\`/\`read … PATH\`) in the provision script (issue #143)"
 else
-  bad "run-once: a \`PATH\` assignment/export/unset appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a \`PATH\` assignment/export/unset or builtin assignment (\`printf -v PATH\`/\`read … PATH\`) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V4/V5): a command-word substitution redirected a drain
 # path invocation with no definition to count: `WITNESS_SYSTEMCTL=/bin/true`
