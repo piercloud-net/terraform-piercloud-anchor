@@ -176,7 +176,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=534  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 6 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal)
+MIN_CHECKS=535  # 516 (#151 matrix tooth) + 12 trailing-newline teeth (#152) + 7 drain-guard teeth (early-exit allowlist + activating/failed/deactivating/reloading state pins + the r7 comment/quoted trailing-backslash refusal + the r8 #-before-backslash refusal)
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3825,8 +3825,15 @@ if awk -v q="'" '
         if (c == "\"") { dq = 0; continue }
         continue
       }
+      if (ansic) {
+        if (esc) { esc = 0; continue }
+        if (c == "\\") { esc = 1; continue }
+        if (c == q) { ansic = 0; continue }
+        continue
+      }
       if (esc) { esc = 0; continue }
       if (c == "\\") { esc = 1; continue }
+      if (c == "$" && substr(line, i+1, 1) == q) { ansic = 1; i++; continue }
       if (c == q) { sq = 1; continue }
       if (c == "\"") { dq = 1; continue }
       if (c == "#" && (i == 1 || substr(line, i-1, 1) ~ /[[:space:];&|()]/)) { com = 1; break }
@@ -3848,6 +3855,19 @@ if awk -v q="'" '
   ok "run-once: the joined view consumes every real continuation (no comment/quoted trailing backslash)"
 else
   bad "run-once: a trailing backslash is not a bash continuation (comment/single-quoted/escaped) — refused fail-closed (issue #143)"
+fi
+# r8 red-team HIGH: a comment ends at the physical newline, so `# … \` does
+# not continue — the next line executes. Any line with a `#` before a
+# trailing backslash is refused fail-closed REGARDLESS of quote state: this
+# is the lexer-independent guard against a crafted quote-state desync (the
+# r8 `$'a\'"'` line flipped the join into a permanent double-quote state and
+# merged an executed line into a comment). The one legitimate occurrence (a
+# `#` inside the multi-line die string) was reworded away; the over-refusal
+# (a `#` inside any string/heredoc before a trailing backslash) is deliberate.
+if awk '/#.*\\[[:space:]]*$/ { print "line " NR " has a # before a trailing backslash — refused fail-closed" > "/dev/stderr"; bad = 1 } END { exit bad ? 1 : 0 }' "${PROVISION}"; then
+  ok "run-once: no # before a trailing backslash (a comment never continues)"
+else
+  bad "run-once: a line carries a # before a trailing backslash — the next line would execute while a joined scan hides it (issue #143)"
 fi
 if awk '
   /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {

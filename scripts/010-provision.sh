@@ -722,7 +722,7 @@ assert_no_key_leak() {
   done < <(compgen -G "${TANG_KEYS_DIR}/*.jwk" || true)
   if [ "${leaked}" -eq 1 ]; then
     die "tang key material matched a terraform state/plan file in $(pwd). \
-This violates the module's hard invariant #1 (tang keys never enter tf state). \
+This violates the module's hard invariant 1 (tang keys never enter tf state). \
 Do NOT apply that configuration; investigate before proceeding."
   fi
   log "Key-leak assertion: tang key material NOT present in terraform state files (OK)"
