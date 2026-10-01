@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=791
+MIN_CHECKS=810
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4664,6 +4664,107 @@ run_delta "${hb_merge_dir}"
 is "heartbeat merge filter: the next run still sees the new shaped heartbeat (cursor moves)" \
   "audit/heartbeat/${HB_NEW_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
 is "heartbeat merge filter: the unshaped key never forces a repair" "delta" "$(state_field observed.coverage.mode)"
+
+# RT4.1: a shaped key dated in the FUTURE sorts above the whole real key
+# space. Letting it move a cursor (sweep or delta merge) pins the cursor above
+# every real key: the next delta lists an empty tail while a real session gap
+# sits below it - green until the sweep. A future-<ts> key must never move a
+# cursor, and a persisted future cursor must fail closed into repair + sweep.
+# The calendar-invalid shape (`99999999T999999Z`) parses to nothing and is
+# rejected too.
+future_dir="${WORK}/state-future-cursor"
+FUT_KEY="audit/20270101T000000Z-user.login.1.json"
+FUT_HB_KEY="audit/heartbeat/20270101T000000Z.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${FUT_HB_KEY}","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"${FUT_KEY}","ago":60},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${future_dir}"
+is "future-ts keys: the sweep keeps the session cursor on the real shaped key" \
+  "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
+is "future-ts keys: the sweep keeps the heartbeat cursor on the real heartbeat" \
+  "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+FUT_HIDDEN_TS="$(audit_stamp -5)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${FUT_HB_KEY}","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"${FUT_KEY}","ago":60},
+  {"key":"audit/${FUT_HIDDEN_TS}-session.start.${NL_HIDDEN_SID}.0.json","ago":1200},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${future_dir}"
+is "future-ts keys: the next delta sees the new shaped session (no blind tail)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${NL_HIDDEN_SID}"*) ok "future-ts keys: the hidden session is gap-checked (recording-gap names it)" ;;
+  *) bad "future-ts keys second-delta detail: ${CASE_DETAIL}" ;;
+esac
+is "future-ts keys: the delta merge keeps the session cursor on the newest real key (never the future key)" \
+  "audit/${FUT_HIDDEN_TS}-session.start.${NL_HIDDEN_SID}.0.json" "$(state_field observed.cursors.audit_session)"
+is "future-ts keys: the delta merge keeps the heartbeat cursor on the real heartbeat" \
+  "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+
+# Forged state with a future-dated cursor (calendar-valid session-family,
+# calendar-invalid sid-less, future heartbeat): the load guard must reject it
+# (repair + sweep + error), never trust it as a shaped cursor.
+future_forge_dir="${WORK}/state-future-forge"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${future_forge_dir}"
+is "future cursor guard: the shaped warm sweep is green (control)" "ok" "${CASE_STATE}"
+for forged_future in "future session|audit_session|${FUT_KEY}" \
+                     "invalid-calendar session|audit_session|audit/99999999T999999Z-session.rejected.0.json" \
+                     "future heartbeat|audit_heartbeat|${FUT_HB_KEY}"; do
+  forged_kind="${forged_future%%|*}"
+  forged_rest="${forged_future#*|}"
+  forged_family="${forged_rest%%|*}"
+  forged_value="${forged_rest#*|}"
+  python3 - "${future_forge_dir}/state.json" "${forged_family}" "${forged_value}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"][sys.argv[2]] = sys.argv[3]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+  start_mock
+  run_delta "${future_forge_dir}"
+  is "future cursor (${forged_kind}): exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
+  is "future cursor (${forged_kind}): error verdict" "error" "${CASE_STATE}"
+  is "future cursor (${forged_kind}): the record is marked repaired" "True" "$(state_field repaired)"
+  case "${CASE_DETAIL}" in
+    *"future-dated"*) ok "future cursor (${forged_kind}): detail names the future-dated violation" ;;
+    *) bad "future cursor (${forged_kind}) detail: ${CASE_DETAIL}" ;;
+  esac
+done
 
 # An unknown cursor version is not trusted: the observed block must take the
 # repair + sweep path, never a delta (deleting the version guard would let a

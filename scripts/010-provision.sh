@@ -1535,6 +1535,30 @@ def is_recording_key(key, recordings_prefix):
         RECORDING_KEY_RE.match(key[len(recordings_prefix):]))
 
 
+def key_ts_is_future(now, relative_key, skew_tolerance):
+    """True when a shaped audit key's ``<ts>`` is future (or unparseable).
+
+    A cursor must never advance over a key dated in the future: the key sorts
+    above the whole real key space, so the next delta lists an empty tail while
+    real keys (and a hidden session's gap) sit below it - a false green bounded
+    only by the sweep interval (round-4 RT4.1). The bound is the same
+    clock-skew tolerance the LastModified checks use. A calendar-invalid
+    ``<ts>`` (the shape regex accepts any digits, e.g. ``99999999T999999Z``)
+    parses to nothing and is rejected too - fail closed. Recordings keys carry
+    no ``<ts>`` and never match a family here.
+    """
+    match = (SESSION_KEY_RE.match(relative_key)
+             or NON_SESSION_KEY_RE.match(relative_key)
+             or HEARTBEAT_KEY_RE.match(relative_key))
+    if not match:
+        return False
+    try:
+        moment = datetime.strptime(match.group("ts"), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return moment > now + timedelta(seconds=skew_tolerance)
+
+
 # Sid-less session.* event types documented by the shipper contract (Teleport
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
@@ -2358,24 +2382,31 @@ def _collect_families(config, boundaries=None):
     return audit_objects, recording_objects, uploads, audit_hidden, recording_hidden
 
 
-def _cursors_from_listings(config, audit_objects, recording_objects):
+def _cursors_from_listings(config, audit_objects, recording_objects, now):
     """High-water keys for the two audit streams + recordings from a listing.
 
     A cursor advances only over keys matching the family's own grammar
-    (is_audit_*_key / is_recording_key): an unshaped key - an acceptance
-    probe, contract drift - still enters the view (audit keys alert as
-    naming-contract/contract-mismatch drift; the recording checks skip
-    unshaped recordings keys), but it must never move a cursor past the real
-    key space, or the next delta lists an empty tail while recordings happen
-    (round-3 live-probe false green). The
+    (is_audit_*_key / is_recording_key) whose key ``<ts>`` is not future-dated
+    (key_ts_is_future): an unshaped key - an acceptance probe, contract drift -
+    still enters the view (audit keys alert as naming-contract/contract-mismatch
+    drift; the recording checks skip unshaped recordings keys), but it must
+    never move a cursor past the real key space, or the next delta lists an
+    empty tail while recordings happen (round-3 live-probe false green). A
+    future-dated shaped key sorts above the whole real key space and would pin
+    the cursor the same way (round-4 RT4.1); it stays a listed event, it just
+    never moves a cursor. The
     session family is additionally bounded above by the heartbeat stem: an
     exact `audit/heartbeat` object (or any key after it) is not a session
     key.
     """
-    heartbeat_keys = [key for key in audit_objects if is_audit_heartbeat_key(key, config.heartbeat_prefix)]
+    heartbeat_keys = [
+        key for key in audit_objects
+        if is_audit_heartbeat_key(key, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
     session_keys = [
         key for key in audit_objects
-        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)]
+        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
     recording_keys = [key for key in recording_objects if is_recording_key(key, config.recordings_prefix)]
     return {
         "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
@@ -2423,12 +2454,13 @@ def _list_cold_start_streams(config, window_start):
     return audit_objects, heartbeat_objects
 
 
-def _delta_repair_sweep(config, observed):
+def _delta_repair_sweep(config, observed, now):
     """Full sweep for a delta recovery (page overflow or cursor nonconformance).
 
     Returns the same shapes as the sweep branch of `run_checks`: a fresh
     object/upload/hidden view and fresh cursors, so the delta's untrusted
-    state is discarded rather than merged.
+    state is discarded rather than merged. `now` bounds the fresh cursors:
+    a future-dated key must not re-pin the rebuilt cursor (round-4 RT4.1).
     """
     boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
     audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
@@ -2438,7 +2470,7 @@ def _delta_repair_sweep(config, observed):
         if marker["key"].startswith(config.audit_prefix)
         or marker["key"].startswith(config.recordings_prefix)
     ]
-    return audit_objects, recording_objects, uploads, hidden_objects, _cursors_from_listings(config, audit_objects, recording_objects)
+    return audit_objects, recording_objects, uploads, hidden_objects, _cursors_from_listings(config, audit_objects, recording_objects, now)
 
 
 def run_checks(config, now, plan):
@@ -2477,13 +2509,13 @@ def run_checks(config, now, plan):
             or marker["key"].startswith(config.recordings_prefix)
         ]
         view_dirty = True
-        cursors = _cursors_from_listings(config, audit_objects, recording_objects)
+        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
     elif run_mode == "seed":
         recording_objects = list_objects(config, config.recordings_prefix)
         uploads = list_uploads(config, config.recordings_prefix)
         hidden_objects = []
         view_dirty = True
-        cursors = _cursors_from_listings(config, audit_objects, recording_objects)
+        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
     else:
         # Delta: the retained view plus the three cursored tails (two audit
         # streams + recordings). Versions are sweep-only, so the retained
@@ -2509,7 +2541,7 @@ def run_checks(config, now, plan):
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
             plan["performed_sweep"] = True
-            audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed)
+            audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
             new_audit = {}
             new_recordings = {}
             run_mode = "sweep"
@@ -2541,7 +2573,7 @@ def run_checks(config, now, plan):
             if violation:
                 log("WARNING: %s; repairing with a full sweep" % violation)
                 plan["performed_sweep"] = True
-                audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed)
+                audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
                 new_audit = {}
                 new_recordings = {}
                 run_mode = "sweep"
@@ -2553,15 +2585,18 @@ def run_checks(config, now, plan):
                 new_audit.update(new_session)
                 audit_objects.update(new_audit)
                 recording_objects.update(new_recordings)
-                # Same grammar filter as _cursors_from_listings: an unshaped
-                # key returned by a tail (an acceptance probe, drift) must
-                # never advance the cursor past the real key space.
+                # Same grammar + future-<ts> filter as _cursors_from_listings:
+                # an unshaped key returned by a tail (an acceptance probe,
+                # drift), or a shaped key dated in the future (sorting above
+                # the real key space), must never advance the cursor.
                 heartbeat_new = [
                     key for key in new_heartbeat
-                    if is_audit_heartbeat_key(key, config.heartbeat_prefix)]
+                    if is_audit_heartbeat_key(key, config.heartbeat_prefix)
+                    and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
                 session_new = [
                     key for key in new_session
-                    if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)]
+                    if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
+                    and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
                 recording_new = [
                     key for key in new_recordings
                     if is_recording_key(key, config.recordings_prefix)]
@@ -3195,7 +3230,7 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     return now_epoch - last_epoch >= int(window)
 
 
-def observed_problem(observed, record_run_seq, config=None):
+def observed_problem(observed, record_run_seq, config=None, now=None):
     """Fail-closed validation of the observed/coverage block ('' = valid).
 
     Any violation (wrong cursor version, bad types, a missing coverage record,
@@ -3266,6 +3301,14 @@ def observed_problem(observed, record_run_seq, config=None):
                 value, prefixes["audit_session"], prefixes["audit_heartbeat"])
         if not shaped:
             return "observed.cursors.%s does not match the witness key grammar: %r" % (name, value)
+        if now is not None and name != "recordings":
+            # A persisted cursor dated in the future sorts above the real key
+            # space and would list an empty tail while runs stay green
+            # (round-4 RT4.1): fail closed into repair + sweep. Recordings
+            # keys carry no <ts>.
+            tolerance = config.clock_skew_tolerance if config is not None else 0
+            if key_ts_is_future(now, value[len(prefixes[name]):], tolerance):
+                return "observed.cursors.%s is future-dated: %r" % (name, value)
     boundaries = observed.get("sweep_boundaries")
     if not isinstance(boundaries, list) or len(boundaries) > 32:
         return "observed.sweep_boundaries is invalid"
@@ -3510,7 +3553,7 @@ def main():
                 cold_start_reason = ("observed block is missing after an error verdict; "
                                      "cold-starting instead of dereferencing it")
         else:
-            observed_reason = observed_problem(previous_observed, previous.get("run_seq"), config)
+            observed_reason = observed_problem(previous_observed, previous.get("run_seq"), config, now)
     elif previous:
         # A pre-v3 record carries no observed block by construction (the
         # schema predates cursors). This is the live-box migration trace:
