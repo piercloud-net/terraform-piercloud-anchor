@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=697
+MIN_CHECKS=716
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -902,13 +902,17 @@ print(node)
 }
 
 force_sweep_state() { # rewrite a readable state.json into a valid, sweep-due observed block
+  # Optional second argument `keep-cursors` preserves the persisted cursors
+  # (the below-cursor replay tooth: the forced sweep must be able to catch a
+  # key below its own cursor, so it cannot be handed blank cursors).
   local state_path="$1/state.json"
   [ -f "${state_path}" ] || return 0
-  python3 - "${state_path}" <<'PY'
+  python3 - "${state_path}" "${2:-}" <<'PY'
 import json
 import sys
 
 path = sys.argv[1]
+keep_cursors = len(sys.argv) > 2 and sys.argv[2] == "keep-cursors"
 try:
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
@@ -921,6 +925,9 @@ if isinstance(run_seq, bool) or not isinstance(run_seq, int) or run_seq < 0:
     run_seq = 0
 existing = data.get("observed") if isinstance(data.get("observed"), dict) else {}
 boundaries = existing.get("sweep_boundaries") if isinstance(existing.get("sweep_boundaries"), list) else []
+cursors = existing.get("cursors") if isinstance(existing.get("cursors"), dict) else {}
+if not keep_cursors:
+    cursors = {"audit_heartbeat": "", "audit_session": "", "recordings": ""}
 data["observed"] = {
     "cursor_version": 1,
     "generation": 1,
@@ -930,7 +937,7 @@ data["observed"] = {
     "sweep_due_epoch": 0,
     "sweep_failed": False,
     "coverage": {"mode": "sweep", "window_start": None, "compact_blind": False},
-    "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
+    "cursors": cursors,
     # Keep prior boundaries: a forced sweep may still range-split, and the
     # union of the branches is the same key set whichever boundaries were
     # sampled from an earlier fixture.
@@ -3287,9 +3294,15 @@ BigHandler.status = 500
 status, body = module.signed_get(config, {"list-type": "2", "prefix": "audit/"})
 if status != 500 or len(body) != 1024:
     raise SystemExit("an oversized non-2xx body must be truncated to MAX_ERROR_BODY (got %d bytes)" % len(body))
+# F4 tooth: the truncation leaves the rest of the body unread, so the pooled
+# keep-alive connection can no longer be reused; it must be dropped now, or
+# the next request burns the one bounded reconnect on a dead socket (an
+# extra Class C call).
+if getattr(module._TRANSPORT, "connection", None) is not None:
+    raise SystemExit("a truncated error body must drop the pooled connection")
 module.close_connections()
 server.shutdown()
-print("body caps: 2xx over cap raised; non-2xx truncated at cap")
+print("body caps: 2xx over cap raised; non-2xx truncated at cap; truncated pool dropped")
 PY
 then ok "transport bounds 2xx bodies (fail-closed) and truncates error bodies"; else bad "transport body-bound test failed"; fi
 
@@ -3638,7 +3651,11 @@ JSON
 start_mock
 RECORDING_WITNESS_COLD_START_SECONDS=3600 run_delta "${failed_seed_dir}"
 unset RECORDING_WITNESS_COLD_START_SECONDS
-is "failed cold start: the retry does not crash (exit 1, not 2/AttributeError)" "1" "${CASE_RC}"
+if [ "${CASE_RC}" = "1" ] && ! grep -q "Traceback" "${WORK}/witness.err"; then
+  ok "failed cold start: the retry does not crash (exit 1, no Traceback)"
+else
+  bad "failed cold start: the retry does not crash (exit 1, no Traceback) (rc='${CASE_RC}')"
+fi
 is "failed cold start: the retry re-seeds (alert, never green)" "alert" "${CASE_STATE}"
 is "failed cold start: the retry wrote a seed block" "seed" "$(state_field observed.coverage.mode)"
 case "${CASE_DETAIL}" in
@@ -3851,7 +3868,10 @@ PY
 then ok "below-cursor replay: the fast delta's session marker excludes it"; else bad "below-cursor replay request shape failed"; fi
 cat "${WORK}/requests-delta-replay.log" >>"${SAVED_REQUEST_LOG}"
 REQUEST_LOG="${SAVED_REQUEST_LOG}"
-force_sweep_state "${delta_dir}"
+replay_cursor="$(state_field observed.cursors.audit_session)"
+force_sweep_state "${delta_dir}" keep-cursors
+is "below-cursor replay: the forced sweep keeps the persisted cursors" \
+  "${replay_cursor}" "$(state_field observed.cursors.audit_session)"
 start_mock
 run_delta "${delta_dir}"
 is "below-cursor replay: the forced sweep catches the duplicate" "alert" "${CASE_STATE}"
@@ -4125,6 +4145,73 @@ case "${CASE_DETAIL}" in
   *) bad "forged session cursor detail: ${CASE_DETAIL}" ;;
 esac
 is "forged session cursor: the record is marked repaired" "True" "$(state_field repaired)"
+
+# RF1: the heartbeat boundary is the stem, not the trailing-slash prefix. The
+# old guard rejected only `audit/heartbeat/...`, so `audit_session` equal to
+# the exact stem or to any key after it (`audit/i`, `audit/zzz`) - all sort
+# above every real session key (which start with a digit) - passed as a
+# trustworthy cursor: the session delta listed an empty tail and a fresh
+# session.start with no tar was never gap-checked while the run stayed green.
+# Every forged value must take the repair + sweep + error path.
+stem_cursor_dir="${WORK}/state-stem-cursor"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${stem_cursor_dir}"
+is "stem session cursor: the warm sweep is green" "ok" "${CASE_STATE}"
+for forged_cursor in "audit/heartbeat" "audit/i" "audit/zzz"; do
+  python3 - "${stem_cursor_dir}/state.json" "${forged_cursor}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"]["audit_session"] = sys.argv[2]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  run_delta "${stem_cursor_dir}"
+  is "stem session cursor (${forged_cursor}): exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
+  is "stem session cursor (${forged_cursor}): error verdict" "error" "${CASE_STATE}"
+  is "stem session cursor (${forged_cursor}): the record is marked repaired" "True" "$(state_field repaired)"
+done
+
+# An exact `audit/heartbeat` object is malformed drift, not a session key: it
+# sorts above every real session key, so a listing that let it become the
+# session cursor would blind the next delta (and the run after that would
+# repair). The sweep must still see it (contract drift), while neither the
+# sweep cursor computation nor the delta's max() may let it advance the
+# session cursor.
+stem_object_dir="${WORK}/state-heartbeat-stem-object"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat","ago":60},
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${stem_object_dir}"
+is "heartbeat stem object: the sweep keeps the session cursor below the stem" \
+  "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
+is "heartbeat stem object: the sweep keeps the heartbeat cursor a real heartbeat key" \
+  "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+case "${CASE_DETAIL}" in
+  *contract*) ok "heartbeat stem object: the malformed key is still flagged as drift" ;;
+  *) bad "heartbeat stem object detail: ${CASE_DETAIL}" ;;
+esac
+run_delta "${stem_object_dir}"
+is "heartbeat stem object: the delta does not advance the session cursor to the stem" \
+  "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
+is "heartbeat stem object: the next run stays a delta" "delta" "$(state_field observed.coverage.mode)"
 
 # An unknown cursor version is not trusted: the observed block must take the
 # repair + sweep path, never a delta (deleting the version guard would let a
@@ -4683,6 +4770,40 @@ is "unordered page: the session key after the heartbeat is still seen" "alert" "
 case "${CASE_DETAIL}" in
   *recording-gap*) ok "unordered page: detail names the recording-gap the early stop would hide" ;;
   *) bad "unordered page detail: ${CASE_DETAIL}" ;;
+esac
+
+# FF2: the early stop must not fire on a truncated page. With page_size=1 the
+# first page ([heartbeat]) is trivially "ordered", so the old guard returned
+# at the heartbeat and never fetched page 2 - where the nonconformant server
+# put the fresh session key - leaving the run green. Only a complete
+# (IsTruncated=false) ordered page may end the session stream.
+cross_page_dir="${WORK}/state-unordered-cross-page"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${cross_page_dir}"
+is "cross-page heartbeat: the warm sweep is green" "ok" "${CASE_STATE}"
+CROSS_TS="$(audit_stamp -5)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,"list_order":"fixture",
+ "objects":[
+  {"key":"audit/heartbeat/$(audit_stamp -30).json","ago":30},
+  {"key":"audit/${CROSS_TS}-session.start.1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e.0.json","ago":1200},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${cross_page_dir}"
+is "cross-page heartbeat: the session key on page 2 is still seen" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *recording-gap*) ok "cross-page heartbeat: detail names the recording-gap the early stop would hide" ;;
+  *) bad "cross-page heartbeat detail: ${CASE_DETAIL}" ;;
 esac
 
 # R3: the recordings tail is key-ordered (<sid>.tar carries no timestamp), so
