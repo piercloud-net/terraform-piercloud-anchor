@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=755
+MIN_CHECKS=791
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3351,6 +3351,11 @@ print("stale-pool: 1 dropped, %d served, %d requests" % (len(served), len(entrie
 PY
 then ok "stale pooled connection: one dropped attempt is followed by a served re-send"; else bad "stale-pool retry evidence missing"; fi
 
+# The displayed heartbeat age can tick across a whole second between two
+# runs (the bucket timestamps are second-resolution); the finding set is the
+# stable identity, so normalize only the age fragment before comparing.
+norm_detail() { printf '%s' "$1" | sed 's/heartbeat_age=[0-9]*s/heartbeat_age=X/'; }
+
 # Worker parity: the parallel family fan-out must not change the verdict,
 # detail or finding signature. Same fixture, fresh state dirs, workers 1 vs 4.
 parity_dir_serial="${WORK}/state-parity-serial"
@@ -3374,7 +3379,7 @@ run_case "${parity_dir_parallel}"
 unset RECORDING_WITNESS_LIST_WORKERS
 is "worker parity: rc identical (serial vs 4 workers)" "${serial_rc}" "${CASE_RC}"
 is "worker parity: verdict identical" "${serial_state}" "${CASE_STATE}"
-is "worker parity: detail identical" "${serial_detail}" "${CASE_DETAIL}"
+is "worker parity: detail identical" "$(norm_detail "${serial_detail}")" "$(norm_detail "${CASE_DETAIL}")"
 if [ -n "${LIST_WORKERS_OVERRIDE}" ]; then export RECORDING_WITNESS_LIST_WORKERS="${LIST_WORKERS_OVERRIDE}"; fi
 
 # M1: the parity teeth compare verdicts, which stay identical even if the
@@ -3782,7 +3787,6 @@ is "quiet delta: compact_blind stays clear" "False" "$(state_field observed.cove
 # The displayed heartbeat age can tick across a whole second between two
 # runs (the bucket timestamps are second-resolution); the finding set is the
 # stable identity, so normalize only the age fragment before comparing.
-norm_detail() { printf '%s' "$1" | sed 's/heartbeat_age=[0-9]*s/heartbeat_age=X/'; }
 warm_detail_norm="$(norm_detail "${warm_detail}")"
 is "quiet delta: detail identical to the sweep (age normalized)" "${warm_detail_norm}" "$(norm_detail "${CASE_DETAIL}")"
 is "quiet delta: finding signature identical to the sweep" "${warm_signature}" "$(state_field signature)"
@@ -4396,6 +4400,270 @@ case "${CASE_DETAIL}" in
 esac
 is "live recordings probe: the delta keeps the cursor on the new shaped tar" \
   "recordings/${LIVE_TAR_NEW}" "$(state_field observed.cursors.recordings)"
+
+# RF3.1: the family regexes are `\Z`-anchored (Python's `$` also matches
+# before a trailing newline). A bucket key ending `json\n`/`tar\n` used to
+# pass both the shape predicates and the classifier's own regexes: the sweep
+# cursor moved onto it (it sorts above every real key), the classifier read
+# it as a shipped session/heartbeat/recording key, and the next delta listed
+# an empty tail while a real recording gap sat below the cursor - green.
+# Such a key must be drift that never moves a cursor; the shaped keys beside
+# it keep the cursors and the delta still sees a hidden session's gap.
+newline_dir="${WORK}/state-trailing-newline"
+NL_TS="$(audit_stamp -20)"
+NL_HIDDEN_TS="$(audit_stamp -60)"
+NL_SID="7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b"
+NL_HIDDEN_SID="1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json\n","ago":59},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/${NL_TS}-session.start.${NL_SID}.0.json\n","ago":20},
+  {"key":"audit/${NL_TS}-user.login.1.json\n","ago":19},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"recordings/${NL_SID}.tar\n","ago":18}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${newline_dir}"
+is "trailing-newline keys: the sweep keeps the session cursor on the shaped key" \
+  "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
+is "trailing-newline keys: the sweep keeps the heartbeat cursor on the shaped key" \
+  "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+is "trailing-newline keys: the sweep keeps the recordings cursor on the shaped tar" \
+  "recordings/${SID}.tar" "$(state_field observed.cursors.recordings)"
+case "${CASE_DETAIL}" in
+  *naming-contract*) ok "trailing-newline session key: the drift is flagged (naming-contract)" ;;
+  *) bad "trailing-newline session key detail: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *contract-mismatch*) ok "trailing-newline non-session/heartbeat keys: the drift is flagged (contract-mismatch)" ;;
+  *) bad "trailing-newline non-session detail: ${CASE_DETAIL}" ;;
+esac
+# The delta must still see a new shaped session: with the cursor poisoned onto
+# `...json\n` (the pre-\Z bug) the tail is empty and the hidden gap stays ok.
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json\n","ago":59},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/${NL_TS}-session.start.${NL_SID}.0.json\n","ago":20},
+  {"key":"audit/${NL_TS}-user.login.1.json\n","ago":19},
+  {"key":"audit/${NL_HIDDEN_TS}-session.start.${NL_HIDDEN_SID}.0.json","ago":1200},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"recordings/${NL_SID}.tar\n","ago":18}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${newline_dir}"
+is "trailing-newline keys: the next delta sees the new shaped session (no blind tail)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${NL_HIDDEN_SID}"*) ok "trailing-newline keys: the hidden session is gap-checked (recording-gap names it)" ;;
+  *) bad "trailing-newline keys second-delta detail: ${CASE_DETAIL}" ;;
+esac
+
+# Forged state with a trailing-newline cursor: the load guard must reject it
+# (repair + sweep + error), never trust it as a shaped cursor; the shaped
+# control is green.
+newline_forge_dir="${WORK}/state-newline-forge"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${newline_forge_dir}"
+is "newline cursor guard: the shaped warm sweep is green (control)" "ok" "${CASE_STATE}"
+NL_FORGE_SESSION="audit/${DELTA_START_TS}-session.start.${SID}.0.json"$'\n'
+NL_FORGE_NONSESSION="audit/${DELTA_START_TS}-user.login.1.json"$'\n'
+NL_FORGE_HEARTBEAT="audit/heartbeat/${DELTA_HEARTBEAT_TS}.json"$'\n'
+NL_FORGE_RECORDING="recordings/${SID}.tar"$'\n'
+NL_FORGE_HIDDEN="audit/20200101T000000Z-session.start.${NL_HIDDEN_SID}.0.json"
+for forged_pair in "session|audit_session|${NL_FORGE_SESSION}" \
+                   "non-session|audit_session|${NL_FORGE_NONSESSION}" \
+                   "heartbeat|audit_heartbeat|${NL_FORGE_HEARTBEAT}" \
+                   "recordings|recordings|${NL_FORGE_RECORDING}"; do
+  forged_kind="${forged_pair%%|*}"
+  forged_rest="${forged_pair#*|}"
+  forged_family="${forged_rest%%|*}"
+  forged_value="${forged_rest#*|}"
+  python3 - "${newline_forge_dir}/state.json" "${forged_family}" "${forged_value}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"][sys.argv[2]] = sys.argv[3]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"${NL_FORGE_HIDDEN}","ago":1200},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+  start_mock
+  run_delta "${newline_forge_dir}"
+  is "newline cursor (${forged_kind}, ${forged_family}): exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
+  is "newline cursor (${forged_kind}, ${forged_family}): error verdict" "error" "${CASE_STATE}"
+  is "newline cursor (${forged_kind}, ${forged_family}): the record is marked repaired" "True" "$(state_field repaired)"
+  case "${CASE_DETAIL}" in
+    *"key grammar"*) ok "newline cursor (${forged_kind}, ${forged_family}): detail names the key-grammar violation" ;;
+    *) bad "newline cursor (${forged_kind}, ${forged_family}) detail: ${CASE_DETAIL}" ;;
+  esac
+done
+
+# TF3.1: `is_audit_session_key` must also mirror the classifier's drift rule.
+# A NON_SESSION-shaped `session.*` key with no sid is naming-contract drift,
+# not a documented non-session event; the predicate used to accept ANY
+# NON_SESSION match, so a drift key (sorting above the real key space) could
+# move the cursor and, forged into state, blind the delta green.
+drift_key="audit/20270101T000000Z-session.start.0.json"
+drift_dir="${WORK}/state-drift-cursor"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"${drift_key}","ago":60}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${drift_dir}"
+is "drift session key: the sweep keeps the session cursor on the shaped key" \
+  "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
+case "${CASE_DETAIL}" in
+  *naming-contract*) ok "drift session key: the classifier still flags it (naming-contract)" ;;
+  *) bad "drift session key detail: ${CASE_DETAIL}" ;;
+esac
+python3 - "${drift_dir}/state.json" "${drift_key}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"]["audit_session"] = sys.argv[2]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+DRIFT_HIDDEN_TS="$(audit_stamp -5)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"${drift_key}","ago":60},
+  {"key":"audit/${DRIFT_HIDDEN_TS}-session.start.${NL_HIDDEN_SID}.0.json","ago":1200},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${drift_dir}"
+is "drift session cursor (forged): exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
+is "drift session cursor (forged): error verdict" "error" "${CASE_STATE}"
+is "drift session cursor (forged): the record is marked repaired" "True" "$(state_field repaired)"
+
+# The drift mirror must not over-reject the documented sid-less session event:
+# `session.rejected` and its replay-conflict variant keep the non-session
+# shape and must stay valid cursor movers (sweep and delta).
+rejected_dir="${WORK}/state-rejected-cursor"
+REJ_TS="$(audit_stamp -100)"
+REJ_VAR_TS="$(audit_stamp -90)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"audit/${REJ_TS}-session.rejected.000001.json","ago":100},
+  {"key":"audit/${REJ_VAR_TS}-session.rejected_0123456789abcdef.000002.json","ago":90}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${rejected_dir}"
+is "sid-less session.rejected: the sweep advances the cursor over the documented key" \
+  "audit/${REJ_VAR_TS}-session.rejected_0123456789abcdef.000002.json" \
+  "$(state_field observed.cursors.audit_session)"
+REJ2_TS="$(audit_stamp -2)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"audit/${REJ_TS}-session.rejected.000001.json","ago":100},
+  {"key":"audit/${REJ_VAR_TS}-session.rejected_0123456789abcdef.000002.json","ago":90},
+  {"key":"audit/${REJ2_TS}-session.rejected.000003.json","ago":2}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${rejected_dir}"
+is "sid-less session.rejected: the delta also advances over it" \
+  "audit/${REJ2_TS}-session.rejected.000003.json" "$(state_field observed.cursors.audit_session)"
+
+# FF3.1: the delta merge's heartbeat filter needs its own tooth. An unshaped
+# key in the heartbeat tail (`audit/heartbeat/9`) must not advance the
+# heartbeat cursor: it sorts above every real `<ts>.json` key, so the next
+# tail would list nothing and freshness would read the stale retained
+# heartbeat. The unshaped key stays a finding.
+hb_merge_dir="${WORK}/state-hb-merge"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${hb_merge_dir}"
+is "heartbeat merge filter: the warm sweep is green" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/heartbeat/9","ago":30},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${hb_merge_dir}"
+is "heartbeat merge filter: the delta keeps the cursor on the shaped heartbeat" \
+  "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+case "${CASE_DETAIL}" in
+  *contract-mismatch*) ok "heartbeat merge filter: the unshaped heartbeat key is still flagged" ;;
+  *) bad "heartbeat merge filter detail: ${CASE_DETAIL}" ;;
+esac
+# A new shaped heartbeat above the poisoned cursor (the mutant keeps `9`) must
+# still be seen: with the cursor at `9` the next run can only repair.
+HB_NEW_TS="$(audit_stamp -2)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/heartbeat/9","ago":30},
+  {"key":"audit/heartbeat/${HB_NEW_TS}.json","ago":2},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${hb_merge_dir}"
+is "heartbeat merge filter: the next run still sees the new shaped heartbeat (cursor moves)" \
+  "audit/heartbeat/${HB_NEW_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+is "heartbeat merge filter: the unshaped key never forces a repair" "delta" "$(state_field observed.coverage.mode)"
 
 # An unknown cursor version is not trusted: the observed block must take the
 # repair + sweep path, never a delta (deleting the version guard would let a
