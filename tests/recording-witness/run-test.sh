@@ -99,7 +99,7 @@
 #       (0:0 / 1:1 / 1:2) -> ok/alert/error and dies when the unit demonstrably
 #       did not run (status unset/203, unpaired rc, or a wedged start whose
 #       InvocationID did not advance); the timer's immediate first fire on a
-#       long-up box (issue #143) is drained (bounded, 100 polls) before the
+#       long-up box (issue #143) is drained (bounded, 3600 polls) before the
 #       capture and retried exactly once if a start still merged with it, so a
 #       merged timer-triggered invocation is never mis-filed as a stale start
 #       (a merged write followed by a failed retry write dies on the
@@ -146,7 +146,20 @@
 #       instead of aborting the run or echoing the token, ntfy redirects are
 #       refused and the signed S3 list GETs refuse redirects too (a 3xx never
 #       re-sends an Authorization header to another host/scheme),
-#       and steady ok stays silent afterwards (fake notifier, no network).
+#       and steady ok stays silent afterwards (fake notifier, no network);
+#   (k) delta cursors + merged sweeps (issue #153): a warm sweep writes the
+#       three high-water cursors and the view.json sidecar; a quiet run makes
+#       only the three cursored tails plus the full multipart family (no
+#       versions, no unfiltered object pages) and returns the byte-identical
+#       verdict/signature; a replayed below-cursor key is caught at the forced
+#       sweep; a delete marker on an old key lands at the sweep bound; cursor
+#       loss, a foreign/out-of-prefix cursor and a mismatched view all take
+#       the preserve+repair+unfiltered-sweep path with an error verdict (never
+#       green); a failed sweep latches until one succeeds; a quiet delta never
+#       re-seeds and advances run_seq; the seed defers the first sweep and
+#       still reports the cold-start alert; range-split sweeps equal a serial
+#       sweep and use the persisted boundaries; delta tails follow pagination;
+#       a delta listing that returns a key at/below its cursor errors closed.
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -176,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=516
+MIN_CHECKS=634
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4608,11 +4621,11 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 # either way). FAKE_SLEEP_NOWAIT keeps the 3600 iterations but removes their
 # wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
 # FAKE_ACTIVE_POLL_FILE pins the iteration count (3600 loop polls + the final
-# ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
+# ActiveState read for the die message = 3601), FAKE_SLEEP_COUNT_FILE pins
 # the sleeps (3600) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
 # bound regression fails whether it changes the poll count, the sleep count
 # or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
-# break) instead of shipping with a stale "100s" message. The count/arg
+# break) instead of shipping with a stale "3600s" message. The count/arg
 # teeth pin volume, not the shape: FAKE_ACTIVE_POLL_SLEEP_FILE records the
 # sleep count observed at every poll so the interleaving tooth (poll N must
 # see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
