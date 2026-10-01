@@ -1759,6 +1759,11 @@ def _read_body(response, limit, truncate):
         total += len(chunk)
         if total > limit:
             if truncate:
+                # The rest of the body stays unread, so the pooled keep-alive
+                # connection cannot be reused (the next request would fail on
+                # it and burn the one bounded reconnect - an extra Class C
+                # call). Drop it now; the next request opens a fresh socket.
+                _drop_connection()
                 return b"".join(chunks)[:limit]
             raise WitnessError("S3 response body exceeds %d bytes" % limit)
     return b"".join(chunks)
@@ -1867,6 +1872,7 @@ def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pa
             raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
         truncated = False
         next_token = ""
+        entries = []
         for child in root:
             name = local_name(child.tag)
             if name == "Contents":
@@ -1879,14 +1885,7 @@ def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pa
                     elif field_name == "LastModified":
                         last_modified = field.text or ""
                 if key:
-                    if stop_at_heartbeat and key.startswith(config.heartbeat_prefix):
-                        # Everything from here on sorts at/after the heartbeat
-                        # subtree: the session stream is complete.
-                        return objects
-                    try:
-                        objects[key] = parse_timestamp(last_modified)
-                    except ValueError:
-                        raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+                    entries.append((key, last_modified))
             elif name == "IsTruncated":
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextContinuationToken":
@@ -1900,6 +1899,23 @@ def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pa
             # IsTruncated=false. Follow the token instead of reading the short
             # page as complete; the token-required guard below still applies.
             truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = stop_at_heartbeat and ordered and any(
+            key.startswith(config.heartbeat_prefix) for key in keys)
+        for key, last_modified in entries:
+            if stop_at_heartbeat and key.startswith(config.heartbeat_prefix):
+                if crossed:
+                    # An ordered page: every later key sorts at/after the
+                    # heartbeat subtree, so the session stream ends here. A
+                    # nonconformant unordered page is filtered entry-by-entry
+                    # and never used as an early-stop signal.
+                    return objects
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
         if not truncated:
             return objects
         if not next_token:
@@ -2341,6 +2357,24 @@ def _list_cold_start_streams(config, window_start):
     return audit_objects, heartbeat_objects
 
 
+def _delta_repair_sweep(config, observed):
+    """Full sweep for a delta recovery (page overflow or cursor nonconformance).
+
+    Returns the same shapes as the sweep branch of `run_checks`: a fresh
+    object/upload/hidden view and fresh cursors, so the delta's untrusted
+    state is discarded rather than merged.
+    """
+    boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+    audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
+    hidden_objects = [
+        marker
+        for marker in audit_hidden + recording_hidden
+        if marker["key"].startswith(config.audit_prefix)
+        or marker["key"].startswith(config.recordings_prefix)
+    ]
+    return audit_objects, recording_objects, uploads, hidden_objects, _cursors_from_listings(config, audit_objects, recording_objects)
+
+
 def run_checks(config, now, plan):
     # NB: `mode` is the per-key session mode inside the check loops below, so
     # the run mode needs its own name.
@@ -2364,6 +2398,10 @@ def run_checks(config, now, plan):
             run_mode = "sweep"
             window_text = None
     if run_mode == "sweep":
+        # A sweep that starts and then fails must latch, so record that the
+        # sweep was actually attempted (a planned sweep or an internal
+        # seed/delta fallback), not merely that the plan said "sweep".
+        plan["performed_sweep"] = True
         boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
         audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
         hidden_objects = [
@@ -2404,45 +2442,58 @@ def run_checks(config, now, plan):
                 config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
-            boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
-            audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
-            hidden_objects = [
-                marker
-                for marker in audit_hidden + recording_hidden
-                if marker["key"].startswith(config.audit_prefix)
-                or marker["key"].startswith(config.recordings_prefix)
-            ]
+            plan["performed_sweep"] = True
+            audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed)
             new_audit = {}
             new_recordings = {}
             run_mode = "sweep"
             window_text = None
             view_dirty = True
-            cursors = _cursors_from_listings(config, audit_objects, recording_objects)
         else:
             # A cursor is a high-water key: a conformant listing never returns
             # a key at or below it (start-after is exclusive). A server that
             # does is nonconformant and must fail closed, never silently
-            # re-read or skip keys.
+            # re-read or skip keys. The documented trace is preserve-and-repair:
+            # discard the delta, rebuild with a full sweep in this run, and
+            # report error (never green) so the rebuilt block serves the next
+            # fast run.
+            violation = ""
             for key in new_heartbeat:
                 if heartbeat_cursor and key <= heartbeat_cursor:
-                    raise WitnessError("heartbeat delta returned %s at or below its cursor" % clip(key, 120))
-            for key in new_session:
-                if session_cursor and key <= session_cursor:
-                    raise WitnessError("session delta returned %s at or below its cursor" % clip(key, 120))
-            for key in new_recordings:
-                if recording_cursor and key <= recording_cursor:
-                    raise WitnessError("recordings delta returned %s at or below its cursor" % clip(key, 120))
-            new_audit.update(new_heartbeat)
-            new_audit.update(new_session)
-            audit_objects.update(new_audit)
-            recording_objects.update(new_recordings)
-            if new_heartbeat:
-                cursors["audit_heartbeat"] = max(new_heartbeat)
-            if new_session:
-                cursors["audit_session"] = max(new_session)
-            if new_recordings:
-                cursors["recordings"] = max(new_recordings)
-            view_dirty = bool(new_audit or new_recordings)
+                    violation = "heartbeat delta returned %s at or below its cursor" % clip(key, 120)
+                    break
+            if not violation:
+                for key in new_session:
+                    if session_cursor and key <= session_cursor:
+                        violation = "session delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if not violation:
+                for key in new_recordings:
+                    if recording_cursor and key <= recording_cursor:
+                        violation = "recordings delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if violation:
+                log("WARNING: %s; repairing with a full sweep" % violation)
+                plan["performed_sweep"] = True
+                audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed)
+                new_audit = {}
+                new_recordings = {}
+                run_mode = "sweep"
+                window_text = None
+                view_dirty = True
+                plan["cursor_repair_reason"] = violation
+            else:
+                new_audit.update(new_heartbeat)
+                new_audit.update(new_session)
+                audit_objects.update(new_audit)
+                recording_objects.update(new_recordings)
+                if new_heartbeat:
+                    cursors["audit_heartbeat"] = max(new_heartbeat)
+                if new_session:
+                    cursors["audit_session"] = max(new_session)
+                if new_recordings:
+                    cursors["recordings"] = max(new_recordings)
+                view_dirty = bool(new_audit or new_recordings)
     # Overlapping watched prefixes report one marker twice (same key + version
     # id in both listings); count each hidden version once.
     hidden_by_version = {}
@@ -3108,6 +3159,13 @@ def observed_problem(observed, record_run_seq, config=None):
             continue
         if not isinstance(value, str) or not value.startswith(prefix):
             return "observed.cursors.%s is invalid: %r" % (name, value)
+    session_cursor = cursors.get("audit_session")
+    if isinstance(session_cursor, str) and session_cursor.startswith(prefixes["audit_heartbeat"]):
+        # The two audit streams partition the ordered key space: a session
+        # cursor at/under the heartbeat prefix would make the session delta
+        # list an empty tail while real session keys sit below it (a
+        # forged-state false green). Fail closed into repair + sweep.
+        return "observed.cursors.audit_session is under the heartbeat prefix: %r" % session_cursor
     boundaries = observed.get("sweep_boundaries")
     if not isinstance(boundaries, list) or len(boundaries) > 32:
         return "observed.sweep_boundaries is invalid"
@@ -3265,6 +3323,7 @@ def main():
     signature = finding_signature("error", [])
     state = "error"
     detail = "error: witness did not run"
+    payload = None
     coverage = None
 
     # The state dir comes first: the observed/coverage block decides whether
@@ -3335,19 +3394,35 @@ def main():
     # cold start, not a corruption.
     previous_observed = previous.get("observed") if isinstance(previous.get("observed"), dict) else None
     observed_reason = ""
+    cold_start_reason = ""
     if previous and previous.get("version") == STATE_VERSION:
         if previous_observed is None:
             # A missing block after a non-error verdict means the cursor/view
             # was lost or tampered with: fail-closed repair + sweep. After an
             # error verdict the block may simply never have been built (the
             # failing run could not list), so this is a cold start, not
-            # corruption.
+            # corruption - the run must re-seed instead of dereferencing the
+            # missing block (a failed cold start otherwise wedges every later
+            # run with AttributeError before state/verdict are written).
             if previous.get("state") != "error":
                 observed_reason = "observed block is missing from a version-%d record" % STATE_VERSION
+            else:
+                cold_start_reason = ("observed block is missing after an error verdict; "
+                                     "cold-starting instead of dereferencing it")
         else:
             observed_reason = observed_problem(previous_observed, previous.get("run_seq"), config)
+    elif previous:
+        # A pre-v3 record carries no observed block by construction (the
+        # schema predates cursors). This is the live-box migration trace:
+        # fail-closed repair + full sweep rebuilds the block, never a silent
+        # seed and never a delta.
+        observed_reason = ("state record version %r predates cursor version %d; "
+                           "rebuilding the observed block with a full sweep"
+                           % (previous.get("version"), STATE_VERSION))
     if observed_reason:
         log("WARNING: invalid observed state discarded for a repair sweep: %s" % clip(observed_reason, 200))
+    if cold_start_reason:
+        log("WARNING: %s" % clip(cold_start_reason, 200))
     forced_reason = state_bad_reason or observed_reason
     if forced_reason:
         # Nothing read from the stale view survives the repair: this run
@@ -3356,7 +3431,10 @@ def main():
 
     plan = {"mode": "sweep"}
     if config is not None and not forced_reason:
-        cold_start = not previous or previous.get("version") != STATE_VERSION
+        # `previous_observed` is None here only for a first run, a v3 error
+        # record with no block, or a foreign-version record (which took the
+        # repair path above): all three are cold starts.
+        cold_start = previous_observed is None
         if cold_start:
             if config.cold_start_seconds > 0:
                 plan = {"mode": "seed", "window_start": now - timedelta(seconds=config.cold_start_seconds)}
@@ -3396,6 +3474,17 @@ def main():
             # so a stale cross-run socket must not survive a systemd retry.
             close_connections()
     detail = clip(detail, 1000)
+
+    if payload is not None and plan.get("cursor_repair_reason"):
+        # A nonconformant delta was repaired with a full sweep in this run:
+        # the delta is untrusted, so the verdict is error (never green) and
+        # the rebuilt block is marked repaired. See docs/recording-witness.md
+        # (preserve-and-repair).
+        observed_reason = "delta cursor nonconformance: %s" % plan["cursor_repair_reason"]
+        if state != "error":
+            state = "error"
+            detail = clip("error: %s" % observed_reason, 1000)
+        signature = finding_signature("error", [])
 
     if forced_reason:
         if state != "error":
@@ -3445,12 +3534,14 @@ def main():
         if payload.get("dirty"):
             view_to_write = view_record(observed_out, payload)
     elif observed_out is not None:
-        # The checks could not run: the previous view is unchanged. A failed
-        # sweep latches (every later run forces a sweep until one succeeds);
+        # The checks could not run: the previous view is unchanged. A sweep
+        # that actually ran (planned or an internal delta/seed fallback) and
+        # failed latches (every later run forces a sweep until one succeeds);
         # a failed delta just carries the block, still in lockstep with the
-        # sidecar's generation and written_run_seq.
+        # sidecar's generation and written_run_seq. A config error (no
+        # run_checks at all) never latches.
         observed_out = dict(observed_out)
-        if plan.get("mode") == "sweep":
+        if plan.get("performed_sweep"):
             observed_out["sweep_failed"] = True
     record = {
         "version": STATE_VERSION,
