@@ -62,6 +62,7 @@ from urllib.parse import parse_qs, urlsplit
 FIXTURE = {}
 REQUEST_LOG = ""
 PAGE_SIZE = 1000
+CLOSED_REQUESTS = 0
 
 
 def xml_escape(value):
@@ -198,6 +199,15 @@ class Handler(BaseHTTPRequestHandler):
         if FIXTURE.get("fail") in ("list", "all"):
             self.record("GET", False, "fixture failure mode")
             self.send_body(500, "<Error><Code>InternalError</Code></Error>")
+            return
+        # Stale-pooled-connection fixture: drop the connection without a
+        # response for the first N list GETs, so the witness's one bounded
+        # reconnect + re-send is exercised end to end.
+        global CLOSED_REQUESTS
+        if CLOSED_REQUESTS < int(FIXTURE.get("close_first_list_requests", 0) or 0):
+            CLOSED_REQUESTS += 1
+            self.record("GET", False, "fixture: closed the connection without a response (stale-pool retry)")
+            self.close_connection = True
             return
         kind = "objects" if query.get("list-type") == ["2"] else (
             "versions" if "versions" in query else ("uploads" if "uploads" in query else ""))

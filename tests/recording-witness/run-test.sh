@@ -897,6 +897,9 @@ RECORDING_WITNESS_KEY_ID=test-key-id-0001
 RECORDING_WITNESS_KEY=test-secret-SENTINEL-0009
 RECORDING_WITNESS_STATE_DIR=${CASE_STATE_DIR}
 EOF
+  if [ -n "${RECORDING_WITNESS_LIST_WORKERS:-}" ]; then
+    printf 'RECORDING_WITNESS_LIST_WORKERS=%s\n' "${RECORDING_WITNESS_LIST_WORKERS}" >>"${WORK}/witness.env"
+  fi
   export RECORDING_WITNESS_ENV_FILE="${WORK}/witness.env"
   CASE_RC=0
   "${WITNESS}" >"${WORK}/witness.out" 2>"${WORK}/witness.err" || CASE_RC=$?
@@ -3149,6 +3152,142 @@ print("requests=%d pagination=%d versions_pagination=%d uploads_pagination=%d si
     entries, pagination, versions_pagination, uploads_pagination, sig_ok))
 PY
 then ok "every witness request was a signed list call (no HEAD/GET-object/ListParts/write)"; else bad "list-only/SigV4 proof failed"; fi
+
+# ---- (f2) transport: bounded bodies, stale-pool reconnect, worker parity ----
+# Bounded response bodies: a 2xx body over the cap must fail the run closed
+# (WitnessError), while an oversized non-2xx body is truncated for the
+# clipped message instead of allocating it whole.
+py_begin="$(grep -n "exec python3 - <<'RECORDING_WITNESS_PY_EOF'" "${PROVISION}" | cut -d: -f1)"
+py_end="$(grep -n '^RECORDING_WITNESS_PY_EOF$' "${PROVISION}" | cut -d: -f1)"
+sed -n "$((py_begin + 1)),$((py_end - 1))p" "${PROVISION}" >"${WORK}/witness_module.py"
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+import threading
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+work = sys.argv[1]
+spec = importlib.util.spec_from_file_location("witness_transport", os.path.join(work, "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class BigHandler(BaseHTTPRequestHandler):
+    status = 200
+    size = 4096
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        body = b"x" * BigHandler.size
+        self.send_response(BigHandler.status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), BigHandler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+config = types.SimpleNamespace(
+    endpoint="http://127.0.0.1:%d" % server.server_address[1],
+    bucket="pc-admin-dr",
+    key_id="k",
+    key="s",
+    signing_region=lambda: "test-region",
+)
+module.MAX_SUCCESS_BODY = 1024
+module.MAX_ERROR_BODY = 1024
+module.close_connections()
+try:
+    module.signed_get(config, {"list-type": "2", "prefix": "audit/"})
+except module.WitnessError:
+    pass
+else:
+    raise SystemExit("a 2xx body over MAX_SUCCESS_BODY must raise WitnessError")
+module.close_connections()
+BigHandler.status = 500
+status, body = module.signed_get(config, {"list-type": "2", "prefix": "audit/"})
+if status != 500 or len(body) != 1024:
+    raise SystemExit("an oversized non-2xx body must be truncated to MAX_ERROR_BODY (got %d bytes)" % len(body))
+module.close_connections()
+server.shutdown()
+print("body caps: 2xx over cap raised; non-2xx truncated at cap")
+PY
+then ok "transport bounds 2xx bodies (fail-closed) and truncates error bodies"; else bad "transport body-bound test failed"; fi
+
+# A pooled connection the server dropped between calls: the witness must
+# reconnect once and re-send the same idempotent list GET, never surface a
+# spurious error. The mock drops the first list connection without a
+# response; the run must stay green and the log must show the dropped attempt
+# followed by a served one.
+LIST_WORKERS_OVERRIDE="${RECORDING_WITNESS_LIST_WORKERS:-}"
+unset RECORDING_WITNESS_LIST_WORKERS
+start_mock
+stale_dir="${WORK}/state-stale"
+fixture <<JSON
+{"bucket":"pc-admin-dr","close_first_list_requests":1,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-stale.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_case "${stale_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "stale pooled connection: reconnect + re-send stays green" "0" "${CASE_RC}"
+is "stale pooled connection: verdict is ok" "ok" "${CASE_STATE}"
+if python3 - "${WORK}/requests-stale.log" <<'PY'
+import json
+import sys
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+dropped = [index for index, entry in enumerate(entries) if "stale-pool retry" in entry.get("note", "")]
+served = [index for index, entry in enumerate(entries) if entry.get("ok")]
+# The five families race on the pool, so the dropped attempt is not
+# necessarily the first logged line; the load-bearing shape is exactly one
+# dropped attempt whose same idempotent re-send is served afterwards.
+if len(dropped) != 1 or len(served) < 5:
+    raise SystemExit("stale-pool retry not observable: dropped=%d served=%d" % (len(dropped), len(served)))
+if not any(index > dropped[0] for index in served):
+    raise SystemExit("no served request followed the dropped one")
+if len(entries) != 6:
+    raise SystemExit("expected 5 family requests + 1 re-send, got %d requests" % len(entries))
+print("stale-pool: 1 dropped, %d served, %d requests" % (len(served), len(entries)))
+PY
+then ok "stale pooled connection: one dropped attempt is followed by a served re-send"; else bad "stale-pool retry evidence missing"; fi
+
+# Worker parity: the parallel family fan-out must not change the verdict,
+# detail or finding signature. Same fixture, fresh state dirs, workers 1 vs 4.
+parity_dir_serial="${WORK}/state-parity-serial"
+parity_dir_parallel="${WORK}/state-parity-parallel"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":2,
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.1.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.2.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+RECORDING_WITNESS_LIST_WORKERS=1
+run_case "${parity_dir_serial}"
+serial_rc="${CASE_RC}"; serial_state="${CASE_STATE}"; serial_detail="${CASE_DETAIL}"
+RECORDING_WITNESS_LIST_WORKERS=4
+run_case "${parity_dir_parallel}"
+unset RECORDING_WITNESS_LIST_WORKERS
+is "worker parity: rc identical (serial vs 4 workers)" "${serial_rc}" "${CASE_RC}"
+is "worker parity: verdict identical" "${serial_state}" "${CASE_STATE}"
+is "worker parity: detail identical" "${serial_detail}" "${CASE_DETAIL}"
+if [ -n "${LIST_WORKERS_OVERRIDE}" ]; then export RECORDING_WITNESS_LIST_WORKERS="${LIST_WORKERS_OVERRIDE}"; fi
 
 # ---- (g) the key is never printed ----------------------------------------
 if grep -q 'SENTINEL' "${WORK}/witness.out" "${WORK}/witness.err" "${WORK}/state/verdict.log" "${WORK}/state/state.json" 2>/dev/null; then

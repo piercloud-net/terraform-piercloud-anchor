@@ -1438,11 +1438,13 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 STATE_VERSION = 2
@@ -1450,6 +1452,12 @@ STATE_VERSION = 2
 # to allocate it. The bounded read keeps a planted huge state.json from raising
 # an uncaught MemoryError before any verdict (round-7 R2).
 STATE_MAX_BYTES = 1 << 20
+# Bounded response reads: a non-2xx body only ever feeds a clipped message,
+# while a 2xx list body is parsed in full. A server that streams without
+# bound must fail the run closed, never allocate it to death. The module
+# constants are patchable for the offline harness.
+MAX_ERROR_BODY = 64 * 1024
+MAX_SUCCESS_BODY = 16 * 1024 * 1024
 VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
@@ -1616,6 +1624,15 @@ class Config(object):
         self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
         self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
         self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
+        # Bounded listing fan-out; 1 keeps the historical serial behavior and
+        # gives the offline harness a deterministic seam. Out of range falls
+        # back to the default (a cadence/perf knob must not take the witness
+        # down). http.client connections are per-thread, so the pool size is
+        # the whole concurrency model.
+        self.list_workers = env_int("RECORDING_WITNESS_LIST_WORKERS", 6)
+        if not 1 <= self.list_workers <= 32:
+            log("WARNING: RECORDING_WITNESS_LIST_WORKERS=%d is outside [1, 32]; using the default 6" % self.list_workers)
+            self.list_workers = 6
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
@@ -1658,8 +1675,79 @@ class Config(object):
         return match.group(1) if match else "us-east-1"
 
 
+# The per-thread keep-alive pool for signed S3 list GETs. The module-level
+# signed_get() stays the single transport entry point so the harness can
+# patch it; close_connections() is called once per run so a stale cross-run
+# socket never survives a systemd retry.
+_TRANSPORT = threading.local()
+
+
+def _new_connection(config, timeout=30):
+    parts = urllib.parse.urlsplit(config.endpoint)
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+    if parts.scheme == "http":
+        return http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    raise WitnessError("RECORDING_WITNESS_ENDPOINT must be an http(s) URL")
+
+
+def _drop_connection():
+    connection = getattr(_TRANSPORT, "connection", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+    _TRANSPORT.connection = None
+    _TRANSPORT.key = None
+
+
+def _pooled_connection(config, timeout=30):
+    """One keep-alive connection per thread (http.client is not thread-safe)."""
+    key = (config.endpoint, timeout)
+    connection = getattr(_TRANSPORT, "connection", None)
+    if connection is not None and getattr(_TRANSPORT, "key", None) == key:
+        return connection
+    _drop_connection()
+    connection = _new_connection(config, timeout)
+    _TRANSPORT.connection = connection
+    _TRANSPORT.key = key
+    return connection
+
+
+def close_connections():
+    """Drop the calling thread's pooled connection after a run (workers exit)."""
+    _drop_connection()
+
+
+def _read_body(response, limit, truncate):
+    chunks = []
+    total = 0
+    while True:
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            if truncate:
+                return b"".join(chunks)[:limit]
+            raise WitnessError("S3 response body exceeds %d bytes" % limit)
+    return b"".join(chunks)
+
+
 def signed_get(config, params):
-    """SigV4-signed path-style GET against the S3 endpoint (list calls only)."""
+    """SigV4-signed path-style GET with a per-thread keep-alive connection.
+
+    Fresh SigV4 per request keeps the 15-minute clock-skew contract. A
+    redirect is refused structurally: http.client has no redirect machinery,
+    so a 3xx comes back as an ordinary non-200 status and can never re-send
+    the Authorization header. One bounded reconnect + re-send covers a pooled
+    connection the peer dropped between calls (RemoteDisconnected /
+    BadStatusLine / broken pipe / timeout); HTTP statuses are never retried.
+    Error bodies truncate at MAX_ERROR_BODY; a 2xx body over
+    MAX_SUCCESS_BODY fails the run closed.
+    """
     now = datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     datestamp = now.strftime("%Y%m%d")
@@ -1690,16 +1778,31 @@ def signed_get(config, params):
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
         config.key_id, scope, signed_headers, signature)
-    url = config.endpoint + canonical_uri + (("?" + canonical_query) if canonical_query else "")
-    request = urllib.request.Request(url, method="GET")
-    request.add_header("Authorization", authorization)
-    request.add_header("x-amz-content-sha256", payload_hash)
-    request.add_header("x-amz-date", amz_date)
-    try:
-        with open_signed(request, timeout=30) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+    request_path = canonical_uri + (("?" + canonical_query) if canonical_query else "")
+    request_headers = dict(headers)
+    request_headers["Authorization"] = authorization
+    last_error = None
+    for _attempt in (0, 1):
+        try:
+            connection = _pooled_connection(config)
+            connection.request("GET", request_path, headers=request_headers)
+            response = connection.getresponse()
+            if 200 <= response.status < 300:
+                body = _read_body(response, MAX_SUCCESS_BODY, False)
+            else:
+                body = _read_body(response, MAX_ERROR_BODY, True)
+            return response.status, body
+        except WitnessError:
+            _drop_connection()
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            # A pooled connection the peer closed between calls, or a
+            # transport failure on an idempotent metadata GET: reconnect once
+            # and re-send the same request; a second failure is fail-closed.
+            _drop_connection()
+            last_error = exc
+    raise WitnessError(
+        "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
 def list_objects(config, prefix):
@@ -1929,18 +2032,48 @@ def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candida
     return current_time, current_mode
 
 
+def _collect_families(config):
+    """Run the five list families, bounded-parallel when workers > 1.
+
+    Every worker returns the same shapes the sequential code produced; a
+    worker failure propagates here and main() turns it into the `error`
+    verdict. Results merge in submission order (never completion order) so
+    the checks stay deterministic. http.client pools one connection per
+    thread, so the executor size is the whole concurrency model.
+    """
+    def fetch_audit_objects():
+        return list_objects(config, config.audit_prefix)
+
+    def fetch_recording_objects():
+        return list_objects(config, config.recordings_prefix)
+
+    def fetch_uploads():
+        return list_uploads(config, config.recordings_prefix)
+
+    def fetch_audit_hidden():
+        return list_object_versions(config, config.audit_prefix)
+
+    def fetch_recording_hidden():
+        return list_object_versions(config, config.recordings_prefix)
+
+    families = [fetch_audit_objects, fetch_recording_objects, fetch_uploads,
+                fetch_audit_hidden, fetch_recording_hidden]
+    if config.list_workers <= 1:
+        return [family() for family in families]
+    with ThreadPoolExecutor(max_workers=config.list_workers) as executor:
+        futures = [executor.submit(family) for family in families]
+        return [future.result() for future in futures]
+
+
 def run_checks(config, now):
-    audit_objects = list_objects(config, config.audit_prefix)
-    recording_objects = list_objects(config, config.recordings_prefix)
-    uploads = list_uploads(config, config.recordings_prefix)
+    audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config)
     # Delete markers = hidden objects. The server scopes both calls by prefix;
     # the client-side re-filter keeps a server that returns out-of-prefix keys
     # from inflating the finding. A 403/error here raises WitnessError and the
     # verdict is `error` (main()'s catch), never a silent green.
     hidden_objects = [
         marker
-        for marker in list_object_versions(config, config.audit_prefix)
-        + list_object_versions(config, config.recordings_prefix)
+        for marker in audit_hidden + recording_hidden
         if marker["key"].startswith(config.audit_prefix)
         or marker["key"].startswith(config.recordings_prefix)
     ]
@@ -2429,9 +2562,9 @@ class RefuseRedirects(urllib.request.HTTPRedirectHandler):
         )
 
 
-# One redirect-refusing opener serves every client call. The module-level
-# _NTFY_OPENER name is patchable for the offline harness; the signed S3 list
-# client always uses the real opener (round-7 R1).
+# One redirect-refusing opener serves the ntfy push (the S3 list client now
+# uses http.client, which has no redirect machinery at all). The module-level
+# _NTFY_OPENER name is patchable for the offline harness.
 _REDIRECT_REFUSING_OPENER = urllib.request.build_opener(RefuseRedirects())
 _NTFY_OPENER = _REDIRECT_REFUSING_OPENER
 
@@ -2439,11 +2572,6 @@ _NTFY_OPENER = _REDIRECT_REFUSING_OPENER
 def open_ntfy(request, timeout=15):
     """Open the ntfy POST through the redirect-refusing opener."""
     return _NTFY_OPENER.open(request, timeout=timeout)
-
-
-def open_signed(request, timeout=30):
-    """Open a SigV4-signed S3 list GET through the redirect-refusing opener."""
-    return _REDIRECT_REFUSING_OPENER.open(request, timeout=timeout)
 
 
 def notify(config, state, detail):
@@ -2548,6 +2676,10 @@ def main():
         state = "error"
         detail = "error: %s: %s" % (type(exc).__name__, exc)
         signature = finding_signature("error", [])
+    finally:
+        # Drop this thread's pooled S3 connection: the process is one run, so
+        # a stale cross-run socket must not survive a systemd retry.
+        close_connections()
     detail = clip(detail, 1000)
 
     state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
