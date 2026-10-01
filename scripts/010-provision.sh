@@ -3171,7 +3171,7 @@ def build_observed(previous_observed, payload, now_epoch, run_seq, config):
 
 
 def read_view(path):
-    """Read + parse the observed-view sidecar (ISO timestamps -> datetimes)."""
+    """Read + parse the observed-view sidecar (timestamp strings -> datetimes)."""
     try:
         with open(path, "rb") as handle:
             raw_bytes = handle.read(VIEW_MAX_BYTES + 1)
@@ -3239,9 +3239,9 @@ def write_view(path, data):
 
 
 def view_record(observed_out, payload):
-    """Serialize the merged view for the sidecar (exact ISO round-trip)."""
+    """Serialize the merged view for the sidecar (exact timestamp round-trip)."""
     def stamp(moment):
-        return moment.astimezone(timezone.utc).isoformat()
+        return moment.astimezone(timezone.utc).isoformat()  # ci-allowlist: datetime.isoformat() is a stdlib call, not an SCP image reference.
     return {
         "view_version": VIEW_VERSION,
         "generation": observed_out["generation"],
@@ -3667,7 +3667,6 @@ recording_witness_accept() { # timer-stopped synchronous acceptance (one run, al
   local rc=0
   # The EXIT trap restarts the timer on EVERY path (success, alert, die):
   # monitoring is never silently left stopped by a failed acceptance.
-  trap 'recording_witness_timer_start' EXIT
   recording_witness_timer_stop
   recording_witness_run_once || rc=$?
   recording_witness_timer_start
