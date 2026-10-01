@@ -1490,6 +1490,34 @@ NON_SESSION_KEY_RE = re.compile(
 HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json$")
 UUID_RE = re.compile(UUID_PATTERN)
 RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
+# Cursor grammar guards: a cursor may only ever advance over keys matching the
+# family's own shape (the same regexes the classifier reads). An unshaped key
+# (an acceptance probe, contract drift) still enters the listing/view and
+# alerts like any other drift, but letting it move a cursor would put the
+# cursor past the real key space and blind the next delta's tail while the run
+# stays green (round-3 forged-cursor / live-probe class). These predicates
+# mirror the current flat layout and must be extended together with the
+# classifier when the date-partitioned/seq-range layout lands (#159).
+def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
+    """True for a shaped session/non-session audit key below the heartbeat stem."""
+    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
+        return False
+    relative = key[len(audit_prefix):]
+    return bool(SESSION_KEY_RE.match(relative) or NON_SESSION_KEY_RE.match(relative))
+
+
+def is_audit_heartbeat_key(key, heartbeat_prefix):
+    """True for a shaped heartbeat key under the heartbeat prefix."""
+    return key.startswith(heartbeat_prefix) and bool(
+        HEARTBEAT_KEY_RE.match(key[len(heartbeat_prefix):]))
+
+
+def is_recording_key(key, recordings_prefix):
+    """True for a shaped `<sid>.tar` recording key."""
+    return key.startswith(recordings_prefix) and bool(
+        RECORDING_KEY_RE.match(key[len(recordings_prefix):]))
+
+
 # Sid-less session.* event types documented by the shipper contract (Teleport
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
@@ -2314,19 +2342,26 @@ def _collect_families(config, boundaries=None):
 
 
 def _cursors_from_listings(config, audit_objects, recording_objects):
-    """High-water keys for the two audit streams + recordings from a listing."""
-    # The session family is bounded above by the heartbeat stem: an exact
-    # `audit/heartbeat` object (or any key after it) is not a session key.
-    # Treating it as one would write a session cursor above every real
-    # session key, so the delta lists an empty tail while recordings happen
-    # (observed_problem rejects such a cursor anyway).
-    heartbeat_stem = config.heartbeat_prefix.rstrip("/")
-    heartbeat_keys = [key for key in audit_objects if key.startswith(config.heartbeat_prefix)]
-    session_keys = [key for key in audit_objects if key < heartbeat_stem]
+    """High-water keys for the two audit streams + recordings from a listing.
+
+    A cursor advances only over keys matching the family's own grammar
+    (is_audit_*_key / is_recording_key): an unshaped key - an acceptance
+    probe, contract drift - still enters the view and alerts, but it must
+    never move a cursor past the real key space, or the next delta lists an
+    empty tail while recordings happen (round-3 live-probe false green). The
+    session family is additionally bounded above by the heartbeat stem: an
+    exact `audit/heartbeat` object (or any key after it) is not a session
+    key.
+    """
+    heartbeat_keys = [key for key in audit_objects if is_audit_heartbeat_key(key, config.heartbeat_prefix)]
+    session_keys = [
+        key for key in audit_objects
+        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)]
+    recording_keys = [key for key in recording_objects if is_recording_key(key, config.recordings_prefix)]
     return {
         "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
         "audit_session": max(session_keys) if session_keys else "",
-        "recordings": max(recording_objects) if recording_objects else "",
+        "recordings": max(recording_keys) if recording_keys else "",
     }
 
 
@@ -2499,12 +2534,24 @@ def run_checks(config, now, plan):
                 new_audit.update(new_session)
                 audit_objects.update(new_audit)
                 recording_objects.update(new_recordings)
-                if new_heartbeat:
-                    cursors["audit_heartbeat"] = max(new_heartbeat)
-                if new_session:
-                    cursors["audit_session"] = max(new_session)
-                if new_recordings:
-                    cursors["recordings"] = max(new_recordings)
+                # Same grammar filter as _cursors_from_listings: an unshaped
+                # key returned by a tail (an acceptance probe, drift) must
+                # never advance the cursor past the real key space.
+                heartbeat_new = [
+                    key for key in new_heartbeat
+                    if is_audit_heartbeat_key(key, config.heartbeat_prefix)]
+                session_new = [
+                    key for key in new_session
+                    if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)]
+                recording_new = [
+                    key for key in new_recordings
+                    if is_recording_key(key, config.recordings_prefix)]
+                if heartbeat_new:
+                    cursors["audit_heartbeat"] = max(heartbeat_new)
+                if session_new:
+                    cursors["audit_session"] = max(session_new)
+                if recording_new:
+                    cursors["recordings"] = max(recording_new)
                 view_dirty = bool(new_audit or new_recordings)
     # Overlapping watched prefixes report one marker twice (same key + version
     # id in both listings); count each hidden version once.
@@ -3181,6 +3228,25 @@ def observed_problem(observed, record_run_seq, config=None):
         # below it (a forged-state false green). Fail closed into repair +
         # sweep.
         return "observed.cursors.audit_session is at/after the heartbeat prefix boundary: %r" % session_cursor
+    # A cursor must also match its family's key grammar (the classifier's flat
+    # layout; extend both together when the date-partitioned/seq-range layout
+    # lands, #159). A forged value below the stem but above the real key space
+    # (`audit/9`, `audit/g`, an acceptance probe) passes the prefix check and
+    # would list an empty tail while real keys sit below it (false green), so
+    # it fails closed into the repair + sweep path.
+    for name in ("audit_heartbeat", "audit_session", "recordings"):
+        value = cursors.get(name)
+        if value is None or value == "":
+            continue
+        if name == "audit_heartbeat":
+            shaped = is_audit_heartbeat_key(value, prefixes["audit_heartbeat"])
+        elif name == "recordings":
+            shaped = is_recording_key(value, prefixes["recordings"])
+        else:
+            shaped = is_audit_session_key(
+                value, prefixes["audit_session"], prefixes["audit_heartbeat"])
+        if not shaped:
+            return "observed.cursors.%s does not match the witness key grammar: %r" % (name, value)
     boundaries = observed.get("sweep_boundaries")
     if not isinstance(boundaries, list) or len(boundaries) > 32:
         return "observed.sweep_boundaries is invalid"
