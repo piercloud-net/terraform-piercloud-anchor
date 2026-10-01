@@ -1445,9 +1445,12 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-STATE_VERSION = 2
+STATE_VERSION = 3
+# The observed/coverage block's own schema version; bumped only when the
+# block layout changes incompatibly (a mismatch is fail-closed repair + sweep).
+CURSOR_VERSION = 1
 # A state record is a few KB; an oversized file is invalid input, never a reason
 # to allocate it. The bounded read keeps a planted huge state.json from raising
 # an uncaught MemoryError before any verdict (round-7 R2).
@@ -1633,6 +1636,13 @@ class Config(object):
         if not 1 <= self.list_workers <= 32:
             log("WARNING: RECORDING_WITNESS_LIST_WORKERS=%d is outside [1, 32]; using the default 6" % self.list_workers)
             self.list_workers = 6
+        # Cold start: a window-bounded seed (seconds of history) whose run
+        # cannot return `ok` until the first full sweep closes it; 0 opts into
+        # the exact-semantics full sweep (slow acceptance, no disclosure).
+        self.cold_start_seconds = env_int("RECORDING_WITNESS_COLD_START_SECONDS", 13 * 3600)
+        if not 0 <= self.cold_start_seconds <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_COLD_START_SECONDS=%d is outside [0, 604800]; using the default 46800" % self.cold_start_seconds)
+            self.cold_start_seconds = 13 * 3600
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
@@ -1805,12 +1815,21 @@ def signed_get(config, params):
         "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
-def list_objects(config, prefix):
-    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content."""
+def list_objects(config, prefix, start_after="", stop_at_heartbeat=False):
+    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
+
+    `start_after` seeds the first page (exclusive, live-verified on B2); it is
+    never combined with a continuation token. `stop_at_heartbeat` stops the
+    scan at the first key under the heartbeat prefix: audit/heartbeat/ sorts
+    after every audit/<ts> key, so that is where the session stream ends and
+    the heartbeat stream owns the tail (keys sorting after it are sweep-only).
+    """
     objects = {}
     token = ""
     for _ in range(1000):
         params = {"list-type": "2", "prefix": prefix}
+        if start_after and not token:
+            params["start-after"] = start_after
         if token:
             params["continuation-token"] = token
         status, body = signed_get(config, params)
@@ -1840,6 +1859,10 @@ def list_objects(config, prefix):
                     elif field_name == "LastModified":
                         last_modified = field.text or ""
                 if key:
+                    if stop_at_heartbeat and key.startswith(config.heartbeat_prefix):
+                        # Everything from here on sorts at/after the heartbeat
+                        # subtree: the session stream is complete.
+                        return objects
                     try:
                         objects[key] = parse_timestamp(last_modified)
                     except ValueError:
@@ -2065,12 +2088,52 @@ def _collect_families(config):
         return [future.result() for future in futures]
 
 
-def run_checks(config, now):
-    audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config)
+def _list_cold_start_streams(config, window_start):
+    """Window-bounded audit seed: heartbeat + session streams from `window_start`.
+
+    Recordings as a whole (a `<sid>.tar` key carries no timestamp) and uploads
+    are listed in full by the caller. Versions stay sweep-only, so a seed
+    cannot see a pre-window delete marker - disclosed by compact_blind.
+    """
+    marker = window_start.strftime("%Y%m%dT%H%M%SZ")
+    heartbeat_objects = list_objects(
+        config, config.heartbeat_prefix, start_after=config.heartbeat_prefix + marker)
+    session_objects = list_objects(
+        config, config.audit_prefix, start_after=config.audit_prefix + marker,
+        stop_at_heartbeat=True)
+    audit_objects = {}
+    audit_objects.update(session_objects)
+    audit_objects.update(heartbeat_objects)
+    return audit_objects, heartbeat_objects
+
+
+def run_checks(config, now, plan):
+    # NB: `mode` is the per-key session mode inside the check loops below, so
+    # the run mode needs its own name.
+    run_mode = plan.get("mode", "sweep")
+    window_start = plan.get("window_start")
+    window_text = None
+    if run_mode == "seed" and window_start is not None:
+        window_text = utc_stamp(window_start)
+        audit_objects, heartbeat_objects = _list_cold_start_streams(config, window_start)
+        if not heartbeat_objects:
+            # A window with no heartbeat at all: either the shipper is dead
+            # (exactly what the sweep is owed for) or the bucket is empty and
+            # an exact sweep is cheap. Never certify a window from nothing.
+            log("WARNING: cold-start window found no heartbeat; falling back to a full sweep")
+            run_mode = "sweep"
+            window_text = None
+    if run_mode == "sweep":
+        audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config)
+    else:
+        recording_objects = list_objects(config, config.recordings_prefix)
+        uploads = list_uploads(config, config.recordings_prefix)
+        audit_hidden, recording_hidden = [], []
     # Delete markers = hidden objects. The server scopes both calls by prefix;
     # the client-side re-filter keeps a server that returns out-of-prefix keys
     # from inflating the finding. A 403/error here raises WitnessError and the
-    # verdict is `error` (main()'s catch), never a silent green.
+    # verdict is `error` (main()'s catch), never a silent green. Versions are
+    # listed on sweeps only; a cold-start seed carries no hidden set at all.
     hidden_objects = [
         marker
         for marker in audit_hidden + recording_hidden
@@ -2425,12 +2488,22 @@ def run_checks(config, now):
             )
             finding_ids.append("open-upload-stale:" + sid)
 
+    if run_mode == "seed":
+        # The seed cannot certify history before its window and skips the
+        # sweep-only versions listing: it can never read as green. The
+        # disclosure rides the alert detail and the finding id, so the
+        # signature changes until the first sweep and notification behaves.
+        alerts.append(
+            "cold-start: seeded baseline from %s; a full sweep is pending and the "
+            "seed cannot certify history before the window" % (window_text or "unknown"))
+        finding_ids.append("cold-start")
     if alerts:
-        return "alert", "; ".join(alerts), finding_signature("alert", finding_ids)
+        return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), {
+            "mode": run_mode, "window_start": window_text}
     detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
         len(sessions), len(uploads), len(audit_objects), len(recording_objects),
         ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
-    return "ok", detail, finding_signature("ok", [])
+    return "ok", detail, finding_signature("ok", []), {"mode": run_mode, "window_start": window_text}
 
 
 def corrupt_state_destination(path, now):
@@ -2664,24 +2737,83 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     return now_epoch - last_epoch >= int(window)
 
 
+def observed_problem(observed, record_run_seq):
+    """Fail-closed validation of the observed/coverage block ('' = valid).
+
+    Any violation (wrong cursor version, bad types, a missing coverage record,
+    a block written by a different run identity) must take the preserve +
+    repair + sweep path: a delta read from an untrusted cursor is never green.
+    """
+    if not isinstance(observed, dict):
+        return "observed block is not a JSON object"
+    if observed.get("cursor_version") != CURSOR_VERSION:
+        return "observed cursor version is not %d" % CURSOR_VERSION
+    for name in ("generation", "written_run_seq", "last_sweep_ok_epoch", "last_sweep_ok_run_seq"):
+        value = observed.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "observed.%s is invalid: %r" % (name, value)
+    if not isinstance(observed.get("sweep_failed"), bool):
+        return "observed.sweep_failed is invalid: %r" % (observed.get("sweep_failed"),)
+    coverage = observed.get("coverage")
+    if not isinstance(coverage, dict):
+        return "observed.coverage is not a JSON object"
+    if coverage.get("mode") not in ("sweep", "seed", "delta"):
+        return "observed.coverage.mode is invalid: %r" % (coverage.get("mode"),)
+    if not isinstance(coverage.get("compact_blind"), bool):
+        return "observed.coverage.compact_blind is invalid: %r" % (coverage.get("compact_blind"),)
+    window = coverage.get("window_start")
+    if window is not None and not isinstance(window, str):
+        return "observed.coverage.window_start is invalid: %r" % (window,)
+    if isinstance(record_run_seq, int) and not isinstance(record_run_seq, bool):
+        if observed.get("written_run_seq") != record_run_seq:
+            return "observed.written_run_seq %r does not match run_seq %r" % (
+                observed.get("written_run_seq"), record_run_seq)
+    return ""
+
+
+def build_observed(previous_observed, coverage, now_epoch, run_seq):
+    """Build the fresh observed/coverage block written with this run's record.
+
+    A full sweep closes every disclosure: last_sweep_ok_* move, compact_blind
+    clears. A seed carries its window and stays blind until the sweep; the
+    sweep latch (stage of the delta path) is carried, never cleared, by a
+    non-sweep run.
+    """
+    legacy = previous_observed if isinstance(previous_observed, dict) else {}
+    mode = coverage.get("mode", "sweep")
+    observed = {
+        "cursor_version": CURSOR_VERSION,
+        "generation": int(legacy.get("generation", 0)) + 1,
+        "written_run_seq": run_seq,
+        "last_sweep_ok_epoch": int(legacy.get("last_sweep_ok_epoch", 0) or 0),
+        "last_sweep_ok_run_seq": int(legacy.get("last_sweep_ok_run_seq", 0) or 0),
+        "sweep_failed": False,
+        "coverage": {
+            "mode": mode,
+            "window_start": coverage.get("window_start"),
+            "compact_blind": mode != "sweep",
+        },
+    }
+    if mode == "sweep":
+        observed["last_sweep_ok_epoch"] = now_epoch
+        observed["last_sweep_ok_run_seq"] = run_seq
+    else:
+        observed["sweep_failed"] = bool(legacy.get("sweep_failed", False))
+    return observed
+
+
 def main():
     now = datetime.now(timezone.utc)
     now_epoch = int(now.timestamp())
     config = None
     signature = finding_signature("error", [])
-    try:
-        config = Config()
-        state, detail, signature = run_checks(config, now)
-    except Exception as exc:  # fail-closed by design: any failure => error
-        state = "error"
-        detail = "error: %s: %s" % (type(exc).__name__, exc)
-        signature = finding_signature("error", [])
-    finally:
-        # Drop this thread's pooled S3 connection: the process is one run, so
-        # a stale cross-run socket must not survive a systemd retry.
-        close_connections()
-    detail = clip(detail, 1000)
+    state = "error"
+    detail = "error: witness did not run"
+    coverage = None
 
+    # The state dir comes first: the observed/coverage block decides whether
+    # this run is a cold-start seed, a full sweep or a delta, so the previous
+    # record must be read before any listing.
     state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
     state_path = os.path.join(state_dir, "state.json")
     verdict_path = os.path.join(state_dir, "verdict.log")
@@ -2714,9 +2846,6 @@ def main():
             log("WARNING: cannot preserve unreadable state as %s: %s"
                 % (corrupt_path or (state_path + ".corrupt"), clip(exc, 200)))
 
-    renotify = config.renotify if config is not None else 1800
-    quiet_renotify = config.quiet_renotify if config is not None else 86400
-    quiet_signature = config.quiet_signature if config is not None else ""
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
     # Defensive numeric parsing: a type-valid state.json with a corrupted
     # counter (e.g. "run_seq": "not-a-number") must never crash the run
@@ -2732,16 +2861,81 @@ def main():
             numerics[name] = 0
         else:
             numerics[name] = value
-    if state_bad_reason:
+
+    # The observed/coverage block decides the run mode. A version-3 record
+    # must carry a valid block: any violation is a fail-closed repair + sweep
+    # (never a delta, never green). A legacy record or no file at all is a
+    # cold start, not a corruption.
+    previous_observed = previous.get("observed") if isinstance(previous.get("observed"), dict) else None
+    observed_reason = ""
+    if previous and previous.get("version") == STATE_VERSION:
+        if previous_observed is None:
+            # A missing block after a non-error verdict means the cursor/view
+            # was lost or tampered with: fail-closed repair + sweep. After an
+            # error verdict the block may simply never have been built (the
+            # failing run could not list), so this is a cold start, not
+            # corruption.
+            if previous.get("state") != "error":
+                observed_reason = "observed block is missing from a version-%d record" % STATE_VERSION
+        else:
+            observed_reason = observed_problem(previous_observed, previous.get("run_seq"))
+    if observed_reason:
+        log("WARNING: invalid observed state discarded for a repair sweep: %s" % clip(observed_reason, 200))
+    forced_reason = state_bad_reason or observed_reason
+    if forced_reason:
+        # Nothing read from the stale view survives the repair: this run
+        # rebuilds the block from a full sweep and never reports green.
+        previous_observed = None
+
+    run_seq = numerics["run_seq"] + 1
+
+    try:
+        config = Config()
+    except Exception as exc:
+        config = None
+        state = "error"
+        detail = "error: %s: %s" % (type(exc).__name__, exc)
+        signature = finding_signature("error", [])
+
+    if config is not None and not forced_reason:
+        cold_start = not previous or previous.get("version") != STATE_VERSION
+        if cold_start and config.cold_start_seconds > 0:
+            plan = {"mode": "seed", "window_start": now - timedelta(seconds=config.cold_start_seconds)}
+        else:
+            # A first install with the full-sweep escape hatch, a legacy
+            # record, or the steady state before the delta path: exact sweep.
+            plan = {"mode": "sweep"}
+    else:
+        plan = {"mode": "sweep"}
+
+    if config is not None:
+        try:
+            state, detail, signature, coverage = run_checks(config, now, plan)
+        except Exception as exc:  # fail-closed by design: any failure => error
+            state = "error"
+            detail = "error: %s: %s" % (type(exc).__name__, exc)
+            signature = finding_signature("error", [])
+            coverage = None
+        finally:
+            # Drop this thread's pooled S3 connection: the process is one run,
+            # so a stale cross-run socket must not survive a systemd retry.
+            close_connections()
+    detail = clip(detail, 1000)
+
+    if forced_reason:
         if state != "error":
             state = "error"
-            detail = clip("error: %s" % state_bad_reason, 1000)
+            detail = clip("error: %s" % forced_reason, 1000)
         else:
-            detail = clip("%s (state record also invalid: %s)" % (detail, state_bad_reason), 1000)
+            detail = clip("%s (state record also invalid: %s)" % (detail, forced_reason), 1000)
         # An invalid record is not a trustworthy previous state: the error
         # verdict must push instead of comparing against it.
         signature = finding_signature("error", [])
         previous = {}
+
+    renotify = config.renotify if config is not None else 1800
+    quiet_renotify = config.quiet_renotify if config is not None else 86400
+    quiet_signature = config.quiet_signature if config is not None else ""
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
     last_notify_signature = previous.get("last_notify_signature")
@@ -2753,7 +2947,6 @@ def main():
     # Per-run identity: a monotonic counter written into state.json, never a
     # second-resolution timestamp, so a genuine same-second run still advances
     # it while a run that failed to persist state still repeats it.
-    run_seq = numerics["run_seq"] + 1
     state_since_run = numerics["state_since_run"]
     state_since_epoch = numerics["state_since_epoch"]
     previous_state = previous.get("state")
@@ -2770,6 +2963,16 @@ def main():
             last_notify_epoch = now_epoch
             last_notify_run = run_seq
             last_notify_signature = signature
+    observed_out = previous_observed
+    if coverage is not None:
+        observed_out = build_observed(previous_observed, coverage, now_epoch, run_seq)
+    elif observed_out is not None:
+        # The checks could not run (Config failure): the previous view is
+        # unchanged, but it is re-stamped with this run's identity so a
+        # transient config error does not make the block look foreign and
+        # force a needless repair sweep on the next run.
+        observed_out = dict(observed_out)
+        observed_out["written_run_seq"] = run_seq
     record = {
         "version": STATE_VERSION,
         "state": state,
@@ -2783,13 +2986,16 @@ def main():
         "signature": signature,
         "last_notify_signature": last_notify_signature,
     }
-    if state_bad_reason:
-        # Explicit repair evidence: an unreadable/invalid record has no
-        # readable baseline, so the counter restarts at 1 above. The run-once
-        # acceptance cannot tell that reset from a stale record by `run_seq`
-        # alone, so mark the repair here and name the systemd invocation that
-        # wrote it below; the acceptance only counts a repair written by the
-        # invocation that just ran.
+    if observed_out is not None:
+        record["observed"] = observed_out
+    if state_bad_reason or observed_reason:
+        # Explicit repair evidence: an unreadable/invalid record (or an
+        # invalid observed block) has no trustworthy view, so the observed
+        # block above was rebuilt from scratch and the run is never green.
+        # The run-once acceptance cannot tell a repair from a stale record by
+        # `run_seq` alone, so mark the repair here and name the systemd
+        # invocation that wrote it below; the acceptance only counts a repair
+        # written by the invocation that just ran.
         record["repaired"] = True
     invocation = env("INVOCATION_ID", "")
     if invocation:
@@ -2899,6 +3105,8 @@ recording_witness_install() { # render + install the component (idempotent)
     if [ -n "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_RENOTIFY_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_QUIET_SIGNATURE:-}" ]; then printf 'RECORDING_WITNESS_QUIET_SIGNATURE=%q\n' "$RECORDING_WITNESS_QUIET_SIGNATURE"; fi
+    if [ -n "${RECORDING_WITNESS_COLD_START_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_COLD_START_SECONDS=%q\n' "$RECORDING_WITNESS_COLD_START_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_SWEEP_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_SWEEP_SECONDS=%q\n' "$RECORDING_WITNESS_SWEEP_SECONDS"; fi
     if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
     if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
   } >"$tmp"
@@ -2912,7 +3120,10 @@ recording_witness_install() { # render + install the component (idempotent)
   chmod 0644 "$RECORDING_WITNESS_TIMER.tmp.$$"
   mv "$RECORDING_WITNESS_TIMER.tmp.$$" "$RECORDING_WITNESS_TIMER"
   systemctl daemon-reload
-  systemctl enable --now pc-recording-witness.timer >/dev/null
+  # Enable WITHOUT --now: the acceptance below stops the timer, runs one
+  # synchronous seed/sweep, and restarts the timer on every exit path, so no
+  # timer fire can land between the drain and the acceptance run.
+  systemctl enable pc-recording-witness.timer >/dev/null
   log "recording witness installed (5 min timer; env file 0600, key never printed)"
 }
 
@@ -2947,14 +3158,34 @@ recording_witness_service_drained() { # no witness invocation in flight right no
 
 recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation to finish
   local attempt active
-  for ((attempt = 0; attempt < 100; attempt++)); do
+  for ((attempt = 0; attempt < 3600; attempt++)); do
     if recording_witness_service_drained; then
       return 0
     fi
     sleep 1
   done
   active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
-  die "witness unit did not drain within 100s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+  die "witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+}
+
+recording_witness_timer_stop() { # stop the timer so no fire can merge with the acceptance
+  systemctl stop pc-recording-witness.timer >/dev/null 2>&1 || true
+}
+
+recording_witness_timer_start() { # restart the timer on every exit path
+  systemctl start pc-recording-witness.timer >/dev/null 2>&1 || true
+}
+
+recording_witness_accept() { # timer-stopped synchronous acceptance (one run, always restarted)
+  local rc=0
+  # The EXIT trap restarts the timer on EVERY path (success, alert, die):
+  # monitoring is never silently left stopped by a failed acceptance.
+  trap 'recording_witness_timer_start' EXIT
+  recording_witness_timer_stop
+  recording_witness_run_once || rc=$?
+  recording_witness_timer_start
+  trap - EXIT
+  return "$rc"
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
@@ -3061,6 +3292,12 @@ recording_witness_run_once() { # run one check now and surface the verdict
     # to keep the daily quiet re-notify while this exact finding set persists.
     log "witness finding signature: ${signature}"
   fi
+  coverage_mode="$(jq -r '.observed.coverage.mode // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  if [ -n "${coverage_mode}" ]; then
+    # A seed run discloses that the verdict is window-bounded until the first
+    # sweep; a sweep run closes the disclosure; a delta run is a fast refresh.
+    log "witness coverage: mode=${coverage_mode}"
+  fi
 }
 
 recording_witness_disable() { # remove a previously installed component
@@ -3092,7 +3329,7 @@ case "$(recording_witness_state)" in
   on)
     log "Installing the list-only recording-completeness witness (B2 metadata checks)"
     recording_witness_install
-    recording_witness_run_once
+    recording_witness_accept
     ;;
   partial)
     witness_problem="$(recording_witness_config_problem)"

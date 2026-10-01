@@ -193,6 +193,9 @@ variant_key() { # replay-conflict variant: --variant <body> <event-type> <ts> [s
 fresh_stamp() { # current UTC in the witness's state.json format
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'
 }
+audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
+  python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
+}
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
 # were generated from the real builder at cad0p/pc-admin @ 25f7922
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key,
@@ -896,6 +899,10 @@ RECORDING_WITNESS_RECORDINGS_PREFIX=recordings/
 RECORDING_WITNESS_KEY_ID=test-key-id-0001
 RECORDING_WITNESS_KEY=test-secret-SENTINEL-0009
 RECORDING_WITNESS_STATE_DIR=${CASE_STATE_DIR}
+# Every pre-delta scenario is an exact full sweep: the cold-start window is
+# disabled unless a tooth asks for a seed (the observed-block injections in
+# stage 3 force the sweep again once cursors exist).
+RECORDING_WITNESS_COLD_START_SECONDS=${RECORDING_WITNESS_COLD_START_SECONDS:-0}
 EOF
   if [ -n "${RECORDING_WITNESS_LIST_WORKERS:-}" ]; then
     printf 'RECORDING_WITNESS_LIST_WORKERS=%s\n' "${RECORDING_WITNESS_LIST_WORKERS}" >>"${WORK}/witness.env"
@@ -3289,6 +3296,228 @@ is "worker parity: verdict identical" "${serial_state}" "${CASE_STATE}"
 is "worker parity: detail identical" "${serial_detail}" "${CASE_DETAIL}"
 if [ -n "${LIST_WORKERS_OVERRIDE}" ]; then export RECORDING_WITNESS_LIST_WORKERS="${LIST_WORKERS_OVERRIDE}"; fi
 
+# ---- (f3) cold start: windowed seed + coverage disclosure -----------------
+# A first run with no observed block lists a window of both audit streams
+# (recordings copies are full - a <sid>.tar key carries no timestamp) and
+# cannot return ok: the verdict carries the cold-start disclosure and the
+# state marks compact_blind until the first sweep. The windowed requests must
+# carry start-after markers that exclude the below-window key; a window with
+# no heartbeat at all falls back to the exact full sweep.
+SEED_OLD_TS="$(audit_stamp -100000)"
+SEED_HEARTBEAT_TS="$(audit_stamp -60)"
+SEED_START_TS="$(audit_stamp -300)"
+SEED_DATA_TS="$(audit_stamp -299)"
+seed_state_dir="${WORK}/state-seed-cold"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":2,
+ "objects":[
+  {"key":"audit/heartbeat/${SEED_OLD_TS}.json","ago":100000},
+  {"key":"audit/heartbeat/${SEED_HEARTBEAT_TS}.json","ago":45},
+  {"key":"audit/${SEED_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/${SEED_DATA_TS}-session.data.${SID}.1.json","ago":299},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-seed.log"
+: >"${REQUEST_LOG}"
+start_mock
+RECORDING_WITNESS_COLD_START_SECONDS=3600
+run_case "${seed_state_dir}"
+unset RECORDING_WITNESS_COLD_START_SECONDS
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "cold-start seed: exit 1 (a windowed seed can never be green)" "1" "${CASE_RC}"
+is "cold-start seed: alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *cold-start*) ok "cold-start seed: detail carries the disclosure" ;;
+  *) bad "cold-start seed: detail lacks the disclosure: ${CASE_DETAIL}" ;;
+esac
+is "cold-start seed: coverage mode is seed" "seed" "$(state_field observed.coverage.mode)"
+is "cold-start seed: compact_blind is set" "True" "$(state_field observed.coverage.compact_blind)"
+if python3 - "${WORK}/requests-seed.log" "${SEED_OLD_TS}" "${SEED_HEARTBEAT_TS}" <<'PY'
+import json
+import sys
+import urllib.parse
+
+log_path, old_ts, recent_ts = sys.argv[1], sys.argv[2], sys.argv[3]
+entries = [json.loads(line) for line in open(log_path, encoding="utf-8") if line.strip()]
+violations = []
+heartbeat_starts = []
+session_starts = []
+recordings = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    note = entry.get("note", "")
+    if "versions" in note:
+        violations.append("seed requested a versions listing: %s" % note)
+    if note.startswith("list-type=2"):
+        prefix = query.get("prefix", [""])[0]
+        start_after = query.get("start-after", [""])[0]
+        continuation = query.get("continuation-token", [""])[0]
+        if prefix == "recordings/":
+            recordings += 1
+            if start_after:
+                violations.append("recordings seed must be a full listing, got start-after=%r" % start_after)
+            continue
+        if not start_after and not continuation:
+            violations.append("audit seed listing without start-after: %s" % entry["path"])
+            continue
+        if prefix == "audit/heartbeat/":
+            if start_after:
+                heartbeat_starts.append(start_after)
+        elif prefix == "audit/":
+            if start_after:
+                session_starts.append(start_after)
+if len(heartbeat_starts) != 1 or len(session_starts) != 1 or recordings != 1:
+    violations.append("seed request shape: heartbeat=%d session=%d recordings=%d"
+                      % (len(heartbeat_starts), len(session_starts), recordings))
+else:
+    heartbeat_marker = heartbeat_starts[0]
+    session_marker = session_starts[0]
+    if not ("audit/heartbeat/%s.json" % old_ts < heartbeat_marker
+            < "audit/heartbeat/%s.json" % recent_ts):
+        violations.append("heartbeat window marker %r does not exclude the old key / include the recent key" % heartbeat_marker)
+    if not ("audit/%s" % old_ts < session_marker < "audit/%s" % recent_ts):
+        violations.append("session window marker %r out of range" % session_marker)
+if not any("uploads" in entry.get("note", "") for entry in entries):
+    violations.append("seed never listed multipart uploads")
+if violations:
+    for violation in violations:
+        print("VIOLATION " + violation)
+    sys.exit(1)
+print("seed shape: heartbeat + session windowed, recordings full, uploads full, no versions")
+PY
+then ok "cold-start seed: windowed audit streams + full recordings/uploads, no versions"; else bad "cold-start seed request shape failed"; fi
+
+# The seed wrote the observed block; the next run is an exact full sweep: an
+# unfiltered audit listing, versions listed, compact_blind cleared, mode back
+# to sweep. (After the delta path lands, an observed sweep-due also forces
+# this shape.)
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-postseed.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_case "${seed_state_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "post-seed run: exit 0" "0" "${CASE_RC}"
+is "post-seed run: ok verdict" "ok" "${CASE_STATE}"
+is "post-seed run: coverage mode is sweep" "sweep" "$(state_field observed.coverage.mode)"
+is "post-seed run: compact_blind cleared" "False" "$(state_field observed.coverage.compact_blind)"
+if grep -q 'versions prefix=audit/' "${WORK}/requests-postseed.log" \
+   && ! grep -q 'list-type=2' "${WORK}/requests-postseed.log"; then
+  bad "post-seed sweep shape unexpected"
+else
+  if python3 - "${WORK}/requests-postseed.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+violations = []
+unfiltered = 0
+versions = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    note = entry.get("note", "")
+    if "versions" in note:
+        versions += 1
+    if note.startswith("list-type=2") and not query.get("start-after"):
+        unfiltered += 1
+if unfiltered < 1:
+    violations.append("post-seed sweep has no unfiltered audit listing")
+if versions < 2:
+    violations.append("post-seed sweep did not list versions for both prefixes (%d)" % versions)
+if violations:
+    for violation in violations:
+        print("VIOLATION " + violation)
+    sys.exit(1)
+print("post-seed sweep shape: unfiltered objects + versions")
+PY
+  then ok "post-seed run: exact full sweep (unfiltered listings + versions)"; else bad "post-seed sweep request shape failed"; fi
+fi
+
+# A cold-start window with no heartbeat at all must fall back to the exact
+# full sweep instead of certifying (or alarming) from an empty window.
+empty_seed_dir="${WORK}/state-seed-empty"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/${SEED_OLD_TS}.json","ago":100000}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-seed-empty.log"
+: >"${REQUEST_LOG}"
+start_mock
+RECORDING_WITNESS_COLD_START_SECONDS=3600
+run_case "${empty_seed_dir}"
+unset RECORDING_WITNESS_COLD_START_SECONDS
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "empty seed window: falls back to a sweep (mode=sweep)" "sweep" "$(state_field observed.coverage.mode)"
+case "${CASE_DETAIL}" in
+  *cold-start*) bad "empty seed window still reported a seed disclosure: ${CASE_DETAIL}" ;;
+  *heartbeat-stale*) ok "empty seed window fallback swept the old heartbeat into a stale alert" ;;
+  *) bad "empty seed window fallback detail unexpected: ${CASE_DETAIL}" ;;
+esac
+
+# A stale/foreign observed block (written by a different run identity) is not
+# a trustworthy view: the run repairs it with an exact sweep, reports error
+# (never green), and rebuilds the block under this run's identity.
+stale_observed_dir="${WORK}/state-observed-stale"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${stale_observed_dir}"
+is "stale observed: the warm-up run is green" "ok" "${CASE_STATE}"
+python3 - "${stale_observed_dir}/state.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["observed"]["written_run_seq"] = 99999
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PY
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-stale-observed.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_case "${stale_observed_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "stale observed: exit 2 (repair, never green)" "2" "${CASE_RC}"
+is "stale observed: error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"observed.written_run_seq"*) ok "stale observed: detail names the foreign run identity" ;;
+  *) bad "stale observed: detail unexpected: ${CASE_DETAIL}" ;;
+esac
+is "stale observed: the record is marked repaired" "True" "$(state_field repaired)"
+record_run_seq="$(state_field run_seq)"
+observed_run_seq="$(state_field observed.written_run_seq)"
+is "stale observed: the rebuilt block carries this run's identity" "${record_run_seq}" "${observed_run_seq}"
+if python3 - "${WORK}/requests-stale-observed.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+unfiltered = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if entry.get("note", "").startswith("list-type=2") and not query.get("start-after"):
+        unfiltered += 1
+if unfiltered < 1:
+    raise SystemExit("repair run did not perform an unfiltered audit listing")
+print("repair run swept unfiltered")
+PY
+then ok "stale observed: the repair run performed a full unfiltered sweep"; else bad "stale observed repair sweep shape failed"; fi
+
 # ---- (g) the key is never printed ----------------------------------------
 if grep -q 'SENTINEL' "${WORK}/witness.out" "${WORK}/witness.err" "${WORK}/state/verdict.log" "${WORK}/state/state.json" 2>/dev/null; then
   bad "the witness printed key material somewhere"
@@ -3468,6 +3697,8 @@ export RECORDING_WITNESS_KEY="install-key-value-SENTINEL-0010"
 export RECORDING_WITNESS_RENOTIFY_SECONDS="2400"
 export RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS="172800"
 export RECORDING_WITNESS_QUIET_SIGNATURE="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+export RECORDING_WITNESS_COLD_START_SECONDS="7200"
+export RECORDING_WITNESS_SWEEP_SECONDS="3600"
 
 recording_witness_install
 [ -x "${RECORDING_WITNESS_SBIN}" ] && ok "install renders the witness script (executable)" || bad "install left no executable witness"
@@ -3494,11 +3725,28 @@ if grep -q '^RECORDING_WITNESS_QUIET_SIGNATURE=sha256:0' "${RECORDING_WITNESS_EN
 else
   bad "installed env file lost the optional quiet signature"
 fi
-unset RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_SIGNATURE
-if grep -q 'enable --now pc-recording-witness.timer' "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null; then
+if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
+  ok "installed env file carries the optional cold-start window"
+else
+  bad "installed env file lost the optional cold-start window"
+fi
+if grep -q '^RECORDING_WITNESS_SWEEP_SECONDS=3600$' "${RECORDING_WITNESS_ENV_FILE}"; then
+  ok "installed env file carries the optional sweep interval"
+else
+  bad "installed env file lost the optional sweep interval"
+fi
+unset RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_SIGNATURE RECORDING_WITNESS_COLD_START_SECONDS RECORDING_WITNESS_SWEEP_SECONDS
+# Install enables the timer WITHOUT --now: the timer-stop acceptance below
+# owns the first start, so no timer fire can merge with the seed run.
+if grep -q '^enable pc-recording-witness.timer$' "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null; then
   ok "install enables the timer"
 else
   bad "install did not enable the timer: $(cat "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null)"
+fi
+if grep -q 'enable --now pc-recording-witness.timer' "${FAKE_SYSTEMCTL_LOG}" 2>/dev/null; then
+  bad "install still enables the timer with --now (the acceptance must own the first start)"
+else
+  ok "install does not start the timer with --now"
 fi
 
 # Seed a verdict log: the disable path must keep it as evidence (docs claim).
@@ -3728,14 +3976,14 @@ is "run-once: drained the unit (active poll then inactive) before starting" "2" 
 unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 
 # Retry/drain bound (red-team INFO-2): a unit that never reports drained must
-# die fail-closed at the bounded 100-poll wait BEFORE any `systemctl start` —
+# die fail-closed at the bounded 3600-poll wait BEFORE any `systemctl start` —
 # zero starts for this pre-start drain, never a start-then-retry loop (the
 # retry-path drain can fire after a merged start already ran — fail-closed
-# either way). FAKE_SLEEP_NOWAIT keeps the 100 iterations but removes their
+# either way). FAKE_SLEEP_NOWAIT keeps the 3600 iterations but removes their
 # wall-clock cost; FAKE_ACTIVE_STATE=active reports active on every poll,
-# FAKE_ACTIVE_POLL_FILE pins the iteration count (100 loop polls + the final
+# FAKE_ACTIVE_POLL_FILE pins the iteration count (3600 loop polls + the final
 # ActiveState read for the die message = 101), FAKE_SLEEP_COUNT_FILE pins
-# the sleeps (100) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
+# the sleeps (3600) and FAKE_SLEEP_ARGS_FILE pins their argument (`1`), so a
 # bound regression fails whether it changes the poll count, the sleep count
 # or only the wall-clock wait (a deleted `sleep 1`, `sleep 0.1`, an early
 # break) instead of shipping with a stale "100s" message. The count/arg
@@ -3749,6 +3997,56 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 # starts before the drain, or retries beyond the bound, moves the start
 # counter off 0; one that loops without the bound hangs this check instead of
 # failing it.
+# The 3600-iteration drain wait forks the fake scripts 7200 times, which
+# dominates the suite runtime; the same counting/serving logic as bash
+# FUNCTIONS keeps the iteration, count, argument and interleaving proofs
+# intact without the process spawn cost. Only ActiveState is served (the
+# only call the wait makes); every other subcommand delegates to the fake
+# script on PATH. Unset after the tooth so the other tests use the script.
+sleep() {
+  if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ]; then
+    seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
+    printf '%s\n' "$((seen + 1))" >"${FAKE_SLEEP_COUNT_FILE}"
+  fi
+  if [ -n "${FAKE_SLEEP_ARGS_FILE:-}" ]; then
+    printf '%s\n' "${1:-}" >>"${FAKE_SLEEP_ARGS_FILE}"
+  fi
+  if [ "${FAKE_SLEEP_NOWAIT:-0}" = "1" ]; then return 0; fi
+  command sleep "$@"
+}
+systemctl() {
+  if [ "${1:-}" = "show" ]; then
+    prop=""
+    prev=""
+    for arg in "$@"; do
+      if [ "${prev}" = "-p" ]; then prop="${arg}"; fi
+      prev="${arg}"
+    done
+    if [ "${prop}" = "ActiveState" ]; then
+      seen=0
+      if [ -n "${FAKE_ACTIVE_POLL_FILE:-}" ]; then
+        seen="$(cat "${FAKE_ACTIVE_POLL_FILE}" 2>/dev/null || echo 0)"
+        seen=$((seen + 1))
+        printf '%s\n' "${seen}" >"${FAKE_ACTIVE_POLL_FILE}"
+      fi
+      if [ -n "${FAKE_ACTIVE_POLL_SLEEP_FILE:-}" ]; then
+        sleep_seen=0
+        if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ] && [ -f "${FAKE_SLEEP_COUNT_FILE}" ]; then
+          sleep_seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
+        fi
+        printf '%s\n' "${sleep_seen}" >>"${FAKE_ACTIVE_POLL_SLEEP_FILE}"
+      fi
+      polls="${FAKE_SERVICE_ACTIVE_POLLS:-0}"
+      if [ "${polls}" -gt 0 ] 2>/dev/null && [ "${seen}" -lt "${polls}" ]; then
+        printf 'active\n'
+        return 0
+      fi
+      printf '%s\n' "${FAKE_ACTIVE_STATE:-inactive}"
+      return 0
+    fi
+  fi
+  command systemctl "$@"
+}
 seed_state ok "$(fresh_stamp)" 61
 printf '0\n' >"${WORK}/no-drain-start-count"
 printf '0\n' >"${WORK}/no-drain-polls"
@@ -3761,12 +4059,12 @@ export FAKE_EXEC_STATUS=0
 run_once_call
 is "run-once: a unit that never drains dies fail-closed (issue #143)" "1" "${runonce_rc}"
 case "${runonce_out}" in
-  *"did not drain within 100s"*) ok "run-once names the bounded drain failure" ;;
+  *"did not drain within 3600s"*) ok "run-once names the bounded drain failure" ;;
   *) bad "run-once non-drain output: ${runonce_out}" ;;
 esac
 is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-drain-start-count")"
-is "run-once: a non-draining unit polls the bounded 100-iteration wait (100 + the final read)" "101" "$(cat "${WORK}/no-drain-polls")"
-is "run-once: a non-draining unit sleeps the bounded 100 iterations" "100" "$(cat "${WORK}/no-drain-sleeps")"
+is "run-once: a non-draining unit polls the bounded 3600-iteration wait (3600 + the final read)" "3601" "$(cat "${WORK}/no-drain-polls")"
+is "run-once: a non-draining unit sleeps the bounded 3600 iterations" "3600" "$(cat "${WORK}/no-drain-sleeps")"
 is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
 # Issue #143 red-team F1: poll N must observe N-1 sleeps (0..100 for the
 # shipped loop; the die path's final ActiveState read is poll 101). Moving
@@ -3790,7 +4088,7 @@ fi
 # `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
 # forms are not detected (fail-closed by design).
 if awk '
-  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*100;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
+  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
     seen_loop = 1; in_loop = 1; depth = 0; prev = ""; next
   }
   in_loop {
@@ -3834,6 +4132,7 @@ case "${runonce_out}" in
   *) bad "run-once non-drain wording: ${runonce_out}" ;;
 esac
 unset FAKE_ACTIVE_STATE FAKE_ACTIVE_POLL_FILE FAKE_ACTIVE_POLL_SLEEP_FILE FAKE_SLEEP_COUNT_FILE FAKE_SLEEP_ARGS_FILE FAKE_SLEEP_NOWAIT
+unset -f sleep systemctl
 
 # The unit ran (InvocationID advanced) but could not persist state.json:
 # reading the old state would still be stale, so the updated_at check dies.
@@ -3990,6 +4289,39 @@ case "${runonce_out}" in
   *"witness verdict: OK"*) bad "run-once mapped EMS=0 to OK despite state=alert" ;;
   *) ok "run-once refuses a state/ExecMainStatus mismatch (alert:0)" ;;
 esac
+
+# Timer-stop acceptance: stop the timer, run one synchronous check, start the
+# timer again; the EXIT trap must restart the timer on BOTH exit paths so a
+# failed acceptance never leaves monitoring silently stopped. The mocked
+# systemctl records stop/start calls; the sequence of timer calls is the
+# load-bearing evidence (a stop without a restart fails both teeth).
+: >"${FAKE_SYSTEMCTL_LOG}"
+seed_state ok "$(fresh_stamp)"
+unset FAKE_START_RC FAKE_NO_STATE_WRITE FAKE_NO_INVOCATION_BUMP FAKE_REPAIR_STATE FAKE_REPAIR_VERDICT FAKE_REPAIR_RUN_SEQ FAKE_MERGE_FIRST_START FAKE_RETRY_NO_STATE_WRITE
+export FAKE_EXEC_STATUS=0
+accept_rc=0
+(recording_witness_accept) >"${WORK}/accept-ok.out" 2>&1 || accept_rc=$?
+is "timer-stop acceptance: an ok run exits 0" "0" "${accept_rc}"
+timer_cmds="$(grep -E '^(stop|start) pc-recording-witness.timer$' "${FAKE_SYSTEMCTL_LOG}" | tr '\n' ',')"
+is "timer-stop acceptance: stop then start the timer in order" \
+  "stop pc-recording-witness.timer,start pc-recording-witness.timer," "${timer_cmds}"
+
+# Both-path restart: an error verdict makes run-once die; the trap must still
+# start the timer before the process exits.
+: >"${FAKE_SYSTEMCTL_LOG}"
+seed_state error "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=2
+accept_rc=0
+(recording_witness_accept) >"${WORK}/accept-error.out" 2>&1 || accept_rc=$?
+is "timer-stop acceptance: an error verdict fails closed" "1" "${accept_rc}"
+timer_cmds="$(grep -E '^(stop|start) pc-recording-witness.timer$' "${FAKE_SYSTEMCTL_LOG}" | tr '\n' ',')"
+is "timer-stop acceptance: the failing path still restarts the timer" \
+  "stop pc-recording-witness.timer,start pc-recording-witness.timer," "${timer_cmds}"
+case "$(cat "${WORK}/accept-error.out")" in
+  *"witness verdict: ERROR"*) ok "timer-stop acceptance surfaces the ERROR verdict" ;;
+  *) bad "timer-stop acceptance error output: $(cat "${WORK}/accept-error.out")" ;;
+esac
+unset FAKE_EXEC_STATUS
 
 # ---- (j) ntfy transitions / recovery / renotify (fake notifier) ----------
 py_begin="$(grep -n "exec python3 - <<'RECORDING_WITNESS_PY_EOF'" "${PROVISION}" | cut -d: -f1)"
@@ -4329,7 +4661,7 @@ module._NTFY_OPENER = FakeOpener(flaky_urlopen)
 captured[:] = []
 verdict = ["alert"]
 sig = ["sha256:" + "1" * 64]
-module.run_checks = lambda config, now: (verdict[0], "detail", sig[0])
+module.run_checks = lambda config, now, plan: (verdict[0], "detail", sig[0], {"mode": "sweep", "window_start": None})
 
 # First-ever green baseline (round-4 LOW 1): two consecutive green runs must
 # not push, and the first-ever run must not arm the recovery retry. Then a
@@ -4619,7 +4951,8 @@ done
 # evaluated with sentinels) so a regression to an empty assignment cannot stay
 # green behind a name grep.
 for witness_var in RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS \
-                   RECORDING_WITNESS_QUIET_SIGNATURE; do
+                   RECORDING_WITNESS_QUIET_SIGNATURE RECORDING_WITNESS_COLD_START_SECONDS \
+                   RECORDING_WITNESS_SWEEP_SECONDS; do
   if grep -q "$witness_var" "${ROOT}/.github/workflows/provision.yml"; then
     ok "provision.yml carries $witness_var"
   else
@@ -4633,12 +4966,15 @@ export TENANT_USER="tenant-sentinel" ANCHOR_HOSTNAME="anchor-sentinel" STATUS_HO
   RECORDING_WITNESS_AUDIT_PREFIX="audit/" RECORDING_WITNESS_RECORDINGS_PREFIX="recordings/" \
   RECORDING_WITNESS_KEY_ID="keyid-sentinel" RECORDING_WITNESS_KEY="key-sentinel" \
   RECORDING_WITNESS_RENOTIFY_SECONDS="2400" RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS="172800" \
-  RECORDING_WITNESS_QUIET_SIGNATURE="${SIGNATURE_SEED}"
+  RECORDING_WITNESS_QUIET_SIGNATURE="${SIGNATURE_SEED}" \
+  RECORDING_WITNESS_COLD_START_SECONDS="7200" RECORDING_WITNESS_SWEEP_SECONDS="3600"
 eval "$(sed -n 's/^  \(ENV_PREFIX=.*\)$/\1/p' "${ROOT}/.github/scripts/020-provision-anchor.sh")"
 eval "$ENV_PREFIX"
 is "020 ENV_PREFIX passes the renotify window through" "2400" "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}"
 is "020 ENV_PREFIX passes the quiet window through" "172800" "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}"
 is "020 ENV_PREFIX passes the quiet signature through" "${SIGNATURE_SEED}" "${RECORDING_WITNESS_QUIET_SIGNATURE:-}"
+is "020 ENV_PREFIX passes the cold-start window through" "7200" "${RECORDING_WITNESS_COLD_START_SECONDS:-}"
+is "020 ENV_PREFIX passes the sweep interval through" "3600" "${RECORDING_WITNESS_SWEEP_SECONDS:-}"
 if grep -q 'tests/recording-witness/run-test.sh' "${ROOT}/.github/workflows/ci.yml"; then
   ok "ci.yml runs the recording-witness harness"
 else

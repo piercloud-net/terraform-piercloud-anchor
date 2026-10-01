@@ -3,7 +3,7 @@
 
 Serves only the three list operations the witness may use:
 
-    GET /<bucket>?list-type=2&prefix=... [&continuation-token=...]
+    GET /<bucket>?list-type=2&prefix=... [&start-after=...] [&continuation-token=...]
     GET /<bucket>?versions&prefix=... [&key-marker=...&version-id-marker=...]
     GET /<bucket>?uploads[&prefix=...] [&key-marker=...&upload-id-marker=...]
 
@@ -253,11 +253,17 @@ class Handler(BaseHTTPRequestHandler):
     def handle_objects(self, query):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
+        start_after = query.get("start-after", [""])[0]
         now = time.time()
         offset = int(token) if token.isdigit() else 0
         matching = [
             obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
         ]
+        # `start-after` is exclusive and seeds the first page only (real B2
+        # semantics, live-verified): a windowed seed lists the tail, and a
+        # continuation token resumes from the same filtered list.
+        if start_after:
+            matching = [obj for obj in matching if obj["key"] > start_after]
         # Real S3/B2 lists ascending by key. A fixture can opt into fixture
         # order to pin that the witness verdict is independent of the order
         # the listing returns (e.g. `.shell` before `.exec` at the same ts, or
