@@ -1842,10 +1842,13 @@ def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pa
     """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
 
     `start_after` seeds the first page (exclusive, live-verified on B2); it is
-    never combined with a continuation token. `stop_at_heartbeat` stops the
-    scan at the first key under the heartbeat prefix: audit/heartbeat/ sorts
-    after every audit/<ts> key, so that is where the session stream ends and
-    the heartbeat stream owns the tail (keys sorting after it are sweep-only).
+    never combined with a continuation token. `stop_at_heartbeat` ends the
+    session stream at the heartbeat stem: any key at/after audit/heartbeat is
+    not a session key (every session key starts with a digit and sorts below
+    it), so the heartbeat stream owns the tail (keys sorting after it are
+    sweep-only). The early stop fires only on a complete ordered page - a
+    truncated page keeps paginating (heartbeat entries stay skipped), because
+    a nonconformant server could still return a session key on a later page.
     `max_pages` bounds a delta tail; overflow raises DeltaTooLong so the run
     can fall back to an exact sweep instead of a truncated view.
     """
@@ -1901,15 +1904,18 @@ def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pa
             truncated = True
         keys = [key for key, _ in entries]
         ordered = all(before <= current for before, current in zip(keys, keys[1:]))
-        crossed = stop_at_heartbeat and ordered and any(
-            key.startswith(config.heartbeat_prefix) for key in keys)
+        heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+        crossed = stop_at_heartbeat and ordered and not truncated and any(
+            key >= heartbeat_stem for key in keys)
         for key, last_modified in entries:
-            if stop_at_heartbeat and key.startswith(config.heartbeat_prefix):
+            if stop_at_heartbeat and key >= heartbeat_stem:
                 if crossed:
-                    # An ordered page: every later key sorts at/after the
-                    # heartbeat subtree, so the session stream ends here. A
-                    # nonconformant unordered page is filtered entry-by-entry
-                    # and never used as an early-stop signal.
+                    # A complete ordered page: every later key sorts at/after
+                    # the heartbeat stem, so the session stream ends here. A
+                    # truncated page proves nothing about later pages (a
+                    # nonconformant server can hide a session key behind the
+                    # heartbeat), and an unordered page is filtered
+                    # entry-by-entry; neither is an early-stop signal.
                     return objects
                 continue
             try:
@@ -2309,8 +2315,14 @@ def _collect_families(config, boundaries=None):
 
 def _cursors_from_listings(config, audit_objects, recording_objects):
     """High-water keys for the two audit streams + recordings from a listing."""
+    # The session family is bounded above by the heartbeat stem: an exact
+    # `audit/heartbeat` object (or any key after it) is not a session key.
+    # Treating it as one would write a session cursor above every real
+    # session key, so the delta lists an empty tail while recordings happen
+    # (observed_problem rejects such a cursor anyway).
+    heartbeat_stem = config.heartbeat_prefix.rstrip("/")
     heartbeat_keys = [key for key in audit_objects if key.startswith(config.heartbeat_prefix)]
-    session_keys = [key for key in audit_objects if not key.startswith(config.heartbeat_prefix)]
+    session_keys = [key for key in audit_objects if key < heartbeat_stem]
     return {
         "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
         "audit_session": max(session_keys) if session_keys else "",
@@ -3160,12 +3172,15 @@ def observed_problem(observed, record_run_seq, config=None):
         if not isinstance(value, str) or not value.startswith(prefix):
             return "observed.cursors.%s is invalid: %r" % (name, value)
     session_cursor = cursors.get("audit_session")
-    if isinstance(session_cursor, str) and session_cursor.startswith(prefixes["audit_heartbeat"]):
-        # The two audit streams partition the ordered key space: a session
-        # cursor at/under the heartbeat prefix would make the session delta
-        # list an empty tail while real session keys sit below it (a
-        # forged-state false green). Fail closed into repair + sweep.
-        return "observed.cursors.audit_session is under the heartbeat prefix: %r" % session_cursor
+    if isinstance(session_cursor, str) and session_cursor >= prefixes["audit_heartbeat"].rstrip("/"):
+        # The two audit streams partition the ordered key space at the
+        # heartbeat stem (every real session key starts with a digit and
+        # sorts below it): a session cursor at/after the stem - the exact
+        # `audit/heartbeat` stem, `audit/i`, or a heartbeat key - would make
+        # the session delta list an empty tail while real session keys sit
+        # below it (a forged-state false green). Fail closed into repair +
+        # sweep.
+        return "observed.cursors.audit_session is at/after the heartbeat prefix boundary: %r" % session_cursor
     boundaries = observed.get("sweep_boundaries")
     if not isinstance(boundaries, list) or len(boundaries) > 32:
         return "observed.sweep_boundaries is invalid"
