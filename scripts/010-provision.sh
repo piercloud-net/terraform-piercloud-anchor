@@ -3667,6 +3667,7 @@ recording_witness_accept() { # timer-stopped synchronous acceptance (one run, al
   local rc=0
   # The EXIT trap restarts the timer on EVERY path (success, alert, die):
   # monitoring is never silently left stopped by a failed acceptance.
+  trap 'recording_witness_timer_start' EXIT
   recording_witness_timer_stop
   recording_witness_run_once || rc=$?
   recording_witness_timer_start
