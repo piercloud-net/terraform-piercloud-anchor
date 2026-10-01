@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=716
+MIN_CHECKS=755
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4212,6 +4212,190 @@ run_delta "${stem_object_dir}"
 is "heartbeat stem object: the delta does not advance the session cursor to the stem" \
   "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
 is "heartbeat stem object: the next run stays a delta" "delta" "$(state_field observed.coverage.mode)"
+
+# F3.1: the stem bound alone is still boundary-anchored: a forged session
+# cursor below the stem but above the whole real session key space (`audit/9`,
+# `audit/g`, `audit/heartbea`, `audit/2027`, an acceptance probe) passed the
+# generic `audit/` prefix check, and the session delta then listed an empty
+# tail while a fresh `session.start` sat below it - green while a real
+# recording gap was hidden. The cursor must match the witness's own key
+# grammar; every forged value takes the repair + sweep + error path.
+shape_cursor_dir="${WORK}/state-shape-cursor"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${shape_cursor_dir}"
+is "shape session cursor: the warm sweep is green" "ok" "${CASE_STATE}"
+SHAPE_TS="$(audit_stamp -5)"
+for forged_cursor in "audit/9" "audit/9999" "audit/g" "audit/heartbea" "audit/2027" \
+                     "audit/a2-check-probe-heartbeat.json"; do
+  python3 - "${shape_cursor_dir}/state.json" "${forged_cursor}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"]["audit_session"] = sys.argv[2]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/${SHAPE_TS}-session.start.1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e.0.json","ago":1200},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+  start_mock
+  run_delta "${shape_cursor_dir}"
+  is "shape session cursor (${forged_cursor}): exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
+  is "shape session cursor (${forged_cursor}): error verdict" "error" "${CASE_STATE}"
+  is "shape session cursor (${forged_cursor}): the record is marked repaired" "True" "$(state_field repaired)"
+done
+
+# The same shape guard covers the heartbeat and recordings families: a cursor
+# that is under its prefix but matches no family shape (`audit/heartbeat/9`,
+# `recordings/a2-check-...`) would blind that delta's tail exactly the same
+# way - and a heartbeat cursor above every heartbeat key misses the freshness
+# signal for up to a sweep. Fail closed.
+for forged_pair in "audit_heartbeat|audit/heartbeat/9" \
+                   "recordings|recordings/a2-check-probe-heartbeat.json"; do
+  forged_family="${forged_pair%%|*}"
+  forged_value="${forged_pair#*|}"
+  python3 - "${shape_cursor_dir}/state.json" "${forged_family}" "${forged_value}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"][sys.argv[2]] = sys.argv[3]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  start_mock
+  run_delta "${shape_cursor_dir}"
+  is "shape ${forged_family} cursor: exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
+  is "shape ${forged_family} cursor: error verdict" "error" "${CASE_STATE}"
+  is "shape ${forged_family} cursor: the record is marked repaired" "True" "$(state_field repaired)"
+  case "${CASE_DETAIL}" in
+    *"key grammar"*) ok "shape ${forged_family} cursor: detail names the key-grammar violation" ;;
+    *) bad "shape ${forged_family} cursor detail: ${CASE_DETAIL}" ;;
+  esac
+done
+
+# Live-shape regression (orchestrator, list-only on the real bucket): the live
+# `audit/` bucket carries unshaped acceptance probes between the real session
+# keys and the heartbeat stem (16 x `audit/a2-check-<date>-<hex>.positive` plus
+# `audit/a2-check-probe-heartbeat.json`). `max()` over the listing used to put
+# the session cursor on the highest probe, so the 5-minute delta listed an
+# empty tail (blind) until the next 6 h sweep - green while real sessions
+# shipped. The cursor must stay on the last SHAPED key; the probe stays a
+# finding and never moves it, and the following deltas still see new sessions.
+live_probe_dir="${WORK}/state-live-probe"
+LIVE_SID3="5c5c5c5c-5c5c-4c5c-8c5c-5c5c5c5c5c5c"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"audit/a2-check-probe-heartbeat.json","ago":60}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${live_probe_dir}"
+is "live probe: the sweep keeps the session cursor on the last shaped key" \
+  "audit/${DELTA_START_TS}-session.start.${SID}.0.json" "$(state_field observed.cursors.audit_session)"
+case "${CASE_DETAIL}" in
+  *contract-mismatch*) ok "live probe: the unshaped object is still flagged as drift" ;;
+  *) bad "live probe detail: ${CASE_DETAIL}" ;;
+esac
+LIVE_SID2_TS="$(audit_stamp -10)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"audit/a2-check-probe-heartbeat.json","ago":60},
+  {"key":"audit/${LIVE_SID2_TS}-session.start.${SID2}.0.json","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${live_probe_dir}"
+is "live probe: the next delta sees the new shaped session (no blind tail)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${SID2}"*) ok "live probe: the new session is gap-checked (recording-gap names it)" ;;
+  *) bad "live probe detail: ${CASE_DETAIL}" ;;
+esac
+is "live probe: the delta keeps the cursor on the new shaped key" \
+  "audit/${LIVE_SID2_TS}-session.start.${SID2}.0.json" "$(state_field observed.cursors.audit_session)"
+is "live probe: the delta does not repair" "" "$(state_field repaired)"
+is "live probe: the run stays a delta (the probe is not a repair loop)" "delta" "$(state_field observed.coverage.mode)"
+LIVE_SID3_TS="$(audit_stamp -2)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297},
+  {"key":"audit/a2-check-probe-heartbeat.json","ago":60},
+  {"key":"audit/${LIVE_SID2_TS}-session.start.${SID2}.0.json","ago":1200},
+  {"key":"audit/${LIVE_SID3_TS}-session.start.${LIVE_SID3}.0.json","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${live_probe_dir}"
+case "${CASE_DETAIL}" in
+  *"${LIVE_SID3}"*) ok "live probe: the following delta still sees a new session (the cursor never sat on the probe)" ;;
+  *) bad "live probe second-delta detail: ${CASE_DETAIL}" ;;
+esac
+
+# The same live-shape guard for the recordings family: an unshaped probe above
+# the shaped tar id space must not become the recordings cursor, or the next
+# delta's tar tail is blind (a new completed tar - orphan or not - invisible
+# until the sweep). The cursor stays on the highest SHAPED tar.
+live_rec_dir="${WORK}/state-live-rec-probe"
+LIVE_TAR_LOW="00000000-0000-4000-8000-000000000000.tar"
+LIVE_TAR_NEW="11111111-1111-4111-8111-111111111111.tar"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"recordings/${LIVE_TAR_LOW}","ago":297},
+  {"key":"recordings/a2-check-probe-heartbeat.json","ago":60}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${live_rec_dir}"
+is "live recordings probe: the sweep keeps the recordings cursor on the last shaped tar" \
+  "recordings/${LIVE_TAR_LOW}" "$(state_field observed.cursors.recordings)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"recordings/${LIVE_TAR_LOW}","ago":297},
+  {"key":"recordings/a2-check-probe-heartbeat.json","ago":60},
+  {"key":"recordings/${LIVE_TAR_NEW}","ago":1200}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${live_rec_dir}"
+is "live recordings probe: the delta sees the new shaped tar (no blind tail)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "live recordings probe: the new orphan tar is checked (session-start-missing)" ;;
+  *) bad "live recordings probe detail: ${CASE_DETAIL}" ;;
+esac
+is "live recordings probe: the delta keeps the cursor on the new shaped tar" \
+  "recordings/${LIVE_TAR_NEW}" "$(state_field observed.cursors.recordings)"
 
 # An unknown cursor version is not trusted: the observed block must take the
 # repair + sweep path, never a delta (deleting the version guard would let a
