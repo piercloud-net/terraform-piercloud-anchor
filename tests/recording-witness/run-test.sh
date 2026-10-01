@@ -880,7 +880,7 @@ state_field() { # $1 = dotted path into the CASE_STATE_DIR state.json
 import json, sys
 try:
     node = json.load(open(sys.argv[1]))
-except (OSError, ValueError):
+except (OSError, ValueError, RecursionError):
     node = {}
 for part in sys.argv[2].split("."):
     node = node.get(part, "") if isinstance(node, dict) else ""
@@ -888,7 +888,47 @@ print(node)
 ' "${CASE_STATE_DIR:-${WORK}/state}/state.json" "$1" 2>/dev/null || true
 }
 
-run_case() { # fixture at ${FIXTURE} ($1 = optional state dir); sets CASE_RC / CASE_STATE / CASE_DETAIL
+force_sweep_state() { # rewrite a readable state.json into a valid, sweep-due observed block
+  local state_path="$1/state.json"
+  [ -f "${state_path}" ] || return 0
+  python3 - "${state_path}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError, RecursionError):
+    raise SystemExit(0)
+if not isinstance(data, dict):
+    raise SystemExit(0)
+run_seq = data.get("run_seq")
+if isinstance(run_seq, bool) or not isinstance(run_seq, int) or run_seq < 0:
+    run_seq = 0
+existing = data.get("observed") if isinstance(data.get("observed"), dict) else {}
+boundaries = existing.get("sweep_boundaries") if isinstance(existing.get("sweep_boundaries"), list) else []
+data["observed"] = {
+    "cursor_version": 1,
+    "generation": 1,
+    "written_run_seq": run_seq,
+    "last_sweep_ok_epoch": 0,
+    "last_sweep_ok_run_seq": 0,
+    "sweep_due_epoch": 0,
+    "sweep_failed": False,
+    "coverage": {"mode": "sweep", "window_start": None, "compact_blind": False},
+    "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
+    # Keep prior boundaries: a forced sweep may still range-split, and the
+    # union of the branches is the same key set whichever boundaries were
+    # sampled from an earlier fixture.
+    "sweep_boundaries": boundaries,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+}
+
+run_case_raw() { # like run_case but never rewrites the persisted observed block
   CASE_STATE_DIR="${1:-${WORK}/state}"
   cat >"${WORK}/witness.env" <<EOF
 RECORDING_WITNESS_ENDPOINT=http://127.0.0.1:${MOCK_PORT}
@@ -899,9 +939,8 @@ RECORDING_WITNESS_RECORDINGS_PREFIX=recordings/
 RECORDING_WITNESS_KEY_ID=test-key-id-0001
 RECORDING_WITNESS_KEY=test-secret-SENTINEL-0009
 RECORDING_WITNESS_STATE_DIR=${CASE_STATE_DIR}
-# Every pre-delta scenario is an exact full sweep: the cold-start window is
-# disabled unless a tooth asks for a seed (the observed-block injections in
-# stage 3 force the sweep again once cursors exist).
+# The cold-start window is disabled unless a tooth asks for a seed (a fresh
+# state dir is then an exact full sweep, keeping historical verdicts).
 RECORDING_WITNESS_COLD_START_SECONDS=${RECORDING_WITNESS_COLD_START_SECONDS:-0}
 EOF
   if [ -n "${RECORDING_WITNESS_LIST_WORKERS:-}" ]; then
@@ -912,6 +951,19 @@ EOF
   "${WITNESS}" >"${WORK}/witness.out" 2>"${WORK}/witness.err" || CASE_RC=$?
   CASE_STATE="$(state_field state)"
   CASE_DETAIL="$(state_field detail)"
+}
+
+run_delta() { # delta/seed teeth: keep the persisted cursors + view sidecar
+  run_case_raw "$@"
+}
+
+run_case() { # fixture at ${FIXTURE} ($1 = optional state dir); sets CASE_RC / CASE_STATE / CASE_DETAIL
+  CASE_STATE_DIR="${1:-${WORK}/state}"
+  # Stage-3 seam: every historical scenario stays a byte-identical exact
+  # sweep by forcing the observed block sweep-due (0), even after a previous
+  # run advanced its cursors. Delta teeth use run_delta, which skips this.
+  force_sweep_state "${CASE_STATE_DIR}"
+  run_case_raw "${CASE_STATE_DIR}"
 }
 
 fixture <<JSON
@@ -3489,7 +3541,7 @@ SAVED_REQUEST_LOG="${REQUEST_LOG}"
 REQUEST_LOG="${WORK}/requests-stale-observed.log"
 : >"${REQUEST_LOG}"
 start_mock
-run_case "${stale_observed_dir}"
+run_delta "${stale_observed_dir}"
 REQUEST_LOG="${SAVED_REQUEST_LOG}"
 is "stale observed: exit 2 (repair, never green)" "2" "${CASE_RC}"
 is "stale observed: error verdict" "error" "${CASE_STATE}"
@@ -3517,6 +3569,580 @@ if unfiltered < 1:
 print("repair run swept unfiltered")
 PY
 then ok "stale observed: the repair run performed a full unfiltered sweep"; else bad "stale observed repair sweep shape failed"; fi
+
+# ---- (f4) delta cursors + merged sweeps (issue #153) ---------------------
+# A warm sweep writes the three high-water cursors plus the view sidecar; a
+# quiet delta then lists only the cursors' tails plus the full multipart
+# family, never versions (sweep-only) and never an unfiltered object page.
+# The verdict/detail/signature must be identical to the sweep: the merge is
+# exact, only the listing surface shrinks.
+DELTA_HEARTBEAT_TS="$(audit_stamp -60)"
+DELTA_START_TS="$(audit_stamp -300)"
+DELTA_DATA_TS="$(audit_stamp -299)"
+DELTA_END_TS="$(audit_stamp -298)"
+delta_dir="${WORK}/state-delta"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/${DELTA_DATA_TS}-session.data.${SID}.1.json","ago":299},
+  {"key":"audit/${DELTA_END_TS}-session.end.${SID}.2.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${delta_dir}"
+is "delta: the warm sweep is green" "ok" "${CASE_STATE}"
+warm_detail="${CASE_DETAIL}"
+warm_signature="$(state_field signature)"
+is "delta: the warm sweep wrote the heartbeat cursor" \
+  "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+is "delta: the warm sweep wrote the session cursor" \
+  "audit/${DELTA_END_TS}-session.end.${SID}.2.json" "$(state_field observed.cursors.audit_session)"
+is "delta: the warm sweep wrote the recordings cursor" \
+  "recordings/${SID}.tar" "$(state_field observed.cursors.recordings)"
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-delta-quiet.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${delta_dir}"
+is "quiet delta: exit 0" "0" "${CASE_RC}"
+is "quiet delta: ok verdict" "ok" "${CASE_STATE}"
+is "quiet delta: coverage mode is delta" "delta" "$(state_field observed.coverage.mode)"
+is "quiet delta: compact_blind stays clear" "False" "$(state_field observed.coverage.compact_blind)"
+# The displayed heartbeat age can tick across a whole second between two
+# runs (the bucket timestamps are second-resolution); the finding set is the
+# stable identity, so normalize only the age fragment before comparing.
+norm_detail() { printf '%s' "$1" | sed 's/heartbeat_age=[0-9]*s/heartbeat_age=X/'; }
+warm_detail_norm="$(norm_detail "${warm_detail}")"
+is "quiet delta: detail identical to the sweep (age normalized)" "${warm_detail_norm}" "$(norm_detail "${CASE_DETAIL}")"
+is "quiet delta: finding signature identical to the sweep" "${warm_signature}" "$(state_field signature)"
+if python3 - "${WORK}/requests-delta-quiet.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+violations = []
+objects = 0
+uploads = 0
+versions = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    note = entry.get("note", "")
+    if "versions" in note:
+        versions += 1
+        violations.append("quiet delta listed versions")
+    elif note.startswith("list-type=2"):
+        objects += 1
+        if not query.get("start-after"):
+            violations.append("quiet delta object listing without start-after: %s" % entry["path"])
+    elif "uploads" in note:
+        uploads += 1
+    else:
+        violations.append("quiet delta made an unexpected request: %s" % note)
+if len(entries) != 4 or objects != 3 or uploads != 1 or versions != 0:
+    violations.append("quiet delta call shape: entries=%d objects=%d uploads=%d versions=%d"
+                      % (len(entries), objects, uploads, versions))
+if violations:
+    for violation in violations:
+        print("VIOLATION " + violation)
+    sys.exit(1)
+print("quiet delta shape: 3 cursored object tails + 1 full uploads, no versions")
+PY
+then ok "quiet delta: three cursored tails + full uploads, no versions, no unfiltered pages"; else bad "quiet delta request shape failed"; fi
+cat "${WORK}/requests-delta-quiet.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+
+# A replayed old-<ts> key sorts below the session cursor: the delta never
+# lists it (the request carries a start-after above it), so the fast verdict
+# is unchanged; the forced sweep sees both identities and alerts.
+REPLAY_TS="$(audit_stamp -100000)"
+REPLAY_KEY="audit/${REPLAY_TS}-session.start.${SID}.0.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${REPLAY_KEY}","ago":400},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"audit/${DELTA_DATA_TS}-session.data.${SID}.1.json","ago":299},
+  {"key":"audit/${DELTA_END_TS}-session.end.${SID}.2.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-delta-replay.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${delta_dir}"
+is "below-cursor replay: the fast delta is unchanged and green" "ok" "${CASE_STATE}"
+is "below-cursor replay: detail identical to the delta (age normalized)" "${warm_detail_norm}" "$(norm_detail "${CASE_DETAIL}")"
+if python3 - "${WORK}/requests-delta-replay.log" "${REPLAY_KEY}" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+replay_key = sys.argv[2]
+bad = False
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if entry.get("note", "").startswith("list-type=2") and query.get("prefix", [""])[0] == "audit/":
+        marker = query.get("start-after", [""])[0]
+        if marker and replay_key > marker:
+            print("VIOLATION the audit delta marker %r is below the replay key" % marker)
+            bad = True
+if bad:
+    sys.exit(1)
+print("audit delta marker excludes the below-cursor replay key")
+PY
+then ok "below-cursor replay: the fast delta's session marker excludes it"; else bad "below-cursor replay request shape failed"; fi
+cat "${WORK}/requests-delta-replay.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+force_sweep_state "${delta_dir}"
+start_mock
+run_delta "${delta_dir}"
+is "below-cursor replay: the forced sweep catches the duplicate" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *sequence-duplicate*) ok "below-cursor replay: sweep detail names sequence-duplicate" ;;
+  *) bad "below-cursor replay sweep detail: ${CASE_DETAIL}" ;;
+esac
+
+# A delete marker for an already-listed key is invisible to deltas by design:
+# the retained hidden set is carried unchanged until the sweep-only versions
+# listing reconciles it. The sweep interval is the hiding-detection bound.
+BOUND_TS="${DELTA_START_TS}"
+bound_dir="${WORK}/state-bound"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${BOUND_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "versions":[{"key":"audit/${BOUND_TS}-session.start.${SID}.0.json","version_id":"v1","delete_marker":false,"ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${bound_dir}"
+is "delete-marker bound: the warm sweep is green" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${BOUND_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "versions":[{"key":"audit/${BOUND_TS}-session.start.${SID}.0.json","version_id":"v1","delete_marker":true,"ago":120}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-delta-bound.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${bound_dir}"
+is "delete-marker bound: the delta does not see the old-key marker" "ok" "${CASE_STATE}"
+if grep -q 'versions' "${WORK}/requests-delta-bound.log"; then
+  bad "delete-marker bound: the delta listed versions"
+else
+  ok "delete-marker bound: the delta made no versions call"
+fi
+cat "${WORK}/requests-delta-bound.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+force_sweep_state "${bound_dir}"
+start_mock
+run_delta "${bound_dir}"
+is "delete-marker bound: the forced sweep alerts hidden-object" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *hidden-object*) ok "delete-marker bound: sweep detail names hidden-object" ;;
+  *) bad "delete-marker bound sweep detail: ${CASE_DETAIL}" ;;
+esac
+
+# Cursor loss and a foreign view are not trustworthy: both take the
+# preserve+repair+full-sweep path and report error (never green).
+loss_dir="${WORK}/state-loss"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${loss_dir}"
+is "cursor loss: the warm sweep is green" "ok" "${CASE_STATE}"
+python3 - "${loss_dir}/state.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+del data["observed"]
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PY
+start_mock
+run_delta "${loss_dir}"
+is "cursor loss: exit 2 (repair, never green)" "2" "${CASE_RC}"
+is "cursor loss: error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"observed block is missing"*) ok "cursor loss: detail names the missing observed block" ;;
+  *) bad "cursor loss detail: ${CASE_DETAIL}" ;;
+esac
+is "cursor loss: the record is marked repaired" "True" "$(state_field repaired)"
+run_delta "${loss_dir}"
+is "cursor loss: the rebuilt block serves the next delta green" "ok" "${CASE_STATE}"
+is "cursor loss: the rebuilt block is a delta" "delta" "$(state_field observed.coverage.mode)"
+
+view_dir="${WORK}/state-badview"
+start_mock
+run_delta "${view_dir}"
+is "bad view: the warm sweep is green" "ok" "${CASE_STATE}"
+python3 - "${view_dir}/view.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["generation"] = int(data.get("generation", 0)) + 1000
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PY
+start_mock
+run_delta "${view_dir}"
+is "bad view: exit 2 (repair, never green)" "2" "${CASE_RC}"
+is "bad view: error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"view.generation"*) ok "bad view: detail names the sidecar generation mismatch" ;;
+  *) bad "bad view detail: ${CASE_DETAIL}" ;;
+esac
+is "bad view: the record is marked repaired" "True" "$(state_field repaired)"
+python3 - "${view_dir}/state.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["observed"]["cursors"]["audit_session"] = "recordings/not-a-session"
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PY
+start_mock
+run_delta "${view_dir}"
+is "foreign cursor: exit 2 (repair, never green)" "2" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *"cursors.audit_session"*) ok "foreign cursor: detail names the out-of-prefix cursor" ;;
+  *) bad "foreign cursor detail: ${CASE_DETAIL}" ;;
+esac
+
+# A failed sweep latches: every later run forces a sweep until one succeeds,
+# so a delta can never paper over an unreconciled history.
+latch_dir="${WORK}/state-latch"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${latch_dir}"
+is "sweep latch: the warm sweep is green" "ok" "${CASE_STATE}"
+python3 - "${latch_dir}/state.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["observed"]["sweep_failed"] = True
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PY
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"fail_versions":"denied",
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${latch_dir}"
+is "sweep latch: the failing sweep exits 2" "2" "${CASE_RC}"
+is "sweep latch: the failing sweep is error" "error" "${CASE_STATE}"
+is "sweep latch: the latch is carried through the failure" "True" "$(state_field observed.sweep_failed)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-delta-latch.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${latch_dir}"
+is "sweep latch: the next healthy run sweeps and clears the latch" "ok" "${CASE_STATE}"
+is "sweep latch: coverage mode is sweep" "sweep" "$(state_field observed.coverage.mode)"
+is "sweep latch: the latch cleared" "False" "$(state_field observed.sweep_failed)"
+if grep -q 'versions' "${WORK}/requests-delta-latch.log"; then
+  ok "sweep latch: the recovery run really swept (versions listed)"
+else
+  bad "sweep latch: the recovery run did not list versions"
+fi
+cat "${WORK}/requests-delta-latch.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+
+# Double-run idempotency: a second apply/quiet run takes the delta path, does
+# not re-seed, keeps the generation, advances run_seq and leaves the verdict
+# and finding signature byte-identical.
+idem_dir="${WORK}/state-idem"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${idem_dir}"
+is "double run: the warm sweep is green" "ok" "${CASE_STATE}"
+warm_run_seq="$(state_field run_seq)"
+warm_generation="$(state_field observed.generation)"
+run_delta "${idem_dir}"
+is "double run: the first quiet run is a green delta" "ok" "${CASE_STATE}"
+is "double run: the first quiet run is a delta" "delta" "$(state_field observed.coverage.mode)"
+first_run_seq="$(state_field run_seq)"
+is "double run: run_seq advanced" "$((warm_run_seq + 1))" "${first_run_seq}"
+is "double run: a quiet delta keeps the view generation" "${warm_generation}" "$(state_field observed.generation)"
+first_detail="${CASE_DETAIL}"
+first_signature="$(state_field signature)"
+run_delta "${idem_dir}"
+is "double run: the second quiet run is a green delta" "ok" "${CASE_STATE}"
+is "double run: the second quiet run is a delta" "delta" "$(state_field observed.coverage.mode)"
+is "double run: run_seq advanced again" "$((first_run_seq + 1))" "$(state_field run_seq)"
+is "double run: verdict detail is byte-identical (age normalized)" "$(norm_detail "${first_detail}")" "$(norm_detail "${CASE_DETAIL}")"
+is "double run: finding signature is byte-identical" "${first_signature}" "$(state_field signature)"
+is "double run: no re-seed and no repair" "" "$(state_field repaired)"
+
+# Sweep deferral: a cold-start seed cannot chain straight into a sweep on the
+# acceptance / post-start timer fire. The next run is a delta (still ALERT
+# with the cold-start disclosure); only the due sweep clears it.
+defer_dir="${WORK}/state-defer"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+RECORDING_WITNESS_COLD_START_SECONDS=3600 run_delta "${defer_dir}"
+is "sweep deferral: the seed cannot be green" "alert" "${CASE_STATE}"
+is "sweep deferral: the seed wrote the seed mode" "seed" "$(state_field observed.coverage.mode)"
+is "sweep deferral: compact_blind is set" "True" "$(state_field observed.coverage.compact_blind)"
+defer_due="$(state_field observed.sweep_due_epoch)"
+if [ "${defer_due}" -gt 0 ] 2>/dev/null; then
+  ok "sweep deferral: the first sweep is deferred into the future"
+else
+  bad "sweep deferral: sweep_due_epoch is not a future epoch: ${defer_due}"
+fi
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-defer-delta.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${defer_dir}"
+is "sweep deferral: the next run is a delta, not a sweep" "delta" "$(state_field observed.coverage.mode)"
+is "sweep deferral: the delta still carries the cold-start alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *cold-start*) ok "sweep deferral: detail keeps the cold-start disclosure" ;;
+  *) bad "sweep deferral delta detail: ${CASE_DETAIL}" ;;
+esac
+if grep -q 'versions' "${WORK}/requests-defer-delta.log"; then
+  bad "sweep deferral: the deferred run listed versions"
+else
+  ok "sweep deferral: the deferred run made no versions call"
+fi
+cat "${WORK}/requests-defer-delta.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+force_sweep_state "${defer_dir}"
+start_mock
+run_delta "${defer_dir}"
+is "sweep deferral: the forced sweep clears the disclosure" "ok" "${CASE_STATE}"
+is "sweep deferral: the sweep mode is recorded" "sweep" "$(state_field observed.coverage.mode)"
+is "sweep deferral: compact_blind cleared" "False" "$(state_field observed.coverage.compact_blind)"
+
+# Range-split sweeps: the second sweep uses the boundaries the first sweep
+# persisted; the union of range branches must be byte-identical to a serial
+# sweep of the same bucket.
+range_dir="${WORK}/state-range"
+serial_dir="${WORK}/state-range-serial"
+python3 -I - "${HARNESS_DIR}" "${SID}" <<'PY' | fixture
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from shipper_keys import audit_key
+
+sid = sys.argv[2]
+objects = [
+    {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+    {"key": "audit/20260925T130000Z-session.start.%s.0.shell.json" % sid, "ago": 300},
+]
+for seq in range(1, 7):
+    objects.append({"key": audit_key("session.data", "20260925T1300%02dZ" % seq, sid, seq), "ago": 299})
+objects.append({"key": audit_key("session.end", "20260925T130100Z", sid, 7, "shell"), "ago": 298})
+objects.append({"key": "recordings/%s.tar" % sid, "ago": 297})
+print(json.dumps({"bucket": "pc-admin-dr", "page_size": 50, "objects": objects, "uploads": []}))
+PY
+start_mock
+RECORDING_WITNESS_LIST_WORKERS=4 run_delta "${range_dir}"
+is "range split: the first serial-branch sweep is green" "ok" "${CASE_STATE}"
+range_first_detail="${CASE_DETAIL}"
+range_boundaries="$(state_field observed.sweep_boundaries)"
+if [ "${range_boundaries}" != "[]" ] && [ -n "${range_boundaries}" ]; then
+  ok "range split: the first sweep persisted audit boundaries"
+else
+  bad "range split: no boundaries persisted: ${range_boundaries}"
+fi
+range_boundary="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["observed"]["sweep_boundaries"][0])' "${range_dir}/state.json" 2>/dev/null || true)"
+force_sweep_state "${range_dir}"
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-range-split.log"
+: >"${REQUEST_LOG}"
+start_mock
+RECORDING_WITNESS_LIST_WORKERS=4 run_delta "${range_dir}"
+is "range split: the boundary-split sweep is green" "ok" "${CASE_STATE}"
+is "range split: split verdict detail equals the unsplit sweep (age normalized)" "$(norm_detail "${range_first_detail}")" "$(norm_detail "${CASE_DETAIL}")"
+if python3 - "${WORK}/requests-range-split.log" "${range_boundary}" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+boundary = sys.argv[2]
+object_ranges = []
+version_ranges = []
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    note = entry.get("note", "")
+    if note.startswith("list-type=2") and query.get("prefix", [""])[0] == "audit/":
+        object_ranges.append(query.get("start-after", [""])[0])
+    if "versions" in note and query.get("prefix", [""])[0] == "audit/":
+        version_ranges.append(query.get("key-marker", [""])[0])
+if "" not in object_ranges:
+    print("VIOLATION no unfiltered first audit object branch")
+    sys.exit(1)
+if boundary not in object_ranges:
+    print("VIOLATION no audit object branch starts after the persisted boundary %r" % boundary)
+    sys.exit(1)
+if "" not in version_ranges or boundary not in version_ranges:
+    print("VIOLATION version branches do not use the persisted boundary: %r" % version_ranges)
+    sys.exit(1)
+print("range split shape: %d object branches + %d version branches" % (len(object_ranges), len(version_ranges)))
+PY
+then ok "range split: object + version branches start after the persisted boundary"; else bad "range split request shape failed"; fi
+cat "${WORK}/requests-range-split.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+RECORDING_WITNESS_LIST_WORKERS=1 run_delta "${serial_dir}"
+is "range split: a serial sweep of the same fixture is green" "ok" "${CASE_STATE}"
+is "range split: split and serial verdicts are identical (age normalized)" "$(norm_detail "${CASE_DETAIL}")" "$(norm_detail "${range_first_detail}")"
+unset RECORDING_WITNESS_LIST_WORKERS
+
+# Delta pagination: new keys above the cursor must be followed through
+# continuation tokens in every delta stream.
+pag_dir="${WORK}/state-paginate"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":2,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${pag_dir}"
+is "delta pagination: the warm sweep is green" "ok" "${CASE_STATE}"
+PAG_HEARTBEAT_TS="$(audit_stamp -120)"
+PAG_START_TS="$(audit_stamp -290)"
+python3 -I - "${HARNESS_DIR}" "${SID2}" "${PAG_HEARTBEAT_TS}" "${PAG_START_TS}" <<'PY' | fixture
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from shipper_keys import audit_key
+
+sid, heartbeat_ts, start_ts = sys.argv[2], sys.argv[3], sys.argv[4]
+objects = [{"key": "audit/heartbeat/%s.json" % heartbeat_ts, "ago": 120}]
+objects.append({"key": "audit/%s-session.start.%s.0.shell.json" % (start_ts, sid), "ago": 290})
+for seq in range(1, 6):
+    objects.append({"key": audit_key("session.data", start_ts, sid, seq), "ago": 289})
+objects.append({"key": audit_key("session.end", start_ts, sid, 6, "shell"), "ago": 288})
+for index in range(3):
+    objects.append({"key": "recordings/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5%d.tar" % index, "ago": 287 - index})
+print(json.dumps({"bucket": "pc-admin-dr", "page_size": 2, "objects": objects, "uploads": []}))
+PY
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-delta-pagination.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${pag_dir}"
+is "delta pagination: the fast run is green" "ok" "${CASE_STATE}"
+if python3 - "${WORK}/requests-delta-pagination.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+continuations = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    note = entry.get("note", "")
+    if note.startswith("list-type=2") and query.get("continuation-token"):
+        continuations += 1
+if continuations < 1:
+    raise SystemExit("no delta continuation-token request - delta pagination not followed")
+print("delta pagination: %d continuation-token requests" % continuations)
+PY
+then ok "delta pagination: continuation tokens are followed for the delta tails"; else bad "delta pagination failed"; fi
+cat "${WORK}/requests-delta-pagination.log" >>"${SAVED_REQUEST_LOG}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+
+# A delta listing that returns a key at/below its cursor is server
+# nonconformance (start-after is exclusive): the run must fail closed.
+nonconf_dir="${WORK}/state-nonconformant"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${nonconf_dir}"
+is "nonconformant delta: the warm sweep is green" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"objects_ignore_start_after":true,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${nonconf_dir}"
+is "nonconformant delta: exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "nonconformant delta: error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"at or below its cursor"*) ok "nonconformant delta: detail names the cursor violation" ;;
+  *) bad "nonconformant delta detail: ${CASE_DETAIL}" ;;
+esac
 
 # ---- (g) the key is never printed ----------------------------------------
 if grep -q 'SENTINEL' "${WORK}/witness.out" "${WORK}/witness.err" "${WORK}/state/verdict.log" "${WORK}/state/state.json" 2>/dev/null; then
@@ -4661,7 +5287,21 @@ module._NTFY_OPENER = FakeOpener(flaky_urlopen)
 captured[:] = []
 verdict = ["alert"]
 sig = ["sha256:" + "1" * 64]
-module.run_checks = lambda config, now, plan: (verdict[0], "detail", sig[0], {"mode": "sweep", "window_start": None})
+module.run_checks = lambda config, now, plan: (
+    verdict[0], "detail", sig[0],
+    {
+        # A synthetic exact sweep payload: main()'s state/view bookkeeping
+        # stays valid across the repeated main() calls this block drives.
+        "mode": "sweep",
+        "window_start": None,
+        "dirty": True,
+        "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
+        "boundaries": [],
+        "audit_objects": {},
+        "recording_objects": {},
+        "hidden": [],
+    },
+)
 
 # First-ever green baseline (round-4 LOW 1): two consecutive green runs must
 # not push, and the first-ever run must not arm the recovery retry. Then a

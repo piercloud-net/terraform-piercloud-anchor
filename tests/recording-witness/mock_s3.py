@@ -26,6 +26,9 @@ The fixture is JSON:
       "fail_versions": null | "denied" | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
       "versions_ignore_prefix": true,     # optional; serve every version entry
                                           # for any prefix (nonconformant server)
+      "objects_ignore_start_after": true, # optional; ignore start-after and serve
+                                          # keys at/below the cursor (nonconformant
+                                          # server; a delta must fail closed)
       "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
                                           # version listings while keeping the
                                           # Next* markers on truncated pages
@@ -262,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         # `start-after` is exclusive and seeds the first page only (real B2
         # semantics, live-verified): a windowed seed lists the tail, and a
         # continuation token resumes from the same filtered list.
-        if start_after:
+        if start_after and not FIXTURE.get("objects_ignore_start_after"):
             matching = [obj for obj in matching if obj["key"] > start_after]
         # Real S3/B2 lists ascending by key. A fixture can opt into fixture
         # order to pin that the witness verdict is independent of the order
