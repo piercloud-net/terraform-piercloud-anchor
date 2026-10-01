@@ -1473,7 +1473,12 @@ VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous k
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
 # Classification is shape-strict so a malformed session key cannot be re-parsed
-# as a non-session event (or vice versa).
+# as a non-session event (or vice versa). The family regexes end `\Z`, not
+# `$`: Python's `$` also matches before a trailing newline (the
+# QUIET_SIGNATURE_RE pitfall below), so a key ending `…json\n`/`…tar\n` would
+# pass the shape predicates (and the classifier's own match) as a real key
+# while sorting above the whole real key space - a cursor-poisoning false
+# green (round-4 RF3.1).
 TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
 # Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
 # optional mode marker (.shell/.exec) is contract-defined for session.start
@@ -1481,19 +1486,20 @@ TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
 SESSION_KEY_RE = re.compile(
     r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
     r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
-    r"(?:\.(?P<mode>shell|exec))?\.json$"
+    r"(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
 # Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
 NON_SESSION_KEY_RE = re.compile(
-    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
 )
-HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json$")
+HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json\Z")
 UUID_RE = re.compile(UUID_PATTERN)
-RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
+RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar\Z")
 # Cursor grammar guards: a cursor may only ever advance over keys matching the
 # family's own shape (the same regexes the classifier reads). An unshaped key
-# (an acceptance probe, contract drift) still enters the listing/view and
-# alerts like any other drift, but letting it move a cursor would put the
+# (an acceptance probe, contract drift) still enters the listing/view (audit
+# keys alert as naming-contract/contract-mismatch drift; the recording checks
+# skip unshaped recordings keys), but letting it move a cursor would put the
 # cursor past the real key space and blind the next delta's tail while the run
 # stays green (round-3 forged-cursor / live-probe class). These predicates
 # mirror the current flat layout and must be extended together with the
@@ -1503,7 +1509,18 @@ def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
     if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
         return False
     relative = key[len(audit_prefix):]
-    return bool(SESSION_KEY_RE.match(relative) or NON_SESSION_KEY_RE.match(relative))
+    if SESSION_KEY_RE.match(relative):
+        return True
+    generic = NON_SESSION_KEY_RE.match(relative)
+    if not generic:
+        return False
+    # Mirror the classifier: a NON_SESSION-shaped `session.*` key with no sid
+    # (and its replay-conflict variant) is naming-contract drift, not a
+    # documented non-session event, so it must not move the cursor either.
+    # Only the documented sid-less session events (session.rejected) keep the
+    # non-session shape and stay valid cursor movers.
+    event_type, _ = canonical_conflict_type(generic.group("etype"))
+    return not (event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS)
 
 
 def is_audit_heartbeat_key(key, heartbeat_prefix):
@@ -2346,9 +2363,11 @@ def _cursors_from_listings(config, audit_objects, recording_objects):
 
     A cursor advances only over keys matching the family's own grammar
     (is_audit_*_key / is_recording_key): an unshaped key - an acceptance
-    probe, contract drift - still enters the view and alerts, but it must
-    never move a cursor past the real key space, or the next delta lists an
-    empty tail while recordings happen (round-3 live-probe false green). The
+    probe, contract drift - still enters the view (audit keys alert as
+    naming-contract/contract-mismatch drift; the recording checks skip
+    unshaped recordings keys), but it must never move a cursor past the real
+    key space, or the next delta lists an empty tail while recordings happen
+    (round-3 live-probe false green). The
     session family is additionally bounded above by the heartbeat stem: an
     exact `audit/heartbeat` object (or any key after it) is not a session
     key.
