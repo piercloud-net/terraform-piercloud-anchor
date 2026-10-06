@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 44cfa8fa7af786f3ba38775e29c21f764db34979 —
+PINNED AGAINST: cad0p/pc-admin @ 262e98c546d336607430d139dd1effa2accd0851 —
 the **prefix-aware full-key SHA with `\Z`-anchored key regexes**: pc-admin #30 made `build_audit_key` emit
 ``audit/YYYYMMDD/<basename>`` (the day derived from the same UTC instant as
 ``<ts>``); pc-admin #39 made the full-key helpers
@@ -138,7 +138,7 @@ import re
 import sys
 from datetime import datetime
 
-PINNED_PC_ADMIN_SHA = "44cfa8fa7af786f3ba38775e29c21f764db34979"
+PINNED_PC_ADMIN_SHA = "262e98c546d336607430d139dd1effa2accd0851"
 # Date-partition grammar (pc-admin #30): ``audit/YYYYMMDD/<basename>``. The
 # segment must be a real calendar date; a non-calendar all-digit segment is
 # malformed and refused, never stripped (mirrors

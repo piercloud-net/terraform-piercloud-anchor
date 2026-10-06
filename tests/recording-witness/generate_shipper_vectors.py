@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 44cfa8f
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 262e98c
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree

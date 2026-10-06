@@ -242,7 +242,7 @@ audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 44cfa8f
+# were generated from the real builder at cad0p/pc-admin @ 262e98c
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key/
 # split_audit_date_segment + parse_audit_key_full, the full-SHA pin in
 # shipper_keys.py; the pinned point (pc-admin #39 r3) `\Z`-anchored the
@@ -602,7 +602,7 @@ if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 15
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "94b46ab4dd95b47d2b056d83fcf6434f586108fd2079e9a8470dc08ad04a8bcf"
+MATRIX_SHA256 = "710493917516d3c8ad2ebe11f6c1923207000710f2731db1aa2c88e5f859eed5"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -713,7 +713,7 @@ print("vectors=%d segments=%d full_key_refusals=%d refusals=%d pin=%s source=%s"
     len(vectors["full_key_refusals"]), len(vectors["refusals"]),
     vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=32 segments=15 full_key_refusals=3 refusals=17 pin=44cfa8fa7af786f3ba38775e29c21f764db34979 source=44cfa8fa7af7" ]]; then
+)" && [[ "$matrix_out" == "vectors=32 segments=15 full_key_refusals=3 refusals=17 pin=262e98c546d336607430d139dd1effa2accd0851 source=262e98c546d3" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
