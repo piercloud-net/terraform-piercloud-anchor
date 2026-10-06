@@ -186,10 +186,12 @@ render_caddyfile() { # print the Caddyfile to stdout
     [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
     case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
     [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
-    # Bare IPv4, octets 0-255: mirrors variables.tf's cidrhost validation for
-    # the firewall variable — a console hand-run sets this secret without
-    # terraform, and the two peers must not drift.
-    printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255)."
+    # Bare single-line IPv4, octets 0-255, no leading zeros: variables.tf
+    # validates the same address for the firewall variable via cidrhost, and
+    # Caddy's netip rejects leading zeros — reject them here rather than
+    # fail later at `caddy validate`. A console hand-run sets this secret
+    # without terraform, so the two peers must not drift.
+    printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 || NR > 1 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i ~ /^0[0-9]/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255, no leading zeros)."
     [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
     cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
     cf_cel="${cf_cel%,}"
@@ -213,12 +215,12 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "		# adapts \`abort\` AFTER \`handle\`, so a site-level gate would sit"
     printf '%s\n' "		# behind this handle and never run (tests/bind-e2e pins the"
     printf '%s\n' "		# adapted route order; tests/edge-origin-auth pins the text)."
-    printf '%s\n' "		# 127.0.0.1/32 is exempt: the on-box probes below reach the"
-    printf '%s\n' "		# dashboard via --resolve …:127.0.0.1, and only local processes"
-    printf '%s\n' "		# can source from loopback."
-    printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '${MAIN_BOX_IPV4}/32'))\`"
+    printf '%s\n' "		# Loopback (127.0.0.1/32 and ::1/128) is exempt: the on-box"
+    printf '%s\n' "		# probes below reach the dashboard via --resolve …:127.0.0.1,"
+    printf '%s\n' "		# and only local processes can source from loopback."
+    printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32'))\`"
     printf '%s\n' "		abort @not_edge_peer"
-    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
+    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
     printf '%s\n' "		abort @unauthorized"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
@@ -1057,11 +1059,17 @@ fi
 TMP_CADDY="${CADDY_CONFIG}.new"
 # Pre-create root-only BEFORE the render: the :443 render carries the
 # X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
-# rejection may leave it readable beyond root.
+# rejection may leave it readable beyond root. The mode assumes the pinned
+# image runs as root (caddy:2.11.4-alpine User=None) — a Renovate bump to a
+# non-root USER would make the bind-mounted file unreadable on recreate;
+# verify on every bump.
 install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
 CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
+  # A no-op render still re-asserts 0600: a pre-0600 file must not survive
+  # just because the bytes match.
+  chmod 600 "${CADDY_CONFIG}"
   log "Caddyfile unchanged"
   rm -f "$TMP_CADDY"
 else

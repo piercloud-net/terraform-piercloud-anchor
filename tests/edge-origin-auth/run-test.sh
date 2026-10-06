@@ -103,6 +103,12 @@ expect_fail "out-of-range MAIN_BOX_IPV4 refuses" "not a bare IPv4"
 export MAIN_BOX_IPV4="1.2.3.4.5"
 expect_fail "five-octet MAIN_BOX_IPV4 refuses" "not a bare IPv4"
 
+export MAIN_BOX_IPV4=$'1.2.3.4\n5.6.7.8'
+expect_fail "multiline MAIN_BOX_IPV4 refuses" "not a bare IPv4"
+
+export MAIN_BOX_IPV4="1.2.3.04"
+expect_fail "leading-zero octet MAIN_BOX_IPV4 refuses" "not a bare IPv4"
+
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="${MAIN_BOX}"
 saved_cidrs="${CLOUDFRONT_ORIGIN_CIDRS}"
 CLOUDFRONT_ORIGIN_CIDRS=""
@@ -120,12 +126,12 @@ has "${WORK}/Caddyfile.443" 'client_ip_headers CloudFront-Viewer-Address' "clien
 
 not_edge_line="$(grep -m1 '@not_edge_peer' "${WORK}/Caddyfile.443" || true)"
 case "${not_edge_line}" in
-  *"!(remote_ip(${cf_cel}, '127.0.0.1/32', '${MAIN_BOX}/32'))"*) ok "not_edge_peer matcher lists all 81 ranges + loopback + the main box" ;;
+  *"!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX}/32'))"*) ok "not_edge_peer matcher lists all 81 ranges + loopback (v4+v6) + the main box" ;;
   *) bad "not_edge_peer matcher shape (got: $(printf '%s' "${not_edge_line}" | tail -c 200))" ;;
 esac
 unauth_line="$(grep -m1 '@unauthorized' "${WORK}/Caddyfile.443" || true)"
 case "${unauth_line}" in
-  *"!(remote_ip('127.0.0.1/32', '${MAIN_BOX}/32') || header({'X-Piercloud-Origin':'${SECRET}'}))"*) ok "unauthorized matcher = loopback/main-box bypass OR the secret header" ;;
+  *"!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX}/32') || header({'X-Piercloud-Origin':'${SECRET}'}))"*) ok "unauthorized matcher = loopback (v4+v6)/main-box bypass OR the secret header" ;;
   *) bad "unauthorized matcher shape (got: $(printf '%s' "${unauth_line}" | tail -c 200))" ;;
 esac
 
@@ -176,6 +182,7 @@ fi
 
 # ---- render custody -------------------------------------------------------
 has "${PROVISION_SH}" 'install -m 0600 /dev/null "$TMP_CADDY"' "rendered Caddyfile pre-created root-only"
+has "${PROVISION_SH}" 'chmod 600 "${CADDY_CONFIG}"' "unchanged render re-asserts 0600 on the live Caddyfile"
 has "${PROVISION_SH}" 'rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate' "validate failure removes the rendered file"
 
 # ---- pipeline wiring ------------------------------------------------------

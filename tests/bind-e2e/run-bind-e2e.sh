@@ -192,10 +192,14 @@ log "Per-anchor origin-ca render validates (real pair + AOP stanza compiled)"
 # `abort` AFTER `handle`, so a site-level gate would sit behind the dashboard
 # catch-all handle and never execute; the gate lives INSIDE that handle
 # (scripts/010-provision.sh) and this section proves it BOTH ways: the
-# adapted route order, then a served peer/header matrix. Loopback is exempt
-# (the on-box probes connect from it), so the matrix uses MAIN_BOX_IPV4=
-# 127.0.0.2 and a test-scoped admitted range 127.0.0.3/32 (production
-# carries the 81 public AWS prefixes; the render reads CLOUDFRONT_ORIGIN_CIDRS).
+# adapted route order (test-scoped AND production-shape), then a served
+# peer/header matrix. Loopback is exempt (the on-box probes connect from
+# it), so the matrix uses MAIN_BOX_IPV4=127.0.0.2 and a test-scoped admitted
+# range 127.0.0.3/32 (production carries the 81 public AWS prefixes; the
+# render reads CLOUDFRONT_ORIGIN_CIDRS). The matrix includes a forged
+# client-IP header from an admitted peer: the gate must match the DIRECT
+# peer (remote_ip), never the trusted-proxy-resolved client, or a
+# viewer-supplied header would be spoofable through the edge.
 log "Gate: adapted route order + served peer/header matrix"
 GATE_HOST="gateprobe.status.piercloud.net:${GATE_TLS_PORT}"
 # The cert SAN must cover the site host or Caddy falls back to ACME (which
@@ -216,7 +220,8 @@ awk 'NR == 1 { print; next } /^\{$/ { print; print "\tauto_https disable_redirec
   "${WORK}/Caddyfile.gate" > "${WORK}/Caddyfile.gate.serve"
 HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.json" \
   || die "gate render does not adapt"
-python3 - "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}" <<'PY' || die "adapted route order puts the origin gate behind the catch-all handle (dead code)"
+assert_gate_order() { # $1 = adapted config json, $2 = site host
+python3 - "$1" "$2" <<'PY' || die "adapted route order puts the origin gate behind the catch-all handle (dead code)"
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 host = sys.argv[2]
@@ -247,6 +252,21 @@ if kinds.index("reverse_proxy") < max(i for i, k in enumerate(kinds) if k == "ab
     sys.exit(1)
 print(f"adapted gate order OK: {kinds}")
 PY
+}
+assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
+# Production-shape render: the real 81-prefix CLOUDFRONT_ORIGIN_CIDRS (the
+# value extracted from 010 above, no test override) must adapt to the same
+# gate order — the served matrix below uses a test-scoped range, so this is
+# the only CI exercise of the production CEL list.
+( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
+  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
+  export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.gate.prod" )
+HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate.prod" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.prod.json" \
+  || die "production-shape gate render does not adapt"
+assert_gate_order "${WORK}/Caddyfile.gate.prod.json" "${GATE_HOST%:*}"
 mkdir -p "${WORK}/gate-stub" && printf 'STUBOK' > "${WORK}/gate-stub/index.html"
 python3 -m http.server "${GATE_STUB_PORT}" --bind 127.0.0.1 --directory "${WORK}/gate-stub" >"${WORK}/gate-stub.log" 2>&1 &
 GATE_STUB_PID=$!
@@ -279,9 +299,10 @@ gate_expect "admitted peer, secret passes"        127.0.0.3 ok    -H 'X-Pierclou
 gate_expect "outside peer, secret aborts"         127.0.0.4 abort -H 'X-Piercloud-Origin: harness-origin-secret'
 gate_expect "outside peer, no header aborts"      127.0.0.4 abort
 gate_expect "loopback, no header passes"          127.0.0.1 ok
+gate_expect "admitted peer, forged viewer-IP header aborts" 127.0.0.3 abort -H 'CloudFront-Viewer-Address: 127.0.0.1'
 kill "${GATE_PID}" "${GATE_STUB_PID}" 2>/dev/null || true
 wait "${GATE_PID}" 2>/dev/null || true
-log "Gate matrix passed (adapted order + 7 request cases)"
+log "Gate matrix passed (adapted order + 8 request cases)"
 
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"
