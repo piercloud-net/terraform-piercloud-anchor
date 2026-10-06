@@ -225,7 +225,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=998
+MIN_CHECKS=1009
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -451,6 +451,9 @@ is "replica dated golden user.login range 3-9" \
 is "replica golden degenerate range 5-5 (dual shape)" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.000005-000005.json" \
   "$(range_key 5 session.data 20260925T100008Z "${REPLICA_SID}" 5)"
+is "replica golden seq-0 range 0-4 (build_audit_range_key accepts 0)" \
+  "audit/${DATE}/20260925T100008Z-session.data.${REPLICA_SID}.000000-000004.json" \
+  "$(dated_range_key 4 session.data 20260925T100008Z "${REPLICA_SID}" 0)"
 is "replica golden 18-digit ceiling range 1-10^18-1" \
   "audit/20260925T100008Z-session.data.${REPLICA_SID}.000001-999999999999999999.json" \
   "$(range_key 999999999999999999 session.data 20260925T100008Z "${REPLICA_SID}" 1)"
@@ -6858,8 +6861,10 @@ is "dated nonconformance (conformant control): the run stays a delta" "delta" \
 # into coverage intervals; sequence-origin is the first interval's start,
 # sequence-gap only BETWEEN intervals, sequence-duplicate is overlap
 # detection; range-on-lifecycle, mode-on-range and reversed ranges are
-# naming-contract drift that never moves a cursor; an event missing *inside*
-# a declared range is invisible list-only (the disclosed loss).
+# naming-contract drift that never moves a cursor (a no-mode lifecycle range
+# isolates the lifecycle branch; a duplicate never suppresses a concurrent
+# gap); an event missing *inside* a declared range is invisible list-only
+# (the disclosed loss).
 R29_SID="5f5f5f5f-5f5f-4f5f-8f5f-5f5f5f5f5f5f"
 R29_HB="audit/heartbeat/$(audit_stamp -60).json"
 R29_START="$(dated_key session.start 20260925T150000Z "${R29_SID}" 1 shell)"
@@ -6924,6 +6929,32 @@ run_case "${WORK}/state-159p2-overlap"
 is "ranges: overlapping intervals -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *"repeats <seq> 5-6"*) ok "ranges: the duplicate render names the overlap intersection (5-6)" ;; *) bad "ranges: overlap detail: ${CASE_DETAIL}" ;; esac
 
+# A hole concurrent with an overlap must be named too (red-team FIX-3):
+# intervals 2-4 / 4-5 / 9-10 + end 11 repeat <seq> 4 AND miss 6-8; the old
+# duplicate short-circuit kept 6-8 out of the detail and the signature.
+R29_CG_START="$(dated_key session.start 20260925T152500Z "${R29_SID}" 1 shell)"
+R29_CG_A="$(dated_range_key 4 session.data 20260925T152510Z "${R29_SID}" 2)"
+R29_CG_B="$(dated_range_key 5 session.data 20260925T152520Z "${R29_SID}" 4)"
+R29_CG_C="$(dated_range_key 10 session.data 20260925T152530Z "${R29_SID}" 9)"
+R29_CG_END="$(dated_key session.end 20260925T152540Z "${R29_SID}" 11 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_CG_START}","ago":300},
+  {"key":"${R29_CG_A}","ago":299},
+  {"key":"${R29_CG_B}","ago":298},
+  {"key":"${R29_CG_C}","ago":297},
+  {"key":"${R29_CG_END}","ago":296},
+  {"key":"recordings/${R29_SID}.tar","ago":295}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-dup-gap"
+is "ranges: a hole concurrent with an overlap -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"repeats <seq> 4"*) ok "ranges: the concurrent overlap is still named" ;; *) bad "ranges: concurrent overlap detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"missing <seq> 6-8"*) ok "ranges: the concurrent hole is named alongside the overlap" ;; *) bad "ranges: concurrent hole detail: ${CASE_DETAIL}" ;; esac
+
 R29_DS_START="$(key session.start 20260925T153000Z "${R29_SID}" 1 shell)"
 R29_DS_ONE="$(key session.data 20260925T153100Z "${R29_SID}" 2)"
 R29_DS_RANGE="$(range_key 4 session.data 20260925T153200Z "${R29_SID}" 3)"
@@ -6944,6 +6975,26 @@ JSON
 start_mock
 run_case "${WORK}/state-159p2-dualshape"
 is "ranges: single-seq + range dual-shape coverage -> ok" "ok" "${CASE_STATE}"
+
+# A degenerate one-event interval (`[N, N]`, contract-legal) must be accepted
+# green by the live witness (red-team/functional N3); the vector matrix pins
+# the replica shape only.
+R29_DG_START="$(dated_key session.start 20260925T153500Z "${R29_SID}" 1 shell)"
+R29_DG_RANGE="$(dated_range_key 2 session.data 20260925T153600Z "${R29_SID}" 2)"
+R29_DG_END="$(dated_key session.end 20260925T153700Z "${R29_SID}" 3 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_DG_START}","ago":300},
+  {"key":"${R29_DG_RANGE}","ago":299},
+  {"key":"${R29_DG_END}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-degenerate-range"
+is "ranges: the degenerate [N, N] range -> ok" "ok" "${CASE_STATE}"
 
 R29_VB_BODY='{"event":"session.data","seq":2,"v":"r29-base"}'
 R29_VB_START="$(dated_key session.start 20260925T154000Z "${R29_SID}" 1 shell)"
@@ -6983,9 +7034,35 @@ case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: lifecycle range is namin
 is "ranges: a lifecycle range never moves the cursor" "${R29_LR_START}" \
   "$(state_field observed.cursors.audit_session_dated)"
 
-R29_MR_START="$(dated_key session.start 20260925T156000Z "${R29_SID}" 1 shell)"
-R29_MR_DRIFT="audit/20260925/20260925T156100Z-session.data.${R29_SID}.2-4.shell.json"
-R29_MR_END="$(dated_key session.end 20260925T156200Z "${R29_SID}" 5 shell)"
+# The `.shell` marker above is refused independently by the mode-on-range
+# rule, so a no-mode lifecycle range is the only shape that isolates the
+# lifecycle branch (red-team FIX-1). The crafted key is the NEWEST: a
+# regression that collects it would absorb the 2-4 hole (green) and win the
+# dated cursor.
+R29_LNR_START="$(dated_key session.start 20260925T155400Z "${R29_SID}" 1 shell)"
+R29_LNR_END="$(dated_key session.end 20260925T155600Z "${R29_SID}" 5 shell)"
+R29_LNR_DRIFT="audit/20260925/20260925T155700Z-session.end.${R29_SID}.2-4.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_LNR_START}","ago":300},
+  {"key":"${R29_LNR_END}","ago":299},
+  {"key":"${R29_LNR_DRIFT}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-lifecycle-range-nomode"
+is "ranges: a no-mode lifecycle range -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: a no-mode lifecycle range is naming-contract drift" ;; *) bad "ranges: no-mode lifecycle-range detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"missing <seq> 2-4"*) ok "ranges: a no-mode lifecycle range is never collected (hole 2-4 named)" ;; *) bad "ranges: no-mode lifecycle-range hole detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a no-mode lifecycle range never moves the cursor" "${R29_LNR_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+R29_MR_START="$(dated_key session.start 20260925T155800Z "${R29_SID}" 1 shell)"
+R29_MR_DRIFT="audit/20260925/20260925T155950Z-session.data.${R29_SID}.2-4.shell.json"
+R29_MR_END="$(dated_key session.end 20260925T155900Z "${R29_SID}" 5 shell)"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
@@ -7000,6 +7077,9 @@ start_mock
 run_case "${WORK}/state-159p2-mode-range"
 is "ranges: a mode marker on a range -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: mode-on-range is naming-contract drift" ;; *) bad "ranges: mode-on-range detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"missing <seq> 2-4"*) ok "ranges: mode-on-range never enters the interval math (hole 2-4 named)" ;; *) bad "ranges: mode-on-range hole detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a mode-on-range key never moves the cursor" "${R29_MR_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
 
 R29_RR_START="$(dated_key session.start 20260925T161000Z "${R29_SID}" 1 shell)"
 R29_RR_END="$(dated_key session.end 20260925T161050Z "${R29_SID}" 3 shell)"

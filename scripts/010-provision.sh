@@ -3355,7 +3355,9 @@ def run_checks(config, now, plan):
                 "sequence-duplicate:%s:%s"
                 % (sid, identity_digest("%d-%d" % (start, stop) for start, stop in duplicates))
             )
-            continue
+        # Origin and gap are INDEPENDENT of the overlap: a concurrent hole (or
+        # an out-of-range first seq) must still be named, not swallowed by a
+        # duplicate finding's former short-circuit (round-1 red-team FIX-3).
         if intervals[0][0] > 1:
             alerts.append(
                 "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
@@ -3364,9 +3366,10 @@ def run_checks(config, now, plan):
             finding_ids.append("sequence-origin:%s:%d" % (sid, intervals[0][0]))
         # A hole BETWEEN merged intervals only (D9): a declared range covers
         # its whole span, so an event missing *inside* one is invisible
-        # list-only - the disclosed loss. Render bounded from the observed
-        # intervals (never range(low, high+1), which crafted seq values could
-        # hang).
+        # list-only - the disclosed loss. Judged even when duplicates exist
+        # (the overlap never suppresses the hole). Render bounded from the
+        # observed intervals (never range(low, high+1), which crafted seq
+        # values could hang).
         missing_ranges = [
             (high + 1, low - 1)
             for (_, high), (low, _) in zip(intervals, intervals[1:])

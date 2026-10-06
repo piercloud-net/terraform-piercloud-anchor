@@ -115,10 +115,12 @@ real builder DOES emit on its documented path is reproduced faithfully):
   HEAD-before-PUT replay absorb a different event). The truncation applies
   only to grammar-valid types — an invalid over-long type is sanitized to
   `unknown` by the real builder and is refused here.
-- `seq` mirrors the real grammar: the builder emits `previous + 1` (floor 1 —
-  seq 0 is legacy-only and must be hand-written) formatted `%06d`, so 7+
-  digits are legal past 999999; the ceiling is the witness's `[0-9]{1,18}`
-  grammar pc-admin's `SEQ_PATTERN` mirrors.
+- `seq` mirrors the real grammar: the single-seq builder emits `previous + 1`
+  (floor 1 — a scalar seq 0 is legacy-only and must be hand-written) formatted
+  `%06d`, so 7+ digits are legal past 999999; a batched RANGE accepts
+  `seq_start = 0` exactly like `build_audit_range_key` (bounds `[0, MAX]`);
+  the ceiling is the witness's `[0-9]{1,18}` grammar pc-admin's `SEQ_PATTERN`
+  mirrors.
 - The optional range token (pc-admin #29, D5) is the inclusive
   ``<seq-start>-<seq-end>`` (``seq_end >= seq_start``, each within the
   18-digit ceiling); ``seq_end=None`` is the legacy single-seq shape (a
@@ -284,15 +286,36 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False, seq_end=None):
     window; the harness's historical fixtures opt in explicitly).
     ``seq_end`` is the inclusive range end (pc-admin #29 D5): ``None`` keeps
     the legacy single-seq shape, otherwise the key carries
-    ``<seq>-<seq_end>``. A range is refused on a lifecycle type, with a mode
-    marker, or reversed — exactly like the real ``build_audit_range_key``.
+    ``<seq>-<seq_end>`` and ``seq_start = 0`` is legal (the real
+    ``build_audit_range_key`` bounds the range at ``[0, 10^18-1]`` and the
+    witness accepts the 0 token); the single-seq shape keeps floor 1. A range
+    is refused on a lifecycle type, with a mode marker, or reversed — exactly
+    like the real ``build_audit_range_key`` (refused in that order, before
+    the seq bounds/reversal, so the refusal reason mirrors the builder's).
     """
     if not isinstance(ts, str) or not TS_RE.match(ts):
         raise ValueError("timestamp must be YYYYmmddTHHMMSSZ, got %r" % ts)
-    if not isinstance(seq, int) or isinstance(seq, bool) or not 1 <= seq <= SEQ_MAX:
+    if not isinstance(event_type, str) or not EVENT_TYPE_RE.match(event_type):
+        raise ValueError("event type outside the shipper grammar: %r" % event_type)
+    if seq_end is not None:
+        # A range is defined on batched (non-lifecycle) events only, with no
+        # mode marker (D1/D5); mirror build_audit_range_key's refusals BEFORE
+        # the seq bounds/reversal so the reason matches the real builder when
+        # an input is both reversed and lifecycle/mode-on-range (round-1
+        # functional N2).
+        if event_type in SESSION_MODE_EVENTS:
+            raise ValueError("a range is never built on a lifecycle event (D1)")
+        if mode:
+            raise ValueError("a mode marker is contract-defined on lifecycle keys only (D5)")
+    # A batched range accepts seq_start 0 (build_audit_range_key bounds
+    # [0, SEQ_MAX]); the single-seq shape mirrors build_audit_key's counter,
+    # which starts at 1 (a scalar seq 0 stays a hand-written legacy fixture).
+    seq_floor = 0 if seq_end is not None else 1
+    if not isinstance(seq, int) or isinstance(seq, bool) or not seq_floor <= seq <= SEQ_MAX:
         raise ValueError(
-            "seq must be >= 1 (the real builder emits previous+1; seq 0 is a "
-            "hand-written legacy fixture) and fit the witness's 18-digit grammar, got %r" % (seq,)
+            "seq must be >= %d (the real builder emits previous+1; seq 0 is a "
+            "hand-written legacy fixture) and fit the witness's 18-digit grammar, got %r"
+            % (seq_floor, seq)
         )
     if seq_end is not None and (
         not isinstance(seq_end, int) or isinstance(seq_end, bool)
@@ -302,8 +325,6 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False, seq_end=None):
             "seq_end must be an int >= seq and fit the witness's 18-digit grammar, got %r"
             % (seq_end,)
         )
-    if not isinstance(event_type, str) or not EVENT_TYPE_RE.match(event_type):
-        raise ValueError("event type outside the shipper grammar: %r" % event_type)
     effective_sid = sid if isinstance(sid, str) and UUID_RE.fullmatch(sid) else ""
     if event_type.startswith("session.") and (
         not SESSION_TYPE_RE.match(event_type)
@@ -344,14 +365,6 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False, seq_end=None):
         # The real builder lowercases; the witness groups sessions
         # case-insensitively, so an uppercase fixture pins the lowercased key.
         sid = sid.lower()
-    if seq_end is not None:
-        # A range is defined on batched (non-lifecycle) events only, with no
-        # mode marker (D1/D5); mirror build_audit_range_key's refusals before
-        # the single-seq mode checks so the reason matches the real builder.
-        if event_type in SESSION_MODE_EVENTS:
-            raise ValueError("a range is never built on a lifecycle event (D1)")
-        if mode:
-            raise ValueError("a mode marker is contract-defined on lifecycle keys only (D5)")
     if mode and (mode not in ("shell", "exec") or event_type not in SESSION_MODE_EVENTS):
         raise ValueError("mode %r is only valid on session.start/session.end" % mode)
     if event_type in SESSION_MODE_EVENTS and mode not in ("shell", "exec"):
