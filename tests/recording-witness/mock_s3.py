@@ -29,6 +29,11 @@ The fixture is JSON:
       "objects_ignore_start_after": true, # optional; ignore start-after and serve
                                           # keys at/below the cursor (nonconformant
                                           # server; a delta must fail closed)
+      "prefixes_ignore_start_after": true, # optional; with delimiter=/, ignore
+                                          # start-after for CommonPrefixes too
+                                          # (nonconformant server; the witness's
+                                          # client-side day filter must stay
+                                          # deterministic under both behaviours)
       "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
                                           # version listings while keeping the
                                           # Next* markers on truncated pages
@@ -257,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
         start_after = query.get("start-after", [""])[0]
+        delimiter = query.get("delimiter", [""])[0]
         now = time.time()
         offset = int(token) if token.isdigit() else 0
         matching = [
@@ -274,24 +280,55 @@ class Handler(BaseHTTPRequestHandler):
         if FIXTURE.get("list_order") != "fixture":
             matching = sorted(matching, key=lambda obj: obj["key"])
         suppress_token = FIXTURE.get("fail_objects") == "truncated-no-token"
-        page = matching[offset:offset + PAGE_SIZE]
+        if delimiter:
+            # `delimiter=/` collapses every key under the same first
+            # delimiter occurrence into a CommonPrefix, and Contents and
+            # CommonPrefixes share the MaxKeys budget. `start_after` filters
+            # prefixes too (the conformant behaviour); a fixture can pin the
+            # nonconformant server with `prefixes_ignore_start_after`, where
+            # the witness's own client-side day filter has to stay
+            # deterministic.
+            entries = []
+            seen_prefixes = set()
+            for obj in matching:
+                key = obj["key"]
+                position = key[len(prefix):].find(delimiter)
+                if position < 0:
+                    entries.append((key, "object", obj))
+                    continue
+                common = key[:len(prefix) + position + len(delimiter)]
+                if common in seen_prefixes:
+                    continue
+                if (start_after and not FIXTURE.get("prefixes_ignore_start_after")
+                        and not common > start_after):
+                    continue
+                seen_prefixes.add(common)
+                entries.append((common, "prefix", None))
+        else:
+            entries = [(obj["key"], "object", obj) for obj in matching]
+        page = entries[offset:offset + PAGE_SIZE]
         next_offset = offset + PAGE_SIZE
-        truncated = suppress_token or next_offset < len(matching)
+        truncated = suppress_token or next_offset < len(entries)
         next_token = ""
         if truncated and not suppress_token:
             next_token = "<NextContinuationToken>%d</NextContinuationToken>" % next_offset
-        rows = "".join(
-            "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
-            "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
-            "<StorageClass>STANDARD</StorageClass></Contents>"
-            % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
-            for obj in page
-        )
+        rows = ""
+        common_rows = ""
+        for name, kind, obj in page:
+            if kind == "prefix":
+                common_rows += "<CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes>" % xml_escape(name)
+                continue
+            rows += (
+                "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
+                "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
+                "<StorageClass>STANDARD</StorageClass></Contents>"
+                % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
+            )
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
             "<Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount>"
-            "<MaxKeys>%d</MaxKeys><IsTruncated>%s</IsTruncated>%s%s</ListBucketResult>"
+            "<MaxKeys>%d</MaxKeys><IsTruncated>%s</IsTruncated>%s%s%s</ListBucketResult>"
             % (
                 xml_escape(FIXTURE.get("bucket", "")),
                 xml_escape(prefix),
@@ -300,6 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                 "true" if truncated else "false",
                 next_token,
                 rows,
+                common_rows,
             )
         )
         self.record("GET", True, "list-type=2 prefix=%s" % prefix)

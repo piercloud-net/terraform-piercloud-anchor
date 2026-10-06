@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 25f7922
+        --pc-admin ../pc-admin          # a checkout whose HEAD is c0ce2f1
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree
@@ -24,18 +24,25 @@ run: a non-clean provenance stamps a non-pin `source_sha` (`<head>-debug`), so
 a file generated from unpinned bytes can never pass the harness's exact-pin
 `source_sha` assertion if it is committed. It imports the real `scripts/lib/b2_client.py`, builds
 the golden + boundary matrix through `build_audit_key` and the replay-conflict
-variant matrix through `disambiguate_audit_key`, and self-checks that the
-replica in this directory reproduces every vector before writing.
+variant matrix through `disambiguate_audit_key`, pins the optional
+`YYYYMMDD/` split through `split_audit_date_segment` (valid/flat/malformed),
+and self-checks that the replica in this directory reproduces every vector
+before writing. The matrix carries **dated** vectors (the pinned builder's
+current output), **flat legacy** vectors (the same real-builder basenames
+under the pre-#30 `audit/<basename>` layout, built with the replica's
+`flat=True` opt-in), and the date-segment vectors.
 
-The pin is the **grammar-defining SHA**: the builder grammar last changed at
-25f7922 (pc-admin #20: the audit-key type regexes are `\Z`-anchored, so a
-trailing-newline type such as `user.login\n` is out of grammar and the real
-builder sanitizes it to the documented `unknown` non-session shape instead of
-building a key with an embedded newline). The previous grammar point was
-3325aeb (pc-admin #19: the exact single-segment `session.data` with no
-effective strict-UUID sid is sanctioned onto the documented `unknown`
-non-session shape instead of the sid-less `session.*` drift shape). Earlier
-points: a7035a9 (the replay-conflict variant —
+The pin is the **date-partition SHA**: the builder layout last changed at
+c0ce2f1 (pc-admin #30: `build_audit_key` emits `audit/YYYYMMDD/<basename>`
+and `split_audit_date_segment` refuses an all-digit segment that is not a real
+8-digit calendar date). The previous grammar point was 25f7922 (pc-admin #20:
+the audit-key type regexes are `\Z`-anchored, so a trailing-newline type such
+as `user.login\n` is out of grammar and the real builder sanitizes it to the
+documented `unknown` non-session shape instead of building a key with an
+embedded newline). Earlier points: 3325aeb (pc-admin #19: the exact
+single-segment `session.data` with no effective strict-UUID sid is sanctioned
+onto the documented `unknown` non-session shape instead of the sid-less
+`session.*` drift shape), a7035a9 (the replay-conflict variant —
 `disambiguate_audit_key` appends `_<sha256[:16]>` to the event type when a
 rebuilt file replays a taken key with different bytes), 66bd304 (the
 `session.rejected` sid-less fold), 929d82c (the 128-char
@@ -58,7 +65,7 @@ import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from shipper_keys import PINNED_PC_ADMIN_SHA, audit_key, disambiguate_key  # noqa: E402
+from shipper_keys import PINNED_PC_ADMIN_SHA, audit_key, disambiguate_key, split_date_segment  # noqa: E402
 
 TS = "20260925T100008Z"
 EVENT_TIME = "2026-09-25T10:00:08Z"
@@ -114,40 +121,68 @@ def real_key(b2, event, session_seq=None, global_seq=0, prefix="audit/"):
 
 def build_vectors(b2):
     vectors = []
+    date_segments = []
 
-    def replicate(args):
+    def replicate(args, flat=False):
         # CLI-form args (strings); seq is the 4th positional and the CLI parses it as int.
         args = list(args)
         args[3] = int(args[3])
-        return audit_key(*args)
+        return audit_key(*args, flat=flat)
 
-    def vector(name, kind, event, replica_args, session_seq=None, global_seq=0):
-        expected = real_key(b2, event, session_seq, global_seq)
-        assert replicate(replica_args) == expected, "replica drift at generation time: %s" % name
+    def layout_expected(dated_key, layout):
+        # The flat legacy layout is the same real-builder basename under
+        # `audit/` (the only difference #30 introduced is the day segment).
+        if layout == "dated":
+            return dated_key
+        assert dated_key.startswith("audit/%s/" % TS[:8]), dated_key
+        return "audit/" + dated_key[len("audit/%s/" % TS[:8]):]
+
+    def vector(name, kind, event, replica_args, session_seq=None, global_seq=0, layout="dated"):
+        dated_expected = real_key(b2, event, session_seq, global_seq)
+        expected = layout_expected(dated_expected, layout)
+        assert replicate(replica_args, flat=(layout == "flat")) == expected, \
+            "replica drift at generation time: %s" % name
         vectors.append({
             "name": name,
             "kind": kind,
+            "layout": layout,
             "event": event,
             "replica_args": replica_args,
             "expected": expected,
         })
 
-    def variant_vector(name, event, replica_args, body, session_seq=None, global_seq=0):
+    def variant_vector(name, event, replica_args, body, session_seq=None, global_seq=0, layout="dated"):
         # The real replay-conflict builder hashes the local BYTES; the replica
         # hashes the UTF-8 encoding of the same string, so both must agree.
-        base = real_key(b2, event, session_seq, global_seq)
-        expected = b2.disambiguate_audit_key(base, body.encode("utf-8"))
+        dated_base = real_key(b2, event, session_seq, global_seq)
+        dated_expected = b2.disambiguate_audit_key(dated_base, body.encode("utf-8"))
+        expected = layout_expected(dated_expected, layout)
+        base = layout_expected(dated_base, layout)
         assert expected != base, "the real builder did not build a variant for %s" % name
-        replica_base = replicate(replica_args)
+        replica_base = replicate(replica_args, flat=(layout == "flat"))
         assert replica_base == base, "replica drift at generation time: %s" % name
         assert disambiguate_key(replica_base, body) == expected, "replica variant drift: %s" % name
         vectors.append({
             "name": name,
             "kind": "variant",
+            "layout": layout,
             "event": event,
             "replica_args": replica_args,
             "body": body,
             "expected": expected,
+        })
+
+    def segment_vector(name, key):
+        # Pin the real builder's optional `YYYYMMDD/` split against the
+        # replica: valid dated, flat, and malformed (refused, never stripped).
+        real = b2.split_audit_date_segment(key)
+        assert split_date_segment(key) == real, \
+            "replica date-segment drift at generation time: %s (%r != %r)" % (name, split_date_segment(key), real)
+        date_segments.append({
+            "name": name,
+            "key": key,
+            "relative": real[0],
+            "day": real[1],
         })
 
     vector(
@@ -315,6 +350,101 @@ def build_vectors(b2):
         [overlong_session_data, TS, LSID, "1"],
     )
 
+    # Flat legacy layout: the identical real-builder basenames under
+    # `audit/<basename>` (the pre-#30 output the dual window still accepts),
+    # built by the replica's explicit `flat=True` opt-in. The expected value
+    # is derived from the real builder's dated key by removing only the day
+    # segment, so the basename grammar keeps real provenance.
+    vector(
+        "flat legacy session.start shell",
+        "flat-legacy",
+        {"time": EVENT_TIME, "event": "session.start", "sid": LSID},
+        ["session.start", TS, LSID, "1", "shell"],
+        layout="flat",
+    )
+    vector(
+        "flat legacy session.data",
+        "flat-legacy",
+        {"time": EVENT_TIME, "event": "session.data", "sid": LSID},
+        ["session.data", TS, LSID, "7"],
+        session_seq={LSID: 6},
+        layout="flat",
+    )
+    vector(
+        "flat legacy session.rejected sid-less",
+        "flat-legacy",
+        {"time": EVENT_TIME, "event": "session.rejected", "sid": LSID},
+        ["session.rejected", TS, USID, "5"],
+        global_seq=4,
+        layout="flat",
+    )
+    vector(
+        "flat legacy user.login",
+        "flat-legacy",
+        {"time": EVENT_TIME, "event": "user.login", "sid": LSID},
+        ["user.login", TS, "", "6"],
+        global_seq=5,
+        layout="flat",
+    )
+    vector(
+        "flat legacy uppercase sid lowercased",
+        "flat-legacy",
+        {"time": EVENT_TIME, "event": "session.start", "sid": USID},
+        ["session.start", TS, USID, "1", "shell"],
+        layout="flat",
+    )
+    variant_vector(
+        "flat legacy session.start exec replay-conflict variant",
+        {"time": EVENT_TIME, "event": "session.start", "sid": LSID, "interactive": False},
+        ["session.start", TS, LSID, "1", "exec"],
+        "{\"event\":\"session.start\",\"seq\":1,\"v\":\"replay-flat-start\"}",
+        layout="flat",
+    )
+
+    # Optional `YYYYMMDD/` split (pc-admin #30): a valid dated segment is
+    # stripped, a flat key is unchanged, and an all-digit segment that is not
+    # a real calendar date is refused — never laundered into a flat parse.
+    segment_vector(
+        "valid dated segment stripped",
+        "audit/20260925/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "flat key has no day segment",
+        "audit/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "day segment with no directory prefix",
+        "20260925/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "calendar-invalid day segment refused (month 09 day 32)",
+        "audit/20260932/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "calendar-invalid day segment refused (month 00)",
+        "audit/20260000/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "all-zero day segment refused",
+        "audit/00000000/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "short numeric day segment refused (never stripped)",
+        "audit/2026092/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "long numeric day segment refused (never stripped)",
+        "audit/202609251/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "session-named segment is not a day (date impersonation refused)",
+        "audit/session.start/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "non-numeric segment is not a day",
+        "audit/user.login/20260925T100008Z-user.login.000001.json",
+    )
+
     # Cross-repo seed (pc-admin @ a7035a9): a rebuilt audit file that replays a
     # taken key with DIFFERENT bytes ships under `disambiguate_audit_key` — the
     # event type gains `_<sha256[:16]>`; a session lifecycle variant drops its
@@ -440,20 +570,30 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder grammar last changed at 25f7922 (pc-admin #20: the "
-                        "audit-key type regexes are \\Z-anchored, so a trailing-newline "
-                        "type is out of grammar and is sanitized to the documented "
-                        "`unknown` non-session shape); previous grammar points 3325aeb "
-                        "(pc-admin #19: the exact single-segment `session.data` with no "
-                        "effective strict-UUID sid is sanctioned onto the documented "
-                        "`unknown` non-session shape), a7035a9 (the replay-conflict "
-                        "`_<sha256[:16]>` variant keys from disambiguate_audit_key), "
-                        "66bd304 (session.rejected sid-less), 929d82c (the 128-char "
-                        "pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>` "
-                        "suffix on the truncated type) and 342a37c (the 10^18-1 seq-ceiling "
-                        "clamp in build_audit_key)",
+        "grammar_note": "builder layout last changed at c0ce2f1 (pc-admin #30: "
+                        "build_audit_key emits `audit/YYYYMMDD/<basename>` from the "
+                        "event's UTC day, and split_audit_date_segment refuses an "
+                        "all-digit segment that is not a real 8-digit calendar date); "
+                        "previous grammar point 25f7922 (pc-admin #20: the audit-key type "
+                        "regexes are \\Z-anchored, so a trailing-newline type is out of "
+                        "grammar and is sanitized to the documented `unknown` non-session "
+                        "shape); earlier points 3325aeb (pc-admin #19: the exact "
+                        "single-segment `session.data` with no effective strict-UUID sid "
+                        "is sanctioned onto the documented `unknown` non-session shape), "
+                        "a7035a9 (the replay-conflict `_<sha256[:16]>` variant keys from "
+                        "disambiguate_audit_key), 66bd304 (session.rejected sid-less), "
+                        "929d82c (the 128-char pre-hash event-type truncation cap), "
+                        "41735ff (the `_<sha256[:8]>` suffix on the truncated type) and "
+                        "342a37c (the 10^18-1 seq-ceiling clamp in build_audit_key)",
+        "layout_note": "dated vectors are the pinned builder's `audit/YYYYMMDD/<basename>` "
+                       "output; flat-legacy vectors are the same real-builder basenames "
+                       "under `audit/<basename>` (the dual-window legacy layout, built "
+                       "with the replica's explicit flat=True); date_segments pins the "
+                       "optional day-segment split (valid dated, flat, malformed-date "
+                       "refusals)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
+        "date_segments": date_segments,
         "refusals": refusals,
     }
 

@@ -155,8 +155,9 @@
 #       re-sends an Authorization header to another host/scheme),
 #       and steady ok stays silent afterwards (fake notifier, no network);
 #   (k) delta cursors + merged sweeps (issue #153): a warm sweep writes the
-#       three high-water cursors and the view.json sidecar; a quiet run makes
-#       only the three cursored tails plus the full multipart family (no
+#       high-water cursors and the view.json sidecar; a quiet run makes
+#       only the cursored tails (flat discovery + selected dated days +
+#       heartbeat + recordings) plus the full multipart family (no
 #       versions, no unfiltered object pages) and returns the byte-identical
 #       verdict/signature; a replayed below-cursor key is caught at the forced
 #       sweep; a delete marker on an old key lands at the sweep bound; cursor
@@ -166,7 +167,24 @@
 #       re-seeds and advances run_seq; the seed defers the first sweep and
 #       still reports the cold-start alert; range-split sweeps equal a serial
 #       sweep and use the persisted boundaries; delta tails follow pagination;
-#       a delta listing that returns a key at/below its cursor errors closed.
+#       a delta listing that returns a key at/below its cursor errors closed;
+#   (l) dual-layout audit keys (issue #159, phase 1): dated session and
+#       non-session keys classify; malformed/calendar-invalid day segments
+#       and date-impersonating segments are drift that never moves a cursor;
+#       a dated re-ship folds onto the same (ts, type, seq) identity as its
+#       flat key; the unseeded transition probe sees same-day dated keys that
+#       sort below the flat cursor (no repair/sweep); a future day is never
+#       listed and a persisted future dated cursor fails closed; the first
+#       dated day above/below the flat cursor is listed/not-listed
+#       deterministically under both mock `start_after`-on-CommonPrefixes
+#       behaviours and the sweep closes the below-flat day; a day below the
+#       dated cursor is not re-listed (request-count pin); the below-cursor
+#       residual and the writer-revert disclosure are sweep-bounded;
+#       non-day/malformed prefixes are never listed in delta; the seed
+#       starts at the window-start day prefix and seeds the dated cursor;
+#       the replica builds the dated layout by default (`--flat` legacy) and
+#       the checked-in vectors replay dated goldens, flat legacy vectors and
+#       the day-segment split (valid/flat/malformed refusals).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -196,7 +214,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=850
+MIN_CHECKS=942
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -204,10 +222,17 @@ is()  { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
 mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || echo "?"; }
-key() { # audit key built by the pc-admin shipper grammar (never hand-written)
-  python3 "${HARNESS_DIR}/shipper_keys.py" "$@"
+key() { # audit key built by the pc-admin shipper grammar (never hand-written);
+        # the legacy flat layout (the dated layout is `dated_key`)
+  python3 "${HARNESS_DIR}/shipper_keys.py" --flat "$@"
 }
 variant_key() { # replay-conflict variant: --variant <body> <event-type> <ts> [sid] [seq] [mode]
+  python3 "${HARNESS_DIR}/shipper_keys.py" --flat --variant "$@"
+}
+dated_key() { # dated `audit/YYYYMMDD/<basename>` (the pinned builder's layout)
+  python3 "${HARNESS_DIR}/shipper_keys.py" "$@"
+}
+dated_variant_key() { # dated replay-conflict variant
   python3 "${HARNESS_DIR}/shipper_keys.py" --variant "$@"
 }
 fresh_stamp() { # current UTC in the witness's state.json format
@@ -217,21 +242,28 @@ audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 25f7922
-# (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key,
-# the full-SHA pin in shipper_keys.py; the grammar-defining point (pc-admin
+# were generated from the real builder at cad0p/pc-admin @ c0ce2f1
+# (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key/
+# split_audit_date_segment, the full-SHA pin in shipper_keys.py; the layout
+# point (pc-admin #30) made build_audit_key emit `audit/YYYYMMDD/<basename>`
+# (the dated default) and added the optional-segment split that refuses a
+# non-calendar all-digit day; the previous grammar-defining point (pc-admin
 # #20) `\Z`-anchored the audit-key type regexes (a trailing-newline type is
 # out of grammar and sanitized to the documented `unknown` non-session shape),
-# the previous point 3325aeb (pc-admin #19) scoped the sid-less `session.data`
-# sanction onto the documented `unknown` non-session shape, then a7035a9 added
-# the replay-conflict `_<sha256[:16]>` variant keys, and the earlier point
-# 41735ff added the over-long event-type truncation cap with the
-# `_<sha256[:8]>` suffix — all pinned by the vector matrix below); a pc-admin
-# grammar change must bump the pin and regenerate these (a contract-neutral
-# change needs no witness-contract edit). Drift fixtures (non-UUID or
-# sid-less session keys, malformed modes) stay hand-written literals on
-# purpose: the replica now refuses shapes the real shipper never emits, so a
-# fixture request for one is itself a failure (the teeth after the golden).
+# the point before that 3325aeb (pc-admin #19) scoped the sid-less
+# `session.data` sanction onto the documented `unknown` non-session shape,
+# then a7035a9 added the replay-conflict `_<sha256[:16]>` variant keys, and
+# the earlier point 41735ff added the over-long event-type truncation cap
+# with the `_<sha256[:8]>` suffix — all pinned by the vector matrix below); a
+# pc-admin grammar change must bump the pin and regenerate these (a
+# contract-neutral change needs no witness-contract edit). The flat goldens
+# use the `key`/`variant_key` helpers (explicit `--flat`: the pre-#30 legacy
+# layout the dual window still accepts) and the dated goldens use
+# `dated_key`/`dated_variant_key` (the pinned builder's current default).
+# Drift fixtures (non-UUID or sid-less session keys, malformed modes) stay
+# hand-written literals on purpose: the replica refuses shapes the real
+# shipper never emits, so a fixture request for one is itself a failure (the
+# teeth after the golden).
 REPLICA_SID="9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70"
 is "replica golden session.start shell" \
   "audit/20260925T100008Z-session.start.${REPLICA_SID}.000001.shell.json" \
@@ -335,6 +367,31 @@ if [ "$(variant_key "${VARIANT_BODY}" session.start 20260925T100008Z "${REPLICA_
 else
   bad "replay-conflict variant key ignored the body bytes"
 fi
+# Dated layout (pc-admin #30, the pinned builder's default): the same
+# basenames under `audit/YYYYMMDD/`, and the variant keeps its day segment.
+# These literals pin the dated golden independently of the vector matrix.
+DATE="20260925"
+is "replica dated golden session.start shell" \
+  "audit/${DATE}/20260925T100008Z-session.start.${REPLICA_SID}.000001.shell.json" \
+  "$(dated_key session.start 20260925T100008Z "${REPLICA_SID}" 1 shell)"
+is "replica dated golden session.end exec" \
+  "audit/${DATE}/20260925T100008Z-session.end.${REPLICA_SID}.000002.exec.json" \
+  "$(dated_key session.end 20260925T100008Z "${REPLICA_SID}" 2 exec)"
+is "replica dated golden session.data (no mode suffix)" \
+  "audit/${DATE}/20260925T100008Z-session.data.${REPLICA_SID}.000007.json" \
+  "$(dated_key session.data 20260925T100008Z "${REPLICA_SID}" 7)"
+is "replica dated golden session.rejected forced sid-less" \
+  "audit/${DATE}/20260925T100008Z-session.rejected.000005.json" \
+  "$(dated_key session.rejected 20260925T100008Z "${REPLICA_SID}" 5)"
+is "replica dated golden non-session key sid-less" \
+  "audit/${DATE}/20260925T100008Z-user.login.000006.json" \
+  "$(dated_key user.login 20260925T100008Z "" 6)"
+is "replica dated golden session.start variant keeps the day segment" \
+  "audit/${DATE}/20260925T100008Z-session.start_${VARIANT_HASH}.${REPLICA_SID}.000001.json" \
+  "$(dated_variant_key "${VARIANT_BODY}" session.start 20260925T100008Z "${REPLICA_SID}" 1 exec)"
+is "replica dated golden user.login variant keeps the day segment" \
+  "audit/${DATE}/20260925T100008Z-user.login_${VARIANT_HASH}.000006.json" \
+  "$(dated_variant_key "${VARIANT_BODY}" user.login 20260925T100008Z "" 6)"
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
 replica_refuses() { # <label> <expected-refusal-reason> + shipper_keys.py args; non-zero = refused
@@ -445,12 +502,14 @@ spec = importlib.util.spec_from_file_location("shipper_keys", os.path.join(here,
 replica = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replica)
 ts = "20260925T100008Z"
-if replica.audit_key("session.rejected", ts, 123, 5) != "audit/%s-session.rejected.000005.json" % ts:
+if replica.audit_key("session.rejected", ts, 123, 5, flat=True) != "audit/%s-session.rejected.000005.json" % ts:
     raise SystemExit("session.rejected with a non-string sid must drop the sid")
-if replica.audit_key("session.data", ts, 123, 1) != "audit/%s-unknown.000001.json" % ts:
+if replica.audit_key("session.data", ts, 123, 1, flat=True) != "audit/%s-unknown.000001.json" % ts:
     raise SystemExit("session.data with a non-string sid must sanitize to unknown")
+if replica.audit_key("session.rejected", ts, 123, 5) != "audit/20260925/%s-session.rejected.000005.json" % ts:
+    raise SystemExit("the replica default layout must be the pinned dated layout")
 try:
-    replica.audit_key("session.start", ts, 123, 1, "shell")
+    replica.audit_key("session.start", ts, 123, 1, "shell", flat=True)
 except ValueError:
     pass
 else:
@@ -503,10 +562,10 @@ with open(matrix_path, "rb") as matrix_file:
 vectors = json.loads(matrix_bytes.decode("utf-8"))
 
 
-def replay(args, body=None):
+def replay(args, body=None, flat=False):
     args = list(args)
     args[3] = int(args[3])
-    key = replica.audit_key(*args)
+    key = replica.audit_key(*args, flat=flat)
     if body is not None:
         # 'kind: "variant"' vectors carry the real builder's
         # 'disambiguate_audit_key' output for this body.
@@ -518,14 +577,15 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
     raise SystemExit("vector pin %r != shipper_keys pin %r" % (
         vectors.get("pinned_pc_admin_sha"), replica.PINNED_PC_ADMIN_SHA))
 
-# Matrix size pin: a deleted vector/refusal entry must fail loudly instead of
-# shrinking the matrix silently (red-team round-2 LOW M10). Update this pin
-# together with the matrix.
-if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 17:
+# Matrix size pin: a deleted vector/segment/refusal entry must fail loudly
+# instead of shrinking the matrix silently (red-team round-2 LOW M10). Update
+# this pin together with the matrix.
+if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 10
+        or len(vectors["refusals"]) != 17):
     raise SystemExit(
-        "vector matrix size changed: %d vectors / %d refusals (pinned 26/17) - "
-        "update this pin together with the matrix"
-        % (len(vectors["vectors"]), len(vectors["refusals"])))
+        "vector matrix size changed: %d vectors / %d segments / %d refusals "
+        "(pinned 32/10/17) - update this pin together with the matrix"
+        % (len(vectors["vectors"]), len(vectors["date_segments"]), len(vectors["refusals"])))
 
 # Matrix content pin (red-team round-3 LOW): a coherent same-size rewrite
 # (both event.sid and replica_args[2], or an entry swap) must fail loudly.
@@ -533,7 +593,7 @@ if len(vectors["vectors"]) != 26 or len(vectors["refusals"]) != 17:
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "cc364752764aacc6cb8d464382d8830df813991e305eba202491cbe17b6dd154"
+MATRIX_SHA256 = "c753bbeb8671a4d222742dda579962ab9c84eced66fdc913addd4f8685014c79"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -605,19 +665,27 @@ for vector in vectors["vectors"]:
             raise SystemExit(
                 "%s: non-UUID sid %r was rewritten to %r in replica_args"
                 % (vector["name"], event_sid, sid_arg))
-    got = replay(vector["replica_args"], vector.get("body"))
+    got = replay(vector["replica_args"], vector.get("body"), flat=(vector.get("layout") == "flat"))
     if got != vector["expected"]:
         raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
+for segment in vectors["date_segments"]:
+    # Date-segment split (pc-admin #30): valid dated segments strip, flat
+    # keys are unchanged, malformed all-digit segments are refused.
+    got = replica.split_date_segment(segment["key"])
+    if list(got) != [segment["relative"], segment["day"]]:
+        raise SystemExit("%s: expected %r got %r" % (
+            segment["name"], [segment["relative"], segment["day"]], list(got)))
 for refusal in vectors["refusals"]:
     try:
         replay(refusal["replica_args"])
     except ValueError:
         continue
     raise SystemExit("refusal accepted: %s" % refusal["name"])
-print("vectors=%d refusals=%d pin=%s source=%s" % (
-    len(vectors["vectors"]), len(vectors["refusals"]), vectors["pinned_pc_admin_sha"], source_sha[:12]))
+print("vectors=%d segments=%d refusals=%d pin=%s source=%s" % (
+    len(vectors["vectors"]), len(vectors["date_segments"]), len(vectors["refusals"]),
+    vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=26 refusals=17 pin=25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 source=25f79223cadd" ]]; then
+)" && [[ "$matrix_out" == "vectors=32 segments=10 refusals=17 pin=c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd source=c0ce2f1567af" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
@@ -844,11 +912,11 @@ failures = []
 for sid in oracle_sids:
     canonical = ORACLE_RE.fullmatch(sid) is not None
     try:
-        data_key = replica.audit_key("session.data", ORACLE_TS, sid, 1)
+        data_key = replica.audit_key("session.data", ORACLE_TS, sid, 1, flat=True)
     except ValueError:
         data_key = None
     try:
-        replica.audit_key("session.start", ORACLE_TS, sid, 1, "shell")
+        replica.audit_key("session.start", ORACLE_TS, sid, 1, "shell", flat=True)
         start_scoped = True
     except ValueError:
         start_scoped = False
@@ -1304,8 +1372,8 @@ objects = [
     {"key": "audit/20260925T135000Z-session.start.%s.0.shell.json" % sid, "ago": 300},
 ]
 for seq in range(2, 61, 2):
-    objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq), "ago": 299})
-objects.append({"key": audit_key("session.end", "20260925T135200Z", sid, 61, "shell"), "ago": 298})
+    objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq, flat=True), "ago": 299})
+objects.append({"key": audit_key("session.end", "20260925T135200Z", sid, 61, "shell", flat=True), "ago": 298})
 objects.append({"key": "recordings/%s.tar" % sid, "ago": 297})
 print(json.dumps({"bucket": "pc-admin-dr", "objects": objects, "uploads": []}))
 PY
@@ -1356,10 +1424,10 @@ objects = [
 # then odds 41..59 present: the remainder is now evens 42..60 instead of
 # 41,43,...,59.
 for seq in range(2, 41, 2):
-    objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq), "ago": 299})
+    objects.append({"key": audit_key("session.data", "20260925T135100Z", sid, seq, flat=True), "ago": 299})
 for seq in range(41, 60, 2):
-    objects.append({"key": audit_key("session.data", "20260925T135200Z", sid, seq), "ago": 298})
-objects.append({"key": audit_key("session.end", "20260925T135300Z", sid, 61, "shell"), "ago": 297})
+    objects.append({"key": audit_key("session.data", "20260925T135200Z", sid, seq, flat=True), "ago": 298})
+objects.append({"key": audit_key("session.end", "20260925T135300Z", sid, 61, "shell", flat=True), "ago": 297})
 objects.append({"key": "recordings/%s.tar" % sid, "ago": 296})
 print(json.dumps({"bucket": "pc-admin-dr", "objects": objects, "uploads": []}))
 PY
@@ -1376,7 +1444,9 @@ fi
 # These fixtures are built with the pc-admin shipper key grammar
 # (shipper_keys.py replicates scripts/lib/b2_client.py build_audit_key): the
 # round-1 hand-written keys are what let the live-v18 contract slip
-# (session.start omits `interactive` and reads `.shell` even for exec).
+# (session.start omits `interactive` and reads `.shell` even for exec). The
+# `key` helper builds the flat legacy layout explicitly; the dated layout is
+# exercised by the #159 scenarios below.
 K_START_SHELL="$(key session.start 20260925T135000Z "$SID" 1 shell)"
 K_DATA_2="$(key session.data 20260925T135100Z "$SID" 2)"
 K_END_SHELL="$(key session.end 20260925T135200Z "$SID" 3 shell)"
@@ -3681,6 +3751,7 @@ SEED_OLD_TS="$(audit_stamp -100000)"
 SEED_HEARTBEAT_TS="$(audit_stamp -60)"
 SEED_START_TS="$(audit_stamp -300)"
 SEED_DATA_TS="$(audit_stamp -299)"
+SEED_DATED_TS="$(audit_stamp -250)"
 seed_state_dir="${WORK}/state-seed-cold"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":2,
@@ -3689,6 +3760,7 @@ fixture <<JSON
   {"key":"audit/heartbeat/${SEED_HEARTBEAT_TS}.json","ago":45},
   {"key":"audit/${SEED_START_TS}-session.start.${SID}.0.json","ago":300},
   {"key":"audit/${SEED_DATA_TS}-session.data.${SID}.1.json","ago":299},
+  {"key":"$(dated_key user.login "${SEED_DATED_TS}" "" 9)","ago":250},
   {"key":"recordings/${SID}.tar","ago":297}],
  "uploads":[]}
 JSON
@@ -3710,6 +3782,7 @@ is "cold-start seed: coverage mode is seed" "seed" "$(state_field observed.cover
 is "cold-start seed: compact_blind is set" "True" "$(state_field observed.coverage.compact_blind)"
 if python3 - "${WORK}/requests-seed.log" "${SEED_OLD_TS}" "${SEED_HEARTBEAT_TS}" <<'PY'
 import json
+import re
 import sys
 import urllib.parse
 
@@ -3751,8 +3824,13 @@ else:
     if not ("audit/heartbeat/%s.json" % old_ts < heartbeat_marker
             < "audit/heartbeat/%s.json" % recent_ts):
         violations.append("heartbeat window marker %r does not exclude the old key / include the recent key" % heartbeat_marker)
-    if not ("audit/%s" % old_ts < session_marker < "audit/%s" % recent_ts):
-        violations.append("session window marker %r out of range" % session_marker)
+    # #159: the session seed starts at the window-start DAY prefix (not the
+    # `audit/<marker>` timestamp, which sorts above the dated keys of its own
+    # day) so both layouts seed.
+    if not re.fullmatch(r"audit/[0-9]{8}/", session_marker):
+        violations.append("session seed start-after is not a day prefix: %r" % session_marker)
+    elif session_marker > "audit/%s" % recent_ts:
+        violations.append("session window marker %r sorts after the recent key" % session_marker)
 if not any("uploads" in entry.get("note", "") for entry in entries):
     violations.append("seed never listed multipart uploads")
 if violations:
@@ -3762,6 +3840,8 @@ if violations:
 print("seed shape: heartbeat + session windowed, recordings full, uploads full, no versions")
 PY
 then ok "cold-start seed: windowed audit streams + full recordings/uploads, no versions"; else bad "cold-start seed request shape failed"; fi
+is "cold-start seed: the seed seeded the dated cursor from the dated key" \
+  "$(dated_key user.login "${SEED_DATED_TS}" "" 9)" "$(state_field observed.cursors.audit_session_dated)"
 
 # The seed wrote the observed block; the next run is an exact full sweep: an
 # unfiltered audit listing, versions listed, compact_blind cleared, mode back
@@ -4010,6 +4090,7 @@ is "quiet delta: detail identical to the sweep (age normalized)" "${warm_detail_
 is "quiet delta: finding signature identical to the sweep" "${warm_signature}" "$(state_field signature)"
 if python3 - "${WORK}/requests-delta-quiet.log" <<'PY'
 import json
+import re
 import sys
 import urllib.parse
 
@@ -4018,6 +4099,7 @@ violations = []
 objects = 0
 uploads = 0
 versions = 0
+day_probes = 0
 for entry in entries:
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
     note = entry.get("note", "")
@@ -4028,20 +4110,26 @@ for entry in entries:
         objects += 1
         if not query.get("start-after"):
             violations.append("quiet delta object listing without start-after: %s" % entry["path"])
+        prefix = query.get("prefix", [""])[0]
+        if re.fullmatch(r"audit/[0-9]{8}/", prefix):
+            day_probes += 1
     elif "uploads" in note:
         uploads += 1
     else:
         violations.append("quiet delta made an unexpected request: %s" % note)
-if len(entries) != 4 or objects != 3 or uploads != 1 or versions != 0:
-    violations.append("quiet delta call shape: entries=%d objects=%d uploads=%d versions=%d"
-                      % (len(entries), objects, uploads, versions))
+# The unseeded transition probe adds exactly one dated-day listing while the
+# dated cursor is empty (the flat-only fixture here); the heartbeat, flat
+# discovery and recordings tails stay.
+if len(entries) != 5 or objects != 4 or uploads != 1 or versions != 0 or day_probes != 1:
+    violations.append("quiet delta call shape: entries=%d objects=%d uploads=%d versions=%d day_probes=%d"
+                      % (len(entries), objects, uploads, versions, day_probes))
 if violations:
     for violation in violations:
         print("VIOLATION " + violation)
     sys.exit(1)
-print("quiet delta shape: 3 cursored object tails + 1 full uploads, no versions")
+print("quiet delta shape: 3 cursored object tails + the transition probe + 1 full uploads, no versions")
 PY
-then ok "quiet delta: three cursored tails + full uploads, no versions, no unfiltered pages"; else bad "quiet delta request shape failed"; fi
+then ok "quiet delta: three cursored tails + transition probe + full uploads, no versions, no unfiltered pages"; else bad "quiet delta request shape failed"; fi
 cat "${WORK}/requests-delta-quiet.log" >>"${SAVED_REQUEST_LOG}"
 REQUEST_LOG="${SAVED_REQUEST_LOG}"
 
@@ -5402,8 +5490,8 @@ objects = [
     {"key": "audit/20260925T130000Z-session.start.%s.0.shell.json" % sid, "ago": 300},
 ]
 for seq in range(1, 7):
-    objects.append({"key": audit_key("session.data", "20260925T1300%02dZ" % seq, sid, seq), "ago": 299})
-objects.append({"key": audit_key("session.end", "20260925T130100Z", sid, 7, "shell"), "ago": 298})
+    objects.append({"key": audit_key("session.data", "20260925T1300%02dZ" % seq, sid, seq, flat=True), "ago": 299})
+objects.append({"key": audit_key("session.end", "20260925T130100Z", sid, 7, "shell", flat=True), "ago": 298})
 objects.append({"key": "recordings/%s.tar" % sid, "ago": 297})
 print(json.dumps({"bucket": "pc-admin-dr", "page_size": 50, "objects": objects, "uploads": []}))
 PY
@@ -5488,8 +5576,8 @@ sid, heartbeat_ts, start_ts = sys.argv[2], sys.argv[3], sys.argv[4]
 objects = [{"key": "audit/heartbeat/%s.json" % heartbeat_ts, "ago": 120}]
 objects.append({"key": "audit/%s-session.start.%s.0.shell.json" % (start_ts, sid), "ago": 290})
 for seq in range(1, 6):
-    objects.append({"key": audit_key("session.data", start_ts, sid, seq), "ago": 289})
-objects.append({"key": audit_key("session.end", start_ts, sid, 6, "shell"), "ago": 288})
+    objects.append({"key": audit_key("session.data", start_ts, sid, seq, flat=True), "ago": 289})
+objects.append({"key": audit_key("session.end", start_ts, sid, 6, "shell", flat=True), "ago": 288})
 for index in range(3):
     objects.append({"key": "recordings/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5%d.tar" % index, "ago": 287 - index})
 print(json.dumps({"bucket": "pc-admin-dr", "page_size": 2, "objects": objects, "uploads": []}))
@@ -5768,6 +5856,683 @@ is "recordings tail: the sweep catches the orphan tar" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in
   *session-start-missing*) ok "recordings tail: sweep detail names session-start-missing" ;;
   *) bad "recordings tail sweep detail: ${CASE_DETAIL}" ;;
+esac
+
+# ---- #159 dual-layout audit keys: date strip + bounded dated streams -----
+# The witness accepts the legacy flat `audit/<basename>` layout and the
+# date-partitioned `audit/YYYYMMDD/<basename>` layout during the transition:
+# one strip helper (calendar-validated, malformed segments never stripped),
+# layout-specific predicates/cursors, bounded day selection for the delta
+# (cursor day + newer discovered days + the unseeded transition probe), and
+# the future-day exclusion. Existing verdicts above stay unchanged.
+DL_SID="3d3d3d3d-3d3d-4d3d-8d3d-3d3d3d3d3d3d"
+DL_SID2="4e4e4e4e-4e4e-4e4e-8e4e-4e4e4e4e4e4e"
+DL_HB_TS="$(audit_stamp -60)"
+DL_HEARTBEAT="audit/heartbeat/${DL_HB_TS}.json"
+
+# (1) Dated session/non-session classification + dated stream advance.
+DL_DATED_START="$(dated_key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
+DL_DATED_DATA="$(dated_key session.data 20260925T130100Z "${DL_SID}" 2)"
+DL_DATED_END="$(dated_key session.end 20260925T130200Z "${DL_SID}" 3 shell)"
+DL_DATED_LOGIN="$(dated_key user.login 20260925T130300Z "" 4)"
+dl_dated_dir="${WORK}/state-159-dated"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_DATED_START}","ago":300},
+  {"key":"${DL_DATED_DATA}","ago":299},
+  {"key":"${DL_DATED_END}","ago":298},
+  {"key":"${DL_DATED_LOGIN}","ago":297},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_dated_dir}"
+is "dated layout: the sweep is green" "ok" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *sessions=1*) ok "dated layout: the dated session is classified (sessions=1)" ;;
+  *) bad "dated layout: sessions count unexpected: ${CASE_DETAIL}" ;;
+esac
+is "dated layout: the flat session cursor stays empty (dated keys never move it)" \
+  "" "$(state_field observed.cursors.audit_session)"
+is "dated layout: the sweep seeds the dated session cursor" \
+  "${DL_DATED_LOGIN}" "$(state_field observed.cursors.audit_session_dated)"
+DL_DATED_CURSOR="$(state_field observed.cursors.audit_session_dated)"
+DL_NEW_START="$(dated_key session.start 20260925T130500Z "${DL_SID2}" 1 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_DATED_START}","ago":300},
+  {"key":"${DL_DATED_DATA}","ago":299},
+  {"key":"${DL_DATED_END}","ago":298},
+  {"key":"${DL_DATED_LOGIN}","ago":297},
+  {"key":"${DL_NEW_START}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-dated-delta.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_dated_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "dated delta: exit 1 (the new session has no tar)" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *"${DL_SID2}"*) ok "dated delta: the new dated session is gap-checked (names the sid)" ;;
+  *) bad "dated delta detail: ${CASE_DETAIL}" ;;
+esac
+is "dated delta: the dated cursor advances over the new dated key" \
+  "${DL_NEW_START}" "$(state_field observed.cursors.audit_session_dated)"
+is "dated delta: the flat cursor stays empty" "" "$(state_field observed.cursors.audit_session)"
+is "dated delta: the run stays a delta (no repair)" "delta" "$(state_field observed.coverage.mode)"
+is "dated delta: no repair record" "" "$(state_field repaired)"
+if python3 - "${WORK}/requests-159-dated-delta.log" "${DL_DATED_CURSOR}" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+resumed = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if entry.get("note", "").startswith("list-type=2") and query.get("prefix", [""])[0] == "audit/20260925/":
+        if query.get("start-after", [""])[0] == sys.argv[2]:
+            resumed += 1
+if resumed != 1:
+    raise SystemExit("the dated cursor's own day was not resumed from the cursor (%d requests)" % resumed)
+print("dated cursor day resumed")
+PY
+then
+  ok "dated delta: the dated cursor's own day is resumed with start-after=the cursor"
+else
+  bad "dated delta: the cursor-day listing did not resume from the dated cursor"
+fi
+
+# (2) Malformed/calendar-invalid/date-impersonation drift: never stripped,
+# never silently classified, never allowed to move either cursor.
+DL_FLAT_OK="$(key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
+DL_CAL_BAD="audit/20260932/20260925T130000Z-session.start.${DL_SID}.7.shell.json"
+DL_SHORT_DAY="audit/2026092/20260925T130000Z-user.login.8.json"
+DL_IMPERSONATE="audit/session.start/20260925T130000Z-session.start.${DL_SID2}.9.shell.json"
+dl_drift_dir="${WORK}/state-159-drift"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_FLAT_OK}","ago":300},
+  {"key":"${DL_CAL_BAD}","ago":299},
+  {"key":"${DL_SHORT_DAY}","ago":298},
+  {"key":"${DL_IMPERSONATE}","ago":297},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_drift_dir}"
+is "dated drift: exit 1 (drift alerts)" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *naming-contract*) ok "dated drift: the malformed/impersonating session-shaped keys are naming-contract" ;;
+  *) bad "dated drift naming-contract detail: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *contract-mismatch*) ok "dated drift: the wrong-length numeric segment is contract-mismatch" ;;
+  *) bad "dated drift contract-mismatch detail: ${CASE_DETAIL}" ;;
+esac
+is "dated drift: the flat cursor stays on the valid flat key" \
+  "${DL_FLAT_OK}" "$(state_field observed.cursors.audit_session)"
+is "dated drift: no malformed day moves the dated cursor" "" "$(state_field observed.cursors.audit_session_dated)"
+
+# (3) Mixed-layout identity: a dated re-ship of the same (ts, type, seq)
+# canonicalizes onto the flat key's identity (no false sequence-duplicate).
+DL_MIX_TS="$(audit_stamp -200)"
+DL_MIX_DATA_TS="$(audit_stamp -199)"
+DL_MIX_END_TS="$(audit_stamp -198)"
+DL_MIX_FLAT_START="$(key session.start "${DL_MIX_TS}" "${DL_SID}" 1 shell)"
+DL_MIX_FLAT_DATA="$(key session.data "${DL_MIX_DATA_TS}" "${DL_SID}" 2)"
+DL_MIX_DATED_DATA="$(dated_key session.data "${DL_MIX_DATA_TS}" "${DL_SID}" 2)"
+DL_MIX_FLAT_END="$(key session.end "${DL_MIX_END_TS}" "${DL_SID}" 3 shell)"
+dl_mix_dir="${WORK}/state-159-mixed"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_MIX_FLAT_START}","ago":300},
+  {"key":"${DL_MIX_FLAT_DATA}","ago":299},
+  {"key":"${DL_MIX_DATED_DATA}","ago":298},
+  {"key":"${DL_MIX_FLAT_END}","ago":297},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_mix_dir}"
+is "mixed layout: the sweep is green (no false sequence-duplicate)" "ok" "${CASE_STATE}"
+is "mixed layout: the flat cursor is the flat end key" \
+  "${DL_MIX_FLAT_END}" "$(state_field observed.cursors.audit_session)"
+is "mixed layout: the dated cursor is the dated data key" \
+  "${DL_MIX_DATED_DATA}" "$(state_field observed.cursors.audit_session_dated)"
+
+# (4) Transition scenario: the first dated keys land on the switch day and
+# sort BELOW the flat cursor, so only the unseeded transition probe sees
+# them. All seen, no missed session, no repair/sweep.
+DL_TR_FLAT_START="$(key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
+DL_TR_DATED_START="$(dated_key session.start 20260925T130500Z "${DL_SID2}" 1 shell)"
+dl_trans_dir="${WORK}/state-159-transition"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_TR_FLAT_START}","ago":300},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_trans_dir}"
+is "transition: the flat-only warm sweep is green" "ok" "${CASE_STATE}"
+is "transition: the warm sweep wrote the flat cursor" \
+  "${DL_TR_FLAT_START}" "$(state_field observed.cursors.audit_session)"
+is "transition: the warm sweep left the dated cursor legacy-empty" "" \
+  "$(state_field observed.cursors.audit_session_dated)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_TR_FLAT_START}","ago":300},
+  {"key":"${DL_TR_DATED_START}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-transition.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_trans_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "transition: the same-day dated key is seen (recording-gap, exit 1)" "1" "${CASE_RC}"
+case "${CASE_DETAIL}" in
+  *"${DL_SID2}"*) ok "transition: the dated session is gap-checked (names the sid)" ;;
+  *) bad "transition detail: ${CASE_DETAIL}" ;;
+esac
+is "transition: the dated cursor seeds from the transition day" \
+  "${DL_TR_DATED_START}" "$(state_field observed.cursors.audit_session_dated)"
+is "transition: the flat cursor is not moved by the dated key" \
+  "${DL_TR_FLAT_START}" "$(state_field observed.cursors.audit_session)"
+is "transition: the run stays a delta (no repair/sweep)" "delta" "$(state_field observed.coverage.mode)"
+is "transition: no repair record" "" "$(state_field repaired)"
+if python3 - "${WORK}/requests-159-transition.log" "audit/20260925/" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+probe = 0
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if entry.get("note", "").startswith("list-type=2") and query.get("prefix", [""])[0] == sys.argv[2]:
+        probe += 1
+if probe != 1:
+    raise SystemExit("the transition probe did not run exactly once (%d)" % probe)
+print("transition probe ran")
+PY
+then ok "transition: the unseeded transition probe listed the flat cursor's own day"; else bad "transition probe request shape failed"; fi
+
+# (5) Future-day vector: a valid later-than-(now+skew) day never moves a
+# cursor, the validator fails closed on a persisted future-day cursor, and a
+# heavy future day with an empty dated cursor is never listed (no enumeration,
+# no forced sweep, the date stays unseeded).
+DL_FUTURE_KEY="audit/20991231/20260925T130000Z-session.start.${DL_SID2}.1.shell.json"
+dl_future_dir="${WORK}/state-159-future"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_DATED_LOGIN}","ago":30},
+  {"key":"${DL_FUTURE_KEY}","ago":30}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_future_dir}"
+is "future day: the sweep is green (no start-without-tar alert inside the grace)" "ok" "${CASE_STATE}"
+is "future day: the sweep keeps the dated cursor on the real dated key" \
+  "${DL_DATED_LOGIN}" "$(state_field observed.cursors.audit_session_dated)"
+DL_FUTURE_CURSOR="$(state_field observed.cursors.audit_session_dated)"
+python3 - "${dl_future_dir}/state.json" "${DL_FUTURE_KEY}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"]["audit_session_dated"] = sys.argv[2]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+start_mock
+run_delta "${dl_future_dir}"
+is "future day cursor: exit 2 (repair, never a pinned empty dated tail)" "2" "${CASE_RC}"
+is "future day cursor: error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *audit_session_dated*future-dated*|*future-dated*audit_session_dated*) ok "future day cursor: detail names the future-dated dated cursor" ;;
+  *) bad "future day cursor detail: ${CASE_DETAIL}" ;;
+esac
+is "future day cursor: the record is marked repaired" "True" "$(state_field repaired)"
+# A poisoned dated cursor does not match the dated grammar (a flat key or a
+# heartbeat key in the dated slot fails closed into the repair + sweep path,
+# never a delta).
+dl_poison_dir="${WORK}/state-159-poisoned-dated"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_DATED_LOGIN}","ago":30}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_poison_dir}"
+is "poisoned dated cursor: the shaped warm sweep is green (control)" "ok" "${CASE_STATE}"
+DL_POISON_FLAT="$(key user.login 20260925T130300Z "" 4)"
+for poisoned_dated in "flat|${DL_POISON_FLAT}" "heartbeat|${DL_HEARTBEAT}"; do
+  poisoned_kind="${poisoned_dated%%|*}"
+  poisoned_value="${poisoned_dated#*|}"
+  python3 - "${dl_poison_dir}/state.json" "${poisoned_value}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursors"]["audit_session_dated"] = sys.argv[2]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  start_mock
+  run_delta "${dl_poison_dir}"
+  is "poisoned dated cursor (${poisoned_kind}): exit 2 (repair, never trusted)" "2" "${CASE_RC}"
+  is "poisoned dated cursor (${poisoned_kind}): error verdict" "error" "${CASE_STATE}"
+  is "poisoned dated cursor (${poisoned_kind}): the record is marked repaired" "True" "$(state_field repaired)"
+  case "${CASE_DETAIL}" in
+    *"audit_session_dated"*grammar*) ok "poisoned dated cursor (${poisoned_kind}): detail names the dated cursor grammar" ;;
+    *) bad "poisoned dated cursor (${poisoned_kind}) detail: ${CASE_DETAIL}" ;;
+  esac
+done
+# Heavy future day with an empty dated cursor above the flat cursor: the
+# discovery returns its prefix, the client-side future filter must drop it, so
+# there is no per-run enumeration (which would overflow the page budget) and
+# no forced sweep, and the date stays unseeded.
+dl_future_heavy_dir="${WORK}/state-159-future-heavy"
+DL_FH_FLAT="$(key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_FH_FLAT}","ago":300},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_future_heavy_dir}"
+is "heavy future day: the flat warm sweep is green" "ok" "${CASE_STATE}"
+python3 - "${FIXTURE}" "${DL_HEARTBEAT}" "${DL_FH_FLAT}" "${DL_SID}" <<'PY'
+import json
+import sys
+
+fixture, heartbeat, flat_start, sid = sys.argv[1:5]
+objects = [
+    {"key": heartbeat, "ago": 60},
+    {"key": flat_start, "ago": 300},
+    {"key": "recordings/%s.tar" % sid, "ago": 296},
+]
+for index in range(200):
+    objects.append({
+        "key": "audit/20991231/20260925T13%02d%02dZ-user.login.%d.json" % (index // 60, index % 60, index + 1),
+        "ago": 30,
+    })
+json.dump({"bucket": "pc-admin-dr", "page_size": 2, "objects": objects, "uploads": []},
+          open(fixture, "w", encoding="utf-8"))
+PY
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-future-heavy.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_future_heavy_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "heavy future day: the run stays a delta (no forced sweep)" "delta" "$(state_field observed.coverage.mode)"
+is "heavy future day: the future date stays unseeded" "" "$(state_field observed.cursors.audit_session_dated)"
+if grep -q 'prefix=audit/20991231/' "${WORK}/requests-159-future-heavy.log" \
+   || grep -q 'prefix=audit%2F20991231%2F' "${WORK}/requests-159-future-heavy.log"; then
+  bad "heavy future day: the delta enumerated the future day"
+else
+  ok "heavy future day: the future day is never listed in delta"
+fi
+
+# (6) Empty dated cursor: a first dated day ABOVE the flat cursor is listed
+# and seeds the cursor; a first dated day BELOW it is not delta-listed (the
+# client filter is deterministic under both server behaviours) and the sweep
+# finds it.
+DL_ABOVE_DATED="$(dated_key user.login 20260926T130000Z "" 1)"
+dl_above_dir="${WORK}/state-159-above"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_TR_FLAT_START}","ago":300},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_above_dir}"
+is "empty cursor above: the flat warm sweep is green" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_TR_FLAT_START}","ago":300},
+  {"key":"${DL_ABOVE_DATED}","ago":30},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${dl_above_dir}"
+is "empty cursor above: the delta is green" "ok" "${CASE_STATE}"
+is "empty cursor above: the first dated day above the flat cursor seeds the dated cursor" \
+  "${DL_ABOVE_DATED}" "$(state_field observed.cursors.audit_session_dated)"
+is "empty cursor above: the run stays a delta" "delta" "$(state_field observed.coverage.mode)"
+DL_BELOW_DATED="$(dated_key session.start 20260925T130000Z "${DL_SID2}" 1 shell)"
+DL_BELOW_FLAT_LATE="$(key session.start 20260926T130000Z "${DL_SID}" 1 shell)"
+dl_below_dir="${WORK}/state-159-below"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_BELOW_FLAT_LATE}","ago":300},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_below_dir}"
+is "empty cursor below: the flat warm sweep is green" "ok" "${CASE_STATE}"
+is "empty cursor below: the flat cursor is on the later day" \
+  "${DL_BELOW_FLAT_LATE}" "$(state_field observed.cursors.audit_session)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_BELOW_FLAT_LATE}","ago":300},
+  {"key":"${DL_BELOW_DATED}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-below.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_below_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "empty cursor below: the delta stays green (the below-flat day is not listed)" "ok" "${CASE_STATE}"
+is "empty cursor below: the dated cursor stays empty" "" "$(state_field observed.cursors.audit_session_dated)"
+if python3 - "${WORK}/requests-159-below.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+violations = []
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if entry.get("note", "").startswith("list-type=2") and query.get("prefix", [""])[0] == "audit/20260925/":
+        violations.append("delta listed the below-flat day: %s" % entry["path"])
+if violations:
+    for violation in violations:
+        print("VIOLATION " + violation)
+    sys.exit(1)
+print("below-flat day not listed (conformant server)")
+PY
+then ok "empty cursor below: the conformant server never lists the below-flat day"; else bad "empty cursor below request shape failed"; fi
+# The non-filtering branch (a server that ignores start_after for prefixes)
+# must reach the same decision through the client-side filter.
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"prefixes_ignore_start_after":true,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_BELOW_FLAT_LATE}","ago":300},
+  {"key":"${DL_BELOW_DATED}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-below-nonfilter.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_below_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "empty cursor below (non-filtering server): the delta stays green" "ok" "${CASE_STATE}"
+is "empty cursor below (non-filtering server): the dated cursor stays empty" "" \
+  "$(state_field observed.cursors.audit_session_dated)"
+if python3 - "${WORK}/requests-159-below-nonfilter.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+violations = []
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if entry.get("note", "").startswith("list-type=2") and query.get("prefix", [""])[0] == "audit/20260925/":
+        violations.append("delta listed the below-flat day: %s" % entry["path"])
+if violations:
+    for violation in violations:
+        print("VIOLATION " + violation)
+    sys.exit(1)
+print("below-flat day not listed (non-filtering server, client filter)")
+PY
+then ok "empty cursor below: the non-filtering server is filtered client-side (same decision)"; else bad "empty cursor below non-filtering request shape failed"; fi
+force_sweep_state "${dl_below_dir}"
+start_mock
+run_delta "${dl_below_dir}"
+is "empty cursor below: the sweep finds the below-flat dated session" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${DL_SID2}"*) ok "empty cursor below: the sweep gap-checks it (names the sid)" ;;
+  *) bad "empty cursor below sweep detail: ${CASE_DETAIL}" ;;
+esac
+is "empty cursor below: the sweep seeds the dated cursor" \
+  "${DL_BELOW_DATED}" "$(state_field observed.cursors.audit_session_dated)"
+
+# (7) Bounded day selection: a discovered day BELOW the dated cursor is not
+# re-listed (request-count pin); a late dated key on a below-cursor day is
+# the disclosed sweep-bounded residual; a writer revert advances the flat
+# cursor past an unlisted dated day (also sweep-bounded).
+DL_SEL_FLAT="$(key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
+DL_SEL_D2="$(dated_key user.login 20260927T130000Z "" 1)"
+DL_SEL_D2_NEW="$(dated_key user.login 20260927T130500Z "" 3)"
+DL_SEL_D1_RESIDUAL="$(dated_key session.start 20260926T130000Z "${DL_SID2}" 1 shell)"
+dl_sel_dir="${WORK}/state-159-selection"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_SEL_FLAT}","ago":300},
+  {"key":"${DL_SEL_D2}","ago":30},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_sel_dir}"
+is "day selection: the warm sweep is green" "ok" "${CASE_STATE}"
+is "day selection: the dated cursor is on the later day" \
+  "${DL_SEL_D2}" "$(state_field observed.cursors.audit_session_dated)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":1,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_SEL_FLAT}","ago":300},
+  {"key":"${DL_SEL_D1_RESIDUAL}","ago":1200},
+  {"key":"${DL_SEL_D2}","ago":30},
+  {"key":"${DL_SEL_D2_NEW}","ago":20},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-selection.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_sel_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "day selection: the delta stays green (the below-cursor day is not listed)" "ok" "${CASE_STATE}"
+is "day selection: the dated cursor advances only on its own day" \
+  "${DL_SEL_D2_NEW}" "$(state_field observed.cursors.audit_session_dated)"
+if python3 - "${WORK}/requests-159-selection.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+day_listings = []
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if not entry.get("note", "").startswith("list-type=2"):
+        continue
+    prefix = query.get("prefix", [""])[0]
+    if prefix.startswith("audit/2026092"):
+        day_listings.append(prefix)
+violations = []
+if day_listings.count("audit/20260927/") != 1:
+    violations.append("expected exactly one listing for the cursor day, got %r" % day_listings)
+if "audit/20260926/" in day_listings:
+    violations.append("the below-cursor day was re-listed: %r" % day_listings)
+if "audit/20260925/" in day_listings:
+    violations.append("the flat cursor day was re-listed: %r" % day_listings)
+if violations:
+    for violation in violations:
+        print("VIOLATION " + violation)
+    sys.exit(1)
+print("day selection request pin: %r" % day_listings)
+PY
+then ok "day selection: only the dated cursor's own day is listed (request-count pin)"; else bad "day selection request-count pin failed"; fi
+force_sweep_state "${dl_sel_dir}"
+start_mock
+run_delta "${dl_sel_dir}"
+is "below-cursor residual: the sweep catches the late below-cursor session" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${DL_SID2}"*) ok "below-cursor residual: the sweep gap-checks it (names the sid)" ;;
+  *) bad "below-cursor residual sweep detail: ${CASE_DETAIL}" ;;
+esac
+# Writer revert: flat keys resume and advance the flat cursor past a dated
+# day the delta has not listed; that day is not re-listed in delta (the
+# disclosure) and the sweep closes it.
+DL_REV_FLAT="$(key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
+DL_REV_DATED_CURSOR="$(dated_key user.login 20260927T130000Z "" 1)"
+DL_REV_RESUMED_FLAT="$(key user.login 20260929T130000Z "" 4)"
+DL_REV_MISSED_DATED="$(dated_key session.start 20260928T130000Z "${DL_SID2}" 1 shell)"
+dl_revert_dir="${WORK}/state-159-revert"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_REV_FLAT}","ago":300},
+  {"key":"${DL_REV_DATED_CURSOR}","ago":30},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_revert_dir}"
+is "writer revert: the warm sweep is green" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_REV_FLAT}","ago":300},
+  {"key":"${DL_REV_RESUMED_FLAT}","ago":30},
+  {"key":"${DL_REV_DATED_CURSOR}","ago":30},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${dl_revert_dir}"
+is "writer revert: the resumed flat key advances the flat cursor" \
+  "${DL_REV_RESUMED_FLAT}" "$(state_field observed.cursors.audit_session)"
+is "writer revert: the dated cursor is unchanged" \
+  "${DL_REV_DATED_CURSOR}" "$(state_field observed.cursors.audit_session_dated)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_REV_FLAT}","ago":300},
+  {"key":"${DL_REV_RESUMED_FLAT}","ago":30},
+  {"key":"${DL_REV_DATED_CURSOR}","ago":30},
+  {"key":"${DL_REV_MISSED_DATED}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-revert.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_revert_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "writer revert: the missed dated day is not re-listed in delta (disclosed)" "ok" "${CASE_STATE}"
+is "writer revert: the dated cursor stays put" \
+  "${DL_REV_DATED_CURSOR}" "$(state_field observed.cursors.audit_session_dated)"
+if grep -q 'prefix=audit/20260928/' "${WORK}/requests-159-revert.log" \
+   || grep -q 'prefix=audit%2F20260928%2F' "${WORK}/requests-159-revert.log"; then
+  bad "writer revert: the delta listed the missed dated day"
+else
+  ok "writer revert: the missed dated day is below the resumed flat cursor (sweep-bounded)"
+fi
+force_sweep_state "${dl_revert_dir}"
+start_mock
+run_delta "${dl_revert_dir}"
+is "writer revert: the sweep closes the missed dated day" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${DL_SID2}"*) ok "writer revert: the sweep gap-checks the missed session (names the sid)" ;;
+  *) bad "writer revert sweep detail: ${CASE_DETAIL}" ;;
+esac
+
+# (8) Prefix drift: a non-day prefix above the flat cursor is never listed in
+# delta (its keys classify at the sweep), and a date-impersonating prefix is
+# not stripped into a flat parse.
+DL_PREFIX_DRIFT="audit/notaday/20260925T130000Z-session.start.${DL_SID2}.1.shell.json"
+DL_PREFIX_IMPERSONATE="audit/session.data/20260925T130000Z-session.start.${DL_SID2}.2.shell.json"
+dl_prefix_dir="${WORK}/state-159-prefix-drift"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_TR_FLAT_START}","ago":300},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_prefix_dir}"
+is "prefix drift: the warm sweep is green" "ok" "${CASE_STATE}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_TR_FLAT_START}","ago":300},
+  {"key":"${DL_PREFIX_DRIFT}","ago":1200},
+  {"key":"${DL_PREFIX_IMPERSONATE}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-prefix-drift.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_prefix_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "prefix drift: the delta stays a green no-op (drift does not repair)" "ok" "${CASE_STATE}"
+is "prefix drift: the run stays a delta" "delta" "$(state_field observed.coverage.mode)"
+if grep -qE 'prefix=audit(%2F|/)notaday(%2F|/)' "${WORK}/requests-159-prefix-drift.log" \
+   || grep -qE 'prefix=audit(%2F|/)session\.data(%2F|/)' "${WORK}/requests-159-prefix-drift.log"; then
+  bad "prefix drift: the delta listed a malformed/impersonating prefix"
+else
+  ok "prefix drift: malformed/impersonating prefixes are never listed in delta"
+fi
+force_sweep_state "${dl_prefix_dir}"
+start_mock
+run_delta "${dl_prefix_dir}"
+is "prefix drift: the sweep classifies the drifted keys (naming-contract)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *naming-contract*) ok "prefix drift: the sweep names naming-contract" ;;
+  *) bad "prefix drift sweep detail: ${CASE_DETAIL}" ;;
 esac
 
 # ---- (g) the key is never printed ----------------------------------------
