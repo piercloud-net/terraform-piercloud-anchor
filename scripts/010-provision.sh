@@ -1918,19 +1918,26 @@ def signed_get(config, params):
         "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
-def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pages=1000):
+def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
     """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
 
     `start_after` seeds the first page (exclusive, live-verified on B2); it is
-    never combined with a continuation token. `stop_at_heartbeat` ends the
-    session stream at the heartbeat stem: any key at/after audit/heartbeat is
-    not a session key (every session key starts with a digit and sorts below
-    it), so the heartbeat stream owns the tail (keys sorting after it are
-    sweep-only). The early stop fires only on a complete ordered page - a
-    truncated page keeps paginating (heartbeat entries stay skipped), because
-    a nonconformant server could still return a session key on a later page.
-    `max_pages` bounds a delta tail; overflow raises DeltaTooLong so the run
-    can fall back to an exact sweep instead of a truncated view.
+    never combined with a continuation token. `until` is an exclusive upper
+    key bound: any key at/after it is not part of this stream (the session
+    stream passes the heartbeat stem, `audit/heartbeat` - every session key
+    starts with a digit and sorts below it, so the heartbeat family owns the
+    tail and keys sorting after it are sweep-only). The early stop fires on
+    an ordered page whose last key is at/above the bound when the page is
+    complete (`IsTruncated=false`) **or** when the page demonstrably crossed
+    the bound (its first key is below it) - the priced conformant-ordering
+    trade from anchor #161: it bounds the session tail at the heartbeat stem
+    instead of paging through the whole heartbeat subtree. A truncated page
+    entirely at/above the bound keeps paginating (its entries stay skipped),
+    because a nonconformant server could still return an in-bound key on a
+    later page (the round-2 FF2 hole). An unordered page is filtered
+    entry-by-entry and is never an early-stop signal. `max_pages` bounds a
+    delta tail; overflow raises DeltaTooLong so the run can fall back to an
+    exact sweep instead of a truncated view.
     """
     objects = {}
     token = ""
@@ -1984,18 +1991,24 @@ def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pa
             truncated = True
         keys = [key for key, _ in entries]
         ordered = all(before <= current for before, current in zip(keys, keys[1:]))
-        heartbeat_stem = config.heartbeat_prefix.rstrip("/")
-        crossed = stop_at_heartbeat and ordered and not truncated and any(
-            key >= heartbeat_stem for key in keys)
+        crossed = (
+            until is not None
+            and ordered
+            and bool(keys)
+            and keys[-1] >= until
+            and (not truncated or keys[0] < until)
+        )
         for key, last_modified in entries:
-            if stop_at_heartbeat and key >= heartbeat_stem:
+            if until is not None and key >= until:
                 if crossed:
-                    # A complete ordered page: every later key sorts at/after
-                    # the heartbeat stem, so the session stream ends here. A
-                    # truncated page proves nothing about later pages (a
-                    # nonconformant server can hide a session key behind the
-                    # heartbeat), and an unordered page is filtered
-                    # entry-by-entry; neither is an early-stop signal.
+                    # The bound is proven exhausted: a complete ordered page
+                    # (no later page exists) or a crossing page (the stream
+                    # entered the out-of-bound tail after in-bound keys - the
+                    # anchor #161 conformant-ordering trade). A truncated page
+                    # entirely at/above the bound proves nothing about later
+                    # pages (a nonconformant server can hide an in-bound key
+                    # behind the bound) and keeps paginating; an unordered
+                    # page is filtered entry-by-entry.
                     return objects
                 continue
             try:
@@ -2458,7 +2471,7 @@ def _list_cold_start_streams(config, window_start):
         config, config.heartbeat_prefix, start_after=config.heartbeat_prefix + marker)
     session_objects = list_objects(
         config, config.audit_prefix, start_after=config.audit_prefix + marker,
-        stop_at_heartbeat=True)
+        until=config.heartbeat_prefix.rstrip("/"))
     audit_objects = {}
     audit_objects.update(session_objects)
     audit_objects.update(heartbeat_objects)
@@ -2545,8 +2558,8 @@ def run_checks(config, now, plan):
             new_heartbeat = list_objects(
                 config, config.heartbeat_prefix, start_after=heartbeat_cursor, max_pages=DELTA_MAX_PAGES)
             new_session = list_objects(
-                config, config.audit_prefix, start_after=session_cursor, stop_at_heartbeat=True,
-                max_pages=DELTA_MAX_PAGES)
+                config, config.audit_prefix, start_after=session_cursor,
+                until=config.heartbeat_prefix.rstrip("/"), max_pages=DELTA_MAX_PAGES)
             new_recordings = list_objects(
                 config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
         except DeltaTooLong as exc:

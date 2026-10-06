@@ -196,7 +196,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=846
+MIN_CHECKS=850
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -5642,6 +5642,96 @@ case "${CASE_DETAIL}" in
   *recording-gap*) ok "cross-page heartbeat: detail names the recording-gap the early stop would hide" ;;
   *) bad "cross-page heartbeat detail: ${CASE_DETAIL}" ;;
 esac
+
+# #161: the delta session listing must not page through the heartbeat subtree.
+# With page_size=50 and a heartbeat tail that spills past the session keys'
+# page, the round-2 complete-page rule alone pages through the whole subtree
+# (62 session keys + 2500 heartbeats = 52 pages > DELTA_MAX_PAGES -> sweep
+# fallback). The explicit `until` bound stops at the crossing page (page 2:
+# 12 session keys then heartbeats) - the priced conformant-ordering trade -
+# while a truncated page entirely at/above the bound (FF2 above, the >50k
+# tooth below) keeps paginating.
+bound_dir="${WORK}/state-session-bound"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${bound_dir}"
+is "#161 bound: the warm sweep is green" "ok" "${CASE_STATE}"
+BOUND_TS="$(audit_stamp -240)"
+BOUND_SID="c1a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b"
+python3 - "${FIXTURE}" "${DELTA_HEARTBEAT_TS}" "${DELTA_START_TS}" "${SID}" "${BOUND_TS}" "${BOUND_SID}" <<'PY'
+import json
+import sys
+
+fixture, warm_hb, warm_start, warm_sid, bound_ts, bound_sid = sys.argv[1:7]
+objects = [
+    {"key": "audit/heartbeat/%s.json" % warm_hb, "ago": 60},
+    {"key": "audit/%s-session.start.%s.0.json" % (warm_start, warm_sid), "ago": 300},
+    {"key": "recordings/%s.tar" % warm_sid, "ago": 297},
+]
+# A complete new session after the warm cursor: start + 60 data + end, so the
+# session keys alone span more than one page_size=50 page.
+objects.append({"key": "audit/%s-session.start.%s.0.json" % (bound_ts, bound_sid), "ago": 240})
+for seq in range(1, 61):
+    objects.append({"key": "audit/%s-session.data.%s.%d.json" % (bound_ts, bound_sid, seq), "ago": 239})
+objects.append({"key": "audit/%s-session.end.%s.61.shell.json" % (bound_ts, bound_sid), "ago": 238})
+objects.append({"key": "recordings/%s.tar" % bound_sid, "ago": 237})
+# 2499 heartbeat keys (year-9999, date-inert) sit above every session key:
+# with the warm key the heartbeat family is exactly 2500 keys = 50 pages (the
+# DELTA_MAX_PAGES bound, so the heartbeat listing itself does not overflow),
+# while the old session listing (62 + 2499 = 52 pages) overflowed to a sweep.
+# (2499, not 2500: the mock resumes a continuation token as an offset into the
+# unfiltered list, so a 2501-key family would take 51 token pages.)
+for index in range(2499):
+    objects.append({"key": "audit/heartbeat/99991231T%02d%02d00Z.json" % (index // 60, index % 60), "ago": 60})
+json.dump({"bucket": "pc-admin-dr", "page_size": 50, "objects": objects, "uploads": []},
+          open(fixture, "w", encoding="utf-8"))
+PY
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-session-bound.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${bound_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "#161 bound: the session tail stays a delta (no sweep fallback)" "delta" "$(state_field observed.coverage.mode)"
+is "#161 bound: the new session is seen (green)" "ok" "${CASE_STATE}"
+if python3 - "${WORK}/requests-session-bound.log" <<'PY'
+import json
+import sys
+import urllib.parse
+
+session_requests = 0
+heartbeat_requests = 0
+for raw in open(sys.argv[1], encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    entry = json.loads(raw)
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if query.get("list-type") != ["2"]:
+        continue
+    prefix = query.get("prefix", [""])[0]
+    if prefix == "audit/":
+        session_requests += 1
+    elif prefix == "audit/heartbeat/":
+        heartbeat_requests += 1
+if session_requests != 2:
+    raise SystemExit("session listing made %d requests (expected 2: the crossing page stops the tail)" % session_requests)
+if heartbeat_requests != 50:
+    raise SystemExit("heartbeat listing made %d requests (expected 50)" % heartbeat_requests)
+print("bounded")
+PY
+then
+  ok "#161 bound: the session listing stops at the crossing page (2 requests, never the heartbeat subtree)"
+else
+  bad "#161 bound: the session listing paged through the heartbeat subtree (expected 2 session requests)"
+fi
 
 # R3: the recordings tail is key-ordered (<sid>.tar carries no timestamp), so
 # a NEW tar whose id sorts below the recordings cursor is invisible to the
