@@ -1438,23 +1438,47 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
-STATE_VERSION = 2
+STATE_VERSION = 3
+# The observed/coverage block's own schema version; bumped only when the
+# block layout changes incompatibly (a mismatch is fail-closed repair + sweep).
+CURSOR_VERSION = 1
 # A state record is a few KB; an oversized file is invalid input, never a reason
 # to allocate it. The bounded read keeps a planted huge state.json from raising
 # an uncaught MemoryError before any verdict (round-7 R2).
 STATE_MAX_BYTES = 1 << 20
+# Bounded response reads: a non-2xx body only ever feeds a clipped message,
+# while a 2xx list body is parsed in full. A server that streams without
+# bound must fail the run closed, never allocate it to death. The module
+# constants are patchable for the offline harness.
+MAX_ERROR_BODY = 64 * 1024
+MAX_SUCCESS_BODY = 16 * 1024 * 1024
+# A delta tail is bounded: an overflow abandons the delta and runs an exact
+# sweep, so a post-downtime backlog can never read as a truncated view.
+DELTA_MAX_PAGES = 50
+# The observed view sidecar: the merged key maps live here (not in state.json,
+# whose 1 MiB bound and preserve-and-repair semantics stay untouched). The cap
+# is fail-closed: an oversized or unreadable view takes the repair-sweep path.
+VIEW_VERSION = 1
+VIEW_MAX_BYTES = 64 << 20
 VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
 # Classification is shape-strict so a malformed session key cannot be re-parsed
-# as a non-session event (or vice versa).
+# as a non-session event (or vice versa). The family regexes end `\Z`, not
+# `$`: Python's `$` also matches before a trailing newline (the
+# QUIET_SIGNATURE_RE pitfall below), so a key ending `…json\n`/`…tar\n` would
+# pass the shape predicates (and the classifier's own match) as a real key
+# while sorting above the whole real key space - a cursor-poisoning false
+# green (round-4 RF3.1).
 TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
 # Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
 # optional mode marker (.shell/.exec) is contract-defined for session.start
@@ -1462,15 +1486,88 @@ TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
 SESSION_KEY_RE = re.compile(
     r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
     r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
-    r"(?:\.(?P<mode>shell|exec))?\.json$"
+    r"(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
 # Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
 NON_SESSION_KEY_RE = re.compile(
-    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
 )
-HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json$")
+HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json\Z")
 UUID_RE = re.compile(UUID_PATTERN)
-RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar$")
+RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar\Z")
+# Cursor grammar guards: a cursor may only ever advance over keys matching the
+# family's own shape (the same regexes the classifier reads). An unshaped key
+# (an acceptance probe, contract drift) still enters the listing/view (audit
+# keys alert as naming-contract/contract-mismatch drift; the recording checks
+# skip unshaped recordings keys), but letting it move a cursor would put the
+# cursor past the real key space and blind the next delta's tail while the run
+# stays green (round-3 forged-cursor / live-probe class). These predicates
+# mirror the current flat layout and must be extended together with the
+# classifier when the date-partitioned/seq-range layout lands (#159).
+def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
+    """True for a shaped session/non-session audit key below the heartbeat stem."""
+    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
+        return False
+    relative = key[len(audit_prefix):]
+    if SESSION_KEY_RE.match(relative):
+        return True
+    generic = NON_SESSION_KEY_RE.match(relative)
+    if not generic:
+        return False
+    # Mirror the classifier: a NON_SESSION-shaped `session.*` key with no sid
+    # (and its replay-conflict variant) is naming-contract drift, not a
+    # documented non-session event, so it must not move the cursor either.
+    # Only the documented sid-less session events (session.rejected) keep the
+    # non-session shape and stay valid cursor movers.
+    event_type, _ = canonical_conflict_type(generic.group("etype"))
+    return not (event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS)
+
+
+def is_audit_heartbeat_key(key, heartbeat_prefix):
+    """True for a shaped heartbeat key under the heartbeat prefix."""
+    return key.startswith(heartbeat_prefix) and bool(
+        HEARTBEAT_KEY_RE.match(key[len(heartbeat_prefix):]))
+
+
+def is_recording_key(key, recordings_prefix):
+    """True for a shaped `<sid>.tar` recording key."""
+    return key.startswith(recordings_prefix) and bool(
+        RECORDING_KEY_RE.match(key[len(recordings_prefix):]))
+
+
+def key_ts_is_future(now, relative_key, skew_tolerance):
+    """True when a shaped audit key's ``<ts>`` is future (or unparseable).
+
+    A cursor must never advance over a key dated in the future: the key sorts
+    above the whole real key space, so the next delta lists an empty tail while
+    real keys (and a hidden session's gap) sit below it - a false green bounded
+    only by the sweep interval (round-4 RT4.1). The bound is the same
+    clock-skew tolerance the LastModified checks use. A calendar-invalid
+    ``<ts>`` (the shape regex accepts any digits, e.g. ``99999999T999999Z``)
+    parses to nothing and is rejected too - fail closed. An absurd operator
+    tolerance overflows the ``timedelta`` constructor (``>= ~8.64e13`` s) or
+    the ``now + timedelta`` addition (from ~2.5e11 s): the key is rejected (it
+    just never moves a cursor) instead of bricking every run with an
+    ``OverflowError`` (round-5 RT5.4; round-6 red-team NIT). Recordings keys
+    carry no ``<ts>`` and never match a family here.
+    """
+    match = (SESSION_KEY_RE.match(relative_key)
+             or NON_SESSION_KEY_RE.match(relative_key)
+             or HEARTBEAT_KEY_RE.match(relative_key))
+    if not match:
+        return False
+    try:
+        moment = datetime.strptime(match.group("ts"), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    try:
+        return moment > now + timedelta(seconds=skew_tolerance)
+    except OverflowError:
+        # A tolerance this large is an operator typo, not a bound: reject the
+        # key (fail closed) rather than raising before state/verdict land.
+        return True
+
+
 # Sid-less session.* event types documented by the shipper contract (Teleport
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
@@ -1500,6 +1597,10 @@ def canonical_conflict_type(event_type):
 
 class WitnessError(Exception):
     """Any condition that makes the witness un-runnable (fail-closed)."""
+
+
+class DeltaTooLong(WitnessError):
+    """A bounded delta listing overflowed; the caller falls back to a sweep."""
 
 
 def env(name, default=""):
@@ -1616,6 +1717,28 @@ class Config(object):
         self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
         self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
         self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
+        # Bounded listing fan-out; 1 keeps the historical serial behavior and
+        # gives the offline harness a deterministic seam. Out of range falls
+        # back to the default (a cadence/perf knob must not take the witness
+        # down). http.client connections are per-thread, so the pool size is
+        # the whole concurrency model.
+        self.list_workers = env_int("RECORDING_WITNESS_LIST_WORKERS", 6)
+        if not 1 <= self.list_workers <= 32:
+            log("WARNING: RECORDING_WITNESS_LIST_WORKERS=%d is outside [1, 32]; using the default 6" % self.list_workers)
+            self.list_workers = 6
+        # Cold start: a window-bounded seed (seconds of history) whose run
+        # cannot return `ok` until the first full sweep closes it; 0 opts into
+        # the exact-semantics full sweep (slow acceptance, no disclosure).
+        self.cold_start_seconds = env_int("RECORDING_WITNESS_COLD_START_SECONDS", 13 * 3600)
+        if not 0 <= self.cold_start_seconds <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_COLD_START_SECONDS=%d is outside [0, 604800]; using the default 46800" % self.cold_start_seconds)
+            self.cold_start_seconds = 13 * 3600
+        # The full-sweep cadence; the interval IS the delete-marker (hiding)
+        # detection bound for keys older than the delta cursor.
+        self.sweep_seconds = env_int("RECORDING_WITNESS_SWEEP_SECONDS", 6 * 3600)
+        if not 300 <= self.sweep_seconds <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_SWEEP_SECONDS=%d is outside [300, 604800]; using the default 21600" % self.sweep_seconds)
+            self.sweep_seconds = 6 * 3600
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
@@ -1658,8 +1781,84 @@ class Config(object):
         return match.group(1) if match else "us-east-1"
 
 
+# The per-thread keep-alive pool for signed S3 list GETs. The module-level
+# signed_get() stays the single transport entry point so the harness can
+# patch it; close_connections() is called once per run so a stale cross-run
+# socket never survives a systemd retry.
+_TRANSPORT = threading.local()
+
+
+def _new_connection(config, timeout=30):
+    parts = urllib.parse.urlsplit(config.endpoint)
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+    if parts.scheme == "http":
+        return http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    raise WitnessError("RECORDING_WITNESS_ENDPOINT must be an http(s) URL")
+
+
+def _drop_connection():
+    connection = getattr(_TRANSPORT, "connection", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+    _TRANSPORT.connection = None
+    _TRANSPORT.key = None
+
+
+def _pooled_connection(config, timeout=30):
+    """One keep-alive connection per thread (http.client is not thread-safe)."""
+    key = (config.endpoint, timeout)
+    connection = getattr(_TRANSPORT, "connection", None)
+    if connection is not None and getattr(_TRANSPORT, "key", None) == key:
+        return connection
+    _drop_connection()
+    connection = _new_connection(config, timeout)
+    _TRANSPORT.connection = connection
+    _TRANSPORT.key = key
+    return connection
+
+
+def close_connections():
+    """Drop the calling thread's pooled connection after a run (workers exit)."""
+    _drop_connection()
+
+
+def _read_body(response, limit, truncate):
+    chunks = []
+    total = 0
+    while True:
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            if truncate:
+                # The rest of the body stays unread, so the pooled keep-alive
+                # connection cannot be reused (the next request would fail on
+                # it and burn the one bounded reconnect - an extra Class C
+                # call). Drop it now; the next request opens a fresh socket.
+                _drop_connection()
+                return b"".join(chunks)[:limit]
+            raise WitnessError("S3 response body exceeds %d bytes" % limit)
+    return b"".join(chunks)
+
+
 def signed_get(config, params):
-    """SigV4-signed path-style GET against the S3 endpoint (list calls only)."""
+    """SigV4-signed path-style GET with a per-thread keep-alive connection.
+
+    Fresh SigV4 per request keeps the 15-minute clock-skew contract. A
+    redirect is refused structurally: http.client has no redirect machinery,
+    so a 3xx comes back as an ordinary non-200 status and can never re-send
+    the Authorization header. One bounded reconnect + re-send covers a pooled
+    connection the peer dropped between calls (RemoteDisconnected /
+    BadStatusLine / broken pipe / timeout); HTTP statuses are never retried.
+    Error bodies truncate at MAX_ERROR_BODY; a 2xx body over
+    MAX_SUCCESS_BODY fails the run closed.
+    """
     now = datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     datestamp = now.strftime("%Y%m%d")
@@ -1690,24 +1889,53 @@ def signed_get(config, params):
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
         config.key_id, scope, signed_headers, signature)
-    url = config.endpoint + canonical_uri + (("?" + canonical_query) if canonical_query else "")
-    request = urllib.request.Request(url, method="GET")
-    request.add_header("Authorization", authorization)
-    request.add_header("x-amz-content-sha256", payload_hash)
-    request.add_header("x-amz-date", amz_date)
-    try:
-        with open_signed(request, timeout=30) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+    request_path = canonical_uri + (("?" + canonical_query) if canonical_query else "")
+    request_headers = dict(headers)
+    request_headers["Authorization"] = authorization
+    last_error = None
+    for _attempt in (0, 1):
+        try:
+            connection = _pooled_connection(config)
+            connection.request("GET", request_path, headers=request_headers)
+            response = connection.getresponse()
+            if 200 <= response.status < 300:
+                body = _read_body(response, MAX_SUCCESS_BODY, False)
+            else:
+                body = _read_body(response, MAX_ERROR_BODY, True)
+            return response.status, body
+        except WitnessError:
+            _drop_connection()
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            # A pooled connection the peer closed between calls, or a
+            # transport failure on an idempotent metadata GET: reconnect once
+            # and re-send the same request; a second failure is fail-closed.
+            _drop_connection()
+            last_error = exc
+    raise WitnessError(
+        "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
-def list_objects(config, prefix):
-    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content."""
+def list_objects(config, prefix, start_after="", stop_at_heartbeat=False, max_pages=1000):
+    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
+
+    `start_after` seeds the first page (exclusive, live-verified on B2); it is
+    never combined with a continuation token. `stop_at_heartbeat` ends the
+    session stream at the heartbeat stem: any key at/after audit/heartbeat is
+    not a session key (every session key starts with a digit and sorts below
+    it), so the heartbeat stream owns the tail (keys sorting after it are
+    sweep-only). The early stop fires only on a complete ordered page - a
+    truncated page keeps paginating (heartbeat entries stay skipped), because
+    a nonconformant server could still return a session key on a later page.
+    `max_pages` bounds a delta tail; overflow raises DeltaTooLong so the run
+    can fall back to an exact sweep instead of a truncated view.
+    """
     objects = {}
     token = ""
-    for _ in range(1000):
+    for _ in range(max_pages):
         params = {"list-type": "2", "prefix": prefix}
+        if start_after and not token:
+            params["start-after"] = start_after
         if token:
             params["continuation-token"] = token
         status, body = signed_get(config, params)
@@ -1725,6 +1953,7 @@ def list_objects(config, prefix):
             raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
         truncated = False
         next_token = ""
+        entries = []
         for child in root:
             name = local_name(child.tag)
             if name == "Contents":
@@ -1737,10 +1966,7 @@ def list_objects(config, prefix):
                     elif field_name == "LastModified":
                         last_modified = field.text or ""
                 if key:
-                    try:
-                        objects[key] = parse_timestamp(last_modified)
-                    except ValueError:
-                        raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+                    entries.append((key, last_modified))
             elif name == "IsTruncated":
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextContinuationToken":
@@ -1754,12 +1980,103 @@ def list_objects(config, prefix):
             # IsTruncated=false. Follow the token instead of reading the short
             # page as complete; the token-required guard below still applies.
             truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+        crossed = stop_at_heartbeat and ordered and not truncated and any(
+            key >= heartbeat_stem for key in keys)
+        for key, last_modified in entries:
+            if stop_at_heartbeat and key >= heartbeat_stem:
+                if crossed:
+                    # A complete ordered page: every later key sorts at/after
+                    # the heartbeat stem, so the session stream ends here. A
+                    # truncated page proves nothing about later pages (a
+                    # nonconformant server can hide a session key behind the
+                    # heartbeat), and an unordered page is filtered
+                    # entry-by-entry; neither is an early-stop signal.
+                    return objects
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
         if not truncated:
             return objects
         if not next_token:
             raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
         token = next_token
-    raise WitnessError("ListObjectsV2 %s exceeded 1000 pages" % prefix)
+    raise DeltaTooLong("ListObjectsV2 %s exceeded %d pages" % (prefix, max_pages))
+
+
+def list_objects_range(config, prefix, after, until, max_pages=1000):
+    """ListObjectsV2 over the half-open key range (after, until].
+
+    `after` seeds the first page; continuation pages follow the token only.
+    Adjacent branches partition the ordered key space exactly: a conformant
+    (ascending) page whose last key is above `until` ends the branch after the
+    in-range entries are kept. A nonconformant unordered page is filtered
+    entry-by-entry and never used as an early-stop signal (the listing-order
+    independence teeth serve fixture-order pages); `until` None keeps the
+    whole fully-open tail.
+    """
+    objects = {}
+    token = ""
+    for _ in range(max_pages):
+        params = {"list-type": "2", "prefix": prefix}
+        if after and not token:
+            params["start-after"] = after
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
+        truncated = False
+        next_token = ""
+        entries = []
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((key, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+            elif name == "Error":
+                raise WitnessError("ListObjectsV2 %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and next_token:
+            truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = until is not None and bool(keys) and ordered and keys[-1] > until
+        for key, last_modified in entries:
+            if until is not None and key > until:
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+        if crossed or not truncated:
+            return objects
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise DeltaTooLong("ListObjectsV2 %s range exceeded %d pages" % (prefix, max_pages))
 
 
 def list_object_versions(config, prefix):
@@ -1842,6 +2159,87 @@ def list_object_versions(config, prefix):
         key_marker = next_key
         version_marker = next_version
     raise WitnessError("ListObjectVersions %s exceeded 1000 pages" % prefix)
+
+
+def list_object_versions_range(config, prefix, after, until, max_pages=1000):
+    """ListObjectVersions over the half-open key range (after, until].
+
+    The first page starts at `key-marker = after` (no key-marker when after is
+    empty); later pages follow the paired NextKeyMarker/NextVersionIdMarker.
+    ListObjectVersions has no end bound, so a conformant (key-ascending) page
+    whose last key is above `until` ends the branch after the in-range entries
+    are kept; a nonconformant unordered page is filtered entry-by-entry and
+    never used as an early-stop signal.
+    """
+    markers = []
+    key_marker = after
+    version_marker = ""
+    for _ in range(max_pages):
+        params = {"versions": "", "prefix": prefix}
+        if key_marker:
+            params["key-marker"] = key_marker
+        if version_marker:
+            params["version-id-marker"] = version_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListVersionsResult":
+            raise WitnessError("ListObjectVersions %s returned %s (expected ListVersionsResult)" % (prefix, root_name))
+        truncated = False
+        next_key = ""
+        next_version = ""
+        entries = []
+        for child in root:
+            name = local_name(child.tag)
+            if name in ("Version", "DeleteMarker"):
+                key = ""
+                version_id = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "VersionId":
+                        version_id = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((name == "DeleteMarker", key, version_id, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextVersionIdMarker":
+                next_version = child.text or ""
+            elif name == "Error":
+                raise WitnessError("ListObjectVersions %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and (next_key or next_version):
+            truncated = True
+        keys = [key for _, key, _, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = until is not None and bool(keys) and ordered and keys[-1] > until
+        for is_marker, key, version_id, last_modified in entries:
+            if until is not None and key > until:
+                continue
+            if is_marker:
+                try:
+                    moment = parse_timestamp(last_modified)
+                except ValueError:
+                    raise WitnessError(
+                        "delete marker %s has unparseable LastModified %r" % (key, last_modified))
+                markers.append({"key": key, "version_id": version_id, "last_modified": moment})
+        if crossed or not truncated:
+            return markers
+        if not next_key or not next_version:
+            raise WitnessError("ListObjectVersions %s truncated without a key/version marker" % prefix)
+        key_marker = next_key
+        version_marker = next_version
+    raise WitnessError("ListObjectVersions %s range exceeded %d pages" % (prefix, max_pages))
 
 
 def list_uploads(config, prefix):
@@ -1929,21 +2327,295 @@ def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candida
     return current_time, current_mode
 
 
-def run_checks(config, now):
-    audit_objects = list_objects(config, config.audit_prefix)
-    recording_objects = list_objects(config, config.recordings_prefix)
-    uploads = list_uploads(config, config.recordings_prefix)
-    # Delete markers = hidden objects. The server scopes both calls by prefix;
-    # the client-side re-filter keeps a server that returns out-of-prefix keys
-    # from inflating the finding. A 403/error here raises WitnessError and the
-    # verdict is `error` (main()'s catch), never a silent green.
+def _collect_families(config, boundaries=None):
+    """Run the five list families, bounded-parallel when workers > 1.
+
+    On a sweep with persisted `boundaries` and workers > 1, the two audit
+    families split into key-range branches (R = min(workers // 2,
+    len(boundaries)+1)); the three small families stay single-branch. Ranges
+    are strict on the lower bound and inclusive on the upper, so they
+    partition the ordered key space exactly. Every worker returns the same
+    shapes the sequential code produced; a worker failure propagates here and
+    main() turns it into the `error` verdict. Results merge in submission
+    order (never completion order) so the checks stay deterministic.
+    """
+    boundaries = [boundary for boundary in (boundaries or []) if isinstance(boundary, str)]
+    branches = 0
+    if boundaries and config.list_workers > 1:
+        branches = min(max(1, config.list_workers // 2), len(boundaries) + 1)
+        # Only the first `branches - 1` boundaries can be honored: the final
+        # branch must stay unbounded (until=None) or keys above the last kept
+        # boundary would fall outside every range.
+        boundaries = boundaries[:max(0, branches - 1)]
+
+    def range_at(index):
+        return (boundaries[index - 1] if index > 0 else "",
+                boundaries[index] if index < len(boundaries) else None)
+
+    work = []
+    if branches <= 1:
+        work.append(("audit_objects", lambda: list_objects(config, config.audit_prefix)))
+        work.append(("audit_hidden", lambda: list_object_versions(config, config.audit_prefix)))
+    else:
+        for index in range(branches):
+            after, until = range_at(index)
+            work.append(("audit_objects",
+                         lambda a=after, u=until: list_objects_range(config, config.audit_prefix, a, u)))
+            work.append(("audit_hidden",
+                         lambda a=after, u=until: list_object_versions_range(config, config.audit_prefix, a, u)))
+    work.append(("recordings", lambda: list_objects(config, config.recordings_prefix)))
+    work.append(("uploads", lambda: list_uploads(config, config.recordings_prefix)))
+    work.append(("recordings_hidden", lambda: list_object_versions(config, config.recordings_prefix)))
+    if config.list_workers <= 1:
+        results = [fetch() for _, fetch in work]
+    else:
+        with ThreadPoolExecutor(max_workers=config.list_workers) as executor:
+            futures = [executor.submit(fetch) for _, fetch in work]
+            results = [future.result() for future in futures]
+    audit_objects = {}
+    audit_hidden = []
+    recording_objects = None
+    uploads = None
+    recording_hidden = None
+    for (kind, _), result in zip(work, results):
+        if kind == "audit_objects":
+            audit_objects.update(result)
+        elif kind == "audit_hidden":
+            audit_hidden.extend(result)
+        elif kind == "recordings":
+            recording_objects = result
+        elif kind == "uploads":
+            uploads = result
+        else:
+            recording_hidden = result
+    return audit_objects, recording_objects, uploads, audit_hidden, recording_hidden
+
+
+def _cursors_from_listings(config, audit_objects, recording_objects, now):
+    """High-water keys for the two audit streams + recordings from a listing.
+
+    A cursor advances only over keys matching the family's own grammar
+    (is_audit_*_key / is_recording_key) whose key ``<ts>`` is not future-dated
+    (key_ts_is_future): an unshaped key - an acceptance probe, contract drift -
+    still enters the view (audit keys alert as naming-contract/contract-mismatch
+    drift; the recording checks skip unshaped recordings keys), but it must
+    never move a cursor past the real key space, or the next delta lists an
+    empty tail while recordings happen (round-3 live-probe false green). A
+    future-dated shaped key sorts above the whole real key space and would pin
+    the cursor the same way (round-4 RT4.1); it stays a listed event, it just
+    never moves a cursor. The
+    session family is additionally bounded above by the heartbeat stem: an
+    exact `audit/heartbeat` object (or any key after it) is not a session
+    key.
+    """
+    heartbeat_keys = [
+        key for key in audit_objects
+        if is_audit_heartbeat_key(key, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
+    session_keys = [
+        key for key in audit_objects
+        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+    recording_keys = [key for key in recording_objects if is_recording_key(key, config.recordings_prefix)]
+    return {
+        "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
+        "audit_session": max(session_keys) if session_keys else "",
+        "recordings": max(recording_keys) if recording_keys else "",
+    }
+
+
+def _sample_boundaries(keys, workers):
+    """Pick the next sweep's audit-key boundaries (<= 31, ~evenly spaced).
+
+    Boundaries come from the previous sweep's already-materialized key list;
+    no extra listing calls. A missing/short list falls back to one unsplit
+    branch, and a deleted boundary key can only empty one range.
+    """
+    ordered = sorted(keys)
+    count = min(31, max(0, min(workers, 8) - 1))
+    if count <= 0 or len(ordered) < 2:
+        return []
+    step = len(ordered) / float(count + 1)
+    chosen = []
+    for index in range(1, count + 1):
+        candidate = ordered[min(len(ordered) - 1, int(index * step))]
+        if candidate not in chosen:
+            chosen.append(candidate)
+    return chosen
+
+
+def _list_cold_start_streams(config, window_start):
+    """Window-bounded audit seed: heartbeat + session streams from `window_start`.
+
+    Recordings as a whole (a `<sid>.tar` key carries no timestamp) and uploads
+    are listed in full by the caller. Versions stay sweep-only, so a seed
+    cannot see a pre-window delete marker - disclosed by compact_blind.
+    """
+    marker = window_start.strftime("%Y%m%dT%H%M%SZ")
+    heartbeat_objects = list_objects(
+        config, config.heartbeat_prefix, start_after=config.heartbeat_prefix + marker)
+    session_objects = list_objects(
+        config, config.audit_prefix, start_after=config.audit_prefix + marker,
+        stop_at_heartbeat=True)
+    audit_objects = {}
+    audit_objects.update(session_objects)
+    audit_objects.update(heartbeat_objects)
+    return audit_objects, heartbeat_objects
+
+
+def _delta_repair_sweep(config, observed, now):
+    """Full sweep for a delta recovery (page overflow or cursor nonconformance).
+
+    Returns the same shapes as the sweep branch of `run_checks`: a fresh
+    object/upload/hidden view and fresh cursors, so the delta's untrusted
+    state is discarded rather than merged. `now` bounds the fresh cursors:
+    a future-dated key must not re-pin the rebuilt cursor (round-4 RT4.1).
+    """
+    boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+    audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
     hidden_objects = [
         marker
-        for marker in list_object_versions(config, config.audit_prefix)
-        + list_object_versions(config, config.recordings_prefix)
+        for marker in audit_hidden + recording_hidden
         if marker["key"].startswith(config.audit_prefix)
         or marker["key"].startswith(config.recordings_prefix)
     ]
+    return audit_objects, recording_objects, uploads, hidden_objects, _cursors_from_listings(config, audit_objects, recording_objects, now)
+
+
+def run_checks(config, now, plan):
+    # NB: `mode` is the per-key session mode inside the check loops below, so
+    # the run mode needs its own name.
+    run_mode = plan.get("mode", "sweep")
+    observed = plan.get("observed") if isinstance(plan.get("observed"), dict) else {}
+    view = plan.get("view") if isinstance(plan.get("view"), dict) else {}
+    window_start = plan.get("window_start")
+    window_text = None
+    view_dirty = False
+    new_audit = {}
+    new_recordings = {}
+    cursors = dict(observed.get("cursors")) if isinstance(observed.get("cursors"), dict) else {}
+    if run_mode == "seed" and window_start is not None:
+        window_text = utc_stamp(window_start)
+        audit_objects, heartbeat_objects = _list_cold_start_streams(config, window_start)
+        if not heartbeat_objects:
+            # A window with no heartbeat at all: either the shipper is dead
+            # (exactly what the sweep is owed for) or the bucket is empty and
+            # an exact sweep is cheap. Never certify a window from nothing.
+            log("WARNING: cold-start window found no heartbeat; falling back to a full sweep")
+            run_mode = "sweep"
+            window_text = None
+    if run_mode == "sweep":
+        # A sweep that starts and then fails must latch, so record that the
+        # sweep was actually attempted (a planned sweep or an internal
+        # seed/delta fallback), not merely that the plan said "sweep".
+        plan["performed_sweep"] = True
+        boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+        audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
+        hidden_objects = [
+            marker
+            for marker in audit_hidden + recording_hidden
+            if marker["key"].startswith(config.audit_prefix)
+            or marker["key"].startswith(config.recordings_prefix)
+        ]
+        view_dirty = True
+        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+    elif run_mode == "seed":
+        recording_objects = list_objects(config, config.recordings_prefix)
+        uploads = list_uploads(config, config.recordings_prefix)
+        hidden_objects = []
+        view_dirty = True
+        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+    else:
+        # Delta: the retained view plus the three cursored tails (two audit
+        # streams + recordings). Versions are sweep-only, so the retained
+        # hidden set is carried unchanged and a delete marker on an old key
+        # lands at the sweep bound. A delta listing that overflows its page
+        # bound abandons the delta and runs an exact sweep instead of reading
+        # a truncated view.
+        audit_objects = dict(view.get("audit_objects") or {})
+        recording_objects = dict(view.get("recording_objects") or {})
+        hidden_objects = list(view.get("hidden") or [])
+        uploads = list_uploads(config, config.recordings_prefix)
+        heartbeat_cursor = cursors.get("audit_heartbeat") or ""
+        session_cursor = cursors.get("audit_session") or ""
+        recording_cursor = cursors.get("recordings") or ""
+        try:
+            new_heartbeat = list_objects(
+                config, config.heartbeat_prefix, start_after=heartbeat_cursor, max_pages=DELTA_MAX_PAGES)
+            new_session = list_objects(
+                config, config.audit_prefix, start_after=session_cursor, stop_at_heartbeat=True,
+                max_pages=DELTA_MAX_PAGES)
+            new_recordings = list_objects(
+                config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
+        except DeltaTooLong as exc:
+            log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
+            plan["performed_sweep"] = True
+            audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+            new_audit = {}
+            new_recordings = {}
+            run_mode = "sweep"
+            window_text = None
+            view_dirty = True
+        else:
+            # A cursor is a high-water key: a conformant listing never returns
+            # a key at or below it (start-after is exclusive). A server that
+            # does is nonconformant and must fail closed, never silently
+            # re-read or skip keys. The documented trace is preserve-and-repair:
+            # discard the delta, rebuild with a full sweep in this run, and
+            # report error (never green) so the rebuilt block serves the next
+            # fast run.
+            violation = ""
+            for key in new_heartbeat:
+                if heartbeat_cursor and key <= heartbeat_cursor:
+                    violation = "heartbeat delta returned %s at or below its cursor" % clip(key, 120)
+                    break
+            if not violation:
+                for key in new_session:
+                    if session_cursor and key <= session_cursor:
+                        violation = "session delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if not violation:
+                for key in new_recordings:
+                    if recording_cursor and key <= recording_cursor:
+                        violation = "recordings delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if violation:
+                log("WARNING: %s; repairing with a full sweep" % violation)
+                plan["performed_sweep"] = True
+                audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+                new_audit = {}
+                new_recordings = {}
+                run_mode = "sweep"
+                window_text = None
+                view_dirty = True
+                plan["cursor_repair_reason"] = violation
+            else:
+                new_audit.update(new_heartbeat)
+                new_audit.update(new_session)
+                audit_objects.update(new_audit)
+                recording_objects.update(new_recordings)
+                # Same grammar + future-<ts> filter as _cursors_from_listings:
+                # an unshaped key returned by a tail (an acceptance probe,
+                # drift), or a shaped key dated in the future (sorting above
+                # the real key space), must never advance the cursor.
+                heartbeat_new = [
+                    key for key in new_heartbeat
+                    if is_audit_heartbeat_key(key, config.heartbeat_prefix)
+                    and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
+                session_new = [
+                    key for key in new_session
+                    if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
+                    and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+                recording_new = [
+                    key for key in new_recordings
+                    if is_recording_key(key, config.recordings_prefix)]
+                if heartbeat_new:
+                    cursors["audit_heartbeat"] = max(heartbeat_new)
+                if session_new:
+                    cursors["audit_session"] = max(session_new)
+                if recording_new:
+                    cursors["recordings"] = max(recording_new)
+                view_dirty = bool(new_audit or new_recordings)
     # Overlapping watched prefixes report one marker twice (same key + version
     # id in both listings); count each hidden version once.
     hidden_by_version = {}
@@ -1962,10 +2634,19 @@ def run_checks(config, now):
     # -> error" holds for every key - including exec sessions that are later
     # exempt from the gap clock and completed tars whose session.end is
     # present, which never reach a per-session age check otherwise.
-    for key, last_modified in audit_objects.items():
-        age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
-    for key, last_modified in recording_objects.items():
-        age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    if run_mode == "delta":
+        # Every NEW timestamp is validated at collection; the retained view
+        # was validated when each key first entered it, so a delta does not
+        # re-parse the whole retained map.
+        for key, last_modified in new_audit.items():
+            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+        for key, last_modified in new_recordings.items():
+            age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    else:
+        for key, last_modified in audit_objects.items():
+            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+        for key, last_modified in recording_objects.items():
+            age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
     for upload in uploads:
         age_seconds(now, upload["initiated"], "upload %s initiated" % upload["key"], config.clock_skew_tolerance)
     for marker in hidden_objects:
@@ -2292,12 +2973,39 @@ def run_checks(config, now):
             )
             finding_ids.append("open-upload-stale:" + sid)
 
+    compact_blind = run_mode == "seed" or (
+        run_mode == "delta" and bool((observed.get("coverage") or {}).get("compact_blind")))
+    if compact_blind:
+        # The seed (or a pre-first-sweep delta on a seeded view) cannot
+        # certify history before its window and skips the sweep-only versions
+        # listing: it can never read as green. The disclosure rides the alert
+        # detail and the finding id, so the signature changes until the first
+        # sweep and notification behaves.
+        window_text = window_text or (observed.get("coverage") or {}).get("window_start")
+        alerts.append(
+            "cold-start: seeded baseline from %s; a full sweep is pending and the "
+            "window-bounded view cannot certify history before the window" % (window_text or "unknown"))
+        finding_ids.append("cold-start")
+    if run_mode == "sweep":
+        boundaries_out = _sample_boundaries(audit_objects, config.list_workers)
+    else:
+        boundaries_out = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+    payload = {
+        "mode": run_mode,
+        "window_start": window_text,
+        "cursors": cursors,
+        "boundaries": boundaries_out,
+        "dirty": view_dirty,
+        "audit_objects": audit_objects if view_dirty else None,
+        "recording_objects": recording_objects if view_dirty else None,
+        "hidden": hidden_objects,
+    }
     if alerts:
-        return "alert", "; ".join(alerts), finding_signature("alert", finding_ids)
+        return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
     detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
         len(sessions), len(uploads), len(audit_objects), len(recording_objects),
         ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
-    return "ok", detail, finding_signature("ok", [])
+    return "ok", detail, finding_signature("ok", []), payload
 
 
 def corrupt_state_destination(path, now):
@@ -2429,9 +3137,9 @@ class RefuseRedirects(urllib.request.HTTPRedirectHandler):
         )
 
 
-# One redirect-refusing opener serves every client call. The module-level
-# _NTFY_OPENER name is patchable for the offline harness; the signed S3 list
-# client always uses the real opener (round-7 R1).
+# One redirect-refusing opener serves the ntfy push (the S3 list client now
+# uses http.client, which has no redirect machinery at all). The module-level
+# _NTFY_OPENER name is patchable for the offline harness.
 _REDIRECT_REFUSING_OPENER = urllib.request.build_opener(RefuseRedirects())
 _NTFY_OPENER = _REDIRECT_REFUSING_OPENER
 
@@ -2439,11 +3147,6 @@ _NTFY_OPENER = _REDIRECT_REFUSING_OPENER
 def open_ntfy(request, timeout=15):
     """Open the ntfy POST through the redirect-refusing opener."""
     return _NTFY_OPENER.open(request, timeout=timeout)
-
-
-def open_signed(request, timeout=30):
-    """Open a SigV4-signed S3 list GET through the redirect-refusing opener."""
-    return _REDIRECT_REFUSING_OPENER.open(request, timeout=timeout)
 
 
 def notify(config, state, detail):
@@ -2536,22 +3239,251 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     return now_epoch - last_epoch >= int(window)
 
 
+def observed_problem(observed, record_run_seq, config=None, now=None):
+    """Fail-closed validation of the observed/coverage block ('' = valid).
+
+    Any violation (wrong cursor version, bad types, a missing coverage record,
+    a cursor outside its prefix) must take the preserve + repair + sweep path:
+    a delta read from an untrusted cursor is never green.
+    """
+    if not isinstance(observed, dict):
+        return "observed block is not a JSON object"
+    if observed.get("cursor_version") != CURSOR_VERSION:
+        return "observed cursor version is not %d" % CURSOR_VERSION
+    for name in ("generation", "written_run_seq", "last_sweep_ok_epoch",
+                 "last_sweep_ok_run_seq", "sweep_due_epoch"):
+        value = observed.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "observed.%s is invalid: %r" % (name, value)
+    if not isinstance(observed.get("sweep_failed"), bool):
+        return "observed.sweep_failed is invalid: %r" % (observed.get("sweep_failed"),)
+    coverage = observed.get("coverage")
+    if not isinstance(coverage, dict):
+        return "observed.coverage is not a JSON object"
+    if coverage.get("mode") not in ("sweep", "seed", "delta"):
+        return "observed.coverage.mode is invalid: %r" % (coverage.get("mode"),)
+    if not isinstance(coverage.get("compact_blind"), bool):
+        return "observed.coverage.compact_blind is invalid: %r" % (coverage.get("compact_blind"),)
+    window = coverage.get("window_start")
+    if window is not None and not isinstance(window, str):
+        return "observed.coverage.window_start is invalid: %r" % (window,)
+    cursors = observed.get("cursors")
+    if not isinstance(cursors, dict):
+        return "observed.cursors is not a JSON object"
+    prefixes = {
+        "audit_heartbeat": config.heartbeat_prefix if config is not None else "audit/heartbeat/",
+        "audit_session": config.audit_prefix if config is not None else "audit/",
+        "recordings": config.recordings_prefix if config is not None else "recordings/",
+    }
+    for name, prefix in prefixes.items():
+        value = cursors.get(name)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return "observed.cursors.%s is invalid: %r" % (name, value)
+    session_cursor = cursors.get("audit_session")
+    if isinstance(session_cursor, str) and session_cursor >= prefixes["audit_heartbeat"].rstrip("/"):
+        # The two audit streams partition the ordered key space at the
+        # heartbeat stem (every real session key starts with a digit and
+        # sorts below it): a session cursor at/after the stem - the exact
+        # `audit/heartbeat` stem, `audit/i`, or a heartbeat key - would make
+        # the session delta list an empty tail while real session keys sit
+        # below it (a forged-state false green). Fail closed into repair +
+        # sweep.
+        return "observed.cursors.audit_session is at/after the heartbeat prefix boundary: %r" % session_cursor
+    # A cursor must also match its family's key grammar (the classifier's flat
+    # layout; extend both together when the date-partitioned/seq-range layout
+    # lands, #159). A forged value below the stem but above the real key space
+    # (`audit/9`, `audit/g`, an acceptance probe) passes the prefix check and
+    # would list an empty tail while real keys sit below it (false green), so
+    # it fails closed into the repair + sweep path.
+    for name in ("audit_heartbeat", "audit_session", "recordings"):
+        value = cursors.get(name)
+        if value is None or value == "":
+            continue
+        if name == "audit_heartbeat":
+            shaped = is_audit_heartbeat_key(value, prefixes["audit_heartbeat"])
+        elif name == "recordings":
+            shaped = is_recording_key(value, prefixes["recordings"])
+        else:
+            shaped = is_audit_session_key(
+                value, prefixes["audit_session"], prefixes["audit_heartbeat"])
+        if not shaped:
+            return "observed.cursors.%s does not match the witness key grammar: %r" % (name, value)
+        if now is not None and name != "recordings":
+            # A persisted cursor dated in the future sorts above the real key
+            # space and would list an empty tail while runs stay green
+            # (round-4 RT4.1): fail closed into repair + sweep. Recordings
+            # keys carry no <ts>.
+            tolerance = config.clock_skew_tolerance if config is not None else 0
+            if key_ts_is_future(now, value[len(prefixes[name]):], tolerance):
+                return "observed.cursors.%s is future-dated: %r" % (name, value)
+    boundaries = observed.get("sweep_boundaries")
+    if not isinstance(boundaries, list) or len(boundaries) > 32:
+        return "observed.sweep_boundaries is invalid"
+    if not all(isinstance(entry, str) for entry in boundaries):
+        return "observed.sweep_boundaries carries a non-string entry"
+    if isinstance(record_run_seq, int) and not isinstance(record_run_seq, bool):
+        # A block carried through failed runs keeps its last written identity;
+        # it may lag the record but must never be ahead of it (a foreign
+        # block copied from a newer state).
+        if observed.get("written_run_seq", 0) > record_run_seq:
+            return "observed.written_run_seq %r is ahead of run_seq %r" % (
+                observed.get("written_run_seq"), record_run_seq)
+    return ""
+
+
+def build_observed(previous_observed, payload, now_epoch, run_seq, config):
+    """Build the fresh observed/coverage block written with this run's record.
+
+    A full sweep closes every disclosure: last_sweep_ok_* move, compact_blind
+    clears, the sweep latch releases, and the next sweep is due one interval
+    out. A seed keeps the view blind and defers the first sweep. A delta that
+    did not change the view carries its identity (the sidecar generation and
+    written_run_seq must stay in lockstep with this block).
+    """
+    legacy = previous_observed if isinstance(previous_observed, dict) else {}
+    mode = payload.get("mode", "sweep")
+    dirty = bool(payload.get("dirty"))
+    generation = int(legacy.get("generation", 0) or 0)
+    if dirty:
+        generation += 1
+    legacy_coverage = legacy.get("coverage") if isinstance(legacy.get("coverage"), dict) else {}
+    observed = {
+        "cursor_version": CURSOR_VERSION,
+        "generation": generation or 1,
+        "written_run_seq": run_seq if dirty else int(legacy.get("written_run_seq", 0) or 0),
+        "last_sweep_ok_epoch": int(legacy.get("last_sweep_ok_epoch", 0) or 0),
+        "last_sweep_ok_run_seq": int(legacy.get("last_sweep_ok_run_seq", 0) or 0),
+        "sweep_due_epoch": int(legacy.get("sweep_due_epoch", 0) or 0),
+        "sweep_failed": bool(legacy.get("sweep_failed", False)),
+        "coverage": {
+            "mode": mode,
+            "window_start": payload.get("window_start") or legacy_coverage.get("window_start"),
+            "compact_blind": mode == "seed" or (
+                mode == "delta" and bool(legacy_coverage.get("compact_blind"))),
+        },
+        "cursors": payload.get("cursors") or legacy.get("cursors") or {},
+        "sweep_boundaries": payload.get("boundaries") or [],
+    }
+    if mode == "sweep":
+        observed["last_sweep_ok_epoch"] = now_epoch
+        observed["last_sweep_ok_run_seq"] = run_seq
+        observed["sweep_due_epoch"] = now_epoch + config.sweep_seconds
+        observed["sweep_failed"] = False
+    elif mode == "seed":
+        # Defer the first sweep so the acceptance and the post-start immediate
+        # timer fire do not chain straight into a full sweep.
+        observed["sweep_due_epoch"] = now_epoch + min(config.sweep_seconds, 900)
+    else:
+        observed["sweep_due_epoch"] = int(legacy.get("sweep_due_epoch", 0) or 0) or (now_epoch + config.sweep_seconds)
+    return observed
+
+
+def read_view(path):
+    """Read + parse the observed-view sidecar (timestamp strings -> datetimes)."""
+    try:
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read(VIEW_MAX_BYTES + 1)
+    except FileNotFoundError:
+        raise WitnessError("observed view is missing")
+    except (OSError, ValueError, RecursionError) as exc:
+        raise WitnessError("observed view unreadable: %s" % exc)
+    if len(raw_bytes) > VIEW_MAX_BYTES:
+        raise WitnessError("observed view exceeds %d bytes" % VIEW_MAX_BYTES)
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WitnessError("observed view is not valid UTF-8: %s" % exc)
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise WitnessError("observed view unreadable: %s" % exc)
+    if not isinstance(data, dict):
+        raise WitnessError("observed view is not a JSON object")
+    if not isinstance(data.get("audit_objects"), dict) or not isinstance(data.get("recording_objects"), dict):
+        raise WitnessError("observed view maps are not JSON objects")
+    if not isinstance(data.get("hidden"), list):
+        raise WitnessError("observed view hidden set is not a JSON array")
+    try:
+        data["audit_objects"] = {
+            key: parse_timestamp(value) for key, value in data["audit_objects"].items()}
+        data["recording_objects"] = {
+            key: parse_timestamp(value) for key, value in data["recording_objects"].items()}
+        data["hidden"] = [
+            {"key": entry["key"], "version_id": entry["version_id"],
+             "last_modified": parse_timestamp(entry["last_modified"])}
+            for entry in data["hidden"]
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WitnessError("observed view entry invalid: %s" % exc)
+    return data
+
+
+def view_problem(view, observed):
+    """The sidecar must belong to exactly this observed block ('' = valid)."""
+    if not isinstance(view, dict):
+        return "view is not a JSON object"
+    if view.get("view_version") != VIEW_VERSION:
+        return "view schema version is not %d" % VIEW_VERSION
+    for name in ("generation", "written_run_seq"):
+        value = view.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "view.%s is invalid: %r" % (name, value)
+    if view.get("generation") != observed.get("generation"):
+        return "view.generation %r does not match observed.generation %r" % (
+            view.get("generation"), observed.get("generation"))
+    if view.get("written_run_seq") != observed.get("written_run_seq"):
+        return "view.written_run_seq %r does not match observed.written_run_seq %r" % (
+            view.get("written_run_seq"), observed.get("written_run_seq"))
+    return ""
+
+
+def write_view(path, data):
+    tmp = path + ".tmp"
+    with _open_state_file(tmp, "w") as handle:
+        json.dump(data, handle, sort_keys=True)
+        handle.write("\n")
+        os.fchmod(handle.fileno(), 0o600)
+    os.replace(tmp, path)
+
+
+def view_record(observed_out, payload):
+    """Serialize the merged view for the sidecar (exact timestamp round-trip)."""
+    def stamp(moment):
+        return moment.astimezone(timezone.utc).isoformat()  # ci-allowlist: datetime.isoformat() is a stdlib call, not an SCP image reference.
+    return {
+        "view_version": VIEW_VERSION,
+        "generation": observed_out["generation"],
+        "written_run_seq": observed_out["written_run_seq"],
+        "audit_objects": {
+            key: stamp(moment) for key, moment in (payload.get("audit_objects") or {}).items()},
+        "recording_objects": {
+            key: stamp(moment) for key, moment in (payload.get("recording_objects") or {}).items()},
+        "hidden": [
+            {"key": marker["key"], "version_id": marker["version_id"],
+             "last_modified": stamp(marker["last_modified"])}
+            for marker in (payload.get("hidden") or [])
+        ],
+    }
+
+
 def main():
     now = datetime.now(timezone.utc)
     now_epoch = int(now.timestamp())
     config = None
     signature = finding_signature("error", [])
-    try:
-        config = Config()
-        state, detail, signature = run_checks(config, now)
-    except Exception as exc:  # fail-closed by design: any failure => error
-        state = "error"
-        detail = "error: %s: %s" % (type(exc).__name__, exc)
-        signature = finding_signature("error", [])
-    detail = clip(detail, 1000)
+    state = "error"
+    detail = "error: witness did not run"
+    payload = None
+    coverage = None
 
+    # The state dir comes first: the observed/coverage block decides whether
+    # this run is a cold-start seed, a full sweep or a delta, so the previous
+    # record must be read before any listing.
     state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
     state_path = os.path.join(state_dir, "state.json")
+    view_path = os.path.join(state_dir, "view.json")
     verdict_path = os.path.join(state_dir, "verdict.log")
     try:
         os.makedirs(state_dir, mode=0o700, exist_ok=True)
@@ -2582,9 +3514,6 @@ def main():
             log("WARNING: cannot preserve unreadable state as %s: %s"
                 % (corrupt_path or (state_path + ".corrupt"), clip(exc, 200)))
 
-    renotify = config.renotify if config is not None else 1800
-    quiet_renotify = config.quiet_renotify if config is not None else 86400
-    quiet_signature = config.quiet_signature if config is not None else ""
     baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
     # Defensive numeric parsing: a type-valid state.json with a corrupted
     # counter (e.g. "run_seq": "not-a-number") must never crash the run
@@ -2600,16 +3529,129 @@ def main():
             numerics[name] = 0
         else:
             numerics[name] = value
-    if state_bad_reason:
+
+    run_seq = numerics["run_seq"] + 1
+
+    try:
+        config = Config()
+    except Exception as exc:
+        config = None
+        state = "error"
+        detail = "error: %s: %s" % (type(exc).__name__, exc)
+        signature = finding_signature("error", [])
+
+    # The observed/coverage block decides the run mode. A version-3 record
+    # must carry a valid block: any violation is a fail-closed repair + sweep
+    # (never a delta, never green). A legacy record or no file at all is a
+    # cold start, not a corruption.
+    previous_observed = previous.get("observed") if isinstance(previous.get("observed"), dict) else None
+    observed_reason = ""
+    cold_start_reason = ""
+    if previous and previous.get("version") == STATE_VERSION:
+        if previous_observed is None:
+            # A missing block after a non-error verdict means the cursor/view
+            # was lost or tampered with: fail-closed repair + sweep. After an
+            # error verdict the block may simply never have been built (the
+            # failing run could not list), so this is a cold start, not
+            # corruption - the run must re-seed instead of dereferencing the
+            # missing block (a failed cold start otherwise wedges every later
+            # run with AttributeError before state/verdict are written).
+            if previous.get("state") != "error":
+                observed_reason = "observed block is missing from a version-%d record" % STATE_VERSION
+            else:
+                cold_start_reason = ("observed block is missing after an error verdict; "
+                                     "cold-starting instead of dereferencing it")
+        else:
+            observed_reason = observed_problem(previous_observed, previous.get("run_seq"), config, now)
+    elif previous:
+        # A pre-v3 record carries no observed block by construction (the
+        # schema predates cursors). This is the live-box migration trace:
+        # fail-closed repair + full sweep rebuilds the block, never a silent
+        # seed and never a delta.
+        observed_reason = ("state record version %r predates cursor version %d; "
+                           "rebuilding the observed block with a full sweep"
+                           % (previous.get("version"), STATE_VERSION))
+    if observed_reason:
+        log("WARNING: invalid observed state discarded for a repair sweep: %s" % clip(observed_reason, 200))
+    if cold_start_reason:
+        log("WARNING: %s" % clip(cold_start_reason, 200))
+    forced_reason = state_bad_reason or observed_reason
+    if forced_reason:
+        # Nothing read from the stale view survives the repair: this run
+        # rebuilds the block from a full sweep and never reports green.
+        previous_observed = None
+
+    plan = {"mode": "sweep"}
+    if config is not None and not forced_reason:
+        # `previous_observed` is None here only for a first run, a v3 error
+        # record with no block, or a foreign-version record (which took the
+        # repair path above): all three are cold starts.
+        cold_start = previous_observed is None
+        if cold_start:
+            if config.cold_start_seconds > 0:
+                plan = {"mode": "seed", "window_start": now - timedelta(seconds=config.cold_start_seconds)}
+            else:
+                # The full-sweep escape hatch: exact semantics on first run.
+                plan = {"mode": "sweep"}
+        else:
+            observed = previous_observed
+            sweep_due = bool(observed.get("sweep_failed")) or now_epoch >= int(observed.get("sweep_due_epoch") or 0)
+            if sweep_due:
+                plan = {"mode": "sweep", "observed": observed}
+            else:
+                try:
+                    view = read_view(view_path)
+                    view_reason = view_problem(view, observed)
+                    if view_reason:
+                        raise WitnessError(view_reason)
+                except WitnessError as exc:
+                    log("WARNING: observed view unusable (%s); falling back to a repair sweep" % clip(exc, 200))
+                    observed_reason = "observed view is invalid: %s" % exc
+                    forced_reason = observed_reason
+                    previous_observed = None
+                    plan = {"mode": "sweep"}
+                else:
+                    plan = {"mode": "delta", "observed": observed, "view": view}
+
+    if config is not None:
+        try:
+            state, detail, signature, payload = run_checks(config, now, plan)
+        except Exception as exc:  # fail-closed by design: any failure => error
+            state = "error"
+            detail = "error: %s: %s" % (type(exc).__name__, exc)
+            signature = finding_signature("error", [])
+            payload = None
+        finally:
+            # Drop this thread's pooled S3 connection: the process is one run,
+            # so a stale cross-run socket must not survive a systemd retry.
+            close_connections()
+    detail = clip(detail, 1000)
+
+    if payload is not None and plan.get("cursor_repair_reason"):
+        # A nonconformant delta was repaired with a full sweep in this run:
+        # the delta is untrusted, so the verdict is error (never green) and
+        # the rebuilt block is marked repaired. See docs/recording-witness.md
+        # (preserve-and-repair).
+        observed_reason = "delta cursor nonconformance: %s" % plan["cursor_repair_reason"]
         if state != "error":
             state = "error"
-            detail = clip("error: %s" % state_bad_reason, 1000)
+            detail = clip("error: %s" % observed_reason, 1000)
+        signature = finding_signature("error", [])
+
+    if forced_reason:
+        if state != "error":
+            state = "error"
+            detail = clip("error: %s" % forced_reason, 1000)
         else:
-            detail = clip("%s (state record also invalid: %s)" % (detail, state_bad_reason), 1000)
+            detail = clip("%s (state record also invalid: %s)" % (detail, forced_reason), 1000)
         # An invalid record is not a trustworthy previous state: the error
         # verdict must push instead of comparing against it.
         signature = finding_signature("error", [])
         previous = {}
+
+    renotify = config.renotify if config is not None else 1800
+    quiet_renotify = config.quiet_renotify if config is not None else 86400
+    quiet_signature = config.quiet_signature if config is not None else ""
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
     last_notify_signature = previous.get("last_notify_signature")
@@ -2621,7 +3663,6 @@ def main():
     # Per-run identity: a monotonic counter written into state.json, never a
     # second-resolution timestamp, so a genuine same-second run still advances
     # it while a run that failed to persist state still repeats it.
-    run_seq = numerics["run_seq"] + 1
     state_since_run = numerics["state_since_run"]
     state_since_epoch = numerics["state_since_epoch"]
     previous_state = previous.get("state")
@@ -2638,6 +3679,22 @@ def main():
             last_notify_epoch = now_epoch
             last_notify_run = run_seq
             last_notify_signature = signature
+    observed_out = previous_observed
+    view_to_write = None
+    if payload is not None:
+        observed_out = build_observed(previous_observed, payload, now_epoch, run_seq, config)
+        if payload.get("dirty"):
+            view_to_write = view_record(observed_out, payload)
+    elif observed_out is not None:
+        # The checks could not run: the previous view is unchanged. A sweep
+        # that actually ran (planned or an internal delta/seed fallback) and
+        # failed latches (every later run forces a sweep until one succeeds);
+        # a failed delta just carries the block, still in lockstep with the
+        # sidecar's generation and written_run_seq. A config error (no
+        # run_checks at all) never latches.
+        observed_out = dict(observed_out)
+        if plan.get("performed_sweep"):
+            observed_out["sweep_failed"] = True
     record = {
         "version": STATE_VERSION,
         "state": state,
@@ -2651,13 +3708,16 @@ def main():
         "signature": signature,
         "last_notify_signature": last_notify_signature,
     }
-    if state_bad_reason:
-        # Explicit repair evidence: an unreadable/invalid record has no
-        # readable baseline, so the counter restarts at 1 above. The run-once
-        # acceptance cannot tell that reset from a stale record by `run_seq`
-        # alone, so mark the repair here and name the systemd invocation that
-        # wrote it below; the acceptance only counts a repair written by the
-        # invocation that just ran.
+    if observed_out is not None:
+        record["observed"] = observed_out
+    if state_bad_reason or observed_reason:
+        # Explicit repair evidence: an unreadable/invalid record (or an
+        # invalid observed block) has no trustworthy view, so the observed
+        # block above was rebuilt from scratch and the run is never green.
+        # The run-once acceptance cannot tell a repair from a stale record by
+        # `run_seq` alone, so mark the repair here and name the systemd
+        # invocation that wrote it below; the acceptance only counts a repair
+        # written by the invocation that just ran.
         record["repaired"] = True
     invocation = env("INVOCATION_ID", "")
     if invocation:
@@ -2675,10 +3735,18 @@ def main():
         record["baseline"] = baseline
     else:
         record["baseline"] = {"state": state, "detail": detail, "updated_at": utc_stamp(now)}
-    try:
-        write_state(state_path, record)
-    except OSError as exc:
-        log("WARNING: cannot write state file: %s" % clip(exc, 200))
+    view_written = True
+    if view_to_write is not None:
+        try:
+            write_view(view_path, view_to_write)
+        except OSError as exc:
+            view_written = False
+            log("WARNING: cannot write observed view: %s" % clip(exc, 200))
+    if view_written:
+        try:
+            write_state(state_path, record)
+        except OSError as exc:
+            log("WARNING: cannot write state file: %s" % clip(exc, 200))
     try:
         append_verdict(verdict_path, state, detail)
     except OSError as exc:
@@ -2767,6 +3835,8 @@ recording_witness_install() { # render + install the component (idempotent)
     if [ -n "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_RENOTIFY_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_QUIET_SIGNATURE:-}" ]; then printf 'RECORDING_WITNESS_QUIET_SIGNATURE=%q\n' "$RECORDING_WITNESS_QUIET_SIGNATURE"; fi
+    if [ -n "${RECORDING_WITNESS_COLD_START_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_COLD_START_SECONDS=%q\n' "$RECORDING_WITNESS_COLD_START_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_SWEEP_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_SWEEP_SECONDS=%q\n' "$RECORDING_WITNESS_SWEEP_SECONDS"; fi
     if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
     if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
   } >"$tmp"
@@ -2780,7 +3850,10 @@ recording_witness_install() { # render + install the component (idempotent)
   chmod 0644 "$RECORDING_WITNESS_TIMER.tmp.$$"
   mv "$RECORDING_WITNESS_TIMER.tmp.$$" "$RECORDING_WITNESS_TIMER"
   systemctl daemon-reload
-  systemctl enable --now pc-recording-witness.timer >/dev/null
+  # Enable WITHOUT --now: the acceptance below stops the timer, runs one
+  # synchronous seed/sweep, and restarts the timer on every exit path, so no
+  # timer fire can land between the drain and the acceptance run.
+  systemctl enable pc-recording-witness.timer >/dev/null
   log "recording witness installed (5 min timer; env file 0600, key never printed)"
 }
 
@@ -2815,14 +3888,34 @@ recording_witness_service_drained() { # no witness invocation in flight right no
 
 recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation to finish
   local attempt active
-  for ((attempt = 0; attempt < 100; attempt++)); do
+  for ((attempt = 0; attempt < 3600; attempt++)); do
     if recording_witness_service_drained; then
       return 0
     fi
     sleep 1
   done
   active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
-  die "witness unit did not drain within 100s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+  die "witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+}
+
+recording_witness_timer_stop() { # stop the timer so no fire can merge with the acceptance
+  systemctl stop pc-recording-witness.timer >/dev/null 2>&1 || true
+}
+
+recording_witness_timer_start() { # restart the timer on every exit path
+  systemctl start pc-recording-witness.timer >/dev/null 2>&1 || true
+}
+
+recording_witness_accept() { # timer-stopped synchronous acceptance (one run, always restarted)
+  local rc=0
+  # The EXIT trap restarts the timer on EVERY path (success, alert, die):
+  # monitoring is never silently left stopped by a failed acceptance.
+  trap 'recording_witness_timer_start' EXIT
+  recording_witness_timer_stop
+  recording_witness_run_once || rc=$?
+  recording_witness_timer_start
+  trap - EXIT
+  return "$rc"
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
@@ -2929,6 +4022,12 @@ recording_witness_run_once() { # run one check now and surface the verdict
     # to keep the daily quiet re-notify while this exact finding set persists.
     log "witness finding signature: ${signature}"
   fi
+  coverage_mode="$(jq -r '.observed.coverage.mode // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  if [ -n "${coverage_mode}" ]; then
+    # A seed run discloses that the verdict is window-bounded until the first
+    # sweep; a sweep run closes the disclosure; a delta run is a fast refresh.
+    log "witness coverage: mode=${coverage_mode}"
+  fi
 }
 
 recording_witness_disable() { # remove a previously installed component
@@ -2960,7 +4059,7 @@ case "$(recording_witness_state)" in
   on)
     log "Installing the list-only recording-completeness witness (B2 metadata checks)"
     recording_witness_install
-    recording_witness_run_once
+    recording_witness_accept
     ;;
   partial)
     witness_problem="$(recording_witness_config_problem)"
