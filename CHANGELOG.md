@@ -56,6 +56,8 @@ All notable changes to this project will be documented in this file.
 - *(security)* Contain device_code to a single runner step (closes #120)
 - *(device-flow)* Card copy nits — new-tab hint + drop "dead" (closes #70)
 - *(witness)* Close the run-once race against the timer's immediate first fire (closes #143)
+- *(provision)* SSH keepalives on the A1 long-lived connection (closes #162)
+- *(witness)* Harden the vector-generator provenance guard + \Z-anchor the replica TS_RE (closes #155)
 
 ### 💼 Other
 
