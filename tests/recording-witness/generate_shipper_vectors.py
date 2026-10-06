@@ -15,7 +15,11 @@ The script refuses to write unless the pc-admin checkout HEAD is exactly
 F1: `git status` is bypassable with `assume-unchanged`/skip-worktree, so the
 guard compares content, not status; replacement refs are disabled with
 `--no-replace-objects`, since `git replace` can also swap the blob
-`cat-file` returns while HEAD is unchanged — the same local-`.git` class). `--allow-sha-mismatch` is a manual debug
+`cat-file` returns while HEAD is unchanged — the same local-`.git` class; and
+the compared bytes are compiled directly (`load_module_from_source`), never
+imported through `spec_from_file_location`/`exec_module`, which would execute
+a planted `__pycache__` entry whose header matches the source — round-2
+red-team). `--allow-sha-mismatch` is a manual debug
 run: a non-clean provenance stamps a non-pin `source_sha` (`<head>-debug`), so
 a file generated from unpinned bytes can never pass the harness's exact-pin
 `source_sha` assertion if it is committed. It imports the real `scripts/lib/b2_client.py`, builds
@@ -46,11 +50,11 @@ a documented non-session shape), keeping the goldens in step.
 """
 
 import argparse
-import importlib.util
 import json
 import os
 import subprocess
 import sys
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -63,10 +67,42 @@ USID = LSID.upper()
 SEQ_MAX = 10 ** 18 - 1
 
 
-def load_module(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def worktree_bytes(repo, relpath):
+    """The worktree bytes at ``relpath`` (hard error if unreadable)."""
+    relpath = relpath.replace(os.sep, "/")
+    try:
+        with open(os.path.join(repo, *relpath.split("/")), "rb") as handle:
+            return handle.read()
+    except OSError as error:
+        raise SystemExit("cannot read %s from %s: %s" % (relpath, repo, error))
+
+
+def committed_blob(repo, relpath):
+    """The committed ``HEAD:`` blob bytes for ``relpath`` (replacement refs off)."""
+    relpath = relpath.replace(os.sep, "/")
+    committed = subprocess.run(
+        ["git", "-C", repo, "--no-replace-objects", "cat-file", "blob", "HEAD:%s" % relpath],
+        capture_output=True)
+    if committed.returncode != 0:
+        raise SystemExit(
+            "pc-admin checkout %s has no %s at HEAD (%s); the pin must name a commit "
+            "that contains it" % (repo, relpath,
+                                  committed.stderr.decode("utf-8", "replace").strip()))
+    return committed.stdout
+
+
+def load_module_from_source(source, path, name):
+    """Execute ``source`` as the module ``name`` — never a cached ``.pyc``.
+
+    ``spec_from_file_location(...).exec_module`` executes a ``__pycache__``
+    entry when its header mtime/size match the source, so a stale or planted
+    pyc could run while the guard vouched for the pinned source bytes (anchor
+    #155 red-team round 2). Compile the exact bytes the caller compared
+    against ``HEAD:`` — the compared provenance is the executed provenance.
+    """
+    module = types.ModuleType(name)
+    module.__file__ = path
+    exec(compile(source, path, "exec"), module.__dict__)
     return module
 
 
@@ -433,23 +469,11 @@ def blob_matches_head(repo, relpath):
     ``git replace`` ref makes ``cat-file blob HEAD:<path>`` return the
     replacement bytes while HEAD (the pin check) is unchanged (anchor #155
     red-team LOW). A path missing from HEAD is a hard error: the pin names
-    a commit that must contain it.
+    a commit that must contain it. The caller compiles the same bytes it
+    compares (``load_module_from_source``), so a planted ``__pycache__`` entry
+    cannot substitute the executed module (anchor #155 red-team round 2).
     """
-    relpath = relpath.replace(os.sep, "/")
-    committed = subprocess.run(
-        ["git", "-C", repo, "--no-replace-objects", "cat-file", "blob", "HEAD:%s" % relpath],
-        capture_output=True)
-    if committed.returncode != 0:
-        raise SystemExit(
-            "pc-admin checkout %s has no %s at HEAD (%s); the pin must name a commit "
-            "that contains it" % (repo, relpath,
-                                  committed.stderr.decode("utf-8", "replace").strip()))
-    try:
-        with open(os.path.join(repo, *relpath.split("/")), "rb") as handle:
-            worktree = handle.read()
-    except OSError as error:
-        raise SystemExit("cannot read %s from %s: %s" % (relpath, repo, error))
-    return worktree == committed.stdout
+    return worktree_bytes(repo, relpath) == committed_blob(repo, relpath)
 
 
 def main():
@@ -475,18 +499,25 @@ def main():
     # on #149). Refuse unless this is an explicit debug run: the pin is a
     # provenance claim about the committed blob, not just the commit id.
     # anchor #155 F1: compare CONTENT, not `git status` — assume-unchanged /
-    # skip-worktree hide a worktree edit from status while the import still
-    # reads the mutated bytes.
-    content_clean = blob_matches_head(repo, "scripts/lib/b2_client.py")
+    # skip-worktree hide a worktree edit from status, and `git replace` can
+    # swap the blob `cat-file` returns; the compare disables replacement refs.
+    # The SAME bytes are then compiled by `load_module_from_source` (never a
+    # cached/planted `__pycache__` entry — anchor #155 red-team round 2), so
+    # the compared provenance is the executed provenance.
+    relpath = "scripts/lib/b2_client.py"
+    builder_source = worktree_bytes(repo, relpath)
+    content_clean = builder_source == committed_blob(repo, relpath)
     if not content_clean and not args.allow_sha_mismatch:
         raise SystemExit(
             "pc-admin checkout %s has scripts/lib/b2_client.py differing from the committed "
             "blob at HEAD; the vectors must come from the committed bytes at the pinned SHA "
-            "(git status can be bypassed with assume-unchanged/skip-worktree). "
+            "(git status can be bypassed with assume-unchanged/skip-worktree, and "
+            "git replace with a swapped blob). "
             "(or pass --allow-sha-mismatch for a debug run)" % repo
         )
     provenance_clean = provenance_clean and content_clean
-    b2 = load_module(os.path.join(repo, "scripts", "lib", "b2_client.py"), "pcadmin_b2_client")
+    b2 = load_module_from_source(builder_source, os.path.join(repo, *relpath.split("/")),
+                                 "pcadmin_b2_client")
     payload = build_vectors(b2)
     # A debug run (unpinned HEAD or uncommitted builder bytes) must never be
     # committable: stamp a non-pin source_sha so the harness's exact-pin

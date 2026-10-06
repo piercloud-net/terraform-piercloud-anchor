@@ -66,9 +66,10 @@
 #       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; the generator's
 #       provenance guard compares content, not `git status` — an
 #       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
-#       builder bytes, and replacement refs are disabled (`git replace`
-#       cannot swap the compared blob) — and the replica `TS_RE` is
-#       `\Z`-anchored, anchor #155;
+#       builder bytes, replacement refs are disabled (`git replace` cannot
+#       swap the compared blob), and the compared bytes are compiled directly
+#       (a planted `__pycache__` entry cannot run) — and the replica `TS_RE`
+#       is `\Z`-anchored, anchor #155;
 #       golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
@@ -195,7 +196,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=845
+MIN_CHECKS=846
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -674,6 +675,49 @@ if [ "$f1_replaced" = "False" ]; then
   ok "generator provenance guard refuses a git-replace'd blob (--no-replace-objects)"
 else
   bad "generator provenance guard: a git replace ref defeated the content compare (helper=${f1_replaced:-<empty>})"
+fi
+# Sibling bypass (anchor #155 red-team round 2): `spec_from_file_location(...)
+# .exec_module` executes a `__pycache__` entry whose header mtime/size match
+# the source, so a planted pyc could run while the guard vouched for the
+# pinned bytes. `load_module_from_source` compiles the given bytes; plant a
+# matching poisoned pyc and require the loader to ignore it.
+f1_pyc_dir="${WORK}/f1-pyc"
+mkdir -p "${f1_pyc_dir}"
+printf 'PINNED = 1\n' > "${f1_pyc_dir}/b2_client.py"
+if python3 -I - "${HARNESS_DIR}" "${f1_pyc_dir}" "${WORK}/f1-pyc-marker" <<'PY'
+import importlib.util
+import marshal
+import os
+import struct
+import sys
+
+harness, root, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, harness)
+import generate_shipper_vectors as g
+
+src = os.path.join(root, "b2_client.py")
+stat = os.stat(src)
+cache = importlib.util.cache_from_source(src)
+os.makedirs(os.path.dirname(cache), exist_ok=True)
+poison = "open(%r, 'w').write('tampered')\nPINNED = 999\n" % marker
+code = compile(poison, src, "exec")
+with open(cache, "wb") as handle:
+    handle.write(importlib.util.MAGIC_NUMBER)
+    handle.write(struct.pack("<III", 0, int(stat.st_mtime) & 0xFFFFFFFF, stat.st_size & 0xFFFFFFFF))
+    handle.write(marshal.dumps(code))
+with open(src, "rb") as handle:
+    source = handle.read()
+module = g.load_module_from_source(source, src, "probe")
+if os.path.exists(marker):
+    raise SystemExit("planted pyc executed")
+if module.PINNED != 1:
+    raise SystemExit("module did not come from the source bytes (PINNED=%r)" % (module.PINNED,))
+print("pyc-ignored")
+PY
+then
+  ok "generator loader compiles the compared bytes, never a planted __pycache__ entry"
+else
+  bad "generator loader executed a planted __pycache__ entry (source bytes not compiled)"
 fi
 
 # Canonical-sid oracle: a literal grid cannot enumerate every normalization
