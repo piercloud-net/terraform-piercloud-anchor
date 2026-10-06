@@ -1,7 +1,7 @@
 {
-  "pinned_pc_admin_sha": "c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd",
-  "grammar_note": "builder layout last changed at c0ce2f1 (pc-admin #30: build_audit_key emits `audit/YYYYMMDD/<basename>` from the event's UTC day, and split_audit_date_segment refuses an all-digit segment that is not a real 8-digit calendar date); previous grammar point 25f7922 (pc-admin #20: the audit-key type regexes are \\Z-anchored, so a trailing-newline type is out of grammar and is sanitized to the documented `unknown` non-session shape); earlier points 3325aeb (pc-admin #19: the exact single-segment `session.data` with no effective strict-UUID sid is sanctioned onto the documented `unknown` non-session shape), a7035a9 (the replay-conflict `_<sha256[:16]>` variant keys from disambiguate_audit_key), 66bd304 (session.rejected sid-less), 929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>` suffix on the truncated type) and 342a37c (the 10^18-1 seq-ceiling clamp in build_audit_key)",
-  "layout_note": "dated vectors are the pinned builder's `audit/YYYYMMDD/<basename>` output; flat-legacy vectors are the same real-builder basenames under `audit/<basename>` (the dual-window legacy layout, built with the replica's explicit flat=True); date_segments pins the optional day-segment split (valid dated, flat, malformed-date refusals)",
+  "pinned_pc_admin_sha": "9a2fe505b892411d25f731c2cf4e6361967fb911",
+  "grammar_note": "builder layout last changed at 9a2fe50 (pc-admin #39: split_audit_date_segment/parse_audit_key_full/disambiguate_audit_key take the configured `prefix` and refuse a foreign prefix or a residual path segment after the prefix/day \u2014 only one leading valid YYYYMMDD/ is stripped and the remainder must be a bare basename; disambiguate_audit_key keeps the passed prefix and returns the key unchanged on refusal); previous grammar point c0ce2f1 (pc-admin #30: build_audit_key emits `audit/YYYYMMDD/<basename>` from the event's UTC day, and split_audit_date_segment refuses an all-digit segment that is not a real 8-digit calendar date); earlier point 25f7922 (pc-admin #20: the audit-key type regexes are \\Z-anchored, so a trailing-newline type is out of grammar and is sanitized to the documented `unknown` non-session shape); earlier points 3325aeb (pc-admin #19: the exact single-segment `session.data` with no effective strict-UUID sid is sanctioned onto the documented `unknown` non-session shape), a7035a9 (the replay-conflict `_<sha256[:16]>` variant keys from disambiguate_audit_key), 66bd304 (session.rejected sid-less), 929d82c (the 128-char pre-hash event-type truncation cap), 41735ff (the `_<sha256[:8]>` suffix on the truncated type) and 342a37c (the 10^18-1 seq-ceiling clamp in build_audit_key)",
+  "layout_note": "dated vectors are the pinned builder's `audit/YYYYMMDD/<basename>` output; flat-legacy vectors are the same real-builder basenames under `audit/<basename>` (the dual-window legacy layout, built with the replica's explicit flat=True); date_segments pins the optional prefix-aware day-segment split (valid dated, flat, malformed-date and foreign-prefix/residual-segment refusals, custom-prefix positive/negative)",
   "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
   "vectors": [
     {
@@ -565,61 +565,106 @@
     {
       "name": "valid dated segment stripped",
       "key": "audit/20260925/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": "audit/20260925T100008Z-user.login.000001.json",
       "day": "20260925"
     },
     {
       "name": "flat key has no day segment",
       "key": "audit/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": "audit/20260925T100008Z-user.login.000001.json",
       "day": null
     },
     {
-      "name": "day segment with no directory prefix",
+      "name": "prefixless dated key refused (foreign prefix)",
       "key": "20260925/20260925T100008Z-user.login.000001.json",
-      "relative": "20260925T100008Z-user.login.000001.json",
-      "day": "20260925"
+      "prefix": "audit/",
+      "relative": null,
+      "day": null
     },
     {
       "name": "calendar-invalid day segment refused (month 09 day 32)",
       "key": "audit/20260932/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": null,
       "day": "20260932"
     },
     {
       "name": "calendar-invalid day segment refused (month 00)",
       "key": "audit/20260000/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": null,
       "day": "20260000"
     },
     {
       "name": "all-zero day segment refused",
       "key": "audit/00000000/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": null,
       "day": "00000000"
     },
     {
       "name": "short numeric day segment refused (never stripped)",
       "key": "audit/2026092/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": null,
       "day": "2026092"
     },
     {
       "name": "long numeric day segment refused (never stripped)",
       "key": "audit/202609251/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
       "relative": null,
       "day": "202609251"
     },
     {
-      "name": "session-named segment is not a day (date impersonation refused)",
+      "name": "session-named segment refused (residual path segment, not a day)",
       "key": "audit/session.start/20260925T100008Z-user.login.000001.json",
-      "relative": "audit/session.start/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
+      "relative": null,
       "day": null
     },
     {
-      "name": "non-numeric segment is not a day",
+      "name": "non-numeric segment refused (residual path segment, not a day)",
       "key": "audit/user.login/20260925T100008Z-user.login.000001.json",
-      "relative": "audit/user.login/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
+      "relative": null,
+      "day": null
+    },
+    {
+      "name": "second day segment refused (only one leading day is stripped)",
+      "key": "audit/20260925/20260926/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
+      "relative": null,
+      "day": null
+    },
+    {
+      "name": "wrong-length date-like segment refused (20260925x)",
+      "key": "audit/20260925x/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
+      "relative": null,
+      "day": null
+    },
+    {
+      "name": "directory before the day refused (audit/foo/20260925/)",
+      "key": "audit/foo/20260925/20260925T100008Z-user.login.000001.json",
+      "prefix": "audit/",
+      "relative": null,
+      "day": null
+    },
+    {
+      "name": "custom prefix valid dated segment stripped",
+      "key": "custom/audit/20260925/20260925T100008Z-user.login.000001.json",
+      "prefix": "custom/audit/",
+      "relative": "custom/audit/20260925T100008Z-user.login.000001.json",
+      "day": "20260925"
+    },
+    {
+      "name": "custom prefix rejects an audit/-prefixed key (foreign prefix)",
+      "key": "audit/20260925/20260925T100008Z-user.login.000001.json",
+      "prefix": "custom/audit/",
+      "relative": null,
       "day": null
     }
   ],
@@ -804,5 +849,5 @@
       "why": "an embedded newline is out of grammar under any anchor; the real builder sanitizes the type to `unknown` and the replica refuses it"
     }
   ],
-  "source_sha": "c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd"
+  "source_sha": "9a2fe505b892411d25f731c2cf4e6361967fb911"
 }

@@ -242,10 +242,14 @@ audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ c0ce2f1
+# were generated from the real builder at cad0p/pc-admin @ 9a2fe50
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key/
-# split_audit_date_segment, the full-SHA pin in shipper_keys.py; the layout
-# point (pc-admin #30) made build_audit_key emit `audit/YYYYMMDD/<basename>`
+# split_audit_date_segment, the full-SHA pin in shipper_keys.py; the pinned
+# point (pc-admin #39) made the full-key helpers prefix-aware (`audit/`
+# default): only one leading valid day segment is stripped after the prefix,
+# the remainder must be a bare basename, and a foreign prefix or residual path
+# segment refuses instead of being laundered into a flat parse or variant; the
+# preceding layout point (pc-admin #30) made build_audit_key emit `audit/YYYYMMDD/<basename>`
 # (the dated default) and added the optional-segment split that refuses a
 # non-calendar all-digit day; the previous grammar-defining point (pc-admin
 # #20) `\Z`-anchored the audit-key type regexes (a trailing-newline type is
@@ -580,11 +584,11 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
 # Matrix size pin: a deleted vector/segment/refusal entry must fail loudly
 # instead of shrinking the matrix silently (red-team round-2 LOW M10). Update
 # this pin together with the matrix.
-if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 10
+if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 15
         or len(vectors["refusals"]) != 17):
     raise SystemExit(
         "vector matrix size changed: %d vectors / %d segments / %d refusals "
-        "(pinned 32/10/17) - update this pin together with the matrix"
+        "(pinned 32/15/17) - update this pin together with the matrix"
         % (len(vectors["vectors"]), len(vectors["date_segments"]), len(vectors["refusals"])))
 
 # Matrix content pin (red-team round-3 LOW): a coherent same-size rewrite
@@ -593,7 +597,7 @@ if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 10
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "c753bbeb8671a4d222742dda579962ab9c84eced66fdc913addd4f8685014c79"
+MATRIX_SHA256 = "3fe6d705b75ab0ca2e8a4f42738b3680c6bd98cf06cf3a3da604fd81e60b03da"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -669,9 +673,11 @@ for vector in vectors["vectors"]:
     if got != vector["expected"]:
         raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
 for segment in vectors["date_segments"]:
-    # Date-segment split (pc-admin #30): valid dated segments strip, flat
-    # keys are unchanged, malformed all-digit segments are refused.
-    got = replica.split_date_segment(segment["key"])
+    # Date-segment split (pc-admin #30 + #39): valid dated segments strip,
+    # flat keys are unchanged, and malformed all-digit segments, a foreign
+    # prefix and residual path segments are refused (never laundered). Each
+    # entry carries its own prefix so the prefix argument round-trips.
+    got = replica.split_date_segment(segment["key"], segment.get("prefix", "audit/"))
     if list(got) != [segment["relative"], segment["day"]]:
         raise SystemExit("%s: expected %r got %r" % (
             segment["name"], [segment["relative"], segment["day"]], list(got)))
@@ -685,7 +691,7 @@ print("vectors=%d segments=%d refusals=%d pin=%s source=%s" % (
     len(vectors["vectors"]), len(vectors["date_segments"]), len(vectors["refusals"]),
     vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=32 segments=10 refusals=17 pin=c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd source=c0ce2f1567af" ]]; then
+)" && [[ "$matrix_out" == "vectors=32 segments=15 refusals=17 pin=9a2fe505b892411d25f731c2cf4e6361967fb911 source=9a2fe505b892" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"

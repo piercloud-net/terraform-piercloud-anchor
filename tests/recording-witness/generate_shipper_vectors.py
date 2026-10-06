@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is c0ce2f1
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 9a2fe50
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree
@@ -32,10 +32,15 @@ current output), **flat legacy** vectors (the same real-builder basenames
 under the pre-#30 `audit/<basename>` layout, built with the replica's
 `flat=True` opt-in), and the date-segment vectors.
 
-The pin is the **date-partition SHA**: the builder layout last changed at
-c0ce2f1 (pc-admin #30: `build_audit_key` emits `audit/YYYYMMDD/<basename>`
+The pin is the **prefix-aware full-key SHA**: the builder layout last changed
+at 9a2fe50 (pc-admin #39: `split_audit_date_segment`/`parse_audit_key_full`/
+`disambiguate_audit_key` take the shipper's configured `prefix` and refuse a
+foreign prefix or a residual path segment after the prefix/day; exactly one
+leading valid `YYYYMMDD/` is stripped and the remainder must be a bare
+basename). The previous grammar point was c0ce2f1 (pc-admin #30:
+`build_audit_key` emits `audit/YYYYMMDD/<basename>`
 and `split_audit_date_segment` refuses an all-digit segment that is not a real
-8-digit calendar date). The previous grammar point was 25f7922 (pc-admin #20:
+8-digit calendar date). The point before that was 25f7922 (pc-admin #20:
 the audit-key type regexes are `\Z`-anchored, so a trailing-newline type such
 as `user.login\n` is out of grammar and the real builder sanitizes it to the
 documented `unknown` non-session shape instead of building a key with an
@@ -172,15 +177,19 @@ def build_vectors(b2):
             "expected": expected,
         })
 
-    def segment_vector(name, key):
-        # Pin the real builder's optional `YYYYMMDD/` split against the
-        # replica: valid dated, flat, and malformed (refused, never stripped).
-        real = b2.split_audit_date_segment(key)
-        assert split_date_segment(key) == real, \
-            "replica date-segment drift at generation time: %s (%r != %r)" % (name, split_date_segment(key), real)
+    def segment_vector(name, key, prefix="audit/"):
+        # Pin the real builder's prefix-aware optional `YYYYMMDD/` split
+        # against the replica: valid dated, flat, malformed-day refusals, and
+        # foreign-prefix/residual-segment refusals (custom-prefix cases build
+        # with their own prefix so the prefix argument round-trips).
+        real = b2.split_audit_date_segment(key, prefix)
+        replica_segment = split_date_segment(key, prefix)
+        assert replica_segment == real, \
+            "replica date-segment drift at generation time: %s (%r != %r)" % (name, replica_segment, real)
         date_segments.append({
             "name": name,
             "key": key,
+            "prefix": prefix,
             "relative": real[0],
             "day": real[1],
         })
@@ -401,9 +410,12 @@ def build_vectors(b2):
         layout="flat",
     )
 
-    # Optional `YYYYMMDD/` split (pc-admin #30): a valid dated segment is
-    # stripped, a flat key is unchanged, and an all-digit segment that is not
-    # a real calendar date is refused — never laundered into a flat parse.
+    # Optional prefix-aware `YYYYMMDD/` split (pc-admin #30 + #39): a valid
+    # dated segment is stripped and a flat key is unchanged, but the key must
+    # start with the configured prefix and the remainder after the single
+    # leading day must be a bare basename — a prefixless key, a session-named
+    # or other directory, a second day or a wrong-length date-like segment is
+    # refused (never stripped into a flat parse or laundered into a variant).
     segment_vector(
         "valid dated segment stripped",
         "audit/20260925/20260925T100008Z-user.login.000001.json",
@@ -413,7 +425,7 @@ def build_vectors(b2):
         "audit/20260925T100008Z-user.login.000001.json",
     )
     segment_vector(
-        "day segment with no directory prefix",
+        "prefixless dated key refused (foreign prefix)",
         "20260925/20260925T100008Z-user.login.000001.json",
     )
     segment_vector(
@@ -437,12 +449,34 @@ def build_vectors(b2):
         "audit/202609251/20260925T100008Z-user.login.000001.json",
     )
     segment_vector(
-        "session-named segment is not a day (date impersonation refused)",
+        "session-named segment refused (residual path segment, not a day)",
         "audit/session.start/20260925T100008Z-user.login.000001.json",
     )
     segment_vector(
-        "non-numeric segment is not a day",
+        "non-numeric segment refused (residual path segment, not a day)",
         "audit/user.login/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "second day segment refused (only one leading day is stripped)",
+        "audit/20260925/20260926/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "wrong-length date-like segment refused (20260925x)",
+        "audit/20260925x/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "directory before the day refused (audit/foo/20260925/)",
+        "audit/foo/20260925/20260925T100008Z-user.login.000001.json",
+    )
+    segment_vector(
+        "custom prefix valid dated segment stripped",
+        "custom/audit/20260925/20260925T100008Z-user.login.000001.json",
+        prefix="custom/audit/",
+    )
+    segment_vector(
+        "custom prefix rejects an audit/-prefixed key (foreign prefix)",
+        "audit/20260925/20260925T100008Z-user.login.000001.json",
+        prefix="custom/audit/",
     )
 
     # Cross-repo seed (pc-admin @ a7035a9): a rebuilt audit file that replays a
@@ -570,11 +604,18 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder layout last changed at c0ce2f1 (pc-admin #30: "
+        "grammar_note": "builder layout last changed at 9a2fe50 (pc-admin #39: "
+                        "split_audit_date_segment/parse_audit_key_full/"
+                        "disambiguate_audit_key take the configured `prefix` and refuse "
+                        "a foreign prefix or a residual path segment after the "
+                        "prefix/day — only one leading valid YYYYMMDD/ is stripped and "
+                        "the remainder must be a bare basename; disambiguate_audit_key "
+                        "keeps the passed prefix and returns the key unchanged on "
+                        "refusal); previous grammar point c0ce2f1 (pc-admin #30: "
                         "build_audit_key emits `audit/YYYYMMDD/<basename>` from the "
                         "event's UTC day, and split_audit_date_segment refuses an "
                         "all-digit segment that is not a real 8-digit calendar date); "
-                        "previous grammar point 25f7922 (pc-admin #20: the audit-key type "
+                        "earlier point 25f7922 (pc-admin #20: the audit-key type "
                         "regexes are \\Z-anchored, so a trailing-newline type is out of "
                         "grammar and is sanitized to the documented `unknown` non-session "
                         "shape); earlier points 3325aeb (pc-admin #19: the exact "
@@ -589,8 +630,9 @@ def build_vectors(b2):
                        "output; flat-legacy vectors are the same real-builder basenames "
                        "under `audit/<basename>` (the dual-window legacy layout, built "
                        "with the replica's explicit flat=True); date_segments pins the "
-                       "optional day-segment split (valid dated, flat, malformed-date "
-                       "refusals)",
+                       "optional prefix-aware day-segment split (valid dated, flat, "
+                       "malformed-date and foreign-prefix/residual-segment refusals, "
+                       "custom-prefix positive/negative)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "date_segments": date_segments,

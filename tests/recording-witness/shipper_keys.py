@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 r"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd — the
-**date-partition SHA**: pc-admin #30 made `build_audit_key` emit
+PINNED AGAINST: cad0p/pc-admin @ 9a2fe505b892411d25f731c2cf4e6361967fb911 —
+the **prefix-aware full-key SHA**: pc-admin #30 made `build_audit_key` emit
 ``audit/YYYYMMDD/<basename>`` (the day derived from the same UTC instant as
-``<ts>``) and added ``split_audit_date_segment``/``parse_audit_key_full``, which
-refuse an all-digit segment that is not a real 8-digit calendar date instead of
-laundering it into a flat parse. Flat legacy keys (``audit/<basename>``) remain
-accepted through the dual window and are built by the replica's ``flat=True``
-opt-in; the builder default is dated. The previous grammar point was
-25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 (pc-admin #20 anchored the audit-key type
+``<ts>``); pc-admin #39 made the full-key helpers
+(``split_audit_date_segment``/``parse_audit_key_full``/``disambiguate_audit_key``)
+take the shipper's configured ``prefix`` (``audit/`` by default) and refuse any
+key that does not start with it or that leaves a residual path segment after the
+prefix/day. Exactly one leading valid ``YYYYMMDD/`` may be stripped and the
+remainder must be a bare basename: a foreign prefix, a second day
+(``audit/20260925/20260926/…``), a wrong-length date-like segment
+(``audit/20260925x/…``) or any other directory (``audit/foo/20260925/…``) refuses
+instead of being stripped into a flat parse or laundered into a variant; a
+non-calendar all-digit day keeps the preserved ``(None, segment)`` refusal shape.
+Flat legacy keys (``audit/<basename>``) remain accepted through the dual window
+and are built by the replica's ``flat=True`` opt-in; the builder default is
+dated, and ``disambiguate_audit_key`` keeps the passed prefix, so a custom-prefix
+variant round-trips. The previous grammar point was
+c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd (the #30 date-partition SHA above), and
+before that 25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 (pc-admin #20 anchored the audit-key type
 regexes at `\Z`; Python's `$` also matches before a trailing newline, so a type
 like `user.login\n` would pass and build a key with an embedded newline the
 witness reads as `contract-mismatch` drift; the real builder now sanitizes such
@@ -98,8 +108,10 @@ checked in (`shipper_key_vectors.json`, regenerated with
 replays every vector against this replica, so silent drift fails there. The
 matrix carries dated vectors (the pinned builder's current output), flat
 legacy vectors (the same basenames under the pre-#30 layout, built with
-`flat=True`), and date-segment vectors pinning the optional `YYYYMMDD/`
-split (valid dated, flat, and malformed-date refusals).
+`flat=True`), and date-segment vectors pinning the prefix-aware optional
+`YYYYMMDD/` split (valid dated, flat, malformed-date refusals,
+foreign-prefix/residual-segment refusals, and a custom-prefix
+positive/negative).
 
 CLI:  shipper_keys.py [--flat|--dated] <event-type> <ts> [sid] [seq] [mode]
       shipper_keys.py --variant <body> <event-type> <ts> [sid] [seq] [mode]
@@ -114,7 +126,7 @@ import re
 import sys
 from datetime import datetime
 
-PINNED_PC_ADMIN_SHA = "c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd"
+PINNED_PC_ADMIN_SHA = "9a2fe505b892411d25f731c2cf4e6361967fb911"
 # Date-partition grammar (pc-admin #30): ``audit/YYYYMMDD/<basename>``. The
 # segment must be a real calendar date; a non-calendar all-digit segment is
 # malformed and refused, never stripped (mirrors
@@ -177,11 +189,14 @@ SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
 SID_LESS_UNKNOWN_SESSION_EVENTS = frozenset({"session.data"})
 
 
-# Date-partition split (pc-admin #30 ``split_audit_date_segment``). Mirrored
-# here so the generator can pin the real builder's segment semantics against
-# this replica: a valid ``YYYYMMDD/`` segment is stripped, a flat key is
-# returned unchanged, and an all-digit segment that is not a real calendar
-# date returns ``(None, segment)`` — malformed, never stripped.
+# Prefix-aware date-partition split (pc-admin #30 + #39
+# ``split_audit_date_segment``). Mirrored here so the generator can pin the
+# real builder's segment semantics against this replica: the key must start
+# with the configured prefix; one valid ``YYYYMMDD/`` segment is stripped and
+# the remainder must be a bare basename; a flat key is returned unchanged; an
+# all-digit segment that is not a real calendar date returns ``(None, segment)``
+# — malformed, never stripped; a foreign prefix or any other residual path
+# segment returns ``(None, None)`` — refused, never stripped or laundered.
 def _valid_audit_day(segment):
     if len(segment) != AUDIT_DAY_LENGTH or not AUDIT_DAY_DIGITS_RE.fullmatch(segment):
         return None
@@ -192,27 +207,34 @@ def _valid_audit_day(segment):
     return segment
 
 
-def split_date_segment(key):
+def split_date_segment(key, prefix="audit/"):
     """Split an optional valid ``YYYYMMDD/`` day segment off a full audit key.
 
-    Returns ``(relative_key, day)`` — the key without the day segment and the
-    validated day string — or ``(None, segment)`` for an all-digit segment
-    that is not a real calendar date. A key without a date segment returns
-    ``(key, None)`` unchanged (flat legacy keys take this path). Pure; mirrors
-    pc-admin's ``split_audit_date_segment`` exactly.
+    ``key`` must start with ``prefix`` — the shipper's configured
+    ``audit_prefix`` (``audit/`` by default) — and exactly one leading valid
+    ``YYYYMMDD/`` may be stripped after it; the remainder must be a bare
+    basename. Returns ``(relative_key, day)`` — the key without the day
+    segment and the validated day string. A flat key ``{prefix}<basename>``
+    returns ``(key, None)`` unchanged (legacy flat keys take this path).
+
+    Refusals (never stripped, never parsed as flat): a key that does not start
+    with ``prefix`` -> ``(None, None)``; an all-digit segment that is not a
+    real calendar date -> ``(None, segment)`` (the preserved malformed-day
+    shape); any other residual path segment — a wrong-length date-like segment
+    (``20260925x``), a directory before the day, a second day or any other
+    prefix-relative directory -> ``(None, None)``. Pure; mirrors pc-admin's
+    ``split_audit_date_segment`` exactly.
     """
-    prefix, sep, basename = key.rpartition("/")
+    if not key.startswith(prefix):
+        return None, None
+    head, sep, tail = key[len(prefix):].partition("/")
     if not sep:
         return key, None
-    head, sep2, segment = prefix.rpartition("/")
-    if not sep2:
-        # ``<segment>/<basename>`` with no directory prefix
-        head, segment = "", prefix
-    if not AUDIT_DAY_DIGITS_RE.fullmatch(segment):
-        return key, None
-    if _valid_audit_day(segment) is None:
-        return None, segment
-    return ("%s/%s" % (head, basename) if head else basename), segment
+    if AUDIT_DAY_DIGITS_RE.fullmatch(head) and _valid_audit_day(head) is None:
+        return None, head
+    if _valid_audit_day(head) is None or "/" in tail:
+        return None, None
+    return prefix + tail, head
 
 
 def _layout_prefix(ts, flat):
@@ -301,24 +323,27 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False):
     return "%s%s-%s.%06d.json" % (_layout_prefix(ts, flat), ts, event_type, seq)
 
 
-def disambiguate_key(key, body):
+def disambiguate_key(key, body, prefix="audit/"):
     """Mirror pc-admin's `disambiguate_audit_key` (replay-conflict variant).
 
     Appends `_<sha256[:16]>` of the local content to the event type: a session
     variant drops its mode marker; on the sid-less shape the hash joins the
     last type segment. A date-partitioned key keeps its ``YYYYMMDD/`` day
-    segment (the variant stays on the same day/layout), and a key whose
-    day segment is malformed is returned unchanged (refused, never laundered
-    into a flat variant), exactly like the pinned builder. Returns the key
-    unchanged outside the shipper grammar, exactly like the producer (the
-    caller never invents a shape the witness cannot classify).
+    segment (the variant stays on the same day/layout) and the emitted variant
+    keeps the passed ``prefix``, so a custom-prefix shipper round-trips. A key
+    whose day segment is malformed, whose prefix does not match, or that
+    carries a residual path segment is refused: the key is returned unchanged
+    — never stripped or laundered into a variant — exactly like the pinned
+    builder. Returns the key unchanged outside the shipper grammar, exactly
+    like the producer (the caller never invents a shape the witness cannot
+    classify).
     """
-    relative, day = split_date_segment(key)
+    relative, day = split_date_segment(key, prefix)
     if relative is None:
         return key
+    basename = relative[len(prefix):]
     payload = body if isinstance(body, bytes) else str(body).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:CONFLICT_HASH_LENGTH]
-    prefix, _, basename = relative.rpartition("/")
     match = SESSION_KEY_PARSE_RE.match(basename)
     if match:
         parts = match.groupdict()
@@ -333,8 +358,8 @@ def disambiguate_key(key, body):
         hashed = "%s.%s_%s" % (head, last, digest) if head else "%s_%s" % (last, digest)
         variant = "%s-%s.%s.json" % (parts["ts"], hashed, parts["seq"])
     if day:
-        prefix = "%s/%s" % (prefix, day) if prefix else day
-    return "%s/%s" % (prefix, variant) if prefix else variant
+        return "%s%s/%s" % (prefix, day, variant)
+    return "%s%s" % (prefix, variant)
 
 
 if __name__ == "__main__":
