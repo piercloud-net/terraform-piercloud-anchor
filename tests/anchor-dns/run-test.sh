@@ -131,6 +131,9 @@ if [[ "$url" == *"api.gcore.com"* ]]; then
             if [ -n "${STUB_GCORE_DUPLICATE:-}" ]; then
               rr="$(printf '%s' "$rr" | jq -c '.resource_records += [.resource_records[0]]')"
             fi
+            if [ -n "${STUB_GCORE_BUNDLED:-}" ]; then
+              rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content += ["203.0.113.99"]')"
+            fi
             emit 200 "$rr"
           else
             emit 404 '{"error":"not found"}'
@@ -298,6 +301,13 @@ reset_state
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_DUPLICATE=1)"
 [ "$rc" != "0" ] && ok "gcore duplicate-record rrset fails the run (rc=$rc)" || bad "gcore duplicate-record rrset did not fail"
 contains "gcore duplicate message names the count" "2 record(s)" "$(LOG)"
+# Bundled content: ONE rrset entry holding [want, stale] — counting entries
+# alone would pass it; the flattened address count must fail it.
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_BUNDLED=1)"
+[ "$rc" != "0" ] && ok "gcore bundled-content rrset fails the run (rc=$rc)" || bad "gcore bundled-content rrset did not fail"
+contains "gcore bundled-content message names both addresses" "2 record(s)" "$(LOG)"
+contains "gcore bundled-content message shows the stale address" "203.0.113.99" "$(LOG)"
 
 # ---- red: Gcore TTL floor is exercised ------------------------------------
 reset_state

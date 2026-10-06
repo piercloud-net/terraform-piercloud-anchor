@@ -216,16 +216,19 @@ gcore_upsert_anchor() {
       ;;
   esac
   # Verify-after-write: re-read and exact-match the rrset (exactly one
-  # record) name + address + ttl + enabled.
+  # record) name + address + ttl + enabled. The address count flattens
+  # every resource_records[].content value: Gcore models an A address as
+  # an array inside ONE rrset entry, so counting entries alone would pass
+  # a bundled [want, stale] content (count=1).
   code="$(curl "${auth[@]}" -o "$tmp" -w '%{http_code}' "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/A")"
   if [ "$code" != "200" ]; then
     rm -f "$tmp"
     echo "::error::verify-after-write GET $fqdn/A returned HTTP ${code} — cannot prove the record. STOP — investigate before any bind-by-name."
     exit 1
   fi
-  count="$(jq -r '(.resource_records // []) | length' "$tmp")"
+  count="$(jq -r '[(.resource_records // [])[] | (.content // empty) | if type == "array" then .[] else . end] | length' "$tmp")"
   got_name="$(jq -r '.name // empty' "$tmp" | sed 's/\.$//')"
-  got_ip="$(jq -r '(.resource_records[0] // {}) | .content | if type == "array" then (.[0] // "") else (. // "") end' "$tmp")"
+  got_ip="$(jq -r '[(.resource_records // [])[] | (.content // empty) | if type == "array" then .[] else . end] | join(",")' "$tmp")"
   got_ttl="$(jq -r '.ttl // empty' "$tmp")"
   # Boolean read via tostring (never `// empty` — false is empty to jq; CI's
   # jq-boolean-guard enforces this shape).
