@@ -61,7 +61,7 @@ Module consumers (registry/GitHub source, `examples/quickstart` as the root modu
 ## The two hard invariants
 
 - **Tang keys never touch Terraform state.** The keypair is generated on the anchor by the script — never by the module — so no unlock key can leak into state, plan output, or CI. CI asserts key material stays out of tracked files; the script fails loudly if state files appear near the key material.
-- **The anchor is a key-holder, never an access-path.** It holds no SSH keys, tokens, or sockets that reach your main box; its only cross-box interactions are answering clevis challenges on TCP/80 from your main box IP and serving the dashboard/ACME to the platform edge — no credential reaches the main box either way. If the anchor is compromised, the worst outcome is that an attacker could have answered a boot-time challenge — not a path into your main box.
+- **The anchor is a key-holder, never an access-path.** It holds no SSH keys, tokens, or sockets that reach your main box; its cross-box interactions are answering clevis challenges on TCP/80 from your main box IP, serving the dashboard/ACME to the platform edge, and probing your public endpoints for availability — no credential reaches the main box either way. If the anchor is compromised, the worst outcome is that an attacker could have answered a boot-time challenge — not a path into your main box.
 
 ## Trust: what we can and cannot do
 
