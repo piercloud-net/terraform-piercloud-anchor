@@ -20,10 +20,12 @@
 #     `.github/scripts`, the provisioning scripts the workflow runs or sources
 #     (`scripts/lib/*` is sourced by the provision job; `scripts/010-provision.sh`
 #     runs on the host), and the root HCL the run applies (`*.tf`, `*.tf.json`,
-#     `*.tfvars`, `*.tfvars.json`, `.terraform.lock.hcl`; `:(glob)` keeps it
-#     top-level-only — the examples are not executed). JSON-syntax HCL is a
-#     full member of the root module to OpenTofu, so it is counted like native
-#     HCL (red-team r1/r2/r3/r4 HIGH/MEDIUM, functional r3/r4 MEDIUM).
+#     `*.tofu`, `*.tofu.json`, `*.tfvars`, `*.tfvars.json`,
+#     `.terraform.lock.hcl`; `:(glob)` keeps it top-level-only — the examples
+#     are not executed). JSON-syntax HCL is a full member of the root module to
+#     OpenTofu, and the `.tofu`/`.tofu.json` extensions are loaded by the
+#     pinned 1.12.2 runtime (functional r5b HIGH), so all are counted like
+#     native HCL (red-team r1/r2/r3/r4 HIGH/MEDIUM, functional r3/r4 MEDIUM).
 #   * Pathspecs are `:(top)`-anchored: a non-root cwd must not silently narrow
 #     the diff to zero (functional r2 / red-team r2 LOW).
 #   * A symlink anywhere in the counted set's closure (at, above, or inside a
@@ -34,10 +36,14 @@
 #     the producer and the pipeline's rc 141 silently skips the guard at
 #     listing scale, and whitespace/C-quoted path rendering (`x main.tf`)
 #     defeats an awk `$4` field split (functional r3 LOW, red-team r4 MEDIUM).
-#   * A local module source (./… or ../…) is executed code outside the counted
-#     set: the script refuses rather than certify (red-team r5 MEDIUM, latent
-#     today — no module blocks in-tree). Add the module tree to the pathspecs
-#     before dispatching.
+#   * A module block in the counted root HCL refuses: its source tree may be
+#     local/executed code the diff cannot see, and source-value matching is
+#     evadable (attached `=`, comments, `\uNNNN` escapes, absolute paths), so
+#     the gate is the block itself (red-team r5/r5b MEDIUM, trust r5b MEDIUM,
+#     functional r5b MEDIUM; latent — no module blocks in the counted root HCL
+#     today; the example tree has one and is not executed). Registry-only
+#     modules refuse too (fail-closed): extend the pathspecs and relax this
+#     gate deliberately.
 #   * A diff that cannot be computed is a loud error, never a silent
 #     "0 files changed": the card's UNCHANGED verdict is a security signal
 #     and an undeterminable count must fail closed.
@@ -62,6 +68,8 @@ pathspecs=(
   ':(top)scripts/010-provision.sh'
   ':(top,glob)*.tf'
   ':(top,glob)*.tf.json'
+  ':(top,glob)*.tofu'
+  ':(top,glob)*.tofu.json'
   ':(top,glob)*.tfvars'
   ':(top,glob)*.tfvars.json'
   ':(top).terraform.lock.hcl'
@@ -73,7 +81,7 @@ counted_closure() {
     scripts|scripts/lib|scripts/lib/*|scripts/010-provision.sh) return 0 ;;
   esac
   case "$1" in
-    *.tf|*.tf.json|*.tfvars|*.tfvars.json|.terraform.lock.hcl)
+    *.tf|*.tf.json|*.tofu|*.tofu.json|*.tfvars|*.tfvars.json|.terraform.lock.hcl)
       [ "${1%/*}" = "$1" ] && return 0 ;;
   esac
   return 1
@@ -96,13 +104,19 @@ if [ -n "$symlink_hit" ]; then
   echo "::error::symlink '$symlink_hit' is in the run's code surface — refusing a banner verdict" >&2
   exit 1
 fi
-# A local module source (./… or ../…) is executed code outside the counted
-# set: refuse rather than certify (red-team r5 MEDIUM, latent today — the
-# repo has no module blocks). Covers native HCL (`source = "./x"`) and JSON
-# HCL (`"source": "./x"`). Extend the pathspecs with the module tree before
-# dispatching.
-if git grep -qE "(^|[[:space:]\"])source[\"']?[[:space:]]*(=|:)[[:space:]]*\"\.\.?/" -- ':(top,glob)*.tf' ':(top,glob)*.tf.json'; then
-  echo "::error::a local module source (./ or ../) is executed code outside the counted set — refusing a banner verdict; add the module tree to the pathspecs" >&2
+# A module block in the counted root HCL refuses: its source tree may be
+# local/executed code the diff cannot see, and source-value matching is
+# evadable (attached `=`, comments, `\uNNNN` escapes, absolute paths), so the
+# gate is the block itself (red-team r5/r5b MEDIUM, trust r5b MEDIUM,
+# functional r5b MEDIUM; latent — no module blocks in the counted root HCL
+# today; the example tree has one and is not executed). Registry-only modules
+# refuse too (fail-closed): extend the pathspecs with the module tree and
+# relax this gate deliberately.
+# Residual: an escaped JSON key (`"\u006dodule"`), a `module` split across
+# lines, and a comment/heredoc carrying a bare `module` token (fail-closed)
+# are out of a textual scan's reach — the review is the backstop.
+if git grep -qE '(^|[[:space:]])module([[:space:]]|$)|"module"[[:space:]]*:' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
+  echo "::error::a module block exists in the counted root HCL — its source tree is executed code outside the counted set; add it to the pathspecs and relax this gate deliberately" >&2
   exit 1
 fi
 if ! changed="$(git diff --name-only "$base" HEAD -- "${pathspecs[@]}")"; then

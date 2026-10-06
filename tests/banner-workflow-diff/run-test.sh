@@ -31,16 +31,22 @@
 #       2000-symlink farm still refuses (the while-read scan is not defeated by
 #       listing size) (red-team r3 MEDIUM / functional r3 LOW);
 #   (n) a scripts/010-provision.sh change is counted (functional r3 LOW);
-#   (p) JSON-syntax root HCL (main.tf.json / *.auto.tfvars.json) is counted —
-#       OpenTofu loads it as part of the root module (red-team r4 HIGH /
-#       functional r4 MEDIUM);
+#   (p) JSON-syntax and `.tofu` root HCL (main.tf.json / *.auto.tfvars.json /
+#       main.tofu / main.tofu.json) is counted — OpenTofu loads all of them as
+#       part of the root module (red-team r4 HIGH / functional r4 MEDIUM /
+#       functional r5b HIGH);
 #   (q) a symlink whose name carries whitespace still refuses — the
-#       NUL-delimited scan must not truncate at the field split, and a
-#       JSON-named symlink refuses too (the closure mirrors the pathspecs)
-#       (red-team r4 MEDIUM / trust r4 MEDIUM / functional r4 LOW);
-#   (r) a local module source (./… or ../…) refuses — the module tree is
-#       executed by the run but is outside the counted set (red-team r5
-#       MEDIUM, latent — no module blocks in-tree today);
+#       NUL-delimited scan must not truncate at the field split, and
+#       JSON-/`.tofu`-named symlinks refuse too (the closure mirrors the
+#       pathspecs) (red-team r4 MEDIUM / trust r4 MEDIUM / functional r4 LOW);
+#   (r) a module block in the counted root HCL refuses — its source tree is
+#       executed by the run but may be outside the counted set; the gate is the
+#       block itself (spelling-independent: attached `=`, comments and `\uNNNN`
+#       escapes are all covered; `.tofu`/`.tofu.json` included), while a
+#       non-module `source` (attribute, comment or heredoc text) does not
+#       refuse (red-team r5/r5b MEDIUM, trust r5b MEDIUM, functional r5b
+#       MEDIUM/LOW; latent — no module blocks in the counted root HCL today;
+#       the example tree has one, unexecuted);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
 #       form (arithmetic/export/read/declare/let/unset/eval/source/printf -v),
@@ -50,8 +56,11 @@
 #       git alias and no fetch/pull assignment, and the banner job's single
 #       fetch-depth: 0; ci.yml gates AND runs this harness. Residual: deep
 #       variable indirection (`cmd=git; $cmd fetch`, `git${IFS}fetch`) is out
-#       of a textual pin's reach — the pin is a regression tripwire, the
-#       review is the backstop.
+#       of a textual pin's reach — single-quote splicing (`COU'NT=0`), an
+#       escaped JSON module key (`"\u006dodule"`), a comment/heredoc carrying a
+#       bare `module` token (fail-closed), deep variable indirection and a
+#       fail-closed pin over-match (`git log --grep pull`) are residuals: the
+#       pin is a regression tripwire, the review is the backstop.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -175,6 +184,14 @@ git_c add -A
 git_c commit -qm "JSON-named symlink in a counted path"
 git_c push -q origin jsonsymlink
 
+git_c checkout -qb dottofusymlink main
+mkdir -p payload
+printf '#!/usr/bin/env bash\necho payload\n' > payload/evil.sh
+ln -s payload/evil.sh main.tofu
+git_c add -A
+git_c commit -qm ".tofu-named symlink in a counted path"
+git_c push -q origin dottofusymlink
+
 git_c checkout -qb modulesrc main
 mkdir -p modules/m
 printf 'module "m" {\n  source = "./modules/m"\n}\n' > main.tf
@@ -190,6 +207,68 @@ printf '{}\n' > modules/m/main.tf.json
 git_c add -A
 git_c commit -qm "JSON local module source"
 git_c push -q origin modulesrcjson
+
+git_c checkout -qb modulesrcattached main
+mkdir -p modules/m
+printf 'module "m" {source="./modules/m"}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "attached-equals module source"
+git_c push -q origin modulesrcattached
+
+git_c checkout -qb modulesrccomment main
+mkdir -p modules/m
+printf 'module "m" {\n  source = /* bypass */ "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "comment-bypassed module source"
+git_c push -q origin modulesrccomment
+
+git_c checkout -qb modulesrcesc main
+mkdir -p modules/m
+printf 'module "m" {\n  source = "\\u002e/modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "escaped module source"
+git_c push -q origin modulesrcesc
+
+git_c checkout -qb ressrc main
+printf 'resource "x" "y" {\n  source = "./file.txt"\n}\n' > main.tf
+git_c add -A
+git_c commit -qm "non-module source attribute"
+git_c push -q origin ressrc
+
+git_c checkout -qb rescomment main
+printf '# source = "./modules/m"\n' > main.tf
+git_c add -A
+git_c commit -qm "comment-only source text"
+git_c push -q origin rescomment
+
+git_c checkout -qb resheredoc main
+printf 'resource "x" "y" {\n  description = <<EOT\nsource = "./modules/m"\nEOT\n}\n' > main.tf
+git_c add -A
+git_c commit -qm "heredoc source text"
+git_c push -q origin resheredoc
+
+git_c checkout -qb dottofu main
+printf 'output "x" { value = "tofu-ext" }\n' > main.tofu
+git_c add -A
+git_c commit -qm ".tofu root HCL change"
+git_c push -q origin dottofu
+
+git_c checkout -qb dottofujson main
+printf '{"output":{"x":{"value":"json-ext"}}}\n' > main.tofu.json
+git_c add -A
+git_c commit -qm ".tofu.json root HCL change"
+git_c push -q origin dottofujson
+
+git_c checkout -qb dottofumodule main
+mkdir -p modules/m
+printf 'module "m" {\n  source = "./modules/m"\n}\n' > main.tofu
+printf '# module\n' > modules/m/main.tofu
+git_c add -A
+git_c commit -qm ".tofu module source"
+git_c push -q origin dottofumodule
 
 git_c checkout -q main
 printf 'name: moved\n' > .github/workflows/moved.yml
@@ -362,6 +441,16 @@ rc=0
 count="$(bash "$SCRIPT" main)" || rc=$?
 is "JSON tfvars: a prod.auto.tfvars.json change is counted" "1" "$count"
 is "JSON tfvars: rc" "0" "$rc"
+git_c checkout -q dottofu
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "tofu HCL: a main.tofu change is counted" "1" "$count"
+is "tofu HCL: rc" "0" "$rc"
+git_c checkout -q dottofujson
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "tofu JSON HCL: a main.tofu.json change is counted" "1" "$count"
+is "tofu JSON HCL: rc" "0" "$rc"
 
 # --- (q) a whitespace-bearing symlink name still refuses --------------------
 # `git ls-files -s` renders `120000 … 0\tevil .tf`; an awk `$4` split yields
@@ -380,11 +469,20 @@ out="$(bash "$SCRIPT" main 2>"$WORK/jsonsymlink.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON-named symlink: rc non-zero"; else bad "JSON-named symlink: rc=$rc"; fi
 is "JSON-named symlink: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/jsonsymlink.err"; then ok "JSON-named symlink: ::error:: annotation"; else bad "JSON-named symlink: no ::error::"; fi
+git_c checkout -q dottofusymlink
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/dottofusymlink.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok ".tofu-named symlink: rc non-zero"; else bad ".tofu-named symlink: rc=$rc"; fi
+is ".tofu-named symlink: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/dottofusymlink.err"; then ok ".tofu-named symlink: ::error:: annotation"; else bad ".tofu-named symlink: no ::error::"; fi
 
-# --- (r) a local module source refuses --------------------------------------
-# A referenced local module tree is executed by `tofu` but is outside the
-# counted set; certifying it would be a false UNCHANGED (red-team r5 MEDIUM,
-# latent — no module blocks in-tree today). Native and JSON HCL both refuse.
+# --- (r) a module block in the counted root HCL refuses ----------------------
+# A referenced module tree is executed by `tofu` but may be outside the
+# counted set; certifying it would be a false UNCHANGED (red-team r5/r5b
+# MEDIUM, trust r5b MEDIUM, functional r5b MEDIUM; latent — no module blocks
+# in the counted root HCL today). The gate is the block itself, so attached
+# `=`, comment-bypassed and `\uNNNN`-escaped sources all refuse; native, JSON
+# and `.tofu` HCL are covered, and a non-module `source` does not refuse.
 git_c checkout -q modulesrc
 rc=0
 out="$(bash "$SCRIPT" main 2>"$WORK/modulesrc.err")" || rc=$?
@@ -397,6 +495,29 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule; do
+  git_c checkout -q "$variant"
+  rc=0
+  out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "$variant: rc non-zero"; else bad "$variant: rc=$rc"; fi
+  is "$variant: no count on stdout" "" "$out"
+  if grep -q '::error::' "$WORK/$variant.err"; then ok "$variant: ::error:: annotation"; else bad "$variant: no ::error::"; fi
+done
+git_c checkout -q ressrc
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "non-module source: counted (not refused)" "1" "$count"
+is "non-module source: rc" "0" "$rc"
+git_c checkout -q rescomment
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "comment-only source text: counted (not refused)" "1" "$count"
+is "comment-only source text: rc" "0" "$rc"
+git_c checkout -q resheredoc
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "heredoc source text: counted (not refused)" "1" "$count"
+is "heredoc source text: rc" "0" "$rc"
 git_c checkout -q behind
 
 # --- (e) wiring --------------------------------------------------------------
@@ -428,7 +549,7 @@ call_line='COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"'
 if [ "$(grep -cF "$call_line" <<<"$banner_active")" = "1" ]; then ok "the banner step calls the diff script (exact active call line)"; else bad "the banner step call line is missing, duplicated, or only commented"; fi
 if [ "$(grep -oF 'COUNT=' <<<"$banner_active" | grep -c .)" = "1" ]; then ok "COUNT is assigned exactly once in the banner step"; else bad "the banner step has extra COUNT assignments or aliases"; fi
 if [ "$(grep -cE 'COUNT[[:space:]]*[+*/%^-]?=' <<<"$banner_active")" = "1" ]; then ok "COUNT is assigned exactly once (space/compound-tolerant spelling)"; else bad "the banner step carries a COUNT assignment beyond the single call line"; fi
-if grep -qE '\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+-v|^[[:space:]]*\.[[:space:]]' <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
+if grep -qE "\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\"']?-v|^[[:space:]]*\.[[:space:]]" <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
 stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
 if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
 if [ "$(grep -oE '\-eq[[:space:]]+0' <<<"$banner_active" | grep -c .)" = "1" ] && ! grep -qE '\-(ge|gt|le|lt|ne)[[:space:]]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0 (no widened/decoy comparison)"; else bad "the COUNT comparison is missing, widened, or decoyed"; fi
@@ -448,9 +569,13 @@ if grep -qE "$splice_re" <<<"$banner_active"; then bad "the banner step carries 
 if grep -qE "$splice_re" <<<"$prov_active"; then bad "provision.yml carries a double-quote-spliced identifier (a fetch can hide behind one)"; else ok "no double-quote-spliced identifier in provision.yml"; fi
 assign_re="=[[:space:]]*[\"']?(fetch|pull)([^[:alnum:]_]|$)"
 if grep -qE "$assign_re" <<<"$prov_active"; then bad "provision.yml assigns fetch/pull to a variable (an indirect fetch)"; else ok "provision.yml does not assign fetch/pull to a variable"; fi
-override_re='\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+-v'
+override_re="\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\"']?-v"
 if grep -qE "$override_re" <<< 'printf -vCOUNT "%s" 0'; then ok "the override pin matches an attached printf -v target"; else bad "the override pin misses an attached printf -v target"; fi
+if grep -qE "$override_re" <<< "printf '-v' COUNT 0"; then ok "the override pin matches a quoted printf -v"; else bad "the override pin misses a quoted printf -v"; fi
 if grep -qE "$override_re" <<< 'export "COU""NT=0"'; then ok "the override pin matches a spliced export"; else bad "the override pin misses a spliced export"; fi
+if grep -qE "$override_re" <<< "readonly COU'NT'=0"; then ok "the override pin matches a single-quote-spliced readonly"; else bad "the override pin misses a single-quote-spliced readonly"; fi
+if grep -qE "$override_re" <<< 'typeset -n r=COUNT'; then ok "the override pin matches a typeset nameref"; else bad "the override pin misses a typeset nameref"; fi
+if grep -qE "$override_re" <<< 'readarray -t COUNT'; then ok "the override pin matches readarray"; else bad "the override pin misses readarray"; fi
 if grep -qE "$splice_re" <<< 'COU""NT=0'; then ok "the splice pin matches a spliced identifier"; else bad "the splice pin misses a spliced identifier"; fi
 if grep -qE "$assign_re" <<< 'f=fetch; git $f'; then ok "the assignment pin matches a fetch alias"; else bad "the assignment pin misses a fetch alias"; fi
 if [ "$(grep -c 'fetch-depth:' <<<"$banner_job")" = "1" ] && grep -q 'fetch-depth: 0' <<<"$banner_job"; then ok "the banner job keeps the single full-history checkout"; else bad "the banner job lost fetch-depth: 0 or gained a decoy"; fi
