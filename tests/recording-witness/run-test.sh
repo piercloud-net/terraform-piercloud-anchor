@@ -6844,6 +6844,26 @@ fi
 # strips run first, so quoted and `command`-prefixed forms are caught).
 # Deliberate fail-closed over-refusal: a `let` arithmetic comparison
 # (`let PATH == 5`) also matches.
+#
+# r23 red-team HIGH + MED (r22 delta re-check): two more run-time token
+# rebuilders evaded the PATH tooth — locale quoting (`export $"PATH"=…`,
+# `readonly $"PATH"=…`, `declare -g $"PATH"=…`, `let $"PATH"=5`,
+# `printf -v $"PATH"`, `read $"PATH"`, `mapfile -t $"PATH"`, `unset $"PATH"`)
+# and brace-comma expansion in an argument position (`export {PATH,x}=…`,
+# `readonly {P,}ATH=…`, `let {PATH,x}=5`, `let PATH{,}=5`,
+# `printf -v {P,}ATH`, `read {P,}ATH`, `mapfile -t {P,}ATH`), plus a nameref
+# alias target (`declare -n p=PATH` then `p=…`); all suite-green and
+# runtime-effective (PATH shadow → the drain gate subverts). Closed: the
+# `$"` introducer is stripped before the token scan (`$$"` masked first so a
+# PID variable survives), argument-position brace-comma groups are expanded
+# textually (bounded: depth 6 / 64 variants per line; overflow refuses
+# fail-closed) and each variant matched, and a nameref declaration whose
+# target is PATH is refused. A command-word brace-comma (`{h,}ash`,
+# `{t,}rap`, `{s,}leep()`) is NOT a gap: bash expands the alternatives as
+# separate arguments of the first word, so it neither hashes, traps nor
+# defines (runtime-probed). Deliberate fail-closed over-refusals: a
+# `declare x=PATH` (literal string assignment) and a brace-expansion
+# overflow.
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6855,6 +6875,23 @@ if awk -v q="'" '
     } while (s != prev)
     return s
   }
+  function expand_braces(s, depth,   m, pre, grp, inner, alts, n, i, out) {
+    if (depth > 6 || expand_over) return ""
+    m = match(s, /\{[^{}]*,[^{}]*\}/)
+    if (m == 0) return s "\n"
+    pre = substr(s, 1, m - 1)
+    grp = substr(s, m, RLENGTH)
+    post = substr(s, m + RLENGTH)
+    inner = substr(grp, 2, length(grp) - 2)
+    n = split(inner, alts, ",")
+    out = ""
+    for (i = 1; i <= n; i++) {
+      expand_count++
+      if (expand_count > 64) { expand_over = 1; return "" }
+      out = out expand_braces(pre alts[i] post, depth + 1)
+    }
+    return out
+  }
   function path_write(s) {
     return (s ~ /(^|[;&|()!{}])[[:space:]]*PATH(\[[^]]*\])?\+?=/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
@@ -6863,38 +6900,58 @@ if awk -v q="'" '
             s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export|readonly)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*let([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH(\[[^]]*\])?[[:space:]]*\+?=/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(for|select)[[:space:]]+PATH([^[:alnum:]_]|$)/)
   }
   {
     line = $0
-    gsub(/\"/, "", line)
+    # r23 red-team HIGH (r22 delta re-check): locale quoting `$"NAME"` expands
+    # to NAME (bash translation); strip the introducer so the token is visible
+    # (`$$"` is a PID variable plus a closing quote and must survive: mask `$$`
+    # first). The shipped script has no real `$"` (one `...com$"` regex false
+    # positive, harmless after the strip).
+    gsub(/\$\$/, "\001", line)
+    gsub(/\$"/, "", line)
+    gsub("\001", "$$", line)
+    gsub(/"/, "", line)
     gsub(q, "", line)
     gsub(/\\/, "", line)
     gsub(/\$\{[^}]*\}/, "", line)
     gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
-    # r18 red-team HIGH: the prefix strip and the reserved-word normalizer
-    # feed each other (`if true; then command export "PATH=…"; fi` only
-    # exposes `command export` after `then` becomes a separator; a
-    # `command command …` chain needs one strip per prefix), so run both
-    # until the line is stable; `!` joins the position class.
-    hit = 0
-    do {
-      if (path_write(line)) hit = 1
-      prev = line
-      gsub(/(^|[;&|()!{}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
-      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^[:space:];&|]*[[:space:]]+/, "; ", line)
-      line = normalize_cmdpos(line)
-    } while (line != prev)
-    if (hit || path_write(line)) {
+    # r23 red-team HIGH (r22 delta re-check): brace-comma expansion in an
+    # argument position (`export {PATH,x}=…`, `readonly {P,}ATH=…`,
+    # `let {PATH,x}=5`, `printf -v {P,}ATH`, `read {P,}ATH`, `mapfile -t
+    # {P,}ATH`) rebuilds the PATH token at run time; expand textually
+    # (bounded, depth 6 / 64 variants) and match each variant. A command-word
+    # brace-comma (`{h,}ash`) is NOT expanded this way by bash (the
+    # alternatives become separate arguments of the first word — runtime-probed
+    # ineffective), so this tooth only needs the argument-position class.
+    # Overflow refuses fail-closed.
+    expand_count = 0
+    expand_over = 0
+    nvar = split(expand_braces(line, 0), variants, "\n")
+    hit = expand_over
+    for (vi = 1; vi <= nvar; vi++) {
+      v = variants[vi]
+      do {
+        if (path_write(v)) hit = 1
+        prev = v
+        gsub(/(^|[;&|()!{}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", v)
+        gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^[:space:];&|]*[[:space:]]+/, "; ", v)
+        v = normalize_cmdpos(v)
+      } while (v != prev)
+      if (path_write(v)) hit = 1
+    }
+    if (hit) {
       print FILENAME ":" FNR ": command-position PATH write on the no-quote-strip view: " $0 > "/dev/stderr"
       bad = 1
     }
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a \`readonly\` declaration, a \`let\` arithmetic assignment, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref target, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
 else
-  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a \`readonly\` declaration, a \`let\` arithmetic assignment, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref target, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
@@ -7099,6 +7156,10 @@ fi
 if awk -v q="'" '
   {
     line = $0
+    # r23: same locale normalization as the cmdpos tooth (see there).
+    gsub(/\$\$/, "\001", line)
+    gsub(/\$"/, "", line)
+    gsub("\001", "$$", line)
     gsub(/"[^"]*"/, "", line)
     gsub(q "[^" q "]*" q, "", line)
     if (line ~ /(^|[^[:alnum:]_])PATH(\[[^]]*\])?\+?=/ ||
