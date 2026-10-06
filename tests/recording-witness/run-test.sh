@@ -6408,17 +6408,30 @@ then ok "empty cursor below: the non-filtering server is filtered client-side (s
 if python3 - "${WORK}/requests-159-below-nonfilter.log" <<'PY'
 import json
 import sys
+import urllib.parse
 
 entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-served = []
+below = "audit/20260925/"
+checked = 0
+served_seen = []
 for entry in entries:
     note = entry.get("note", "")
-    if "nonfiltering-prefixes=" in note:
-        served += note.split("nonfiltering-prefixes=", 1)[1].split(",")
-if "audit/20260925/" in served:
-    print("non-filtering server served the below-flat day prefix (mock pinned)")
-    sys.exit(0)
-print("SERVED %r" % served)
+    if "nonfiltering-prefixes=" not in note:
+        continue
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    start_after = query.get("start-after", [""])[0]
+    # Bind the pin to the request that discriminates: one whose start-after
+    # sorts ABOVE the below-flat prefix (a future extra delimiter listing
+    # with a low floor must not mask the regression; red-team r2b LOW).
+    if not start_after or start_after <= below:
+        continue
+    checked += 1
+    served = note.split("nonfiltering-prefixes=", 1)[1].split(",")
+    served_seen.append(served)
+    if below in served:
+        print("non-filtering server served the below-flat day prefix (mock pinned)")
+        sys.exit(0)
+print("checked=%d served=%r" % (checked, served_seen))
 sys.exit(1)
 PY
 then ok "empty cursor below: the mock really served the below-flat prefix (non-filtering pinned)"; else bad "empty cursor below non-filtering mock pin failed"; fi

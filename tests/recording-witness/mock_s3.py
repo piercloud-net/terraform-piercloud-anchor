@@ -397,8 +397,12 @@ class Handler(BaseHTTPRequestHandler):
             # CommonPrefixes include prefixes at/below start_after (derived
             # from the unfiltered pool). A harness tooth asserts this, so a
             # regression to the conformant branch cannot silently re-vacuum
-            # the client-floor-filter tooth (red-team r2 LOW).
-            served = sorted(name for name, kind, _obj in entries if kind == "prefix")
+            # the client-floor-filter tooth (red-team r2 LOW). Derive the
+            # list from the SERIALIZED page, not the pre-slice `entries`
+            # (red-team r2b LOW): a serialization-layer filter that drops the
+            # prefix from the response would otherwise leave the pin green
+            # while the response no longer carries it.
+            served = sorted(name for name, kind, _obj in page if kind == "prefix")
             note += " nonfiltering-prefixes=%s" % ",".join(served)
         self.record("GET", True, note)
         self.send_body(200, body)
