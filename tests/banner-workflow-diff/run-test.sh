@@ -18,8 +18,15 @@
 #       ::error:: on stderr, and NO count on stdout (a silent "0" would be a
 #       false UNCHANGED verdict);
 #   (d) a branch at the base tip -> count 0;
-#   (e) wiring: provision.yml carries the exact call and no fetch; ci.yml
-#       gates AND runs this harness (two separate pins).
+#   (g) a scripts/lib (sourced provisioning) change is counted (red-team r2);
+#   (h) a non-root cwd must not narrow the diff (:(top) pathspecs);
+#   (i) a missing remote-tracking ref refuses instead of dwim-resolving a tag
+#       literally named refs/remotes/origin/<base> (red-team r2);
+#   (j) a symlink in the counted set refuses (a target-only change would not
+#       appear in the diff) (red-team r2);
+#   (e) wiring: comment-proof pins for the exact call line, the sole COUNT
+#       assignment, the exact `-eq 0` comparison, a whitespace-tolerant
+#       no-fetch, and fetch-depth: 0; ci.yml gates AND runs this harness.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -57,6 +64,23 @@ printf '#!/usr/bin/env bash\necho branch\n' > .github/scripts/branch.sh
 git_c add -A
 git_c commit -qm "branch workflow + CI-script change"
 git_c push -q origin behind
+
+# A scripts/lib (sourced by provision.yml) change and a symlink-in-the-set
+# branch: both are counted-set teeth (red-team r2).
+git_c checkout -qb sourced main
+mkdir -p scripts/lib
+printf '#!/usr/bin/env bash\necho sourced\n' > scripts/lib/naming.sh
+git_c add -A
+git_c commit -qm "sourced provisioning script change"
+git_c push -q origin sourced
+
+git_c checkout -qb symlink main
+mkdir -p scripts/lib .github/scripts
+printf '#!/usr/bin/env bash\necho target\n' > scripts/lib/naming.sh
+ln -s ../../scripts/lib/naming.sh .github/scripts/link.sh
+git_c add -A
+git_c commit -qm "symlink in the counted set"
+git_c push -q origin symlink
 
 git_c checkout -q main
 printf 'name: moved\n' > .github/workflows/moved.yml
@@ -121,15 +145,74 @@ count="$(bash "$SCRIPT" main)" || rc=$?
 is "at tip: rc" "0" "$rc"
 is "at tip: count 0" "0" "$count"
 
+# --- (g) the sourced provisioning script is part of the counted set ---------
+# provision.yml sources scripts/lib/naming.sh (line 527): a change there must
+# move the verdict (red-team r2 MEDIUM).
+cd "$CLONE"
+git_c checkout -q sourced
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "sourced script: a scripts/lib change is counted" "1" "$count"
+is "sourced script: rc" "0" "$rc"
+
+# --- (h) cwd independence: a non-root cwd must not narrow the diff ----------
+# The wired caller runs at the workspace root; the pathspecs are :(top)-
+# anchored so any cwd sees the same set (functional r2 / red-team r2 LOW).
+git_c checkout -q behind
+rc=0
+count="$(cd "$CLONE/.github" && bash "$SCRIPT" main)" || rc=$?
+is "non-root cwd: count unchanged" "2" "$count"
+is "non-root cwd: rc" "0" "$rc"
+
+# --- (i) the exact remote-tracking ref is required (no tag dwim) ------------
+# With refs/remotes/origin/main deleted and a tag literally named
+# refs/remotes/origin/main present, merge-base dwim-resolves the tag; the
+# script must refuse loud instead (red-team r2 LOW).
+git_c update-ref -d refs/remotes/origin/main
+git_c tag refs/remotes/origin/main
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/dwim.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "missing remote-tracking ref: rc non-zero"; else bad "missing remote-tracking ref: rc=$rc"; fi
+is "missing remote-tracking ref: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/dwim.err"; then ok "missing remote-tracking ref: ::error:: annotation"; else bad "missing remote-tracking ref: no ::error::"; fi
+git_c tag -d refs/remotes/origin/main >/dev/null
+git_c fetch -q origin main
+
+# --- (j) a symlink in the counted set refuses -------------------------------
+# A symlink can point outside the counted set, so a target-only change would
+# not appear in the diff; refusing is the fail-closed answer (red-team r2).
+git_c checkout -q symlink
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/symlink.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "symlink in the counted set: rc non-zero"; else bad "symlink in the counted set: rc=$rc"; fi
+is "symlink in the counted set: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/symlink.err"; then ok "symlink in the counted set: ::error:: annotation"; else bad "symlink in the counted set: no ::error::"; fi
+git_c checkout -q behind
+
 # --- (e) wiring --------------------------------------------------------------
+# Comment-proof pins: a commented-out call line, a second `COUNT=` assignment,
+# a `-ge 0` comparison, a whitespace-variant `git  fetch`, or a shallow
+# checkout must redden (functional r1/r2, red-team r1/r2). Full-line and
+# inline comments are stripped first, so only ACTIVE code satisfies a pin.
 # The pins below are deliberately exact: a comment mentioning the script, the
 # `--depth 1` spelling, or one half of the ci.yml wiring must not satisfy them
 # (functional r1 LOWs / red-team r1 MEDIUM-LOW).
 PROV="$REPO_ROOT/.github/workflows/provision.yml"
 CI="$REPO_ROOT/.github/workflows/ci.yml"
-if grep -qF 'COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"' "$PROV"; then ok "provision.yml calls the diff script (exact call line)"; else bad "provision.yml does not call the diff script (exact call line)"; fi
-prov_code="$(grep -vE '^[[:space:]]*#' "$PROV" || true)"
-if grep -q 'git fetch' <<<"$prov_code"; then bad "provision.yml still carries a fetch"; else ok "provision.yml carries no fetch"; fi
+prov_active="$(sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]+#.*$//' "$PROV")"
+# The verdict pins are scoped to the banner step, so a `COUNT=` assignment in
+# another job (e.g. the DNS job's list_count) is neither counted nor
+# satisfying (red-team r2 MEDIUM).
+banner_step="$(awk '/- name: Approval card/{f=1} /- name: Record head SHA/{f=0} f' "$PROV")"
+banner_active="$(sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]+#.*$//' <<<"$banner_step")"
+if [ -n "$banner_step" ]; then ok "the banner step was located for the scoped pins"; else bad "the banner step was not located (pin scope lost)"; fi
+call_line='COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"'
+if [ "$(grep -cF "$call_line" <<<"$banner_active")" = "1" ]; then ok "the banner step calls the diff script (exact active call line)"; else bad "the banner step call line is missing, duplicated, or only commented"; fi
+if [ "$(grep -cE '^[[:space:]]*COUNT=' <<<"$banner_active")" = "1" ]; then ok "the script call is the only COUNT assignment in the banner step"; else bad "the banner step has extra or missing COUNT assignments"; fi
+if grep -qF '[ "$COUNT" -eq 0 ]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0"; else bad "the COUNT comparison is missing or widened"; fi
+if grep -qE 'git[[:space:]]+fetch' <<<"$prov_active"; then bad "provision.yml still carries a fetch"; else ok "provision.yml carries no fetch (whitespace-tolerant)"; fi
+if printf 'git  fetch origin main --depth=1\n' | grep -qE 'git[[:space:]]+fetch'; then ok "the no-fetch pin matches whitespace variants"; else bad "the no-fetch pin misses whitespace variants"; fi
+if grep -qF 'fetch-depth: 0' <<<"$prov_active"; then ok "provision.yml keeps the full-history checkout"; else bad "provision.yml lost fetch-depth: 0"; fi
 if grep -qF 'tests/(banner-workflow-diff|' "$CI"; then ok "ci.yml path gate includes the harness"; else bad "ci.yml path gate does not include the harness"; fi
 if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml run list includes the harness"; else bad "ci.yml run list does not include the harness"; fi
 

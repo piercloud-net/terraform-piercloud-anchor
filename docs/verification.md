@@ -87,7 +87,7 @@ Live proof means running the real flow against a real anchor and capturing the a
 
 ### Banner / CI-workflow change (`.github/scripts/banner-workflow-diff.sh`, workflow steps)
 
-- [ ] CI green; `tests/banner-workflow-diff/run-test.sh` runs the real shipped script against synthetic behind-main / grafted / unrelated-history / tag-shadowed repositories and pins the `provision.yml` call + no-fetch and the `ci.yml` gate + run list.
+- [ ] CI green; `tests/banner-workflow-diff/run-test.sh` runs the real shipped script against synthetic behind-main / grafted / unrelated-history / tag-shadowed / sourced-script / symlink repositories and pins the `provision.yml` call + sole-COUNT + exact `-eq 0` + whitespace-tolerant no-fetch + `fetch-depth: 0` and the `ci.yml` gate + run list.
 - [ ] A real `provision.yml` dispatch from a behind-main branch carrying the fix (a scratch branch based below `main`) renders the approval card instead of dying with exit 128 — capture the banner job log (the card + count) and cancel the run after the banner job; no provisioning behaviour changed, and the banner job needs no device approval.
 - [ ] No live `mode=apply` unless provisioning behaviour changed; say that explicitly in the PR.
 
