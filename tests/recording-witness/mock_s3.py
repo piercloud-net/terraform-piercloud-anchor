@@ -421,7 +421,10 @@ class Handler(BaseHTTPRequestHandler):
                     if field.tag.rsplit("}", 1)[-1] == "Prefix":
                         served.append(field.text or "")
             served.sort()
-            note += " nonfiltering-prefixes=%s" % ",".join(served)
+            # JSON, not a comma join (red-team r2f LOW): a served prefix may
+            # itself contain a comma, so a comma-joined note could forge the
+            # exact below-flat marker while the wire carried only a variant.
+            note += " nonfiltering-prefixes=%s" % json.dumps(served)
         self.record("GET", True, note)
         self.send_body(200, body)
 

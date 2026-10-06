@@ -6426,7 +6426,9 @@ for entry in entries:
     if not start_after or start_after <= below:
         continue
     checked += 1
-    served = note.split("nonfiltering-prefixes=", 1)[1].split(",")
+    # JSON-encoded served list (red-team r2f LOW): a comma join let a
+    # comma-bearing prefix forge the exact below-flat marker.
+    served = json.loads(note.split("nonfiltering-prefixes=", 1)[1])
     served_seen.append(served)
     if below in served:
         print("non-filtering server served the below-flat day prefix (mock pinned)")
