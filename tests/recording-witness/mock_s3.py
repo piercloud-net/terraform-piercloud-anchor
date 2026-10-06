@@ -3,7 +3,7 @@
 
 Serves only the three list operations the witness may use:
 
-    GET /<bucket>?list-type=2&prefix=... [&continuation-token=...]
+    GET /<bucket>?list-type=2&prefix=... [&start-after=...] [&continuation-token=...]
     GET /<bucket>?versions&prefix=... [&key-marker=...&version-id-marker=...]
     GET /<bucket>?uploads[&prefix=...] [&key-marker=...&upload-id-marker=...]
 
@@ -26,6 +26,9 @@ The fixture is JSON:
       "fail_versions": null | "denied" | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
       "versions_ignore_prefix": true,     # optional; serve every version entry
                                           # for any prefix (nonconformant server)
+      "objects_ignore_start_after": true, # optional; ignore start-after and serve
+                                          # keys at/below the cursor (nonconformant
+                                          # server; a delta must fail closed)
       "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
                                           # version listings while keeping the
                                           # Next* markers on truncated pages
@@ -62,6 +65,7 @@ from urllib.parse import parse_qs, urlsplit
 FIXTURE = {}
 REQUEST_LOG = ""
 PAGE_SIZE = 1000
+CLOSED_REQUESTS = 0
 
 
 def xml_escape(value):
@@ -199,6 +203,15 @@ class Handler(BaseHTTPRequestHandler):
             self.record("GET", False, "fixture failure mode")
             self.send_body(500, "<Error><Code>InternalError</Code></Error>")
             return
+        # Stale-pooled-connection fixture: drop the connection without a
+        # response for the first N list GETs, so the witness's one bounded
+        # reconnect + re-send is exercised end to end.
+        global CLOSED_REQUESTS
+        if CLOSED_REQUESTS < int(FIXTURE.get("close_first_list_requests", 0) or 0):
+            CLOSED_REQUESTS += 1
+            self.record("GET", False, "fixture: closed the connection without a response (stale-pool retry)")
+            self.close_connection = True
+            return
         kind = "objects" if query.get("list-type") == ["2"] else (
             "versions" if "versions" in query else ("uploads" if "uploads" in query else ""))
         failure = FIXTURE.get("fail_%s" % kind, "") if kind else ""
@@ -243,11 +256,17 @@ class Handler(BaseHTTPRequestHandler):
     def handle_objects(self, query):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
+        start_after = query.get("start-after", [""])[0]
         now = time.time()
         offset = int(token) if token.isdigit() else 0
         matching = [
             obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
         ]
+        # `start-after` is exclusive and seeds the first page only (real B2
+        # semantics, live-verified): a windowed seed lists the tail, and a
+        # continuation token resumes from the same filtered list.
+        if start_after and not FIXTURE.get("objects_ignore_start_after"):
+            matching = [obj for obj in matching if obj["key"] > start_after]
         # Real S3/B2 lists ascending by key. A fixture can opt into fixture
         # order to pin that the witness verdict is independent of the order
         # the listing returns (e.g. `.shell` before `.exec` at the same ts, or
