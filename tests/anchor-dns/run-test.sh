@@ -257,7 +257,7 @@ lacks "no status record was written on the CF path" "status" "$(jq -r 'keys | jo
 # ---- static wiring ---------------------------------------------------------
 contains "provision.yml passes GCORE_DNS_TOKEN" 'GCORE_DNS_TOKEN: ${{ secrets.GCORE_DNS_TOKEN }}' "$(cat "$PROV")"
 contains "provision.yml passes the provider switch" 'NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}' "$(cat "$PROV")"
-lacks "gcore boolean read never uses // empty" ".enabled // empty" "$(cat "$SCRIPT")"
+lacks "gcore boolean read never uses the jq alternative on enabled" ".enabled //" "$(cat "$SCRIPT")"
 contains "gcore boolean read uses tostring" ".enabled | tostring" "$(cat "$SCRIPT")"
 contains "anchor TTL constant documented" "ANCHOR_TTL=300" "$(cat "$SCRIPT")"
 
