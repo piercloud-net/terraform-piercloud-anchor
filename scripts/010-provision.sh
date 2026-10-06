@@ -722,7 +722,7 @@ assert_no_key_leak() {
   done < <(compgen -G "${TANG_KEYS_DIR}/*.jwk" || true)
   if [ "${leaked}" -eq 1 ]; then
     die "tang key material matched a terraform state/plan file in $(pwd). \
-This violates the module's hard invariant #1 (tang keys never enter tf state). \
+This violates the module's hard invariant 1 (tang keys never enter tf state). \
 Do NOT apply that configuration; investigate before proceeding."
   fi
   log "Key-leak assertion: tang key material NOT present in terraform state files (OK)"
@@ -1579,7 +1579,9 @@ SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
 # line. The witness is list-only and cannot see bytes, so a variant is the
 # SAME event identity as its base key, re-shipped under a disambiguated name:
 # canonicalize the type and count the (ts, type, seq) identity once per session.
-CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}$")
+# Anchoring is hygiene only here: the input is the newline-free etype capture,
+# never a raw key name.
+CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}\Z")
 # The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): a finding
 # signature exactly as emitted in state.json. \A/\Z is a FULL-string match -
 # Python's `$` also matches before a trailing newline, which would accept a
@@ -3887,12 +3889,41 @@ recording_witness_service_drained() { # no witness invocation in flight right no
 }
 
 recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation to finish
+  # 3600s, not 100s: a witness run re-lists both watched prefixes in full
+  # (objects + versions + multipart), so its duration grows with the bucket
+  # (~48k audit objects on 2026-09-30; historical install->verdict phases at
+  # ~3.5k keys took 80-182s and no on-box measurement exists at the current
+  # size) and the old 100s bound failed a healthy in-flight run closed on
+  # every dispatch (runs 36658506403/36662210599/36662866976). The bound is a
+  # cap above every plausible run, not added latency: a drain normally returns
+  # as soon as the in-flight run ends. Issue #153 cuts the per-run listing
+  # cost (delta listings + slower full sweeps) and can shrink the bound again.
+  # The drain sleep is `/usr/bin/env sleep 1`, not a bare `sleep 1` and not
+  # `command sleep 1`: `/usr/bin/env` is called by absolute path, so function
+  # and alias lookup cannot shadow `env` itself, and it execs the real sleep
+  # binary, so a definition named after the sleep utility — or after
+  # `command`/`builtin`/`env`, the names an earlier `command sleep 1` fix left
+  # shadowable — whatever its body spelling — `{ … }`, `( : )`, `(( 0 ))`,
+  # `if …; then …; fi`, … — cannot turn the loop into a busy poll and
+  # collapse the 3600s bound. r9 red-team HIGH: a crafted compound-bodied
+  # `sleep` definition before this span ran the harness 535/0 while all 3600
+  # calls no-opped and the bound collapsed to ~2s; `command sleep 1` closed
+  # that spelling chase but `command` is not a special builtin, so a crafted
+  # `command () { :; }` collapsed it identically (0.000s) and `builtin`
+  # shadows the same way. PATH lookup of `sleep` is preserved (`/usr/bin/env`
+  # resolves it through PATH), so the harness's fake-sleep seam still counts
+  # and interleaves the calls; a PATH-prepended shadow binary is refused by
+  # the harness teeth (r13: no `PATH` assignment/export/unset, no
+  # command-position `builtin`/`enable`/`trap`/`hash`, no `$'` quoting in
+  # code), which are a regression detector for the pinned source, not a
+  # sandbox; definition-shaped text for sleep/command/builtin/env is refused
+  # too, defense-in-depth.
   local attempt active
   for ((attempt = 0; attempt < 3600; attempt++)); do
     if recording_witness_service_drained; then
       return 0
     fi
-    sleep 1
+    /usr/bin/env sleep 1
   done
   active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
   die "witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"

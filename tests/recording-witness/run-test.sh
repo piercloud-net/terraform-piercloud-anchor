@@ -185,11 +185,11 @@ fail=0
 # Check-count floor: pinned to the real count so a removed tooth (or a suite
 # that stops running scenarios) fails loudly instead of shrinking silently.
 # Bump it with every intended check. The shellcheck lint tooth is skipped when
-# shellcheck is absent (a local run without it must not fail the full floor;
+# it is absent (a local run without it must not fail the full floor;
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=816
+MIN_CHECKS=842
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -1941,6 +1941,106 @@ run_case
 is "unknown audit key shape -> exit 1" "1" "${CASE_RC}"
 is "unknown audit key shape -> alert" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *contract-mismatch*) ok "contract-mismatch is reachable with a heartbeat present" ;; *) bad "contract-mismatch detail: ${CASE_DETAIL}" ;; esac
+
+# ---- trailing-newline key names: \Z-anchored key classifiers (#152) -------
+# The provisioned span's key classifiers are \Z-anchored (full string), so a
+# newline-suffixed key name is judged as drift instead of being absorbed as
+# its non-newline shape. pc-admin #20 \Z-anchors the builder, so the real
+# producer cannot emit these names - the teeth are the anti-regression proof
+# for the anchored span (a `$` reversion turns them green/misclassified).
+NEWLINE_USER_KEY="$(key user.login 20260925T135000Z "" 6)"$'\n'
+python3 - "${NEWLINE_USER_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+        {"key": sys.argv[1], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed user.login key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed user.login key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *contract-mismatch*) ok "newline-suffixed user.login key alerts contract-mismatch" ;; *) bad "newline-suffixed user.login detail: ${CASE_DETAIL}" ;; esac
+
+NEWLINE_SESSION_KEY="$(key session.start 20260925T135000Z "${SID}" 1 shell)"$'\n'
+python3 - "${NEWLINE_SESSION_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+        {"key": sys.argv[1], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed session.start key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed session.start key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "newline-suffixed session.start key alerts naming-contract" ;; *) bad "newline-suffixed session.start detail: ${CASE_DETAIL}" ;; esac
+
+# A newline-suffixed recording key never matches the recording check, so it
+# cannot satisfy the shell session's gap: the session still alerts
+# recording-gap (with `$` the tar is absorbed and this fixture stays green).
+NEWLINE_GAP_START="$(key session.start 20260925T130000Z "${SID}" 1 shell)"
+NEWLINE_TAR_KEY="recordings/${SID}.tar"$'\n'
+python3 - "${NEWLINE_GAP_START}" "${NEWLINE_TAR_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45},
+        {"key": sys.argv[1], "ago": 1200},
+        {"key": sys.argv[2], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed recording key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed recording key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *recording-gap*) ok "newline-suffixed tar never satisfies the recording check (recording-gap)" ;; *) bad "newline-suffixed tar detail: ${CASE_DETAIL}" ;; esac
+
+# A newline-suffixed heartbeat key is not a heartbeat: it must not match
+# HEARTBEAT_KEY_RE, so the only heartbeat-shaped object can neither satisfy
+# the freshness check (head detail carries `heartbeat-missing: ...` first)
+# nor dodge drift classification (`contract-mismatch: ...` second). With `$`
+# the key is absorbed as a healthy heartbeat (age 300s) and this fixture stays
+# green: this tooth is what pins HEARTBEAT_KEY_RE's \Z.
+NEWLINE_HEARTBEAT_KEY="audit/heartbeat/20260925T140000Z.json"$'\n'
+python3 - "${NEWLINE_HEARTBEAT_KEY}" <<'PY' | fixture
+import json
+import sys
+
+print(json.dumps({
+    "bucket": "pc-admin-dr",
+    "objects": [
+        {"key": sys.argv[1], "ago": 300},
+    ],
+    "uploads": [],
+}))
+PY
+start_mock
+run_case
+is "newline-suffixed heartbeat key -> exit 1" "1" "${CASE_RC}"
+is "newline-suffixed heartbeat key -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *contract-mismatch*) ok "newline-suffixed heartbeat key alerts contract-mismatch" ;; *) bad "newline-suffixed heartbeat key detail: ${CASE_DETAIL}" ;; esac
+
+# The fifth anchored classifier, CONFLICT_SUFFIX_RE, is provably inert and
+# needs no tooth: its only input is the newline-free `etype` capture from the
+# already-\Z-anchored key classifiers, never a raw key name.
 
 # ---- clock skew: future timestamps must error, never look healthy --------
 
@@ -5605,12 +5705,13 @@ esac
 exit 0
 FAKE
 chmod +x "${FAKEBIN}/systemctl"
-# The drain-bound tooth drives all 100 wait-idle polls; FAKE_SLEEP_NOWAIT
+# The drain-bound tooth drives all 3600 wait-idle polls; FAKE_SLEEP_NOWAIT
 # removes the wall-clock cost while keeping the iteration count (and with it
 # the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
-# the sleep count and its argument (`sleep 1`) so a bound regression that
-# keeps the poll count (a deleted `sleep 1`, a shorter sleep, fewer iterations
-# with an early break) still fails. Every other test sleeps for real.
+# the sleep count and its argument (`1`; the `/usr/bin/env` shape is pinned
+# statically by the drain-loop tooth) so a bound regression that keeps the
+# poll count (a deleted `/usr/bin/env sleep 1`, a shortened sleep, fewer
+# iterations with an early break) still fails. Every other test sleeps for real.
 cat >"${FAKEBIN}/sleep" <<'FAKESLEEP'
 #!/usr/bin/env bash
 if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ]; then
@@ -5919,6 +6020,39 @@ esac
 is "run-once: drained the unit (active poll then inactive) before starting" "2" "$(cat "${WORK}/active-polls")"
 unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 
+# Red-team LOW: the drain matcher's state set was unpinned — adding
+# `activating` (the in-flight oneshot state) or dropping `failed` (the
+# post-alert/error oneshot state) kept every check green. Pin both ends
+# directly against the sourced span function and the fake systemctl.
+# Red-team LOW (round 2): the set was still open — adding `deactivating` (a
+# stop still winding down) or `reloading` (a reload in progress) also kept
+# the suite green, so those two must-not-drain states are pinned the same way.
+export FAKE_ACTIVE_STATE=activating
+if recording_witness_service_drained; then
+  bad "run-once: \`activating\` must not count as drained (issue #143)"
+else
+  ok "run-once: \`activating\` (in-flight oneshot) does not count as drained (issue #143)"
+fi
+export FAKE_ACTIVE_STATE=failed
+if recording_witness_service_drained; then
+  ok "run-once: \`failed\` (post-alert/error oneshot) counts as drained (issue #143)"
+else
+  bad "run-once: \`failed\` must count as drained or every post-alert dispatch burns the bound (issue #143)"
+fi
+export FAKE_ACTIVE_STATE=deactivating
+if recording_witness_service_drained; then
+  bad "run-once: \`deactivating\` must not count as drained (issue #143)"
+else
+  ok "run-once: \`deactivating\` (a stop still winding down) does not count as drained (issue #143)"
+fi
+export FAKE_ACTIVE_STATE=reloading
+if recording_witness_service_drained; then
+  bad "run-once: \`reloading\` must not count as drained (issue #143)"
+else
+  ok "run-once: \`reloading\` (a reload in progress) does not count as drained (issue #143)"
+fi
+unset FAKE_ACTIVE_STATE
+
 # Retry/drain bound (red-team INFO-2): a unit that never reports drained must
 # die fail-closed at the bounded 3600-poll wait BEFORE any `systemctl start` —
 # zero starts for this pre-start drain, never a start-then-retry loop (the
@@ -5936,17 +6070,26 @@ unset FAKE_ACTIVE_POLL_FILE FAKE_SERVICE_ACTIVE_POLLS
 # see N-1 sleeps) fails a loop whose sleeps are moved out of the poll body
 # (a busy poll with identical counters), and two static teeth pin the
 # executed drain sleep (the last statement before the loop's `done` must be
-# a foreground `sleep 1` — catches a backgrounded or shortened sleep — and
-# no `sleep` function may shadow it). A regression that
+# a foreground `/usr/bin/env sleep 1` — catches a backgrounded or shortened
+# sleep or a reverted absolute path — and no sleep/command/builtin/env
+# definition may exist: the absolute `/usr/bin/env` cannot itself be
+# shadowed and execs the real sleep, so the bound survives any shadow
+# spelling).
+# A regression that
 # starts before the drain, or retries beyond the bound, moves the start
 # counter off 0; one that loops without the bound hangs this check instead of
 # failing it.
 # The 3600-iteration drain wait forks the fake scripts 7200 times, which
-# dominates the suite runtime; the same counting/serving logic as bash
-# FUNCTIONS keeps the iteration, count, argument and interleaving proofs
-# intact without the process spawn cost. Only ActiveState is served (the
-# only call the wait makes); every other subcommand delegates to the fake
-# script on PATH. Unset after the tooth so the other tests use the script.
+# dominates the suite runtime. The drain sleep is `/usr/bin/env sleep 1`
+# (the #143 hardening), and `/usr/bin/env` resolves `sleep` through PATH, so
+# the `sleep()` function below is BYPASSED for the drain path — the
+# `${FAKEBIN}/sleep` script carries the iteration/count/argument/interleaving
+# teeth (and the 7200 forks remain; the absolute-path call is a shadowing
+# defence, not a spawn optimisation). The function stays for any direct
+# `sleep` call in sourced code. The `systemctl()` function serves only
+# ActiveState (the only call the wait makes); every other subcommand
+# delegates to the fake script on PATH. Unset after the tooth so the other
+# tests use the script.
 sleep() {
   if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ]; then
     seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
@@ -6010,8 +6153,8 @@ is "run-once: a non-draining unit performed 0 starts" "0" "$(cat "${WORK}/no-dra
 is "run-once: a non-draining unit polls the bounded 3600-iteration wait (3600 + the final read)" "3601" "$(cat "${WORK}/no-drain-polls")"
 is "run-once: a non-draining unit sleeps the bounded 3600 iterations" "3600" "$(cat "${WORK}/no-drain-sleeps")"
 is "run-once: every drain sleep waits the pinned 1 s" "1" "$(sort -u "${WORK}/no-drain-sleep-args")"
-# Issue #143 red-team F1: poll N must observe N-1 sleeps (0..100 for the
-# shipped loop; the die path's final ActiveState read is poll 101). Moving
+# Issue #143 red-team F1: poll N must observe N-1 sleeps (0..3600 for the
+# shipped loop; the die path's final ActiveState read is poll 3601). Moving
 # the sleeps out of the poll body keeps every volume counter green but
 # collapses the bounded wait to a busy poll — this fails it.
 if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
@@ -6019,21 +6162,241 @@ if awk 'NR - 1 != $1 { exit 1 }' "${WORK}/no-drain-poll-sleeps"; then
 else
   bad "run-once: drain polls and sleeps are not interleaved (issue #143): $(tr '\n' ' ' <"${WORK}/no-drain-poll-sleeps")"
 fi
-# Issue #143 red-team F2 (+ rounds 4-6 F1): counters cannot prove the sleep
-# blocks — a backgrounded `sleep 1 &` keeps them all green while the bounded
-# wait stops waiting, and a bare `sleep 1` elsewhere keeps a presence-only
-# tooth green while the executed loop sleep is shortened (`timeout 0.5 sleep
-# 1`) or shadowed by a `sleep` function. Pin the executed line: the drain
-# loop (the `for ((attempt...))` header) must end — at depth 0, so nested
-# decoy loops cannot latch — in a foreground `sleep 1` (a trailing comment is
-# fine); and no `sleep` function may exist in plain code (`sleep()` or
-# `function sleep`, same-line or brace-on-next-line; comments and quoted
-# spans ignored). Residual (intentional-crafting class, disclosed): `eval`/
-# `alias`+`expand_aliases`/sourced-file shadows and blocking-equivalent loop
-# forms are not detected (fail-closed by design).
+# Issue #143 red-team F2 (+ rounds 4-6 F1, r6 F1/F2): counters cannot prove
+# the sleep blocks — a backgrounded `sleep 1 &` keeps them all green while
+# the bounded wait stops waiting, and a bare `sleep 1` elsewhere keeps a
+# presence-only tooth green while the executed loop sleep is shortened
+# (`timeout 0.5 sleep 1`) or shadowed by a `sleep` function. Pin the executed
+# line: the drain loop (the `for ((attempt...))` header) must end — at depth
+# 0, so nested decoy loops cannot latch — in a foreground `/usr/bin/env sleep 1`
+# (a trailing comment is fine); exactly one such header may match — a second
+# exact header (a decoy loop after the real one) fails instead of overwriting
+# the remembered body — and the executed drain loop must be the only C-style
+# `for ((` loop in the script (r4 red-team mutF: a respelled executed header
+# plus a sacrificial exact-header decoy otherwise nullifies the exactly-one
+# rule while the unscanned respelled loop carries the clock early-exit; r5
+# red-team candB: a same-line prefix — `:; for (( …` — is matched by the
+# non-anchored alternation; r5 candA/candC: `for \` + newline + `(( …`, or
+# the mid-token `fo\` + newline + `r (( …`, lets bash form the loop while the
+# line-based scan sees neither half) — and no `sleep` definition may exist in
+# any body form (r9 red-team HIGH: a compound-bodied `sleep () ( : )` before
+# the witness span ran the whole suite 535/0 while every drain call no-opped
+# and the 3600s bound collapsed to ~2s; the old tooth only matched `{`-body
+# forms; r10 broadened the same any-body refusal to `systemctl` and made a
+# non-identifier `function`-keyword name fail — see below), on both the raw
+# and the continuation-joined view.
+#
+# r6 red-team F1/F2 + r7 trust HIGH: the old continuation tooth scanned a
+# wait-idle span extracted by the first column-0 `}`; a multi-line quoted
+# string could close that span early (a quoted `}` line) and the opener regex
+# missed valid bash spellings (`name () {`, `function name {`, indented), so
+# a split `for \` + `(( …` header could hide between lines while both count
+# teeth stayed green (533/0 with the bound collapsed to 300s). Both teeth
+# (and the sleep-shadow tooth) now run against a continuation-joined copy:
+# the join is quote/comment-state aware (single/double quotes persist across
+# lines; `#` starts a comment only at a word boundary), so a real
+# continuation joins into the counted forms, while a backslash that is NOT a
+# bash continuation (comment, single-quoted, escaped) does not merge — a
+# naive text join merged `# comment \` with the next (executed) line into
+# one comment line every scanner skips (the r7 trust HIGH), so any such
+# trailing backslash fails the check fail-closed instead. No wait-idle span
+# extraction remains (the marker-span extraction for the install span is
+# unrelated). r9 red-team HIGH: a compound-bodied command definition named
+# after the sleep utility evaded the old brace-body tooth (535/0 while the
+# drain bound collapsed to ~2s). The drain loop calls `/usr/bin/env sleep 1`:
+# `/usr/bin/env` at an absolute path cannot itself be function/alias-shadowed
+# and execs the real sleep binary, so the bound's wall clock is immune to ANY
+# shadow spelling of sleep, command, builtin or env — the first r9 fold's
+# `command sleep 1` was bypassable (`command` is not a special builtin; a
+# `command () { :; }` definition made `command sleep 0.2` return in 0.000s) —
+# while the broadened static tooth refuses definition-shaped text for those
+# names outright (any body form, both the raw and joined views).
+#
+# r10 red-team: the crafted-definition class is a regression detector for the
+# drain path's FINITE NAME SURFACE, not a sandbox. The surface: the helpers
+# `recording_witness_service_drained` and `recording_witness_wait_idle`, the
+# fail-closed `die`, the `systemctl` query inside the check (and its at-bound
+# repeat), the `/usr/bin/env sleep` loop sleep, and the loop/builtins.
+# Reproduced misses, each suite-green before this fold: a `function
+# /usr/bin/env { :; }` (or `function /bin/sleep { :; }`) path-name keyword
+# definition shadowed the absolute-path invocation — the POSIX `/usr/bin/env
+# ()` form was already caught by the basename pattern, the keyword form was
+# not; a second `recording_witness_service_drained`, a `systemctl` function
+# lying about ActiveState, a second `recording_witness_wait_idle`, and a
+# `die () { :; }` override each neutralized one link of the drain path
+# (fail-open at poll 0, or a silenced at-bound abort) while every static
+# tooth stayed green. The closure: (1) a `function <name>` definition must
+# carry a plain identifier name (`[A-Za-z_][A-Za-z0-9_]*`) — a decorated path
+# name fails; (2) `systemctl` definitions are refused outright (the script
+# only ever invokes it), like the existing sleep/command/builtin/env names;
+# (3) each of the three drain-path functions — `die` included — is pinned to
+# EXACTLY ONE definition on both views: a second definition anywhere in the
+# script fails. The real script's single definitions and every invocation
+# stay green.
+#
+# r13 red-team: three HIGHs plus a MED stayed suite-green (538/0) while the
+# on-box arm failed open. (1) `x=; h${x}ash -p /usr/bin/true systemctl`
+# rebuilt the `hash` token with a parameter expansion; the joined view kept
+# `h{x}ash` (it stripped only `$`), so the command-position match missed.
+# (2) `enable -n exit` (with a `command_not_found_handle` definition)
+# disabled the `exit` builtin, so the at-bound `die`'s `exit 1` hit the
+# handler and returned 0; `builtin enable -n exit` is the same. (3)
+# `trap 'exit 0' EXIT` rewrote the process rc. (4) a PATH-prepended shadow
+# `systemctl` misreported state; the r12 wording claimed that needs a
+# root-level PATH write — false, the script edits itself as root. The
+# closure: strip parameter expansions (`${...}` and `$name`) from the joined
+# view before the command-position match (`h${x}ash` -> `hash`), add `!` to
+# the command-position class, refuse ANSI-C `$'` quoting in code (0
+# occurrences in the script), refuse command-position `builtin`/`enable`/
+# `trap` invocations (the script's only `enable` occurrences are `systemctl
+# enable --now …` subcommands), add `command_not_found_handle` to the
+# refused-definition name set, and refuse `PATH=`/`PATH+=`/`export PATH`/
+# `unset PATH` in code (0 occurrences). Each refusal is a deliberate
+# over-refusal: the shipped script never uses these forms.
+#
+# r14 red-team/functional: every closure above (and the r7/r8 definition
+# scan) stripped comments with a per-line `sub(/[[:space:]]#.*$/, …)` BEFORE
+# its quote handling, so a `#` inside a quoted span (`echo " # " ; <payload>`)
+# truncated the scanned view and the payload became invisible — six repros,
+# each suite-green with the payload executing on-box: a parameter-rebuilt
+# `h${x}ash`, an ANSI-C `$'\x68…'`, a command-position `builtin … hash`,
+# `trap 'exit 0' EXIT`, `enable -n exit`, `PATH="/tmp/shad:${PATH}"`; the
+# command-position class also missed the reserved-word separators (`if true;
+# then trap …; fi`, `{ trap …; }`, `time trap …`, `if true; then h${x}ash …;
+# fi`), a brace-sequence spelling (`{h..h}ash -p …`) slipped past the
+# literal-token match, the quote-blind `line` view falsely refused the shipped
+# prose (`log "PATH=${PATH}"`, `log "export PATH and unset PATH here"`), and
+# the PATH tooth missed the builtin assignment forms (`printf -v PATH …`,
+# `read -r PATH …`). The closure: the join scanner now also emits a
+# quote-aware-comment-stripped continuation-joined copy (`PROVISION_CODE`)
+# and the closure teeth read it instead of re-stripping comments; the
+# command-position match is preceded by a reserved-word normalizer
+# (`then`/`do`/`else`/`elif`/`time`/`{`/`}` rewritten to `;`, iterated); any
+# brace sequence (`{…..…}`) in code is refused (the script has zero); the
+# PATH tooth strips quoted spans (so quoted prose stays green) and also
+# refuses `printf -v PATH` / `read … PATH`; the ANSI-C refusal now sees a
+# `$'` even behind a quoted `#` decoy. Deliberate over-refusals: the
+# reserved-word normalizer and the brace-sequence refusal (fail-closed; the
+# shipped script uses neither form).
+#
+# Boundary (disclosed): the teeth are a regression detector for the drain
+# path's pinned source (any definition of the utilities/builtins
+# sleep/command/builtin/env/systemctl and of the rc-path exit/return plus
+# printf/local/true plus the `command_not_found_handle` hook; `die` plus the
+# two drain-path helpers pinned to a single definition occurrence each, with
+# the `die` definition pinned to the EXACT shipped line — a dead, quoted,
+# subshell or multiline rewrite fails closed; the
+# `recording_witness_service_drained` body and the at-bound `die`
+# invocation pinned to the shipped source lines; `hash` refused as a word and
+# in the quote-joined/expansion-stripped view at a command position,
+# including `builtin`/`command hash`, and any brace sequence
+# (`{…..…}`) refused; command-position `builtin`/`enable`/`trap` invocations
+# refused after the reserved-word normalizer
+# (`then`/`do`/`else`/`elif`/`time`/`{`/`}`); `PATH` assignment/export/unset
+# plus the builtin assignment forms `printf -v PATH` / `read … PATH` refused;
+# any ANSI-C `$'` quoting in code refused; non-identifier `function` names) —
+# the comment-stripping teeth read a quote-aware-comment-stripped
+# continuation-joined view, so a `#` inside a quoted span cannot truncate the
+# scan; not a sandbox: an adversary who can edit the provision script can
+# also edit
+# this harness, so crafted edits outside that pinned source (and harness
+# self-edits) are out of scope by construction. Deliberate over-refusals
+# (fail-closed): a `die` spelling that deviates from the exact shipped line
+# (`exit "1"`, multiline, tab-indented), any `hash` spelling at a command
+# position, any `$'` quoting in code, any brace sequence in code, and any
+# `PATH` assignment/export/unset (incl. `printf -v PATH`/`read … PATH`).
+# Residual (intentional-crafting class, disclosed): a dynamically constructed
+# `eval`/`alias`+`expand_aliases`/sourced shadow is not statically detectable
+# — behaviorally neutralized by the absolute `/usr/bin/env` for the drain
+# sleep — a command-substitution-rebuilt word (`ha$(printf s)h -p …`) and a
+# refused word rebuilt from a non-empty parameter expansion (`${x:-a}`) are
+# not statically resolvable and stay in the crafted-edit class,
+# blocking-equivalent loop forms stay heuristic (state pins + on-box
+# wall-clock backstop), and any other such crafted edit outside the pinned
+# source is out of scope by construction.
+PROVISION_JOINED="${WORK}/provision-joined.sh"
+PROVISION_CODE="${WORK}/provision-code.sh"
+# The same scanner also emits a comment-stripped copy (`PROVISION_CODE`):
+# r14 red-team/functional HIGH — a `#` inside a quoted span (`echo " # " ;
+# <payload>`) made the per-tooth `sub(/[[:space:]]#.*$/, …)` truncate the
+# scanned view before the closure transforms, so a parameter-expansion-
+# rebuilt `hash`, an ANSI-C `$'…'`, a command-position `builtin`/`enable`/
+# `trap` or a `PATH=` assignment after the decoy was invisible while the
+# payload executed on-box. The scanner already tracks quote state (single/
+# double/ANSI-C) for the continuation decision, so it also records where a
+# true comment starts and emits the quote-aware-comment-stripped, still
+# continuation-joined copy; the closure teeth below read it instead of
+# re-stripping comments naively.
+if awk -v q="'" -v code_out="${PROVISION_CODE}" '
+  {
+    line = $0
+    n = length(line)
+    esc = 0
+    com_at = 0
+    for (i = 1; i <= n; i++) {
+      c = substr(line, i, 1)
+      if (com) break
+      if (sq) { if (c == q) sq = 0; continue }
+      if (dq) {
+        if (esc) { esc = 0; continue }
+        if (c == "\\") { esc = 1; continue }
+        if (c == "\"") { dq = 0; continue }
+        continue
+      }
+      if (ansic) {
+        if (esc) { esc = 0; continue }
+        if (c == "\\") { esc = 1; continue }
+        if (c == q) { ansic = 0; continue }
+        continue
+      }
+      if (esc) { esc = 0; continue }
+      if (c == "\\") { esc = 1; continue }
+      if (c == "$" && substr(line, i+1, 1) == q) { ansic = 1; i++; continue }
+      if (c == q) { sq = 1; continue }
+      if (c == "\"") { dq = 1; continue }
+      if (c == "#" && (i == 1 || substr(line, i-1, 1) ~ /[[:space:];&|()]/)) { com = 1; com_at = i; break }
+    }
+    code_line = (com_at > 0) ? substr(line, 1, com_at-1) : line
+    cont = (esc == 1 && !com && !sq)
+    if (cont) {
+      printf "%s", substr(line, 1, n-1)
+      printf "%s", substr(code_line, 1, n-1) > code_out
+    } else {
+      print
+      print code_line > code_out
+      if (n > 0 && substr(line, n, 1) == "\\") {
+        print "trailing backslash at line " NR " is not a bash continuation (comment, single-quoted, or escaped) — refused fail-closed" > "/dev/stderr"
+        bad = 1
+      }
+    }
+    com = 0
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION}" >"${PROVISION_JOINED}"; then
+  ok "run-once: the joined view consumes every real continuation (no comment/quoted trailing backslash; the quote-aware-comment-stripped code view is emitted)"
+else
+  bad "run-once: a trailing backslash is not a bash continuation (comment/single-quoted/escaped) — refused fail-closed (issue #143)"
+fi
+# r8 red-team HIGH: a comment ends at the physical newline, so `# … \` does
+# not continue — the next line executes. Any line with a `#` before a
+# trailing backslash is refused fail-closed REGARDLESS of quote state: this
+# is the lexer-independent guard against a crafted quote-state desync (the
+# r8 `$'a\'"'` line flipped the join into a permanent double-quote state and
+# merged an executed line into a comment). The one legitimate occurrence (a
+# `#` inside the multi-line die string) was reworded away; the over-refusal
+# (a `#` inside any string/heredoc before a trailing backslash) is deliberate.
+if awk '/#.*\\[[:space:]]*$/ { print "line " NR " has a # before a trailing backslash — refused fail-closed" > "/dev/stderr"; bad = 1 } END { exit bad ? 1 : 0 }' "${PROVISION}"; then
+  ok "run-once: no # before a trailing backslash (a comment never continues)"
+else
+  bad "run-once: a line carries a # before a trailing backslash — the next line would execute while a joined scan hides it (issue #143)"
+fi
 if awk '
+  /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
+    c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
+  }
   /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
-    seen_loop = 1; in_loop = 1; depth = 0; prev = ""; next
+    headers++; header_lines = header_lines (header_lines == "" ? "" : ", ") NR
+    in_loop = 1; depth = 0; prev = ""; next
   }
   in_loop {
     if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
@@ -6046,13 +6409,242 @@ if awk '
     if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
     prev = $0
   }
-  END { exit (seen_loop && loop_prev ~ /^[[:space:]]*sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1 }
-' "${PROVISION}"; then
-  ok "run-once: the drain loop ends in a foreground \`sleep 1\` (issue #143)"
+  END {
+    if (headers != 1 || c_headers != 1) {
+      print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
+      exit 1
+    }
+    exit (loop_prev ~ /^[[:space:]]*\/usr\/bin\/env[[:space:]]+sleep 1[[:space:]]*(#.*)?$/) ? 0 : 1
+  }
+' "${PROVISION_JOINED}"; then
+  ok "run-once: the drain loop ends in a foreground \`/usr/bin/env sleep 1\` (issue #143)"
 else
-  bad "run-once: the drain loop sleep is missing, backgrounded, shortened or not last (issue #143)"
+  bad "run-once: the drain loop sleep is missing, backgrounded, shortened, not last or not `/usr/bin/env sleep 1`, a second C-style loop header matched, or a continuation-split header joined into an extra counted loop (issue #143)"
+fi
+# Red-team MED: the count/shape teeth above run under FAKE_SLEEP_NOWAIT, so a
+# wall-clock early exit keeps every count green while the effective bound
+# collapses. The first cut was a denylist over the extracted body
+# (`break`/`continue`/`SECONDS`/`date`/...); two mutants evaded it with the
+# suite at 531/0 (round 2): (1) a `printf -v now '%(%s)T' -1` clock read in
+# the body plus a `return 0` once `now >= entry+300` (fail-open: `wait_idle`
+# declares "drained" with a live invocation while the die message still
+# claims 3600s), and (2) a `: <<'MARKER'` heredoc whose body contains `sleep
+# 1` then a bare `done`, which terminates both body scanners early — the real
+# `if (( SECONDS >= deadline )); then break; fi` (300) after it was never
+# scanned. Replace the denylist with an exact ALLOWLIST of the four intended
+# body forms (the drain check, its `return 0`, its `fi` and the
+# `/usr/bin/env sleep 1`),
+# tolerant of leading whitespace and a trailing `#` comment: any other line —
+# the printf clock, the heredoc opener — fails the tooth, and the accumulator
+# is latched across every matched body instead of being reset per header. A
+# second exact header match (a decoy loop carrying the four pinned forms,
+# appended after the real one) also fails the tooth, so the last matching body
+# can no longer become authoritative (r3 MED), and the general C-style
+# `for ((` count is pinned to 1 (r4 red-team mutF: the executed header
+# respelled — `for (( attempt …` — so the anchored regex misses it, plus a
+# never-called exact-header decoy satisfying the exactly-one rule, kept the
+# suite at 533/0 while the unscanned respelled loop carried the clock
+# early-exit). r5 red-team: the general match is non-anchored (`:; for (( …`
+# counts too), any `for ((` occurrence anywhere in the script — including
+# inert text/heredocs — fails closed (deliberate over-refusal: the script
+# ships exactly one C-style loop), and the r6 joined view (both teeth run on
+# `PROVISION_JOINED`) turns a `for \` + newline + `(( …` (or the mid-token
+# split) into the counted forms instead of letting bash join it past a
+# line-based scan. Residual (intentional-crafting class, disclosed): an early
+# exit moved outside the rendered loop body (e.g. into a helper) and a
+# non-C-style loop construct (`while`/`until`) replacing the drain loop
+# together with a sacrificial exact-header decoy stay heuristic; the state
+# pins above and the on-box wall-clock behavior remain the backstop.
+if awk '
+  function pinned(line) {
+    sub(/[[:space:]]+#.*$/, "", line)
+    sub(/[[:space:]]+$/, "", line)
+    sub(/^[[:space:]]+/, "", line)
+    return (line == "if recording_witness_service_drained; then" ||
+            line == "return 0" ||
+            line == "fi" ||
+            line == "/usr/bin/env sleep 1")
+  }
+  /(^|[^[:alnum:]_])for[[:space:]]*\(\(/ {
+    c_headers++; c_header_lines = c_header_lines (c_header_lines == "" ? "" : ", ") NR
+  }
+  /^[[:space:]]*for[[:space:]]*\(\(attempt[[:space:]]*=[[:space:]]*0;[[:space:]]*attempt[[:space:]]*<[[:space:]]*3600;[[:space:]]*attempt\+\+\)\);[[:space:]]*do[[:space:]]*(#.*)?$/ {
+    headers++; header_lines = header_lines (header_lines == "" ? "" : ", ") NR
+    in_loop = 1; depth = 0; next
+  }
+  in_loop {
+    if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
+    if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) {
+      if (depth == 0) { in_loop = 0; next }
+      depth--
+    }
+    if ($0 ~ /(^|[[:space:]])do[[:space:]]*(#.*)?$/) depth++
+    if (!pinned($0)) unpinned = unpinned (unpinned == "" ? "" : " | ") "line " NR ": " $0
+  }
+  END {
+    if (headers != 1 || c_headers != 1) print "drain-loop C-style headers: " headers " exact, " c_headers " total (expected 1 and 1): exact line(s) " header_lines "; all line(s) " c_header_lines > "/dev/stderr"
+    if (unpinned != "") print "unpinned drain-loop line(s): " unpinned > "/dev/stderr"
+    exit (headers == 1 && c_headers == 1 && unpinned == "") ? 0 : 1
+  }
+' "${PROVISION_JOINED}"; then
+  ok "run-once: every drain loop body line is one of the four pinned forms (issue #143)"
+else
+  bad "run-once: the drain loop body carries a line outside the pinned allowlist or a second C-style loop header (a clock read, a break, a heredoc desync or any other unplanned statement) — the bound would not be wall-clock-pinned (issue #143)"
 fi
 if awk -v q="'" '
+  # r9 red-team HIGH + the command-shadow strengthening + r10 red-team:
+  # refuse ANY definition spelling of the sleep utility — and of `command`,
+  # `builtin`, `env` and `systemctl`, which an earlier `command sleep 1` fix
+  # left shadowable (`command` is not a special builtin; `builtin` shadows the
+  # same way; `env` is a plain external; a `systemctl` function lying
+  # `inactive` fail-opens the drain check at poll 0) — whatever the body form,
+  # on the quote-aware-comment-stripped continuation-joined copy
+  # (PROVISION_CODE; r14: a quoted `#` decoy must not truncate the scan).
+  # Every valid bash
+  # definition has `name ()`/`name()` or `function name` on one (post-join)
+  # line (a backslash-split `name \` + `()` is rejoined by the join scanner;
+  # the bare-newline split is a syntax error), so a definition-shaped match
+  # anywhere in code is refused. Comments are already stripped; quoted spans
+  # are stripped for `sleep`/`systemctl` (so literal prose/strings stay green
+  # by design), while `command`/`builtin`/`env` are matched on the
+  # quote-preserved line: a
+  # quoted or escaped spelling of those identifiers is not a valid bash
+  # function name (`e"nv" () { :; }` is `not a valid identifier`), but real
+  # code passes strings to `env` (`env("RECORDING_WITNESS_ENDPOINT")`), and
+  # stripping the quotes would turn those calls into `env()` and refuse the
+  # shipped script. Invocations (`command -v …`, `env NAME=… …`) and the
+  # `#!/usr/bin/env bash` shebang (a comment) stay green; the
+  # brace-body/pending logic is gone.
+  #
+  # r10 trust: the `function` KEYWORD form accepts a non-identifier name
+  # (`function /usr/bin/env { :; }` defines a function that shadows the
+  # absolute-path invocation `time /usr/bin/env sleep 0.2` → 0.002s), which
+  # the basename patterns cannot see; refuse any `function <name>` whose name
+  # token is not a plain identifier ([A-Za-z_][A-Za-z0-9_]*). The POSIX
+  # `/usr/bin/env ()` form is matched by the `env` basename clause above.
+  #
+  # r12 red-team HIGH: the drain path and `die` also depend on the `exit`
+  # (the fail-closed rc) and `return` (the helper state decision) BUILTINS,
+  # which bash lets a function shadow with a plain definition — `exit() { :; }`
+  # after the `die` definition made the at-bound abort return 0 (the unit had
+  # not drained, yet run_once proceeded), and `return() { :; }` made the drain
+  # check report "drained" at poll 0. `printf` (the die message), `local` (the
+  # helper scratch) and `true` (`|| true` on the systemctl query) are
+  # refused for the same class closure; `command_not_found_handle` (the
+  # command-not-found hook — with `enable -n exit` it swallowed the at-bound
+  # `die` call, whose `exit 1` returned 0) joins the set by the same rule.
+  # Tested: bash accepts ONLY the plain
+  # `name()`/`name ()` and `function name` spellings for these names — every
+  # quoted or escaped spelling (`ex"it"()`, `ex\it()`, `$'exit'()`,
+  # `function "exit"`) is a `not a valid identifier` syntax error — so these
+  # plain patterns on both views are the complete accepted set (the joined
+  # view also catches a backslash-newline split rejoined to a plain name).
+  # Invocations (`exit 1`, `return 0`, `printf …`, `local active`, `true`)
+  # stay green.
+  #
+  # main-sync fold (2026-10-06, PR #156): the merged script embeds Python
+  # (`_TRANSPORT = threading.local()`), so the leading boundary excludes `.`
+  # — a `.`-preceded `name()` defines the dotted word, never the bare name
+  # (`x.local(){ …; }` defines `x.local`; `local` stays the builtin,
+  # verified live), so no shadowing path is lost.
+  {
+    line = $0
+    raw = line
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
+    if (line ~ /^[[:space:]]*$/) next
+    if (line ~ /(^|[^[:alnum:]_.])sleep[[:space:]]*\([[:space:]]*\)/ ||
+        line ~ /(^|[^[:alnum:]_.])function[[:space:]]+sleep([^[:alnum:]_]|$)/ ||
+        raw ~ /(^|[^[:alnum:]_.])command[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_.])builtin[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_.])env[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_.])function[[:space:]]+(command|builtin|env)([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_.])systemctl[[:space:]]*\([[:space:]]*\)/ ||
+        raw ~ /(^|[^[:alnum:]_.])function[[:space:]]+systemctl([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_.])(exit|return|printf|local|true|command_not_found_handle)[[:space:]]*\([[:space:]]*\)/ ||
+        line ~ /(^|[^[:alnum:]_.])function[[:space:]]+(exit|return|printf|local|true|command_not_found_handle)([^[:alnum:]_]|$)/) {
+      shadow = 1
+      print FILENAME ":" FNR ": " $0 > "/dev/stderr"
+    }
+    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]/) {
+      rest = line
+      sub(/^.*function[[:space:]]+/, "", rest)
+      sub(/[[:space:]].*$/, "", rest)
+      # r11 functional LOW: strip an extracted token of its trailing
+      # `(){`/`{` suffix before the identifier test — `function zzz(){ :; }`
+      # left `zzz{` and false-positived; a decorated path name keeps its
+      # slash (`function /usr/bin/env{ :; }`) and still fails.
+      sub(/[({].*$/, "", rest)
+      if (rest !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+        shadow = 1
+        print FILENAME ":" FNR ": non-identifier function name: " $0 > "/dev/stderr"
+      }
+    }
+  }
+  END { exit shadow ? 1 : 0 }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`/\`command_not_found_handle\`) and no non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+else
+  bad "run-once: a drain-path utility/builtin definition (\`sleep\`/\`command\`/\`builtin\`/\`env\`/\`systemctl\`/\`exit\`/\`return\`/\`printf\`/\`local\`/\`true\`/\`command_not_found_handle\`) or a non-identifier \`function\` name shadows the drain path (any body form, issue #143)"
+fi
+# r10 red-team: the drain path resolves its two helpers and the fail-closed
+# `die` by name at call time, so any definition AFTER the real one overrides
+# it: a second `recording_witness_service_drained` returning 0 declared
+# "drained" at poll 0 with the unit active (suite 535/0), a second `die`
+# silenced the at-bound abort, and a second `recording_witness_wait_idle`
+# replaced the bounded loop (all reproduced; the residual bullet disclosed
+# the second-wait_idle spelling but nothing enforced it). Pin each of the
+# three to EXACTLY ONE definition, per view (raw and continuation-joined),
+# with comments and quoted spans stripped and invocations (no definition
+# parens) naturally excluded. The real script defines each once.
+#
+# r11 red-team MED: the r10 pin counted definition LINES, not definitions —
+# `die() { ...; exit 1; }; die() { :; }` on one line passed (count 1) and an
+# in-place no-op `die` body passed with the count untouched, both
+# suite-green (the override silences every later `die` gate). The count now
+# accumulates definition OCCURRENCES per line, and the single `die`
+# definition must carry `exit 1` inside its brace body — an `exit 1`
+# elsewhere on the line, or a `die` spelled with the `function` keyword form
+# (no paren form to pin), fails closed.
+#
+# r12 red-team HIGH: that textual `exit 1` check accepted an UNREACHABLE
+# `exit 1` — `die()  { …; if false; then exit 1; fi; }`, `(exit 1)` and
+# `true || exit 1` all kept the suite green while the on-box refusal returned
+# 0 and run_once proceeded into the #143 merged-run path. Replace the textual
+# check with an exact-line pin of the shipped definition
+# (scripts/010-provision.sh:48) on both views: any other line — a dead,
+# quoted, subshell or multiline `exit 1`, a tab-indented or trailing-comment
+# rewrite — fails closed. The `exit "1"` rewrite is a DELIBERATE
+# over-refusal (a valid fail-closed body that no longer matches the pin).
+#
+# r18 red-team HIGH: the #153 acceptance functions
+# (`recording_witness_run_once`/`_accept`/`_timer_start`/`_timer_stop`) are
+# extracted-and-sourced from the marker span only, so a post-END redefinition
+# (`recording_witness_run_once() { return 0; }` inserted after
+# `# --- END RECORDING WITNESS ---`) is invisible to every behavior tooth
+# while it overrides the real function on-box (a no-op `run_once` bypasses
+# the acceptance's witness run; a no-op `timer_start` leaves the timer
+# stopped after a failed acceptance). They join the exactly-once count.
+if awk -v q="'" '
+  function keyword_defs(line, name) {
+    return gsub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", line)
+  }
+  function paren_defs(line, name) {
+    return gsub("(^|[^[:alnum:]_])" name "[[:space:]]*[(][[:space:]]*[)]", "F", line)
+  }
+  function defs(line, name,   s) {
+    s = line
+    # Remove one `function NAME` occurrence before counting the POSIX forms,
+    # so `function NAME()` is not counted twice (keyword_defs counts every
+    # keyword occurrence, and a leftover second one still gets counted).
+    sub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", s)
+    return keyword_defs(line, name) + paren_defs(s, name)
+  }
+  BEGIN {
+    n = split("recording_witness_service_drained recording_witness_wait_idle die recording_witness_run_once recording_witness_accept recording_witness_timer_start recording_witness_timer_stop", names, " ")
+    die_line = "die()  { printf " q "\\n\\033[1;31mFAIL:\\033[0m %s\\n" q " \"$*\" >&2; exit 1; }"
+  }
+  FNR == 1 { file = FILENAME; seen[file] = 1 }
   {
     line = $0
     sub(/^[[:space:]]*#.*/, "", line)
@@ -6060,16 +6652,616 @@ if awk -v q="'" '
     gsub(q "[^" q "]*" q, "", line)
     sub(/[[:space:]]#.*$/, "", line)
     if (line ~ /^[[:space:]]*$/) next
-    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]+sleep([[:space:]]*\(\))?[[:space:]]*\{/) shadow = 1
-    if (line ~ /(^|[^[:alnum:]_])sleep[[:space:]]*\(\)[[:space:]]*\{/) shadow = 1
-    if (!pending && line ~ /(^|[^[:alnum:]_])(function[[:space:]]+sleep([[:space:]]*\(\))?|sleep[[:space:]]*\(\))[[:space:]]*$/) { pending = 1; next }
-    if (pending) { if (line ~ /^[[:space:]]*\{/) shadow = 1; pending = 0 }
+    for (i = 1; i <= n; i++) {
+      k = defs(line, names[i])
+      if (k == 0) continue
+      c[file, names[i]] += k
+      if (c[file, names[i]] - k < 2 && c[file, names[i]] > 1)
+        print file ":" FNR ": multiple definition occurrences of " names[i] ": " $0 > "/dev/stderr"
+      if (names[i] == "die" && $0 != die_line) {
+        print file ":" FNR ": die definition diverges from the pinned shipped line: " $0 > "/dev/stderr"
+        die_body_bad = 1
+      }
+    }
   }
-  END { exit shadow ? 1 : 0 }
-' "${PROVISION}"; then
-  ok "run-once: no \`sleep\` function shadows the drain sleep (issue #143)"
+  END {
+    bad = die_body_bad ? 1 : 0
+    for (f in seen) {
+      for (i = 1; i <= n; i++) {
+        if (c[f, names[i]] != 1) {
+          printf "%s: expected exactly 1 definition occurrence of %s, found %d\n", f, names[i], c[f, names[i]] + 0 > "/dev/stderr"
+          bad = 1
+        }
+      }
+    }
+    exit bad ? 1 : 0
+  }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\`, \`die\` and the four #153 acceptance functions (\`recording_witness_run_once\`/\`recording_witness_accept\`/\`recording_witness_timer_start\`/\`recording_witness_timer_stop\`) are each defined exactly once (occurrence-counted) and the \`die\` definition is the exact shipped fail-closed line (issue #143)"
 else
-  bad "run-once: a \`sleep\` function shadows the drain sleep (issue #143)"
+  bad "run-once: a drain-path or acceptance function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`/\`recording_witness_run_once\`/\`recording_witness_accept\`/\`recording_witness_timer_start\`/\`recording_witness_timer_stop\`) is defined zero or multiple times (per occurrence) or the \`die\` definition is not the exact shipped line (a dead, quoted, subshell or multiline rewrite fails closed; issue #143)"
+fi
+# r15 red-team HIGH: the multi-line single-quote desync. `s='` on one line,
+# then `' ; die() { :; } ; : '`, then `'` — bash pairs the quotes ACROSS the
+# lines, so the `die()`/`systemctl()` definition between them EXECUTES, while
+# every per-line quote-stripping view hides it (each view strips the `' … '`
+# span on its own line) and the suite stayed 540/0. The closure is a
+# definition scan on the comment-stripped code view WITHOUT quote stripping:
+# the provision script has no legitimate definition-like string (comments are
+# already stripped), so any `name()`/`function name` spelling of the
+# load-bearing names — quoted or not — is refused; the one legitimate `die`
+# definition must still be exactly the pinned shipped line, so a
+# desync-hidden rewrite of it also fails closed.
+if awk -v q="'" '
+  BEGIN {
+    die_line = "die()  { printf " q "\\n\\033[1;31mFAIL:\\033[0m %s\\n" q " \"$*\" >&2; exit 1; }"
+  }
+  {
+    line = $0
+    # F1 (r16): ANY `function NAME` keyword form on the no-quote-strip view is
+    # refused — the script has zero keyword-form definitions (paren form only),
+    # so a desync-hidden keyword override of the drain helpers cannot slip.
+    if (line ~ /(^|[^[:alnum:]_])function[[:space:]]/) {
+      print FILENAME ":" FNR ": a keyword-form definition on the no-quote-strip view: " $0 > "/dev/stderr"
+      bad = 1
+    }
+    n = gsub(/(^|[^[:alnum:]_])die[[:space:]]*\([[:space:]]*\)/, "F", line)
+    if (n > 0) {
+      c += n
+      if ($0 != die_line) {
+        print FILENAME ":" FNR ": a die definition outside the pinned shipped line (a multi-line quote desync hides it from the stripped views): " $0 > "/dev/stderr"
+        bad = 1
+      }
+    }
+    # F1 (r16): the two drain helpers are each defined exactly once in the
+    # script (the span paren-form definitions); a desync-hidden second
+    # definition would override them (the r10 pin runs on quote-stripped views).
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_service_drained[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hd += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_wait_idle[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hi += h
+    # r18 red-team HIGH: the four #153 acceptance functions join the
+    # no-quote-strip count (a desync-hidden post-END redefinition would
+    # otherwise override the span-sourced one on-box).
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_run_once[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hr += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_accept[[:space:]]*\([[:space:]]*\)/, "F", line)
+    ha += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_timer_start[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hts += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_timer_stop[[:space:]]*\([[:space:]]*\)/, "F", line)
+    htp += h
+    # main-sync fold (2026-10-06, PR #156): a `.`-preceded `name()` cannot
+    # shadow the bare name (it defines the dotted word; embedded Python
+    # `threading.local()` is the false positive this excludes).
+    if (line ~ /(^|[^[:alnum:]_.])(sleep|command|builtin|env|systemctl|exit|return|printf|local|true|command_not_found_handle)[[:space:]]*\([[:space:]]*\)/) {
+      print FILENAME ":" FNR ": a load-bearing definition visible only without quote stripping: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END {
+    if (c != 1) {
+      print "die definitions in the no-quote-strip view: " c " (expected exactly 1, the pinned shipped line)" > "/dev/stderr"
+      bad = 1
+    }
+    if (hd != 1 || hi != 1 || hr != 1 || ha != 1 || hts != 1 || htp != 1) {
+      print "drain-path definitions in the no-quote-strip view: service_drained=" hd " wait_idle=" hi " run_once=" hr " accept=" ha " timer_start=" hts " timer_stop=" htp " (expected exactly 1 each)" > "/dev/stderr"
+      bad = 1
+    }
+    exit bad ? 1 : 0
+  }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no load-bearing definition spelling is hidden behind a multi-line quote desync (a definition scan without quote stripping finds only the pinned \`die\` + the two drain helpers + the four #153 acceptance functions, and no keyword-form definition, issue #143)"
+else
+  bad "run-once: a load-bearing definition spelling (incl. the drain helpers, the #153 acceptance functions, or any \`function NAME\` keyword form) appears in code only when quote stripping is skipped — a multi-line quote desync can execute a definition the per-line scanners hide (issue #143)"
+fi
+# r16 red-team HIGH: the PATH tooth strips quoted spans, so a quoted token
+# (`printf -v 'PATH'`, `declare -x "PATH=…"`, `unset -v 'PATH'`,
+# `read -r "PATH"`) or a desync-hidden assignment (`s='` / `' ; PATH=… ; : '`)
+# evaded it. This second view strips only quote CHARACTERS/backslashes (no
+# span stripping) and requires every PATH write to sit at a command position
+# (`^`/`;`/`&`/`|`/`(`/`)`/`{`/`}`), so quoted prose (`log "PATH=${PATH}"`,
+# `log "export PATH and unset PATH here"`) stays green while the quoted-token
+# and desync spellings are refused. `unset -- PATH` is covered by the option
+# class; associative-array declarations (`declare -A` — the rebuilt
+# `BASH_CMDS` vector) are refused in the hash tooth (the script has zero).
+#
+# r17 functional HIGH: a `command`/`builtin` prefix (plain or
+# parameter-expansion-rebuilt) composed with a quoted-token PATH write
+# (`command export "PATH=…"`, `command printf -v PATH …`,
+# `command declare -x "PATH=…"`, `command unset -- PATH`,
+# `builtin export "PATH=…"`, `comm${x}and export …`) evaded every branch:
+# the prefix pushed the verb off the position class. Strip parameter
+# expansions so a rebuilt prefix word joins, then drop `builtin`/`command`
+# prefixes (with their options) at a command position so the verb lands
+# where the branches match. (A prefix whose separator is itself a parameter
+# expansion — `command${IFS}export` — stays in the crafted-edit class like
+# the other non-statically-resolvable spellings.)
+#
+# r17 red-team HIGHs: three composition gaps closed in the same view.
+# (a) The command-position class lacked the reserved-word separators and
+# `!` (`if true; then PATH=…`, `! PATH=…`, `do PATH=…`) that the r14
+# normalizer already handles for the hash/builtin teeth — the view now runs
+# the same reserved-word normalizer and the class carries `!`.
+# (b) Array-writing builtins that rewrite `PATH` (`mapfile -t PATH`,
+# `readarray -t PATH`) were outside every branch (the script has zero).
+# (c) The `declare -A` clause lives in the hash tooth on the quote-span-
+# stripped view, so a quoted option/name (`declare "-A" "${b}SH_CMDS[…]"`
+# rebuilding `BASH_CMDS`) hid from it — the hash tooth now also reads its
+# quote/expansion-stripped joined view for that clause.
+#
+# r19 red-team HIGH: an assignment word before the prefix chain
+# (`FOO=bar export "PATH=…"`, `FOO=bar command export …`, `! FOO=bar export`,
+# `time FOO=bar export`, `FOO=bar command printf -v "PATH"`,
+# `FOO=bar declare -x "PATH=…"`, `FOO=bar mapfile -t "PATH"`) shifted the
+# verb past the position class with every static tooth green while the
+# assignment poisoned PATH on-box. The loop now also strips assignment words
+# at a command position, so the verb lands where the branches match. (An
+# assignment whose quoted value contains whitespace — `FOO="a b" export …` —
+# is not statically resolvable after the char-level quote strip and stays in
+# the disclosed crafted-edit class, like the `${IFS}` separators.)
+#
+# r20 red-team HIGH + MED (delta re-check): the r19 strip matched only
+# `NAME=`, so append/subscript prefixes (`A+=b declare -x "PATH=…"`,
+# `FOO[0]=bar export "PATH=…"`, `A[0]=1 …`) still shifted the verb past the
+# position class, and a loop-variable binding (`for PATH in /tmp/shad; do …`,
+# also `select PATH`) poisoned PATH outside every branch (both pre-existing;
+# runtime shadow probes confirmed). The strip now matches
+# `NAME(\[sub\])?+=`; the branches also run on each intermediate line — a
+# stripped `PATH=…`/`FOO=bar PATH=…` prefix must not hide its own write,
+# which the final view alone would (the raw-PATH tooth backstops direct
+# `PATH=`/`PATH+=` writes) — and `for`/`select PATH` joins the refusal set.
+# A parameter-rebuilt name (`p=PATH; export "$p"=…`) stays in the disclosed
+# crafted-edit class.
+#
+# r21 red-team HIGH (delta re-check): the documented PATH-write classes had
+# single-line gaps — an array-element assignment (`PATH[0]=/tmp/shad`,
+# `PATH[$i]=`, `PATH[0]+=`), a `declare -- PATH` (the option class required a
+# letter after `-`), and a separated mapfile/readarray option argument
+# (`mapfile -O 0 PATH`, `mapfile -n 1 PATH`) all evaded both PATH teeth
+# (pre-existing; runtime array-PATH probe confirmed). Closed: the assignment
+# branch accepts `PATH[sub]+=`, the declare/nameref option class accepts
+# `--`, and the mapfile/readarray branch accepts arbitrary separated tokens.
+# Disclosed residuals (pre-existing): a physical newline inside a subscript
+# (`A[x` ⏎ `]=v trap …`, `PATH[0` ⏎ `]=…`) defeats every per-line tooth — the
+# scanner joins backslash continuations but not bracket state, and a per-line
+# bracket-balance guard would over-refuse the 31 legitimate unbalanced-bracket
+# lines in the shipped span (ANSI escapes, Python list literals); and an
+# absurd assignment-prefix chain (5k+ `A=1 ` prefixes) makes the strip loop
+# quadratic (DoS-only; rewrites are monotone, so it terminates).
+#
+# r22 red-team HIGH (r21 delta re-check; the lens ended without a report, its
+# driver results recovered and re-verified by the orchestrator): two more
+# single-line PATH-write spellings evaded both teeth — `readonly 'PATH'=…` /
+# `readonly 'PATH'+=…` (the declaration branch listed declare/typeset/local/
+# export only, and the raw backstop's quoted-span strip hid the quoted token)
+# and `let 'PATH=5'` (arithmetic assignment; `let` was in no branch). Both
+# runtime-proven: PATH becomes `/tmp/shad` / `5`, command lookup fails, and
+# `systemctl` resolves into the crafted dir (or not at all) — the drain gate
+# can report not-drained while the service is up (the r20/r21 HIGH class).
+# Closed: `readonly` joins the declaration branch and a `let` branch matches
+# an assignment-shaped `PATH[sub]+=` token (the existing quote/`$`-expansion
+# strips run first, so quoted and `command`-prefixed forms are caught).
+# Deliberate fail-closed over-refusal: a `let` arithmetic comparison
+# (`let PATH == 5`) also matches.
+#
+# r23 red-team HIGH + MED (r22 delta re-check): two more run-time token
+# rebuilders evaded the PATH tooth — locale quoting (`export $"PATH"=…`,
+# `readonly $"PATH"=…`, `declare -g $"PATH"=…`, `let $"PATH"=5`,
+# `printf -v $"PATH"`, `read $"PATH"`, `mapfile -t $"PATH"`, `unset $"PATH"`)
+# and brace-comma expansion in an argument position (`export {PATH,x}=…`,
+# `readonly {P,}ATH=…`, `let {PATH,x}=5`, `let PATH{,}=5`,
+# `printf -v {P,}ATH`, `read {P,}ATH`, `mapfile -t {P,}ATH`), plus a nameref
+# alias target (`declare -n p=PATH` then `p=…`); all suite-green and
+# runtime-effective (PATH shadow → the drain gate subverts). Closed: the
+# `$"` introducer is stripped before the token scan (`$$"` masked first so a
+# PID variable survives), argument-position brace-comma groups are expanded
+# textually (bounded: depth 6 / 64 variants per line; overflow refuses
+# fail-closed) and each variant matched, and a nameref declaration whose
+# target is PATH is refused. A command-word brace-comma (`{h,}ash`,
+# `{t,}rap`, `{s,}leep()`) is NOT a gap: bash expands the alternatives as
+# separate arguments of the first word — `{t,}rap …` installs `trap -- 'rap'
+# …` (no handler subversion) and `{h,}ash -p …` invokes the hash builtin with
+# a shifted name argument (no lookup poisoning) — so command lookup is
+# unaffected (runtime-probed). Deliberate fail-closed over-refusals: a
+# `declare x=PATH` (literal string assignment) and a brace-expansion
+# overflow.
+#
+# r24 red-team + trust HIGH (r23 delta re-check): the r23 brace-comma closure
+# was unsound — `expand_braces` omitted `post` from its local-parameter list,
+# so recursion clobbered the global and every sibling alternative after the
+# first got a truncated suffix (variants silently dropped; the 64-variant cap
+# never fired: `export {x,}{PATH,x}=/tmp/shad`, the 7-group and nested
+# payloads were suite-green and PATH-effective, and a 125-variant line was a
+# suite-green cap-bypass carrier — no expansion of it is exactly `PATH`), and
+# the depth
+# guard returned "" without setting `expand_over`, so a deeply nested payload
+# was dropped fail-open. The r23 nameref closure was also incomplete: a
+# two-step target (`declare -n p` then `p=PATH` then `p=…`) evaded the
+# same-line `[name]=PATH` regex. Closed: `post` is a function local, a
+# depth-cap hit sets `expand_over` (the caller's `hit = expand_over` refuses
+# fail-closed), and ANY nameref declaration is refused
+# (`declare`/`typeset`/`local` with an option token containing `n`) — the
+# shipped span has zero namerefs, so this is a deliberate fail-closed
+# over-refusal (`declare -n foo=BAR` included); the one-line
+# `declare -n p=PATH` target rule stays as a belt.
+if awk -v q="'" '
+  function normalize_cmdpos(s,   prev) {
+    do {
+      prev = s
+      gsub(/(^|[;&|()!{}])[[:space:]]*(if|then|do|else|elif|while|until)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
+    } while (s != prev)
+    return s
+  }
+  function expand_braces(s, depth,   m, pre, grp, inner, alts, n, i, out, post) {
+    if (depth > 6) { expand_over = 1; return "" }
+    if (expand_over) return ""
+    m = match(s, /\{[^{}]*,[^{}]*\}/)
+    if (m == 0) return s "\n"
+    pre = substr(s, 1, m - 1)
+    grp = substr(s, m, RLENGTH)
+    post = substr(s, m + RLENGTH)
+    inner = substr(grp, 2, length(grp) - 2)
+    n = split(inner, alts, ",")
+    out = ""
+    for (i = 1; i <= n; i++) {
+      expand_count++
+      if (expand_count > 64) { expand_over = 1; return "" }
+      out = out expand_braces(pre alts[i] post, depth + 1)
+    }
+    return out
+  }
+  function path_write(s) {
+    return (s ~ /(^|[;&|()!{}])[[:space:]]*PATH(\[[^]]*\])?\+?=/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export|readonly)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*let([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH(\[[^]]*\])?[[:space:]]*\+?=/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+-[A-Za-z]*n[A-Za-z]*([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(for|select)[[:space:]]+PATH([^[:alnum:]_]|$)/)
+  }
+  {
+    line = $0
+    # r23 red-team HIGH (r22 delta re-check): locale quoting `$"NAME"` expands
+    # to NAME (bash translation); strip the introducer so the token is visible
+    # (`$$"` is a PID variable plus a closing quote and must survive: mask `$$`
+    # first). The shipped script has no real `$"` (one `...com$"` regex false
+    # positive, harmless after the strip).
+    gsub(/\$\$/, "\001", line)
+    gsub(/\$"/, "", line)
+    gsub("\001", "$$", line)
+    gsub(/"/, "", line)
+    gsub(q, "", line)
+    gsub(/\\/, "", line)
+    gsub(/\$\{[^}]*\}/, "", line)
+    gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
+    # r23 red-team HIGH (r22 delta re-check): brace-comma expansion in an
+    # argument position (`export {PATH,x}=…`, `readonly {P,}ATH=…`,
+    # `let {PATH,x}=5`, `printf -v {P,}ATH`, `read {P,}ATH`, `mapfile -t
+    # {P,}ATH`) rebuilds the PATH token at run time; expand textually
+    # (bounded, depth 6 / 64 variants) and match each variant. A command-word
+    # brace-comma (`{h,}ash`) is NOT expanded this way by bash (the
+    # alternatives become separate arguments of the first word — runtime-probed
+    # ineffective), so this tooth only needs the argument-position class.
+    # Overflow refuses fail-closed.
+    expand_count = 0
+    expand_over = 0
+    nvar = split(expand_braces(line, 0), variants, "\n")
+    hit = expand_over
+    for (vi = 1; vi <= nvar; vi++) {
+      v = variants[vi]
+      do {
+        if (path_write(v)) hit = 1
+        prev = v
+        gsub(/(^|[;&|()!{}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", v)
+        gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^[:space:];&|]*[[:space:]]+/, "; ", v)
+        v = normalize_cmdpos(v)
+      } while (v != prev)
+      if (path_write(v)) hit = 1
+    }
+    if (hit) {
+      print FILENAME ":" FNR ": command-position PATH write on the no-quote-strip view: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref declaration, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+else
+  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref declaration, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+fi
+# r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
+# (one line before the witness span) poisoned command lookup for every later
+# `systemctl` call with no definition and no edit inside the rendered span:
+# the suite stayed 536/0 while a fake systemctl reported the unit active and
+# the drain returned "drained" at poll 0 (issue #143 fail-open). The first
+# tooth matched the word `hash` only on the quote-stripped view, so the
+# quote-concatenated / ANSI-C / escaped spellings bash joins before command
+# lookup (`"ha""sh" -p …`, `$'hash' -p …`, `h\ash -p …`,
+# `builtin h$'ash' …`) stayed suite-green (538/0). The closure: keep the
+# stripped-view word match (plain `hash`, `hash ()`), and ADD a quote-joined
+# view — remove the quote characters (`$'`/`$"` prefixes included) and
+# backslashes — refusing `hash` at a command position
+# (`(^|[;&|()])[[:space:]]*hash([^[:alnum:]_]|$)`) plus `builtin hash` /
+# `command hash` (no such invocation exists in the script). Prose stays
+# green: `die "cannot hash …"` (515/551/573), `log "… cert hash recorded …"`
+# (1108), `origin_ca_write_hash`/`origin_ca_cert_hash` identifiers,
+# `hashlib`/`hashed`/`_<hash16>` (none is at a command position). The script
+# has no legitimate `hash` call. r13 red-team HIGH: the token was rebuilt
+# with a parameter expansion (`x=` + `h${x}ash -p …`; the joined view had
+# stripped only `$` and kept `h{x}ash`), which also left `en${x}able`-style
+# spellings open. The closure also strips parameter expansions (`${…}` and
+# `$name`) from the joined view before the command-position match, adds `!`
+# to the command-position class, and refuses any ANSI-C `$'` quoting in code
+# (the script has 0) so `$'\x68…'`/`$'hash'` cannot smuggle a command word;
+# the next tooth refuses command-position `builtin`/`enable`/`trap`.
+#
+# r14 red-team/functional: the `joined` view stripped comments naively on
+# the raw line, so `echo " # " ; $'\x68\x61\x73\x68' …` (and every other
+# quoted-# decoy) truncated the `ansic` detection and left the joined match
+# seeing `echo "`. The tooth now reads PROVISION_CODE (quote-aware comment
+# stripping) and also refuses a `{…..…}` brace sequence in code
+# (`{h..h}ash -p …` built the token with bash brace expansion) and
+# normalizes the reserved-word separators before the command-position match
+# (`if true; then h${x}ash …`; `time h\ash …` — the backslash-joined
+# spelling rides the same class).
+if awk -v q="'" '
+  function normalize_cmdpos(s,   prev) {
+    do {
+      prev = s
+      gsub(/(^|[;&|()!{}])[[:space:]]*(if|then|do|else|elif|while|until)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
+    } while (s != prev)
+    return s
+  }
+  {
+    line = $0
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
+    joined = $0
+    ansic = (index(joined, "$" q) > 0)
+    gsub(/\$\{[^}]*\}/, "", joined)
+    gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", joined)
+    gsub(/[$"]/, "", joined)
+    gsub(q, "", joined)
+    gsub(/\\/, "", joined)
+    joined = normalize_cmdpos(joined)
+    if (ansic ||
+        line ~ /(^|[^[:alnum:]_])hash([^[:alnum:]_]|$)/ ||
+        line ~ /BASH_CMDS/ ||
+        joined ~ /BASH_CMDS/ ||
+        line ~ /(^|[^[:alnum:]_])(declare|typeset|local)[[:space:]]+-[A-Za-z]*A[A-Za-z]*([^[:alnum:]_]|$)/ ||
+        joined ~ /(^|[^[:alnum:]_])(declare|typeset|local)[[:space:]]+-[A-Za-z]*A[A-Za-z]*([^[:alnum:]_]|$)/ ||
+        line ~ /\{[^{}]*\.\.[^{}]*\}/ ||
+        joined ~ /(^|[;&|()!])[[:space:]]*hash([^[:alnum:]_]|$)/ ||
+        joined ~ /(^|[^[:alnum:]_])(builtin|command)[[:space:]]+hash([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": hash invocation: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no \`hash\` command-lookup poisoning (plain, parameter-expansion-rebuilt, brace-sequence, reserved-word-separated or quote-joined/ANSI-C/escaped spelling at a command position, incl. \`builtin\`/\`command hash\`) in the provision script (issue #143)"
+else
+  bad "run-once: a \`hash\` command-lookup poisoning spelling appeared in the provision script — plain, parameter-expansion-rebuilt, brace-sequence, reserved-word-separated, quote-concatenated/ANSI-C/escaped at a command position, or \`builtin\`/\`command hash\`; the script has no legitimate \`hash\` call (issue #143)"
+fi
+# r13 red-team HIGH 2/3: `enable -n exit` disables the `exit` builtin — with
+# a `command_not_found_handle` definition the at-bound `die`'s `exit 1` hit
+# the handler and returned 0, so `wait_idle` declared a live unit drained;
+# `builtin enable -n exit` and `command enable -n exit` reach the same builtin
+# and `trap 'exit 0' EXIT` rewrites the process rc. The shipped script never
+# invokes `enable` at a command position (its `enable` occurrences are
+# `systemctl enable --now …` subcommands — `enable` sits after `systemctl`),
+# never invokes `builtin`, and its only `trap` invocations are the two pinned
+# acceptance forms (`trap 'recording_witness_timer_start' EXIT`,
+# `trap - EXIT`; main-sync fold 2026-10-06 — #153's timer stop/start); refuse
+# everything else (plus `command`-prefixed spellings) at a command position
+# on the expansion-stripped joined view, so `en${x}able`/`builtin h${x}ash`
+# are caught too. Deliberate over-refusal (fail-closed).
+#
+# r14 red-team: the same quoted-# decoy (`echo " # " ; trap …`) truncated
+# this view before the match, and the position class missed a command after
+# a reserved-word separator (`if true; then trap …`, `{ trap …; }`,
+# `time trap …`). The tooth now reads PROVISION_CODE (quote-aware comment
+# stripping) and runs the reserved-word normalizer before the match, so
+# `then`/`do`/`else`/`elif`/`time`/`{`/`}` all count as command positions.
+#
+# r19 red-team HIGH + functional MED (delta re-check): the main-sync allowlist
+# collapsed a brace-less `$name` to its name — `trap "$…timer_start" EXIT`
+# (value `…; :`) read as the pinned literal and ran an arbitrary EXIT action —
+# and the deny branch missed repeated `command` prefixes
+# (`command command trap …`, `command -p command trap …`); an assignment word
+# (`FOO=bar trap …`) was the same position-class gap. Closed in place: the
+# allowlist view no longer strips `$`, and the deny view strips
+# `command`/assignment prefixes iteratively before the match.
+#
+# r20 red-team HIGH (delta re-check): the r19 assignment strip matched only
+# `NAME=`, so append/subscript prefixes (`FOO+=bar trap 'exit 0' EXIT`,
+# `FOO[0]=bar trap …`, `A[0]=1 trap …`) still shifted the verb past the
+# position class (pre-existing; runtime rc-rewrite probe confirmed). The strip
+# now matches `NAME(\[sub\])?+=`. (An assignment whose quoted value contains
+# whitespace — `FOO="a b" trap …` — stays in the disclosed crafted-edit
+# class, like the PATH tooth's and the `${IFS}` separators.)
+if awk -v q="'" '
+  function normalize_cmdpos(s,   prev) {
+    do {
+      prev = s
+      gsub(/(^|[;&|()!{}])[[:space:]]*(if|then|do|else|elif|while|until)([[:space:]]+)/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*time[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!])[[:space:]]*\{[[:space:]]+/, "; ", s)
+      gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
+    } while (s != prev)
+    return s
+  }
+  {
+    line = $0
+    gsub(/\$\{[^}]*\}/, "", line)
+    gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
+    gsub(/[$"]/, "", line)
+    gsub(q, "", line)
+    gsub(/\\/, "", line)
+    line = normalize_cmdpos(line)
+    # r19 red-team HIGH: a repeated `command` prefix (`command command trap
+    # …`, `command -p command trap …`) shifted the verb past the single
+    # `command` branch, and an assignment word (`FOO=bar trap …`) shifted it
+    # past the position class; both ran an arbitrary EXIT trap with every
+    # static tooth green (the crafted line is in-span — it can replace the
+    # shipped trap). Strip `command` prefixes (with their options) and
+    # assignment words at a command position, iterating with the
+    # reserved-word normalizer like the PATH tooth (r18), so the verb lands
+    # where the deny branch matches.
+    do {
+      prev = line
+      gsub(/(^|[;&|()!{}])[[:space:]]*command([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
+      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^[:space:];&|]*[[:space:]]+/, "; ", line)
+      line = normalize_cmdpos(line)
+    } while (line != prev)
+    # main-sync fold (2026-10-06, PR #156): the merged #153 acceptance
+    # installs and clears its EXIT trap, so pin exactly those two shipped
+    # forms (anchored: a combined or rewritten line stays refused). The
+    # allowlist reads a quote/backslash-stripped, expansion-PRESERVED view
+    # (r18 red-team HIGH + functional LOW): the main view drops `${x}`/`$x`,
+    # so an expansion-rebuilt action or sigspec would read as the pinned
+    # form while its runtime effect is attacker-controlled (`x="; exit 0; :"`
+    # rewrites the process rc; a substitution runs arbitrary root commands).
+    # `$` is never stripped from this view (r19 functional MED + red-team
+    # HIGH): stripping it glued a brace-less `$name` onto the pinned word
+    # (`trap "recording_witness_timer_$start" EXIT` read as the literal
+    # action), so a braced (`${x}`), brace-less (`$start`, incl. a rebuilt
+    # sigspec `EX$IT`) or command-substitution spelling stays visible and
+    # fails the anchored match. The shipped lines carry no expansion.
+    pinned_view = $0
+    gsub(/"/, "", pinned_view)
+    gsub(q, "", pinned_view)
+    gsub(/\\/, "", pinned_view)
+    pinned_trap = (pinned_view ~ /^[[:space:]]*trap[[:space:]]+recording_witness_timer_start[[:space:]]+EXIT[[:space:]]*$/ ||
+                   pinned_view ~ /^[[:space:]]*trap[[:space:]]+-[[:space:]]+EXIT[[:space:]]*$/)
+    if (!pinned_trap &&
+        (line ~ /(^|[;&|()!])[[:space:]]*(builtin|enable|trap|eval)([^[:alnum:]_]|$)/ ||
+         line ~ /(^|[;&|()!])[[:space:]]*command[[:space:]]+(builtin|enable|trap|eval)([^[:alnum:]_]|$)/)) {
+      print FILENAME ":" FNR ": command-position builtin/enable/trap/eval invocation: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no command-position \`builtin\`/\`enable\`/\`trap\`/\`eval\` invocation (incl. after reserved-word separators; the two pinned acceptance trap forms are allowed) in the provision script (the rc-path builtins stay reachable, issue #143)"
+else
+  bad "run-once: a command-position \`builtin\`/\`enable\`/\`trap\`/\`eval\` invocation (incl. after a reserved-word separator; outside the two pinned acceptance trap forms) appeared in the provision script — it could disable the \`exit\` builtin, rewrite the process rc, or eval a shadow definition (issue #143)"
+fi
+# r13 red-team MED: the script runs as root and can prepend a shadow dir to
+# `PATH`, planting a `systemctl` (or `sleep`) binary that misreports state —
+# the r12 wording claimed that needs "a root-level PATH write (out of scope)",
+# false for a self-editing root script. The shipped script never assigns,
+# exports or unsets `PATH` (the word appears in comments only); refuse
+# `PATH=`, `PATH+=`, `export PATH` and `unset PATH` in code.
+#
+# r14 red-team/functional: the same quoted-# decoy hid a `PATH=` assignment,
+# the quote-blind view falsely refused the shipped prose (`log
+# "PATH=${PATH}"`, `log "export PATH and unset PATH here"`), and the builtin
+# assignment forms (`printf -v PATH …`, `read -r PATH …`) slipped through.
+# The tooth now reads PROVISION_CODE (quote-aware comment stripping), drops
+# quoted spans (so quoted prose is not code), and adds the `printf -v PATH`
+# and `read … PATH` forms.
+# r21 red-team HIGH (delta re-check): the raw backstop's `PATH=` branch also
+# missed the array-element form (`PATH[0]=`/`PATH[0]+=`); it now matches
+# `PATH(\[sub\])?+=` and accepts `--` in the declare/nameref option class.
+# (The cmdpos tooth carries the full r21 closure; this view stays a subset.)
+
+if awk -v q="'" '
+  {
+    line = $0
+    # r23: same locale normalization as the cmdpos tooth (see there).
+    gsub(/\$\$/, "\001", line)
+    gsub(/\$"/, "", line)
+    gsub("\001", "$$", line)
+    gsub(/"[^"]*"/, "", line)
+    gsub(q "[^" q "]*" q, "", line)
+    if (line ~ /(^|[^[:alnum:]_])PATH(\[[^]]*\])?\+?=/ ||
+        line ~ /(^|[^[:alnum:]_])export[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])unset([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])(declare|typeset|local|export)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+-[A-Za-z]*n[A-Za-z]*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
+      print FILENAME ":" FNR ": PATH assignment/export/unset: " $0 > "/dev/stderr"
+      bad = 1
+    }
+  }
+  END { exit bad ? 1 : 0 }
+' "${PROVISION_CODE}"; then
+  ok "run-once: no \`PATH\` assignment/export/unset (incl. \`printf -v PATH\`/\`printf -vPATH\`/\`read … PATH\`/nameref/\`unset -v PATH\` forms) in the provision script (issue #143)"
+else
+  bad "run-once: a \`PATH\` assignment/export/unset or builtin/nameref assignment (\`printf -v PATH\`/\`printf -vPATH\`/\`read … PATH\`/\`declare -n PATH\`/\`unset -v PATH\`) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+fi
+# r11 red-team HIGH (V4/V5): a command-word substitution redirected a drain
+# path invocation with no definition to count: `WITNESS_SYSTEMCTL=/bin/true`
+# plus `"${WITNESS_SYSTEMCTL:-systemctl}"` in
+# recording_witness_service_drained, and `WITNESS_DIE=:` plus
+# `"${WITNESS_DIE:-die}"` at the at-bound call — both suite-green (536/0)
+# with the unit active (issue #143 fail-open). Pin the shipped source of both
+# invocations exactly: the six body lines of recording_witness_service_drained
+# (the local, the systemctl query, the case decision and its arms) and the
+# at-bound die line; the paren-form header must appear exactly once, so a
+# header respelling (e.g. the `function NAME` keyword form) is refused too.
+# Any intended edit to these lines must update this pin (the shipped source
+# is the spec); fail-closed over-refusal is deliberate.
+if awk '
+  BEGIN {
+    want[1] = "  local active"
+    want[2] = "  active=\"$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)\""
+    want[3] = "  case \"${active}\" in"
+    want[4] = "    \"\"|inactive|failed) return 0 ;;"
+    want[5] = "    *) return 1 ;;"
+    want[6] = "  esac"
+    want[7] = "}"
+    nwant = 7
+    die_line = "  die \"witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run\""
+  }
+  FNR == 1 {
+    if (in_body) {
+      print file ": recording_witness_service_drained body not terminated by the pinned `}`" > "/dev/stderr"
+      badfile[file] = 1
+    }
+    file = FILENAME; seen[file] = 1; in_body = 0; i = 0
+  }
+  {
+    if (in_body) {
+      i++
+      if (i > nwant || $0 != want[i]) {
+        print file ":" FNR ": drain-path body diverges from the pinned source at line " i ": " $0 > "/dev/stderr"
+        badfile[file] = 1
+      }
+      if (i >= nwant) in_body = 0
+      next
+    }
+    line = $0
+    sub(/^[[:space:]]*#.*/, "", line)
+    if (line ~ /(^|[^[:alnum:]_])recording_witness_service_drained[[:space:]]*[(][[:space:]]*[)][[:space:]]*[{]/) {
+      h[file]++; in_body = 1; i = 0; next
+    }
+    if ($0 == die_line) d[file]++
+  }
+  END {
+    bad = 0
+    for (f in seen) {
+      if (h[f] != 1) { print f ": recording_witness_service_drained paren-form headers: " h[f] + 0 " (expected 1)" > "/dev/stderr"; bad = 1 }
+      if (badfile[f]) bad = 1
+      if (d[f] != 1) { print f ": at-bound die invocation lines: " d[f] + 0 " (expected 1)" > "/dev/stderr"; bad = 1 }
+    }
+    exit bad ? 1 : 0
+  }
+' "${PROVISION}" "${PROVISION_JOINED}"; then
+  ok "run-once: the \`recording_witness_service_drained\` body and the at-bound \`die\` invocation match the pinned drain-path source (issue #143)"
+else
+  bad "run-once: a drain-path invocation was redirected (systemctl query, state decision, or the at-bound die call) or the pinned source diverged — an intended edit must update the pin (issue #143)"
 fi
 case "${runonce_out}" in
   *"refusing to continue with a possibly merged run"*) ok "run-once names the continue-refusal wording" ;;
