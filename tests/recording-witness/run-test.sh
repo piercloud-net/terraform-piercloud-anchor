@@ -63,7 +63,11 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; golden strings,
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; the generator's
+#       provenance guard compares content, not `git status` — an
+#       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
+#       builder bytes — and the replica `TS_RE` is `\Z`-anchored, anchor #155;
+#       golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
 #       the over-long event-type truncation cap with its `_<sha256[:8]>`
@@ -189,7 +193,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=842
+MIN_CHECKS=844
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -550,6 +554,17 @@ if replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
     raise SystemExit(
         "replica UUID_RE.pattern %r != pinned canonical pattern %r"
         % (replica.UUID_RE.pattern, CANONICAL_UUID_PATTERN))
+# Trailing-newline class (anchor #155 F2): pin the timestamp regex too.
+# Python's `$` also matches before a trailing newline, so a `$`-anchored
+# TS_RE accepts `20260925T100008Z\n` and builds a key with an embedded
+# newline. The real builder's `audit_ts` emits `strftime` output (always
+# newline-free), so this is defense-in-depth symmetry with the `\Z` type
+# anchors (pc-admin #20).
+CANONICAL_TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z\Z"
+if replica.TS_RE.pattern != CANONICAL_TS_PATTERN:
+    raise SystemExit(
+        "replica TS_RE.pattern %r != pinned canonical pattern %r"
+        % (replica.TS_RE.pattern, CANONICAL_TS_PATTERN))
 
 
 def source_sha_ok(value):
@@ -567,7 +582,10 @@ if not source_sha_ok(source_sha):
         "--allow-sha-mismatch must never be committed" % (source_sha, replica.PINNED_PC_ADMIN_SHA))
 for hostile in (replica.PINNED_PC_ADMIN_SHA[:7], replica.PINNED_PC_ADMIN_SHA[:7] + "!!!",
                 replica.PINNED_PC_ADMIN_SHA + "0", replica.PINNED_PC_ADMIN_SHA + "!!!",
-                replica.PINNED_PC_ADMIN_SHA.upper()):
+                replica.PINNED_PC_ADMIN_SHA.upper(),
+                # anchor #155 F1: a debug run stamps `<pin>-debug`; the
+                # predicate must refuse it, never accept a pin-prefixed stamp.
+                replica.PINNED_PC_ADMIN_SHA + "-debug"):
     if source_sha_ok(hostile):
         raise SystemExit("source_sha predicate accepted a hostile value: %r" % hostile)
 for vector in vectors["vectors"]:
@@ -600,6 +618,47 @@ PY
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
+fi
+
+# F2 tooth (anchor #155): the replica TS_RE must be \Z-anchored. Python's `$`
+# also matches before a trailing newline, so a `$`-anchored revert accepts
+# this timestamp (rc 0) and builds a key with an embedded newline; the tooth
+# then fails.
+if python3 "${HARNESS_DIR}/shipper_keys.py" user.login $'20260925T100008Z\n' "" 1 >/dev/null 2>&1; then
+  bad "replica TS_RE accepted a trailing-newline timestamp (must be \\Z-anchored)"
+else
+  ok "replica TS_RE refuses a trailing-newline timestamp (\\Z-anchored)"
+fi
+
+# F1 tooth (anchor #155): the generator's provenance guard must compare the
+# worktree bytes against the committed HEAD blob, not `git status` —
+# `update-index --assume-unchanged` hides a worktree edit from status while an
+# import still reads the mutated bytes. Prove the helper True on pristine
+# bytes, then mutate + assume-unchanged and prove status is clean AND the
+# helper is False.
+f1_repo="${WORK}/f1-repo"
+mkdir -p "${f1_repo}/scripts/lib"
+git -C "${f1_repo}" init -q
+git -C "${f1_repo}" config user.email "harness@example.invalid"
+git -C "${f1_repo}" config user.name "recording-witness harness"
+# Commit on a scratch branch, never the init default (a protected-branch
+# guard would refuse a fixture commit on `main`).
+git -C "${f1_repo}" checkout -q -b harness-fixture
+printf 'PINNED = 1\n' > "${f1_repo}/scripts/lib/b2_client.py"
+git -C "${f1_repo}" add scripts/lib/b2_client.py
+git -C "${f1_repo}" -c commit.gpgsign=false commit -q -m "pinned bytes"
+f1_helper() {
+  python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import generate_shipper_vectors as g; print(g.blob_matches_head(sys.argv[2], "scripts/lib/b2_client.py"))' "${HARNESS_DIR}" "$1"
+}
+f1_pristine="$(f1_helper "${f1_repo}")"
+printf 'MUTATED = 1\n' > "${f1_repo}/scripts/lib/b2_client.py"
+git -C "${f1_repo}" update-index --assume-unchanged scripts/lib/b2_client.py
+f1_status="$(git -C "${f1_repo}" status --porcelain)"
+f1_mutated="$(f1_helper "${f1_repo}")"
+if [ "$f1_pristine" = "True" ] && [ "$f1_mutated" = "False" ] && [ -z "$f1_status" ]; then
+  ok "generator provenance guard compares content (assume-unchanged edit refused, status clean)"
+else
+  bad "generator provenance guard: pristine=${f1_pristine:-<empty>} mutated=${f1_mutated:-<empty>} status='${f1_status}' (a content compare must catch an assume-unchanged edit)"
 fi
 
 # Canonical-sid oracle: a literal grid cannot enumerate every normalization
