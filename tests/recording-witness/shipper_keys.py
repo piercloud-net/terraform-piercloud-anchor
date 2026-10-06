@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 r"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 262e98c546d336607430d139dd1effa2accd0851 —
-the **prefix-aware full-key SHA with `\Z`-anchored key regexes**: pc-admin #30 made `build_audit_key` emit
+PINNED AGAINST: cad0p/pc-admin @ 807bfd454b204aa1e197275b312a8fb7c2272274 —
+the **seq-range grammar** (pc-admin #29): the optional inclusive range token
+``<seq-start>-<seq-end>`` on batched (non-lifecycle) keys, built by
+``build_audit_range_key`` and preserved by ``disambiguate_audit_key`` (a
+range on a lifecycle type, a mode marker on a range and a reversed range are
+refused). On top of the **prefix-aware full-key SHA with `\Z`-anchored key
+regexes**: pc-admin #30 made `build_audit_key` emit
 ``audit/YYYYMMDD/<basename>`` (the day derived from the same UTC instant as
 ``<ts>``); pc-admin #39 made the full-key helpers
 (``split_audit_date_segment``/``parse_audit_key_full``/``disambiguate_audit_key``)
@@ -23,8 +28,9 @@ flat or session) refuses the parse and ``disambiguate_audit_key`` returns the
 key unchanged — before the anchor, Python's ``$`` matched before the newline
 and the capture-group variant rebuild dropped it, laundering a key the witness
 reads as ``contract-mismatch``/``naming-contract`` drift. The previous grammar
-point was 9a2fe50 (the prefix-aware full-key helpers themselves), and before
-that c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd (the #30 date-partition SHA above), and
+point was 262e98c546d336607430d139dd1effa2accd0851 (pc-admin #30's date-partition
+squash, the layout this replica pinned before #29), and before that 9a2fe50 (the prefix-aware full-key helpers themselves), and before
+that c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd (the #30 branch head above), and
 before that 25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 (pc-admin #20 anchored the audit-key type
 regexes at `\Z`; Python's `$` also matches before a trailing newline, so a type
 like `user.login\n` would pass and build a key with an embedded newline the
@@ -113,6 +119,14 @@ real builder DOES emit on its documented path is reproduced faithfully):
   seq 0 is legacy-only and must be hand-written) formatted `%06d`, so 7+
   digits are legal past 999999; the ceiling is the witness's `[0-9]{1,18}`
   grammar pc-admin's `SEQ_PATTERN` mirrors.
+- The optional range token (pc-admin #29, D5) is the inclusive
+  ``<seq-start>-<seq-end>`` (``seq_end >= seq_start``, each within the
+  18-digit ceiling); ``seq_end=None`` is the legacy single-seq shape (a
+  one-line batch keeps the dual shape). A range on a lifecycle type
+  (``session.start``/``session.end``), a mode marker on a range and a
+  reversed range are refused here exactly like the real
+  ``build_audit_range_key``; the CLI ``--range <end>`` opt-in builds a batched
+  key and the default stays the single-seq shape.
 
 Golden + boundary vectors are generated from the pinned real builder and
 checked in (`shipper_key_vectors.json`, regenerated with
@@ -125,12 +139,14 @@ legacy vectors (the same basenames under the pre-#30 layout, built with
 foreign-prefix/residual-segment refusals, and a custom-prefix
 positive/negative).
 
-CLI:  shipper_keys.py [--flat|--dated] <event-type> <ts> [sid] [seq] [mode]
-      shipper_keys.py --variant <body> <event-type> <ts> [sid] [seq] [mode]
+CLI:  shipper_keys.py [--flat|--dated] [--range <end>] <event-type> <ts> [sid] [seq] [mode]
+      shipper_keys.py --variant <body> [--range <end>] <event-type> <ts> [sid] [seq] [mode]
       prints the audit key (single line); the `--variant` form prints the
       replay-conflict variant key for <body>. The default layout is the pinned
       builder's dated `audit/YYYYMMDD/<basename>`; `--flat` builds the legacy
-      flat key (the harness's pre-#30 fixtures opt in explicitly).
+      flat key (the harness's pre-#30 fixtures opt in explicitly). `--range
+      <end>` builds the inclusive `<seq>-<end>` batched shape (refused on
+      lifecycle types and with a mode marker).
 """
 
 import hashlib
@@ -138,7 +154,7 @@ import re
 import sys
 from datetime import datetime
 
-PINNED_PC_ADMIN_SHA = "262e98c546d336607430d139dd1effa2accd0851"
+PINNED_PC_ADMIN_SHA = "807bfd454b204aa1e197275b312a8fb7c2272274"
 # Date-partition grammar (pc-admin #30): ``audit/YYYYMMDD/<basename>``. The
 # segment must be a real calendar date; a non-calendar all-digit segment is
 # malformed and refused, never stripped (mirrors
@@ -186,10 +202,11 @@ CONFLICT_HASH_LENGTH = 16
 SESSION_KEY_PARSE_RE = re.compile(
     r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>session\.[A-Za-z0-9_]+)\.(?P<sid>"
     + UUID_PATTERN
-    + r")\.(?P<seq>[0-9]{1,18})(?:\.(?P<mode>shell|exec))?\.json\Z"
+    + r")\.(?P<seq>[0-9]{1,18})(?:-(?P<seq_end>[0-9]{1,18}))?(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
 OTHER_KEY_PARSE_RE = re.compile(
-    r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
+    r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?\.json\Z"
 )
 
 # Session lifecycle events get the `interactive`-derived mode suffix; every
@@ -258,13 +275,17 @@ def _layout_prefix(ts, flat):
     return "audit/" if flat else "audit/%s/" % ts[:8]
 
 
-def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False):
+def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False, seq_end=None):
     """Build one audit object key exactly as pc-admin's shipper does.
 
     The pinned builder is **date-partitioned**: ``audit/YYYYMMDD/<basename>``,
     the day derived from the same UTC instant as ``<ts>``. ``flat=True``
     builds the legacy ``audit/<basename>`` layout (accepted through the dual
     window; the harness's historical fixtures opt in explicitly).
+    ``seq_end`` is the inclusive range end (pc-admin #29 D5): ``None`` keeps
+    the legacy single-seq shape, otherwise the key carries
+    ``<seq>-<seq_end>``. A range is refused on a lifecycle type, with a mode
+    marker, or reversed — exactly like the real ``build_audit_range_key``.
     """
     if not isinstance(ts, str) or not TS_RE.match(ts):
         raise ValueError("timestamp must be YYYYmmddTHHMMSSZ, got %r" % ts)
@@ -272,6 +293,14 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False):
         raise ValueError(
             "seq must be >= 1 (the real builder emits previous+1; seq 0 is a "
             "hand-written legacy fixture) and fit the witness's 18-digit grammar, got %r" % (seq,)
+        )
+    if seq_end is not None and (
+        not isinstance(seq_end, int) or isinstance(seq_end, bool)
+        or not seq <= seq_end <= SEQ_MAX
+    ):
+        raise ValueError(
+            "seq_end must be an int >= seq and fit the witness's 18-digit grammar, got %r"
+            % (seq_end,)
         )
     if not isinstance(event_type, str) or not EVENT_TYPE_RE.match(event_type):
         raise ValueError("event type outside the shipper grammar: %r" % event_type)
@@ -315,17 +344,26 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False):
         # The real builder lowercases; the witness groups sessions
         # case-insensitively, so an uppercase fixture pins the lowercased key.
         sid = sid.lower()
+    if seq_end is not None:
+        # A range is defined on batched (non-lifecycle) events only, with no
+        # mode marker (D1/D5); mirror build_audit_range_key's refusals before
+        # the single-seq mode checks so the reason matches the real builder.
+        if event_type in SESSION_MODE_EVENTS:
+            raise ValueError("a range is never built on a lifecycle event (D1)")
+        if mode:
+            raise ValueError("a mode marker is contract-defined on lifecycle keys only (D5)")
     if mode and (mode not in ("shell", "exec") or event_type not in SESSION_MODE_EVENTS):
         raise ValueError("mode %r is only valid on session.start/session.end" % mode)
     if event_type in SESSION_MODE_EVENTS and mode not in ("shell", "exec"):
         raise ValueError(
             "%r requires the mandatory shell|exec mode suffix the real shipper always emits" % event_type
         )
+    seq_token = "%06d" % seq if seq_end is None else "%06d-%06d" % (seq, seq_end)
     if event_type in SID_LESS_SESSION_EVENTS:
         # Forced sid-less (module docstring): the real builder at the pinned
         # SHA drops any sid for session.rejected; a sid-bearing key would alert
         # the witness session-start-missing.
-        return "%s%s-%s.%06d.json" % (_layout_prefix(ts, flat), ts, event_type, seq)
+        return "%s%s-%s.%s.json" % (_layout_prefix(ts, flat), ts, event_type, seq_token)
     if SESSION_TYPE_RE.match(event_type):
         if not sid:
             raise ValueError(
@@ -333,10 +371,10 @@ def audit_key(event_type, ts, sid="", seq=1, mode="", flat=False):
                 % event_type
             )
         suffix = ".%s" % mode if mode else ""
-        return "%s%s-%s.%s.%06d%s.json" % (_layout_prefix(ts, flat), ts, event_type, sid, seq, suffix)
+        return "%s%s-%s.%s.%s%s.json" % (_layout_prefix(ts, flat), ts, event_type, sid, seq_token, suffix)
     if sid:
         raise ValueError("non-session %r with a sid: the real shipper drops the sid for this shape" % event_type)
-    return "%s%s-%s.%06d.json" % (_layout_prefix(ts, flat), ts, event_type, seq)
+    return "%s%s-%s.%s.json" % (_layout_prefix(ts, flat), ts, event_type, seq_token)
 
 
 def disambiguate_key(key, body, prefix="audit/"):
@@ -365,16 +403,20 @@ def disambiguate_key(key, body, prefix="audit/"):
     match = SESSION_KEY_PARSE_RE.match(basename)
     if match:
         parts = match.groupdict()
+        seq_token = parts["seq"] if not parts.get("seq_end") else "%s-%s" % (
+            parts["seq"], parts["seq_end"])
         variant = "%s-%s_%s.%s.%s.json" % (
-            parts["ts"], parts["type"], digest, parts["sid"], parts["seq"])
+            parts["ts"], parts["type"], digest, parts["sid"], seq_token)
     else:
         match = OTHER_KEY_PARSE_RE.match(basename)
         if not match:
             return key
         parts = match.groupdict()
+        seq_token = parts["seq"] if not parts.get("seq_end") else "%s-%s" % (
+            parts["seq"], parts["seq_end"])
         head, _, last = parts["type"].rpartition(".")
         hashed = "%s.%s_%s" % (head, last, digest) if head else "%s_%s" % (last, digest)
-        variant = "%s-%s.%s.json" % (parts["ts"], hashed, parts["seq"])
+        variant = "%s-%s.%s.json" % (parts["ts"], hashed, seq_token)
     if day:
         return "%s%s/%s" % (prefix, day, variant)
     return "%s%s" % (prefix, variant)
@@ -384,6 +426,7 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     variant_body = None
     flat = False
+    range_end = None
     rest = []
     index = 0
     while index < len(argv):
@@ -393,6 +436,18 @@ if __name__ == "__main__":
                 print("shipper_keys: --variant needs a body string", file=sys.stderr)
                 sys.exit(2)
             variant_body = argv[index + 1]
+            index += 2
+            continue
+        if arg == "--range":
+            if index + 1 >= len(argv):
+                print("shipper_keys: --range needs the inclusive end seq", file=sys.stderr)
+                sys.exit(2)
+            try:
+                range_end = int(argv[index + 1])
+            except ValueError:
+                print("shipper_keys: --range end must be an integer, got %r" % (argv[index + 1],),
+                      file=sys.stderr)
+                sys.exit(2)
             index += 2
             continue
         if arg == "--flat":
@@ -408,8 +463,8 @@ if __name__ == "__main__":
     argv = rest
     if len(argv) < 2:
         print(
-            "usage: shipper_keys.py [--flat|--dated] <event-type> <ts> [sid] [seq] [mode] "
-            "| shipper_keys.py --variant <body> <event-type> <ts> [sid] [seq] [mode]",
+            "usage: shipper_keys.py [--flat|--dated] [--range <end>] <event-type> <ts> [sid] [seq] [mode] "
+            "| shipper_keys.py --variant <body> [--range <end>] <event-type> <ts> [sid] [seq] [mode]",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -423,7 +478,7 @@ if __name__ == "__main__":
         sys.exit(2)
     mode = argv[4] if len(argv) > 4 else ""
     try:
-        key = audit_key(event_type, ts, sid, seq, mode, flat=flat)
+        key = audit_key(event_type, ts, sid, seq, mode, flat=flat, seq_end=range_end)
         if variant_body is not None:
             key = disambiguate_key(key, variant_body)
         print(key)

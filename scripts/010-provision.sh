@@ -1430,7 +1430,6 @@ oversized state file is preserved as `state.json.corrupt` - or a timestamped
 reports `baseline: null` - it could not be read and is never fabricated);
 alerts exit 1; green exits 0.
 """
-import collections
 import hashlib
 import hmac
 import http.client
@@ -1480,17 +1479,22 @@ UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 # while sorting above the whole real key space - a cursor-poisoning false
 # green (round-4 RF3.1).
 TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
-# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
+# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[-<seq-end>][.<mode>].json.
+# The optional inclusive seq range token (pc-admin #29, D5) rides after the
+# start seq; a single-seq key is the degenerate [seq, seq] (dual shape). The
 # optional mode marker (.shell/.exec) is contract-defined for session.start
 # and session.end only (pc-admin D1); other session events keep the old shape.
 SESSION_KEY_RE = re.compile(
     r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
     r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?"
     r"(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
-# Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
+# Documented non-session audit event: <ts>-<event-type>.<seq>[-<seq-end>].json
+# (no sid); batched non-session events carry the same optional range token.
 NON_SESSION_KEY_RE = re.compile(
-    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?\.json\Z"
 )
 HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json\Z")
 UUID_RE = re.compile(UUID_PATTERN)
@@ -1535,8 +1539,14 @@ def strip_date_segment(relative):
 
 def _audit_session_basename_matches(basename):
     """True for a basename shaped as a documented session/non-session key."""
-    if SESSION_KEY_RE.match(basename):
-        return True
+    match = SESSION_KEY_RE.match(basename)
+    if match:
+        # A range on a lifecycle type, a mode marker on a range or a reversed
+        # range is naming/contract drift (D1/D5), never a cursor mover: the
+        # same rule the classifier applies before collection.
+        event_type, _ = canonical_conflict_type(match.group("etype"))
+        return not _audit_range_is_drift(
+            match.group("seq"), match.group("seq_end"), event_type, match.group("mode"))
     generic = NON_SESSION_KEY_RE.match(basename)
     if not generic:
         return False
@@ -1546,7 +1556,10 @@ def _audit_session_basename_matches(basename):
     # Only the documented sid-less session events (session.rejected) keep the
     # non-session shape and stay valid cursor movers.
     event_type, _ = canonical_conflict_type(generic.group("etype"))
-    return not (event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS)
+    if event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS:
+        return False
+    return not _audit_range_is_drift(
+        generic.group("seq"), generic.group("seq_end"), event_type, "")
 
 
 def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
@@ -1656,6 +1669,9 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
 SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
+# Session lifecycle events stay one object per event (pc-admin D1): a range
+# token on one of these is contract drift, never a batched coverage claim.
+SESSION_MODE_EVENTS = frozenset({"session.start", "session.end"})
 # Replay-conflict variants (pc-admin `disambiguate_audit_key`): when a rebuilt
 # audit file replays an event under a key that already exists with DIFFERENT
 # bytes, the shipper appends `_<sha256[:16]>` to the event type (a session
@@ -1679,6 +1695,63 @@ def canonical_conflict_type(event_type):
     if not match:
         return event_type, False
     return event_type[: match.start()], True
+
+
+def _audit_range_is_drift(seq, seq_end, event_type, mode):
+    """True when a parsed range token violates the batched-key contract.
+
+    Contract (pc-admin #29 D1/D5): a range is defined on batched
+    (non-lifecycle) events only, inclusive with ``seq_end >= seq``, and never
+    carries a mode marker (the mode is contract-defined on the single-object
+    ``session.start``/``session.end`` keys only). A violation is
+    naming/contract drift, judged before the key can claim any coverage.
+    """
+    if seq_end is None:
+        return False
+    if int(seq_end) < int(seq):
+        return True
+    if event_type in SESSION_MODE_EVENTS:
+        return True
+    return bool(mode)
+
+
+def merge_coverage_interval(intervals, start, end):
+    """Merge inclusive ``[start, end]`` into sorted disjoint intervals. Pure.
+
+    Returns ``(merged, overlaps)``: ``merged`` is the coalesced coverage
+    (adjacent intervals coalesce without an overlap) and ``overlaps`` holds
+    the inclusive intersection with coverage already claimed by another
+    identity - the duplicate claims D9 flags. The caller owns the list.
+    """
+    merged = []
+    overlaps = []
+    for low, high in intervals:
+        if high + 1 < start or end + 1 < low:
+            merged.append((low, high))
+            continue
+        if start <= high and end >= low:
+            overlaps.append((max(low, start), min(high, end)))
+        start = min(start, low)
+        end = max(end, high)
+    merged.append((start, end))
+    merged.sort()
+    return merged, overlaps
+
+
+def render_interval_ranges(ranges, limit=20):
+    """Render inclusive ranges boundedly (single values bare, ranges ``a-b``).
+
+    The detail render caps at ``limit`` ranges + an ellipsis; callers fold the
+    full list into the finding identity so a range beyond the cap still moves
+    the signature.
+    """
+    rendered = [
+        str(start) if start == stop else "%d-%d" % (start, stop)
+        for start, stop in ranges[:limit]
+    ]
+    if len(ranges) > limit:
+        rendered.append("...")
+    return ",".join(rendered)
 
 
 class WitnessError(Exception):
@@ -3053,29 +3126,41 @@ def run_checks(config, now, plan):
         if match:
             event_type, is_variant = canonical_conflict_type(match.group("etype"))
             sid = match.group("sid").lower()
+            mode = match.group("mode")
+            seq_text = match.group("seq")
+            seq_end_text = match.group("seq_end")
+            seq = int(seq_text)
+            seq_end = int(seq_end_text) if seq_end_text is not None else seq
+            if _audit_range_is_drift(seq_text, seq_end_text, event_type, mode):
+                # A range on a lifecycle type, a mode marker on a range or a
+                # reversed range is naming/contract drift (D1/D5), judged
+                # before collection: the malformed key never creates session
+                # state and never enters the interval coverage math.
+                contract_bad_keys.append(relative)
+                continue
             state = sessions.setdefault(
-                sid, {"seqs": [], "start": None, "end": None, "start_mode": None,
-                      "end_mode": None, "identities": set()})
-            seq = int(match.group("seq"))
+                sid, {"intervals": [], "duplicates": [], "start": None, "end": None,
+                      "start_mode": None, "end_mode": None, "identities": set()})
             # A base key and its replay-conflict variant share one identity
-            # (ts, canonical type, seq): count the seq once so a legitimate
-            # variant cannot read as a `sequence-duplicate`, while a genuine
-            # duplicate from a different timestamp still does. The identity is
-            # for sequence counting ONLY - it must not skip lifecycle
-            # resolution: a same-ts `.exec`/`.shell` marker pair also shares
-            # the identity (the mode is not part of it), so forcing the second
-            # key to skip would let whichever key the listing returns first
-            # win regardless of LastModified (a stale/equal-LM `.exec` silently
-            # exempting a shell session). Only a key whose type
-            # `canonical_conflict_type` actually flags as a replay-conflict
-            # variant skips resolution; every canonical key reaches
-            # `resolve_lifecycle_marker` and the newest marker (or the
-            # conservative conflicting tie) wins in either listing order.
-            identity = (match.group("ts"), event_type, seq)
+            # (ts, canonical type, start, end): count the interval once so a
+            # legitimate variant cannot read as a `sequence-duplicate`, while
+            # a genuine duplicate from a different timestamp still does. The
+            # identity is for sequence counting ONLY - it must not skip
+            # lifecycle resolution: a same-ts `.exec`/`.shell` marker pair
+            # also shares the identity (the mode is not part of it), so
+            # forcing the second key to skip would let whichever key the
+            # listing returns first win regardless of LastModified (a
+            # stale/equal-LM `.exec` silently exempting a shell session).
+            # Only a key whose type `canonical_conflict_type` actually flags
+            # as a replay-conflict variant skips resolution; every canonical
+            # key reaches `resolve_lifecycle_marker` and the newest marker (or
+            # the conservative conflicting tie) wins in either listing order.
+            identity = (match.group("ts"), event_type, seq, seq_end)
             if identity not in state["identities"]:
                 state["identities"].add(identity)
-                state["seqs"].append(seq)
-            mode = match.group("mode")
+                merged, overlaps = merge_coverage_interval(state["intervals"], seq, seq_end)
+                state["intervals"] = merged
+                state["duplicates"].extend(overlaps)
             if is_variant:
                 # Variants drop the mode marker by contract and must not
                 # re-resolve the lifecycle marker: the base key (which the
@@ -3107,6 +3192,13 @@ def run_checks(config, now, plan):
             # A replay-conflict variant (`session.rejected_<hash16>`) is the
             # same documented event as its base type, never naming drift.
             event_type, _ = canonical_conflict_type(generic.group("etype"))
+            if _audit_range_is_drift(
+                    generic.group("seq"), generic.group("seq_end"), event_type, ""):
+                # A reversed range (or a range on a lifecycle type) on the
+                # sid-less shape is contract drift (D1/D5), never a documented
+                # event: fail closed before the classification.
+                contract_bad_keys.append(relative)
+                continue
             if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
                 continue  # documented non-session (or known sid-less session) event
         # Drift is judged by shape (a UUID-shaped sid or a session.* event
@@ -3161,7 +3253,7 @@ def run_checks(config, now, plan):
             # be gap-checked, so they must alert on their own.
             alerts.append(
                 "session-start-missing: session %s has %d audit event(s) but no session.start"
-                % (sid, len(state["seqs"]))
+                % (sid, len(state["identities"]))
             )
             finding_ids.append("session-start-missing:events:" + sid)
             continue
@@ -3245,39 +3337,45 @@ def run_checks(config, now, plan):
             finding_ids.append("session-start-missing:orphan-tar:" + sid)
 
     for sid in sorted(sessions):
-        seqs = sessions[sid]["seqs"]
-        counts = collections.Counter(seqs)
-        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
+        intervals = sessions[sid]["intervals"]
+        duplicates = sessions[sid]["duplicates"]
         if duplicates:
-            rendered = ",".join(str(number) for number in duplicates)
+            # Overlap detection (D9): merged coverage flags any interval claim
+            # that intersects coverage already declared by another identity -
+            # the same seq under a different ts/type, or the rebuild-overlap
+            # residual. Duplicate coverage is never a drop.
             alerts.append(
-                "sequence-duplicate: session %s repeats <seq> %s" % (sid, rendered)
+                "sequence-duplicate: session %s repeats <seq> %s"
+                % (sid, render_interval_ranges(duplicates))
             )
-            finding_ids.append("sequence-duplicate:%s:%s" % (sid, rendered))
+            # Identity from ALL overlaps: the detail render caps at 20 ranges
+            # + ellipsis, and hashing the capped render would let an overlap
+            # beyond range 20 ride a quiet pin unchanged.
+            finding_ids.append(
+                "sequence-duplicate:%s:%s"
+                % (sid, identity_digest("%d-%d" % (start, stop) for start, stop in duplicates))
+            )
             continue
-        unique = sorted(counts)
-        if unique[0] > 1:
+        if intervals[0][0] > 1:
             alerts.append(
                 "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
-                % (sid, unique[0])
+                % (sid, intervals[0][0])
             )
-            finding_ids.append("sequence-origin:%s:%d" % (sid, unique[0]))
-        if unique[-1] - unique[0] + 1 != len(unique):
-            # Bounded missing-set: render gap ranges from the observed values
-            # (never range(low, high+1), which crafted seq values could hang).
-            missing_ranges = [
-                (before + 1, after - 1)
-                for before, after in zip(unique, unique[1:]) if after > before + 1
-            ]
-            rendered = [
-                str(start) if start == stop else "%d-%d" % (start, stop)
-                for start, stop in missing_ranges[:20]
-            ]
-            if len(missing_ranges) > 20:
-                rendered.append("...")
+            finding_ids.append("sequence-origin:%s:%d" % (sid, intervals[0][0]))
+        # A hole BETWEEN merged intervals only (D9): a declared range covers
+        # its whole span, so an event missing *inside* one is invisible
+        # list-only - the disclosed loss. Render bounded from the observed
+        # intervals (never range(low, high+1), which crafted seq values could
+        # hang).
+        missing_ranges = [
+            (high + 1, low - 1)
+            for (_, high), (low, _) in zip(intervals, intervals[1:])
+            if low > high + 1
+        ]
+        if missing_ranges:
             alerts.append(
                 "sequence-gap: session %s missing <seq> %s"
-                % (sid, ",".join(rendered))
+                % (sid, render_interval_ranges(missing_ranges))
             )
             # Identity from ALL missing ranges: the detail render caps at 20
             # ranges + ellipsis, and hashing the capped render would let a gap

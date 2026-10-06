@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 262e98c
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 807bfd4
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree
@@ -30,10 +30,19 @@ and self-checks that the replica in this directory reproduces every vector
 before writing. The matrix carries **dated** vectors (the pinned builder's
 current output), **flat legacy** vectors (the same real-builder basenames
 under the pre-#30 `audit/<basename>` layout, built with the replica's
-`flat=True` opt-in), and the date-segment vectors.
+`flat=True` opt-in), the **range** vectors (the inclusive `-<seq-end>` batched
+shape from `build_audit_range_key`, incl. the degenerate `[seq, seq]` and the
+18-digit ceiling), and the date-segment vectors.
 
-The pin is the **prefix-aware full-key SHA with anchored key
-type/full-key regexes**. The builder layout last changed at 44cfa8f
+The pin is the **seq-range grammar** (pc-admin #29: the optional inclusive
+`<seq-start>-<seq-end>` token on batched non-lifecycle keys, preserved through
+`disambiguate_audit_key`; a range on a lifecycle type, a mode marker on a
+range and a reversed range refuse) on top of the **prefix-aware full-key SHA
+with anchored key type/full-key regexes**. The layout point before it was
+262e98c (pc-admin #30's date-partition squash: `build_audit_key` emits
+`audit/YYYYMMDD/<basename>` and `split_audit_date_segment` refuses an
+all-digit segment that is not a real 8-digit calendar date). The point before
+that was 44cfa8f
 (pc-admin #39 r3: the full-key basename regexes are `\Z`-anchored, so a
 trailing newline after `.json` refuses the parse and is returned unchanged by
 `disambiguate_audit_key` — pre-fix `$` matched before the newline and the
@@ -135,11 +144,11 @@ def build_vectors(b2):
     vectors = []
     date_segments = []
 
-    def replicate(args, flat=False):
+    def replicate(args, flat=False, seq_end=None):
         # CLI-form args (strings); seq is the 4th positional and the CLI parses it as int.
         args = list(args)
         args[3] = int(args[3])
-        return audit_key(*args, flat=flat)
+        return audit_key(*args, flat=flat, seq_end=seq_end)
 
     def layout_expected(dated_key, layout):
         # The flat legacy layout is the same real-builder basename under
@@ -180,6 +189,53 @@ def build_vectors(b2):
             "layout": layout,
             "event": event,
             "replica_args": replica_args,
+            "body": body,
+            "expected": expected,
+        })
+
+    def range_vector(name, kind, event, replica_args, seq_end, layout="dated"):
+        # Real provenance for the batched shape (pc-admin #29): the scope the
+        # shipper's batch path extracts (audit_event_scope sanitizes the type
+        # and sid exactly like build_audit_key), then build_audit_range_key.
+        # The replica builds the same shape through its seq_end opt-in.
+        _, sid, event_type, ts, _mode = b2.audit_event_scope(dict(event))
+        start = int(replica_args[3])
+        dated_expected = b2.build_audit_range_key(event_type, ts, sid, start, int(seq_end))
+        expected = layout_expected(dated_expected, layout)
+        assert replicate(replica_args, flat=(layout == "flat"), seq_end=int(seq_end)) == expected, \
+            "replica range drift at generation time: %s" % name
+        vectors.append({
+            "name": name,
+            "kind": kind,
+            "layout": layout,
+            "event": event,
+            "replica_args": replica_args,
+            "seq_end": str(seq_end),
+            "expected": expected,
+        })
+
+    def variant_range_vector(name, event, replica_args, seq_end, body, layout="dated"):
+        # A batched replay-conflict variant keeps the inclusive range token
+        # (pc-admin disambiguate_audit_key); the witness canonicalizes the
+        # suffix back to the base type and reads the same interval identity.
+        _, sid, event_type, ts, _mode = b2.audit_event_scope(dict(event))
+        start = int(replica_args[3])
+        dated_base = b2.build_audit_range_key(event_type, ts, sid, start, int(seq_end))
+        dated_expected = b2.disambiguate_audit_key(dated_base, body.encode("utf-8"))
+        expected = layout_expected(dated_expected, layout)
+        base = layout_expected(dated_base, layout)
+        assert expected != base, "the real builder did not build a range variant for %s" % name
+        replica_base = replicate(replica_args, flat=(layout == "flat"), seq_end=int(seq_end))
+        assert replica_base == base, "replica range drift at generation time: %s" % name
+        assert disambiguate_key(replica_base, body) == expected, \
+            "replica range variant drift: %s" % name
+        vectors.append({
+            "name": name,
+            "kind": "variant",
+            "layout": layout,
+            "event": event,
+            "replica_args": replica_args,
+            "seq_end": str(seq_end),
             "body": body,
             "expected": expected,
         })
@@ -527,6 +583,10 @@ def build_vectors(b2):
         "dated session.start full key with a trailing newline (\\Z full-key anchors)",
         real_key(b2, {"time": EVENT_TIME, "event": "session.start", "sid": LSID}, None, 0),
     )
+    full_key_refusal_vector(
+        "dated session.data range full key with a trailing newline (\\Z full-key anchors)",
+        b2.build_audit_range_key("session.data", TS, LSID, 2, 7),
+    )
 
     # Cross-repo seed (pc-admin @ a7035a9): a rebuilt audit file that replays a
     # taken key with DIFFERENT bytes ships under `disambiguate_audit_key` — the
@@ -567,6 +627,63 @@ def build_vectors(b2):
         {"time": EVENT_TIME, "event": long_type},
         [long_type, TS, "", "1"],
         "{\"event\":\"over-long\",\"seq\":1,\"v\":\"replay-truncated\"}",
+    )
+
+    # pc-admin #29 seq-range grammar: the optional inclusive range token on
+    # batched (non-lifecycle) keys. The real builder is
+    # `build_audit_range_key` (the shipper's batch path feeds it the
+    # `audit_event_scope` output); the replica builds the same shape through
+    # its `seq_end` opt-in. A one-line batch keeps the legacy single-seq shape
+    # (the dual window) and the degenerate `[seq, seq]` range is legal.
+    range_vector(
+        "session.data range 2-7 (dated)",
+        "golden",
+        {"time": EVENT_TIME, "event": "session.data", "sid": LSID},
+        ["session.data", TS, LSID, "2"],
+        "7",
+    )
+    range_vector(
+        "user.login range 3-9 (dated)",
+        "golden",
+        {"time": EVENT_TIME, "event": "user.login", "sid": LSID},
+        ["user.login", TS, "", "3"],
+        "9",
+    )
+    range_vector(
+        "session.data degenerate range 5-5 (dual shape)",
+        "boundary",
+        {"time": EVENT_TIME, "event": "session.data", "sid": LSID},
+        ["session.data", TS, LSID, "5"],
+        "5",
+    )
+    range_vector(
+        "session.data 18-digit ceiling range 1-10^18-1",
+        "boundary",
+        {"time": EVENT_TIME, "event": "session.data", "sid": LSID},
+        ["session.data", TS, LSID, "1"],
+        str(SEQ_MAX),
+    )
+    range_vector(
+        "flat legacy session.data range 2-7",
+        "flat-legacy",
+        {"time": EVENT_TIME, "event": "session.data", "sid": LSID},
+        ["session.data", TS, LSID, "2"],
+        "7",
+        layout="flat",
+    )
+    variant_range_vector(
+        "session.data range 2-7 replay-conflict variant (range preserved)",
+        {"time": EVENT_TIME, "event": "session.data", "sid": LSID},
+        ["session.data", TS, LSID, "2"],
+        "7",
+        "{\"event\":\"session.data\",\"seq\":2,\"v\":\"replay-range\"}",
+    )
+    variant_range_vector(
+        "user.login range 3-9 replay-conflict variant (range preserved)",
+        {"time": EVENT_TIME, "event": "user.login", "sid": LSID},
+        ["user.login", TS, "", "3"],
+        "9",
+        "{\"event\":\"user.login\",\"seq\":3,\"v\":\"replay-range-other\"}",
     )
 
     refusals = [
@@ -644,16 +761,64 @@ def build_vectors(b2):
          "why": "an embedded newline is out of grammar under any anchor; the "
                 "real builder sanitizes the type to `unknown` and the replica "
                 "refuses it"},
+        # pc-admin #29 range drifts: the real build_audit_range_key refuses the
+        # same shapes (asserted below before the replica check).
+        {"name": "reversed session range (7-2)",
+         "replica_args": ["session.data", TS, LSID, "7"],
+         "seq_end": "2",
+         "why": "a range is inclusive with seq_end >= seq_start; a reversed "
+                "token is drift"},
+        {"name": "reversed non-session range (7-2)",
+         "replica_args": ["user.login", TS, "", "7"],
+         "seq_end": "2",
+         "why": "the reversed-range refusal is shape-wide, not session-only"},
+        {"name": "range on a lifecycle type (session.end 1-2)",
+         "replica_args": ["session.end", TS, LSID, "1"],
+         "seq_end": "2",
+         "why": "lifecycle events stay one object per event (D1)"},
+        {"name": "mode marker on a range (session.data 1-2 shell)",
+         "replica_args": ["session.data", TS, LSID, "1", "shell"],
+         "seq_end": "2",
+         "why": "the mode marker is contract-defined on the single-object "
+                "lifecycle keys only (D5)"},
+        {"name": "range end beyond the 18-digit ceiling",
+         "replica_args": ["user.login", TS, "", "1"],
+         "seq_end": str(SEQ_MAX + 1),
+         "why": "the witness accepts [0-9]{1,18}; a 19-digit range end is drift"},
     ]
+    # Real-builder provenance for the range refusals: build_audit_range_key
+    # refuses the same shapes the replica refuses below.
+    for real_args in (
+            ("session.data", LSID, 7, 2),
+            ("user.login", "", 7, 2),
+            ("session.end", LSID, 1, 2),
+            ("session.data", LSID, 1, 2, "shell"),
+            ("user.login", "", 1, SEQ_MAX + 1)):
+        try:
+            b2.build_audit_range_key(real_args[0], TS, real_args[1], real_args[2],
+                                     real_args[3], *(real_args[4:]))
+        except ValueError:
+            continue
+        raise AssertionError("the real range builder accepted a drift shape: %r" % (real_args,))
     for refusal in refusals:
         try:
-            replicate(refusal["replica_args"])
+            replicate(refusal["replica_args"], seq_end=refusal.get("seq_end"))
         except ValueError:
             continue
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder layout last changed at 44cfa8f (pc-admin #39 r3: "
+        "grammar_note": "builder layout last changed at 807bfd4 (pc-admin #29: the optional "
+                        "inclusive seq-range token on batched non-lifecycle keys - "
+                        "build_audit_range_key emits `<seq-start>-<seq-end>`, the parser returns "
+                        "seq_end, and disambiguate_audit_key preserves the range through the "
+                        "replay-conflict variant; a range on a lifecycle type, a mode marker "
+                        "on a range and a reversed range refuse); previous grammar point "
+                        "262e98c (pc-admin #30's date-partition squash: "
+                        "build_audit_key emits `audit/YYYYMMDD/<basename>` from the "
+                        "event's UTC day, and split_audit_date_segment refuses an "
+                        "all-digit segment that is not a real 8-digit calendar date); "
+                        "44cfa8f (pc-admin #39 r3: "
                         "the full-key basename regexes are \\Z-anchored, so a "
                         "trailing-newline key refuses the parse and is returned "
                         "unchanged by disambiguate_audit_key - never laundered "
@@ -662,13 +827,10 @@ def build_vectors(b2):
                         "split_audit_date_segment/parse_audit_key_full/"
                         "disambiguate_audit_key take the configured `prefix` and refuse "
                         "a foreign prefix or a residual path segment after the "
-                        "prefix/day — only one leading valid YYYYMMDD/ is stripped and "
+                        "prefix/day - only one leading valid YYYYMMDD/ is stripped and "
                         "the remainder must be a bare basename; disambiguate_audit_key "
                         "keeps the passed prefix and returns the key unchanged on "
-                        "refusal); previous grammar point c0ce2f1 (pc-admin #30: "
-                        "build_audit_key emits `audit/YYYYMMDD/<basename>` from the "
-                        "event's UTC day, and split_audit_date_segment refuses an "
-                        "all-digit segment that is not a real 8-digit calendar date); "
+                        "refusal)); "
                         "earlier point 25f7922 (pc-admin #20: the audit-key type "
                         "regexes are \\Z-anchored, so a trailing-newline type is out of "
                         "grammar and is sanitized to the documented `unknown` non-session "
@@ -683,10 +845,11 @@ def build_vectors(b2):
         "layout_note": "dated vectors are the pinned builder's `audit/YYYYMMDD/<basename>` "
                        "output; flat-legacy vectors are the same real-builder basenames "
                        "under `audit/<basename>` (the dual-window legacy layout, built "
-                       "with the replica's explicit flat=True); date_segments pins the "
-                       "optional prefix-aware day-segment split (valid dated, flat, "
-                       "malformed-date and foreign-prefix/residual-segment refusals, "
-                       "custom-prefix positive/negative)",
+                       "with the replica's explicit flat=True); range vectors carry the "
+                       "optional `seq_end` (the inclusive batched token); date_segments "
+                       "pins the optional prefix-aware day-segment split (valid dated, "
+                       "flat, malformed-date and foreign-prefix/residual-segment "
+                       "refusals, custom-prefix positive/negative)",
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "date_segments": date_segments,
