@@ -91,9 +91,11 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="$(echo "$HEAD_SHA" | cut -c1-7)"
-          git fetch origin "$BASE_REF" --depth=1 >/dev/null 2>&1 || true
-          COUNT="$(git diff --name-only "origin/$BASE_REF"...HEAD -- .github/workflows 2>/dev/null | wc -l | tr -d ' ')"
-          [ -z "$COUNT" ] && COUNT=0
+          # The count comes from .github/scripts/banner-workflow-diff.sh:
+          # no shallow fetch (it grafts origin/$BASE_REF and kills the merge
+          # base on a behind-main branch — #130), and an undeterminable
+          # count fails the step loud instead of reporting a false UNCHANGED.
+          COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"
           DIFF_LINK="${{ github.server_url }}/${{ github.repository }}/compare/$BASE_REF...$HEAD_SHA"
           echo "head_short=$SHORT" >> "$GITHUB_OUTPUT"
           echo "head_full=$HEAD_SHA" >> "$GITHUB_OUTPUT"
