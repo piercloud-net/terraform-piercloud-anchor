@@ -52,7 +52,11 @@ jobs:
         id: probe
         continue-on-error: true
         env:
-          PROBE_URL: ${{ inputs.probe_url }}
+          # At the A2 cutover (platform `*.status` records live, flat name
+          # tombstoned) set the repo variable STATUS_PROBE_URL to the nested
+          # dashboard URL. Until then it is unset and the shell default below
+          # probes the flat name.
+          PROBE_URL: ${{ inputs.probe_url || vars.STATUS_PROBE_URL }}
           MIN_CERT_DAYS: "14"
           ATTEMPTS: "3"
           RETRY_SLEEP: "10"
@@ -61,11 +65,13 @@ jobs:
           # see the header comment. Env knobs exist so the exact code can be
           # extracted and run locally against good/bad URLs.
           set -uo pipefail
-          # Flat name until the A2 cutover (edge buildout): the nested
+          # Flat name until the A2 cutover: the nested
           # <tenant>.status.piercloud.net NXDOMAINs until the platform
           # `*.status` wildcard exists, and this workflow is scheduled — a
-          # default flip now would file an incident every 15 minutes. Flip
-          # this default in the same change that lands the platform records.
+          # default flip now would file an incident every 15 minutes. Set the
+          # STATUS_PROBE_URL repo variable to the nested URL in the same
+          # change that lands the platform records (and before the first
+          # post-merge dispatch that tombstones the flat name).
           URL="${PROBE_URL:-https://status-pier.piercloud.net/}"
           base="${URL%/}"
           host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"

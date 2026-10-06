@@ -329,7 +329,8 @@ contains "writer still derives the anchor name" "derive_anchor_hostname" "$(cat 
 lacks "writer no longer derives a status host" "derive_status_host" "$(cat "$SCRIPT")"
 
 # ---- static wiring ---------------------------------------------------------
-contains "provision.yml passes GCORE_DNS_TOKEN" 'GCORE_DNS_TOKEN: ${{ secrets.GCORE_DNS_TOKEN }}' "$(cat "$PROV")"
+contains "provision.yml passes GCORE_DNS_TOKEN" "GCORE_DNS_TOKEN: \${{ vars.NET_DNS_PROVIDER == 'gcore'" "$(cat "$PROV")"
+contains "provision.yml gates CLOUDFLARE_DNS_TOKEN off the gcore path" "CLOUDFLARE_DNS_TOKEN: \${{ vars.NET_DNS_PROVIDER != 'gcore'" "$(cat "$PROV")"
 contains "provision.yml passes the provider switch" 'NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}' "$(cat "$PROV")"
 lacks "gcore boolean read never uses the jq alternative on enabled" ".enabled //" "$(cat "$SCRIPT")"
 contains "gcore boolean read uses tostring" ".enabled | tostring" "$(cat "$SCRIPT")"

@@ -15,16 +15,16 @@ The module provisions **no SSH access and no write-capable standing credentials 
 
 There are **no other standing credentials** in the module surface: no SSH keys, no Teleport tokens, no sockets. The only standing API credentials are the list-only witness key (row 1, optional, present only when all six `RECORDING_WITNESS_*` secrets are set) and the ntfy publish token (row 2, pre-existing Gatus alerting, reused by the witness when enabled). The default template carries neither.
 
-## CI-side (runner) credentials
+## CI-side DNS-write credentials
 
-The `anchor-dns` job (`.github/workflows/provision.yml` → `.github/scripts/030-anchor-dns.sh`) is the one workflow that consumes a DNS-write credential. Both DNS secrets below are **org secrets, visibility all** (GitHub has no finer visibility here), so they are readable by any workflow in the repo — the controls are scope, custody and retirement, not visibility:
+The `anchor-dns` job (`.github/workflows/provision.yml` → `.github/scripts/030-anchor-dns.sh`) is the one workflow that consumes a DNS-write credential. Both DNS secrets below are **org secrets scoped to all repositories** (repo-level placement or selected-repository scoping is possible; all-repos is the current choice), so they are readable by any workflow in this repo — the controls are scope, custody and retirement, not visibility:
 
 | Secret | Scope | Custody / rotation | Retirement |
 |---|---|---|---|
 | `CLOUDFLARE_DNS_TOKEN` | `DNS:Edit` + `Zone:Read` on the `piercloud.net` zone only (Cloudflare tokens cannot be scoped below a zone) | Rotate in the Cloudflare dashboard; Vault-brokered short-lived creds are the platform-side path, not this CI secret | Retires at/after the B `.net` zone move (the zone leaves Cloudflare) and at the stage-2 broker cutover |
 | `GCORE_DNS_TOKEN` | **No zone scoping** — Gcore tokens are account-wide, so this is near-account-wide DNS write authority over the **dedicated platform account** (pc-canary.com now; `piercloud.net` post-B) | A2 interim, owner-approved 2026-10-06 (call C): dedicated token with explicit expiry + calendar rotation; risk-register entry for the H3→M1 window | Deleted at the stage-2 broker cutover (entry criteria: broker anchor path live + registry value validation #8/#124) |
 
-Both secrets are injected into the job env by GitHub; only the active provider's path (selected by the `NET_DNS_PROVIDER` repo variable) reads and masks its token — the script never reads the other. The script enforces the standing invariants: mask-first, token passed via a mode-0600 header file (`-H @file`, never argv or logs), `curl` + `jq` only, fail-closed when the active provider's token is absent, and verify-after-write before any thumbprint is issued. The end state is the M1 broker API with a short-lived OpenBao-minted role — both org secrets deleted, org-secret count back to 0.
+Only the active provider's token is injected into the job env (the workflow selects it by the `NET_DNS_PROVIDER` repo variable), and the script reads and masks exactly that one. The script enforces the standing invariants: mask-first, token passed via a mode-0600 header file (`-H @file`, never argv or logs), `curl` + `jq` only, fail-closed when the active provider's token is absent, and verify-after-write before any thumbprint is issued. The end state is the M1 broker API with a short-lived OpenBao-minted role — both DNS org secrets deleted; no org-level DNS-write credential remains (other org secrets, e.g. the witness/ntfy rows above, are separate legs).
 
 ## Why the witness key is acceptable
 
