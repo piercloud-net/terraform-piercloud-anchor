@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# tests/anchor-dns/run-test.sh — A2 writer proofs for .github/scripts/030-anchor-dns.sh.
+#
+# Drives the REAL writer script (never a copy) with a PATH-stubbed curl; no
+# network, no credentials, real jq. Green paths: Cloudflare create/overwrite,
+# Gcore create/overwrite (404 -> POST, 200 -> PUT), zone override, provider
+# switch. Red paths: verify-after-write mismatch (both providers), Gcore GET
+# non-200, missing token per provider (fail-closed, names the org secret),
+# bad provider, bad zone. Static wiring: no status-record write survives,
+# provision.yml passes the provider switch + both tokens, and the Gcore
+# boolean read uses tostring (the repo's jq-boolean-guard shape).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+SCRIPT=".github/scripts/030-anchor-dns.sh"
+PROV=".github/workflows/provision.yml"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/bin"
+
+pass=0
+fail=0
+ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+is()  { # $1 label, $2 expected, $3 actual
+  if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
+}
+contains() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1 (missing '$2' in: $(printf '%s' "$3" | tail -c 400))" ;; esac; }
+lacks()    { case "$3" in *"$2"*) bad "$1 (found '$2')" ;; *) ok "$1" ;; esac; }
+
+# ---- stubbed curl ----------------------------------------------------------
+# Handles exactly the shapes 030-anchor-dns.sh uses: -sS, -H <h>, -X <M>,
+# --data <json>, -o <file>, -w '%{http_code}'. State lives in JSON files under
+# $STUB_DIR; $STUB_CF_MISMATCH / $STUB_GCORE_MISMATCH force a verify read to
+# answer a different address; $STUB_GCORE_HTTP forces the initial GET status.
+cat > "$WORK/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="${STUB_DIR:?}"
+method="GET"; url=""; out=""; wfmt=""; data=""
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  a="${args[$i]}"
+  case "$a" in
+    -X) i=$((i + 1)); method="${args[$i]}" ;;
+    --data) i=$((i + 1)); data="${args[$i]}" ;;
+    -o) i=$((i + 1)); out="${args[$i]}" ;;
+    -w) i=$((i + 1)); wfmt="${args[$i]}" ;;
+    -H) i=$((i + 1)) ;; # header value; not inspected by the stub
+    -sS | -s | -S | -f | -k | --fail) ;;
+    http://* | https://*) url="$a" ;;
+  esac
+  i=$((i + 1))
+done
+[ -n "$url" ] || { echo "stub-curl: no URL" >&2; exit 2; }
+printf '%s %s\n' "$method" "$url" >> "$DIR/curl.log"
+[ -n "$data" ] && printf '%s\n' "$data" >> "$DIR/curl-data.log"
+emit() { # $1 = code, $2 = body
+  if [ -n "$out" ]; then
+    printf '%s' "$2" > "$out"
+    if [ -n "$wfmt" ]; then printf '%s' "${wfmt//\%\{http_code\}/$1}"; fi
+  else
+    printf '%s' "$2"
+    if [ -n "$wfmt" ]; then printf '%s' "${wfmt//\%\{http_code\}/$1}"; fi
+  fi
+}
+
+# ---- Cloudflare ----
+if [[ "$url" == *"api.cloudflare.com"* ]]; then
+  CF="$DIR/cf-records.json"
+  [ -f "$CF" ] || printf '{}' > "$CF"
+  case "$url" in
+    *"/zones?name="*)
+      zone="${url#*name=}"
+      printf '%s\n' "$zone" >> "$DIR/zones.log"
+      emit 200 '{"result":[{"id":"zone-cf"}]}'
+      exit 0 ;;
+  esac
+  if [[ "$url" == *"/zones/zone-cf/dns_records"* ]]; then
+    if [[ "$url" == *"?"* ]]; then
+      name="${url#*name=}"
+      rec="$(jq -c --arg n "$name" '.[$n] // empty' "$CF")"
+      if [ -n "$rec" ]; then
+        if [ -n "${STUB_CF_MISMATCH:-}" ]; then
+          rec="$(printf '%s' "$rec" | jq -c '.content = "203.0.113.99"')"
+        fi
+        emit 200 "{\"result\":[$rec]}"
+      else
+        emit 200 '{"result":[]}'
+      fi
+    else
+      jq -c --argjson d "$data" '.[$d.name] = {id: "rec1", name: $d.name, type: $d.type, content: $d.content, ttl: $d.ttl, proxied: $d.proxied}' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+      emit 200 '{"success":true}'
+    fi
+    exit 0
+  fi
+  emit 500 '{"error":"stub-curl: unhandled Cloudflare URL"}'
+  exit 0
+fi
+
+# ---- Gcore ----
+if [[ "$url" == *"api.gcore.com"* ]]; then
+  GC="$DIR/gcore-rrsets.json"
+  [ -f "$GC" ] || printf '{}' > "$GC"
+  case "$url" in
+    *"/dns/v2/zones/"*"/A")
+      path="${url#*"/dns/v2/zones/"}" # <zone>/<fqdn>/A
+      zone="${path%%/*}"
+      rest="${path#*/}" # <fqdn>/A
+      fqdn="${rest%/A}"
+      printf '%s\n' "$zone" >> "$DIR/zones.log"
+      case "$method" in
+        GET)
+          if [ -n "${STUB_GCORE_HTTP:-}" ]; then emit "$STUB_GCORE_HTTP" '{"error":"stub"}'; exit 0; fi
+          rr="$(jq -c --arg n "$fqdn" '.[$n] // empty' "$GC")"
+          if [ -n "$rr" ]; then
+            if [ -n "${STUB_GCORE_MISMATCH:-}" ]; then
+              rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content = ["203.0.113.99"]')"
+            fi
+            emit 200 "$rr"
+          else
+            emit 404 '{"error":"not found"}'
+          fi ;;
+        PUT | POST)
+          jq -c --argjson d "$data" --arg n "$fqdn" '.[$n] = {name: $n, type: "A", ttl: $d.ttl, resource_records: $d.resource_records}' "$GC" > "$GC.tmp" && mv "$GC.tmp" "$GC"
+          emit 200 '{"ok":true}' ;;
+        *) emit 500 '{"error":"stub-curl: unhandled method"}' ;;
+      esac
+      exit 0 ;;
+  esac
+  emit 500 '{"error":"stub-curl: unhandled Gcore URL"}'
+  exit 0
+fi
+
+emit 500 '{"error":"stub-curl: unhandled URL"}'
+STUB
+chmod +x "$WORK/bin/curl"
+export PATH="$WORK/bin:$PATH"
+export STUB_DIR="$WORK"
+
+# ---- helpers ---------------------------------------------------------------
+reset_state() {
+  printf '{}' > "$WORK/cf-records.json"
+  printf '{}' > "$WORK/gcore-rrsets.json"
+  : > "$WORK/curl.log"
+  : > "$WORK/curl-data.log"
+  : > "$WORK/zones.log"
+}
+run_writer() { # $@ = env assignments for the writer; rc echoed; log in $WORK/last.log
+  local rc=0
+  (
+    unset NET_DNS_PROVIDER NET_DNS_ZONE CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP
+    env "$@" bash "$SCRIPT"
+  ) >"$WORK/last.log" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+LOG() { cat "$WORK/last.log"; }
+CF_KEYS() { jq -r 'keys | join(",")' "$WORK/cf-records.json"; }
+GC_KEYS() { jq -r 'keys | join(",")' "$WORK/gcore-rrsets.json"; }
+
+T_USER="pier"
+T_IP="203.0.113.10"
+T_HOST="anchor-01-pier.piercloud.net"
+
+[ -f "$SCRIPT" ] || { printf 'FAIL writer not found: %s\n' "$SCRIPT"; exit 1; }
+[ -f "$PROV" ] || { printf 'FAIL workflow not found: %s\n' "$PROV"; exit 1; }
+
+# ---- green: Cloudflare create ---------------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token")"
+is "cloudflare create rc" "0" "$rc"
+contains "cloudflare create verifies" "verified: $T_HOST -> $T_IP (proxied=false)" "$(LOG)"
+is "cloudflare create writes exactly the anchor record" "$T_HOST" "$(CF_KEYS)"
+contains "cloudflare create used POST (no record existed)" "POST" "$(cat "$WORK/curl.log")"
+lacks "cloudflare create did not PUT" "PUT" "$(cat "$WORK/curl.log")"
+is "cloudflare create zone resolved" "piercloud.net" "$(cat "$WORK/zones.log")"
+
+# ---- green: Cloudflare overwrite ------------------------------------------
+reset_state
+jq -n --arg n "$T_HOST" '{($n): {id:"rec1",name:$n,type:"A",content:"198.51.100.7",ttl:300,proxied:false}}' > "$WORK/cf-records.json"
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token")"
+is "cloudflare overwrite rc" "0" "$rc"
+contains "cloudflare overwrite PUT" "PUT" "$(cat "$WORK/curl.log")"
+is "cloudflare overwrite final address" "$T_IP" "$(jq -r --arg n "$T_HOST" '.[$n].content' "$WORK/cf-records.json")"
+contains "cloudflare overwrite logs the old address" "record exists (198.51.100.7)" "$(LOG)"
+
+# ---- red: Cloudflare verify mismatch --------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token" STUB_CF_MISMATCH=1)"
+[ "$rc" != "0" ] && ok "cloudflare verify mismatch fails the run (rc=$rc)" || bad "cloudflare verify mismatch did not fail"
+contains "cloudflare verify mismatch message" "verify-after-write mismatch" "$(LOG)"
+
+# ---- green: Gcore create (404 -> POST) ------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+is "gcore create rc" "0" "$rc"
+contains "gcore create verifies" "verified: $T_HOST -> $T_IP (ttl=300, enabled=true)" "$(LOG)"
+is "gcore create writes exactly the anchor record" "$T_HOST" "$(GC_KEYS)"
+contains "gcore create used POST (404 first)" "POST" "$(cat "$WORK/curl.log")"
+is "gcore create body shape (A content single-element array)" "[\"$T_IP\"]" "$(jq -c --arg n "$T_HOST" '.[$n].resource_records[0].content' "$WORK/gcore-rrsets.json")"
+is "gcore create enabled flag" "true" "$(jq -r --arg n "$T_HOST" '.[$n].resource_records[0].enabled' "$WORK/gcore-rrsets.json")"
+
+# ---- green: Gcore overwrite (200 -> PUT) ----------------------------------
+reset_state
+jq -n --arg n "$T_HOST" '{($n): {name:$n,type:"A",ttl:300,resource_records:[{content:["198.51.100.7"],enabled:true}]}}' > "$WORK/gcore-rrsets.json"
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+is "gcore overwrite rc" "0" "$rc"
+contains "gcore overwrite PUT" "PUT" "$(cat "$WORK/curl.log")"
+is "gcore overwrite final address" "$T_IP" "$(jq -r --arg n "$T_HOST" '.[$n].resource_records[0].content[0]' "$WORK/gcore-rrsets.json")"
+
+# ---- red: Gcore verify mismatch -------------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_MISMATCH=1)"
+[ "$rc" != "0" ] && ok "gcore verify mismatch fails the run (rc=$rc)" || bad "gcore verify mismatch did not fail"
+contains "gcore verify mismatch message" "verify-after-write mismatch" "$(LOG)"
+
+# ---- red: Gcore initial GET non-200 ---------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_HTTP=500)"
+[ "$rc" != "0" ] && ok "gcore GET 500 fails the run (rc=$rc)" || bad "gcore GET 500 did not fail"
+contains "gcore GET 500 message" "returned HTTP 500" "$(LOG)"
+is "gcore GET 500 wrote nothing" "" "$(GC_KEYS)"
+
+# ---- red: missing token per provider (fail-closed, names the secret) ------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP")"
+[ "$rc" != "0" ] && ok "missing CLOUDFLARE_DNS_TOKEN fails closed (rc=$rc)" || bad "missing CLOUDFLARE_DNS_TOKEN did not fail"
+contains "missing token names CLOUDFLARE_DNS_TOKEN" "CLOUDFLARE_DNS_TOKEN is not set" "$(LOG)"
+is "missing token wrote nothing" "" "$(CF_KEYS)"
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore)"
+[ "$rc" != "0" ] && ok "missing GCORE_DNS_TOKEN fails closed (rc=$rc)" || bad "missing GCORE_DNS_TOKEN did not fail"
+contains "missing token names GCORE_DNS_TOKEN" "GCORE_DNS_TOKEN is not set" "$(LOG)"
+
+# ---- red: bad provider / bad zone ------------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=bogus CLOUDFLARE_DNS_TOKEN="cf-token")"
+[ "$rc" != "0" ] && ok "unknown provider fails closed (rc=$rc)" || bad "unknown provider did not fail"
+contains "unknown provider message" "is not one of cloudflare|gcore" "$(LOG)"
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_ZONE="bad zone" CLOUDFLARE_DNS_TOKEN="cf-token")"
+[ "$rc" != "0" ] && ok "invalid zone fails closed (rc=$rc)" || bad "invalid zone did not fail"
+contains "invalid zone message" "NET_DNS_ZONE is empty or invalid" "$(LOG)"
+
+# ---- green: zone override (canary-proof path) ------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" NET_DNS_ZONE=pc-canary.com)"
+is "canary zone override rc" "0" "$rc"
+contains "canary zone resolved on Gcore" "pc-canary.com" "$(cat "$WORK/zones.log")"
+is "canary zone record key" "anchor-01-pier.pc-canary.com" "$(GC_KEYS)"
+
+# ---- no per-tenant status record survives ----------------------------------
+contains "writer still derives the anchor name" "derive_anchor_hostname" "$(cat "$SCRIPT")"
+lacks "writer no longer derives a status host" "derive_status_host" "$(cat "$SCRIPT")"
+lacks "no status record was written on the CF path" "status" "$(jq -r 'keys | join(",")' "$WORK/cf-records.json")"
+
+# ---- static wiring ---------------------------------------------------------
+contains "provision.yml passes GCORE_DNS_TOKEN" 'GCORE_DNS_TOKEN: ${{ secrets.GCORE_DNS_TOKEN }}' "$(cat "$PROV")"
+contains "provision.yml passes the provider switch" 'NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}' "$(cat "$PROV")"
+lacks "gcore boolean read never uses // empty" ".enabled // empty" "$(cat "$SCRIPT")"
+contains "gcore boolean read uses tostring" ".enabled | tostring" "$(cat "$SCRIPT")"
+contains "anchor TTL constant documented" "ANCHOR_TTL=300" "$(cat "$SCRIPT")"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
