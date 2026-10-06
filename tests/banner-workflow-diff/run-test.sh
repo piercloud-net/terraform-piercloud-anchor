@@ -44,12 +44,13 @@
 #   (r) a module block in the counted root HCL refuses — its source tree is
 #       executed by the run but may be outside the counted set; the gate is the
 #       block statement itself (line-anchored `module` token: attached `=`,
-#       attached label, inline block comments, a BOM prefix, JSON split keys
-#       and `\uNNNN` escapes covered; `.tf`/`.tf.json`/`.tofu`/`.tofu.json`
-#       included), while a non-module `source` (attribute, comment or heredoc
-#       text) and the bare word "module" in prose do not refuse (red-team
-#       r5/r5b/r5c MEDIUM, trust r5b MEDIUM, functional r5b MEDIUM/LOW,
-#       functional r5c HIGH; latent — no module blocks in the counted root HCL
+#       attached label, leading inline/multi-line block comments, indentation,
+#       a BOM prefix, JSON split keys and spaced colons, source-value escapes
+#       covered; `.tf`/`.tf.json`/`.tofu`/`.tofu.json` included), while a
+#       non-module `source` (attribute, comment or heredoc text) and the bare
+#       word "module" in prose do not refuse (red-team r5/r5b/r5c/r5c-delta
+#       MEDIUM, trust r5b/r5c-delta MEDIUM/LOW, functional r5b/r5c/r5c-delta
+#       HIGH/MEDIUM/LOW; latent — no module blocks in the counted root HCL
 #       today; the example tree has one, unexecuted);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
@@ -303,6 +304,44 @@ git_c add -A
 git_c commit -qm "BOM-prefixed module block"
 git_c push -q origin modulebom
 
+git_c checkout -qb moduleleadcomment main
+mkdir -p modules/m
+printf '/*c*/ module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "leading block-comment module block"
+git_c push -q origin moduleleadcomment
+
+git_c checkout -qb moduleleadcommentnl main
+mkdir -p modules/m
+printf '/* c\n*/ module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "multi-line leading block-comment module block"
+git_c push -q origin moduleleadcommentnl
+
+git_c checkout -qb moduleindented main
+mkdir -p modules/m
+printf '  module "m" {\n    source = "./modules/m"\n  }\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "indented module block"
+git_c push -q origin moduleindented
+
+git_c checkout -qb modulejsonspaced main
+mkdir -p modules/m
+printf '{"module" : {"m":{"source":"./modules/m"}}}\n' > main.tf.json
+printf '{}\n' > modules/m/main.tf.json
+git_c add -A
+git_c commit -qm "JSON spaced-colon module block"
+git_c push -q origin modulejsonspaced
+
+git_c checkout -qb modulecount main
+printf 'locals {\n  module_count = 3\n}\n' > main.tf
+git_c add -A
+git_c commit -qm "module_count local (prose-like identifier)"
+git_c push -q origin modulecount
+
 git_c checkout -qb modulejsonsplit main
 mkdir -p modules/m
 printf '{"module"\n:{"m":{"source":"./modules/m"}}}\n' > main.tf.json
@@ -345,6 +384,30 @@ ln -s payload/evil.sh prod.auto.tfvars.json
 git_c add -A
 git_c commit -qm "tfvars-named symlink in a counted path"
 git_c push -q origin tfvarssymlink
+
+git_c checkout -qb tfsymlink main
+mkdir -p payload
+printf '#!/usr/bin/env bash\necho payload\n' > payload/evil.sh
+ln -s payload/evil.sh prod.tfvars
+git_c add -A
+git_c commit -qm "plain-tfvars-named symlink in a counted path"
+git_c push -q origin tfsymlink
+
+git_c checkout -qb lockfilesymlink main
+mkdir -p payload
+printf '#!/usr/bin/env bash\necho payload\n' > payload/evil.sh
+ln -s payload/evil.sh .terraform.lock.hcl
+git_c add -A
+git_c commit -qm "lockfile-named symlink in a counted path"
+git_c push -q origin lockfilesymlink
+
+git_c checkout -qb dottofujsonsymlink main
+mkdir -p payload
+printf '#!/usr/bin/env bash\necho payload\n' > payload/evil.sh
+ln -s payload/evil.sh main.tofu.json
+git_c add -A
+git_c commit -qm ".tofu.json-named symlink in a counted path"
+git_c push -q origin dottofujsonsymlink
 
 git_c checkout -q main
 printf 'name: moved\n' > .github/workflows/moved.yml
@@ -572,6 +635,14 @@ out="$(bash "$SCRIPT" main 2>"$WORK/tfvarssymlink.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "tfvars-named symlink: rc non-zero"; else bad "tfvars-named symlink: rc=$rc"; fi
 is "tfvars-named symlink: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/tfvarssymlink.err"; then ok "tfvars-named symlink: ::error:: annotation"; else bad "tfvars-named symlink: no ::error::"; fi
+for variant in tfsymlink lockfilesymlink dottofujsonsymlink; do
+  git_c checkout -q "$variant"
+  rc=0
+  out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "$variant: rc non-zero"; else bad "$variant: rc=$rc"; fi
+  is "$variant: no count on stdout" "" "$out"
+  if grep -q '::error::' "$WORK/$variant.err"; then ok "$variant: ::error:: annotation"; else bad "$variant: no ::error::"; fi
+done
 
 # --- (r) a module block in the counted root HCL refuses ----------------------
 # A referenced module tree is executed by `tofu` but may be outside the
@@ -592,7 +663,7 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
-for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule; do
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleindented modulejsonspaced; do
   git_c checkout -q "$variant"
   rc=0
   out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
@@ -605,6 +676,11 @@ rc=0
 count="$(bash "$SCRIPT" main)" || rc=$?
 is "module prose: counted (not refused)" "1" "$count"
 is "module prose: rc" "0" "$rc"
+git_c checkout -q modulecount
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "module_count local: counted (not refused)" "1" "$count"
+is "module_count local: rc" "0" "$rc"
 git_c checkout -q ressrc
 rc=0
 count="$(bash "$SCRIPT" main)" || rc=$?
@@ -641,8 +717,16 @@ strip_comments() { sed -E 's/^[[:space:]]*#.*$//'; }
 prov_active="$(join_continuations < "$PROV" | strip_comments)"
 prov_flat="$(tr '\n' ' ' <<<"$prov_active")"
 # Backslash-escaped letters are a bash no-op (`g\it fetch` runs `git fetch`);
-# unescape so the pins see through that spelling too (red-team r5c LOW).
-prov_unslashed="$(sed -E 's/\\(.)/\1/g' <<<"$prov_flat")"
+# unescape so the pins see through that spelling too (red-team r5c LOW). The
+# helper and the scan are functions so the wiring itself is pin-able (trust
+# r5c-delta LOW).
+unslash() { sed -E 's/\\(.)/\1/g'; }
+prov_unslashed="$(unslash <<<"$prov_flat")"
+no_fetch_scan() {
+  grep -qE "$no_fetch_re" <<<"$prov_active" \
+    || grep -qE "$no_fetch_re" <<<"$prov_flat" \
+    || grep -qE "$no_fetch_re" <<<"$prov_unslashed"
+}
 # The verdict pins are scoped to the banner job/step, so a `COUNT=` assignment
 # in another job (e.g. the DNS job's list_count) is neither counted nor
 # satisfying (red-team r2/r3 MEDIUM).
@@ -654,15 +738,20 @@ call_line='COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"'
 if [ "$(grep -cF "$call_line" <<<"$banner_active")" = "1" ]; then ok "the banner step calls the diff script (exact active call line)"; else bad "the banner step call line is missing, duplicated, or only commented"; fi
 if [ "$(grep -oF 'COUNT=' <<<"$banner_active" | grep -c .)" = "1" ]; then ok "COUNT is assigned exactly once in the banner step"; else bad "the banner step has extra COUNT assignments or aliases"; fi
 if [ "$(grep -cE 'COUNT[[:space:]]*[+*/%^-]?=' <<<"$banner_active")" = "1" ]; then ok "COUNT is assigned exactly once (space/compound-tolerant spelling)"; else bad "the banner step carries a COUNT assignment beyond the single call line"; fi
-if grep -qE "\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\\]?[\"']?-v|^[[:space:]]*\.[[:space:]]" <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
+override_re="\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\\]?[\"']?-v|^[[:space:]]*\.[[:space:]]"
+if grep -qE "$override_re" <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
 stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
 if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
 if [ "$(grep -oE '\-eq[[:space:]]+0' <<<"$banner_active" | grep -c .)" = "1" ] && ! grep -qE '\-(ge|gt|le|lt|ne)[[:space:]]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0 (no widened/decoy comparison)"; else bad "the COUNT comparison is missing, widened, or decoyed"; fi
 no_fetch_re="(^|[^[:alnum:]_])[\"']?git[\"']?([[:space:]]+[^[:space:];&|]+)*[[:space:]]+[\"']?(fetch|pull)[\"']?"
-if grep -qE "$no_fetch_re" <<<"$prov_active" || grep -qE "$no_fetch_re" <<<"$prov_flat" || grep -qE "$no_fetch_re" <<<"$prov_unslashed"; then bad "provision.yml still carries a fetch/pull"; else ok "provision.yml carries no fetch/pull (continuation-, option-, quote-, newline-, backslash-splice- and whitespace-tolerant)"; fi
+if no_fetch_scan; then bad "provision.yml still carries a fetch/pull"; else ok "provision.yml carries no fetch/pull (continuation-, option-, quote-, newline-, backslash-splice- and whitespace-tolerant)"; fi
 if printf 'git -c protocol.version=2 fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches global-option variants"; else bad "the no-fetch pin misses global-option variants"; fi
 if printf 'git \\\nfetch origin main --depth=1\n' | join_continuations | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches continuation variants"; else bad "the no-fetch pin misses continuation variants"; fi
-if printf 'g\\it fetch origin main --depth=1\n' | sed -E 's/\\(.)/\1/g' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches backslash-spliced variants"; else bad "the no-fetch pin misses backslash-spliced variants"; fi
+if printf 'g\\it fetch origin main --depth=1\n' | unslash | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches backslash-spliced variants"; else bad "the no-fetch pin misses backslash-spliced variants"; fi
+no_fetch_saved_active="$prov_active"; no_fetch_saved_flat="$prov_flat"; no_fetch_saved_unslashed="$prov_unslashed"
+prov_active=""; prov_flat=""; prov_unslashed='git fetch origin main --depth=1'
+if no_fetch_scan; then ok "the no-fetch scan consumes prov_unslashed (the backslash-splice wiring is pinned)"; else bad "the no-fetch scan ignores prov_unslashed"; fi
+prov_active="$no_fetch_saved_active"; prov_flat="$no_fetch_saved_flat"; prov_unslashed="$no_fetch_saved_unslashed"
 if printf '"git" fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches quoted git"; else bad "the no-fetch pin misses quoted git"; fi
 if printf 'git "fetch" origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches quoted fetch"; else bad "the no-fetch pin misses quoted fetch"; fi
 if printf 'git pull origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches pull"; else bad "the no-fetch pin misses pull"; fi
@@ -675,7 +764,6 @@ if grep -qE "$splice_re" <<<"$banner_active"; then bad "the banner step carries 
 if grep -qE "$splice_re" <<<"$prov_active"; then bad "provision.yml carries a double-quote-spliced identifier (a fetch can hide behind one)"; else ok "no double-quote-spliced identifier in provision.yml"; fi
 assign_re="=[[:space:]]*[\"']?(fetch|pull)([^[:alnum:]_]|$)"
 if grep -qE "$assign_re" <<<"$prov_active"; then bad "provision.yml assigns fetch/pull to a variable (an indirect fetch)"; else ok "provision.yml does not assign fetch/pull to a variable"; fi
-override_re="\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\\]?[\"']?-v"
 if grep -qE "$override_re" <<< 'printf -vCOUNT "%s" 0'; then ok "the override pin matches an attached printf -v target"; else bad "the override pin misses an attached printf -v target"; fi
 if grep -qE "$override_re" <<< "printf '-v' COUNT 0"; then ok "the override pin matches a quoted printf -v"; else bad "the override pin misses a quoted printf -v"; fi
 if grep -qE "$override_re" <<< 'printf \-v COUNT 0'; then ok "the override pin matches an escaped printf -v"; else bad "the override pin misses an escaped printf -v"; fi
