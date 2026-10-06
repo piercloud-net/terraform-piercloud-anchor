@@ -1284,7 +1284,9 @@ jobs:
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
       # A2 provider switch (cloudflare default | gcore post-B) + both tokens:
       # the script requires exactly the active provider's token and fails
-      # closed naming the org secret when it is absent.
+      # closed naming the org secret when it is absent. Both secrets are
+      # present in the job env; only the active provider's token is ever
+      # read and masked — the unused one is never expanded.
       NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}
       CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
       GCORE_DNS_TOKEN: ${{ secrets.GCORE_DNS_TOKEN }}

@@ -72,7 +72,7 @@ The run opens the hardened A1 self-open /32 SSH window, sets its own one-time ro
 
 The tang thumbprint reaches you via the H1 chain — run artifact (`retention-days: 90` = the public-repo cap, a 90-day convenience copy only; the durable legs — committed break-glass file via reviewable App PR and the platform registry — are pending). Never rely on logs or artifacts alone (repo logs are a separate setting, also capped at 90 days on public repos). `mode=check` asserts every workflow's retention stays within the cap. **Save the thumbprint in your PM NOW** (and finish the [day-1 checklist](dr.md#day-1-off-device-checklist)).
 
-The run also creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://<you>.status.piercloud.net` (served through the platform status edge; TLS terminated on the box by Caddy; nothing to enter).
+The run also creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://<you>.status.piercloud.net` (served through the platform status edge; visitor TLS ends at the edge, and the edge→origin leg's TLS is terminated on the box by Caddy; nothing to enter).
 
 ## 5. Bind your main box (clevis) — at its keyboard, not your phone
 

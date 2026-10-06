@@ -61,7 +61,12 @@ jobs:
           # see the header comment. Env knobs exist so the exact code can be
           # extracted and run locally against good/bad URLs.
           set -uo pipefail
-          URL="${PROBE_URL:-https://pier.status.piercloud.net/}"
+          # Flat name until the A2 cutover (edge buildout): the nested
+          # <tenant>.status.piercloud.net NXDOMAINs until the platform
+          # `*.status` wildcard exists, and this workflow is scheduled — a
+          # default flip now would file an incident every 15 minutes. Flip
+          # this default in the same change that lands the platform records.
+          URL="${PROBE_URL:-https://status-pier.piercloud.net/}"
           base="${URL%/}"
           host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
           fail=""

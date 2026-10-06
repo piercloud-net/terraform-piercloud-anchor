@@ -851,7 +851,7 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s' "$ENDPOINTS_YAML"
   if [ -n "${STATUS_HOST:-}" ]; then
     printf '%s\n' "  # Dashboard through the platform status edge (CloudFront at the A2"
-    printf '%s\n' "  # target; the orange cloud on the interim flat name): proves edge ->"
+    printf '%s\n' "  # target — the platform status wildcard routes this name): proves edge ->"
     printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
     printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
@@ -1247,7 +1247,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
     case "${dash_code}" in
       301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the proxied edge record is upserted by the DNS stage after close)" ;;
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the DNS stage writes only the anchor record; the dashboard name is covered by the platform status wildcard at the edge buildout)" ;;
       *)
         docker logs caddy 2>&1 | tail -20 || true
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
@@ -1305,9 +1305,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The proxied edge record is upserted by the DNS stage AFTER this job, so on a first-time/DR dispatch this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once DNS converges re-enable AOP (docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge re-enable AOP (docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the proxied record may still point at the old box (edge 521/522) — the DNS stage converges only AFTER this job, see docs/dr.md"
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -1333,10 +1333,10 @@ if [ -n "${STATUS_HOST:-}" ]; then
   elif [ "${ORIGIN_TLS}" != "1" ]; then
     # No origin pair selected (absent, or the one-way marker suppressed the
     # legacy fallback): auto-TLS cannot reliably issue for a name whose public
-    # record is only upserted by the DNS stage after this job. Origin TLS is
-    # proven there (verify-after-write + orange-cloud) and by the edge, so
-    # this is loud, not fatal; with a pair selected it stays fail-closed.
-    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the proxied edge record is upserted after close (docs/dr.md)"
+    # edge path (the platform status wildcard) is not in place yet. Origin TLS
+    # is proven by the edge once the platform records exist, so this is loud,
+    # not fatal; with a pair selected it stays fail-closed.
+    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the platform status wildcard may not be in place yet (docs/dr.md)"
   else
     docker logs caddy 2>&1 | tail -20 || true
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
