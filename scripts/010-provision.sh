@@ -56,7 +56,9 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # (dispatched runs receive STATUS_HOST as the dashboard FQDN via 020's
 # ENV_PREFIX; ANCHOR_HOSTNAME stays the zone-less SCP hostname);
 # tests/naming-scheme/run-test.sh diffs the block against the lib — edit the
-# lib and copy the block, never fork it.
+# lib and copy the block, never fork it. A2 2026-09-30: the dashboard is the
+# NESTED `<tenant>.status.piercloud.net` (platform status namespace,
+# CloudFront-covered); the anchor name stays flat on `.net`.
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
@@ -84,8 +86,8 @@ derive_anchor_hostname() { # $1 = sanitized tenant -> anchor-<NN>-<tenant> (NN=0
   printf 'anchor-01-%s\n' "$1"
 }
 
-derive_status_host() { # $1 = sanitized tenant -> status-<tenant> (dashboard singleton, one label)
-  printf 'status-%s\n' "$1"
+derive_status_host() { # $1 = sanitized tenant -> <tenant>.status (dashboard under the platform status namespace)
+  printf '%s.status\n' "$1"
 }
 # --- END NAMING ---
 caddy_status_names() { # STATUS_HOST/ANCHOR_HOSTNAME from dispatch env, else derived from TENANT_USER
@@ -331,13 +333,18 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 }
 
 # --- origin-ca:start --- (tests/origin-ca extracts this span; keep markers)
-# Per-anchor Cloudflare Origin CA material (issue #123): the private key is
+# Per-anchor cert material (issue #123; A2 2026-09-30): the private key is
 # generated ON this box and never leaves it; the CSR is public material
-# published in the run artifact for operator-side signing; the signed cert
-# returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and is
-# validated fail-closed before Caddy may serve it. Paths are overridable so
-# the harness can run this span off-box (same pattern as the bind-e2e
-# render span).
+# published in the run artifact for operator/broker-side signing; the signed
+# cert returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and
+# is validated fail-closed before Caddy may serve it. A2: the dashboard sits
+# behind CloudFront, which trusts Mozilla-store CAs only — so the cert is a
+# PUBLIC single-SAN cert for the nested `<tenant>.status.piercloud.net`
+# viewer host (broker-issued via ACME DNS-01; Cloudflare Origin CA is dead
+# for this leg). The span/variable names stay `origin-ca` for continuity;
+# the single-SAN selfcheck below is the fail-closed gate either way. Paths
+# are overridable so the harness can run this span off-box (same pattern as
+# the bind-e2e render span).
 ORIGIN_CA_DIR="${ORIGIN_CA_DIR:-/etc/caddy}"
 ORIGIN_CA_KEY="${ORIGIN_CA_KEY:-${ORIGIN_CA_DIR}/origin-ca.key}"
 ORIGIN_CA_CSR="${ORIGIN_CA_CSR:-${ORIGIN_CA_DIR}/origin-ca.csr}"
@@ -843,9 +850,10 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "      - \"[RESPONSE_TIME] < 500\"  # Caddy p95>500ms alert, per-probe form (docs: https://gatus.io/docs)"
   printf '%s' "$ENDPOINTS_YAML"
   if [ -n "${STATUS_HOST:-}" ]; then
-    printf '%s\n' "  # Dashboard through the orange cloud: proves edge -> origin TLS and"
-    printf '%s\n' "  # warns while the cert is still fresh (stale-cert failure is"
-    printf '%s\n' "  # dashboard-only — tang answers plain HTTP on its own port)."
+    printf '%s\n' "  # Dashboard through the platform status edge (CloudFront at the A2"
+    printf '%s\n' "  # target; the orange cloud on the interim flat name): proves edge ->"
+    printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
+    printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
     printf '%s\n' "    url: https://${STATUS_HOST}"
     printf '%s\n' "    interval: 300s"
@@ -4114,4 +4122,4 @@ case "$(recording_witness_state)" in
     ;;
 esac
 
-log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."
+log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-<alias>.status.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

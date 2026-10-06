@@ -110,8 +110,8 @@ for fn in origin_ca_generate origin_ca_cert_hash origin_ca_csr_selfcheck origin_
   declare -f "$fn" >/dev/null || { printf 'FAIL extraction did not yield %s\n' "$fn"; exit 1; }
 done
 
-STATUS_HOST="status-citest.piercloud.net"
-OTHER_HOST="status-other.piercloud.net"
+STATUS_HOST="citest.status.piercloud.net"
+OTHER_HOST="other.status.piercloud.net"
 
 # ---- (a) generation ------------------------------------------------------
 origin_ca_generate
