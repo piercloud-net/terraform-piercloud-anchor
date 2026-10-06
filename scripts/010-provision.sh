@@ -1502,16 +1502,42 @@ RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar\Z")
 # skip unshaped recordings keys), but letting it move a cursor would put the
 # cursor past the real key space and blind the next delta's tail while the run
 # stays green (round-3 forged-cursor / live-probe class). These predicates
-# mirror the current flat layout and must be extended together with the
-# classifier when the date-partitioned/seq-range layout lands (#159).
-def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
-    """True for a shaped session/non-session audit key below the heartbeat stem."""
-    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
-        return False
-    relative = key[len(audit_prefix):]
-    if SESSION_KEY_RE.match(relative):
+# are layout-specific since #159: `is_audit_session_key` is flat-only and
+# `is_audit_session_dated_key` requires a valid `YYYYMMDD/` day segment; both
+# build on `strip_date_segment`, and the classifier strips the same segment so
+# the cursor movers and the classifier stay in step.
+def strip_date_segment(relative):
+    """Strip exactly one leading ``YYYYMMDD/`` calendar-date segment.
+
+    Returns ``(basename, day)``. ``relative`` is an audit key without its
+    configured prefix. ``day`` is ``None`` for a flat key (no day segment);
+    ``basename`` is the key name the family regexes then match. The segment
+    is stripped only when the eight digits are a real calendar date
+    (``datetime.strptime``): a non-calendar ``[0-9]{8}`` segment (``20260932``,
+    ``00000000``) returns ``(None, segment)``, so callers treat the key as
+    unmatchable drift and never silently strip it into a flat parse. Any
+    other leading segment (a wrong digit count, or a ``session.start``-named
+    segment) is left in place, so the family regexes cannot match it either
+    (a leading `/` makes the basename grammar fail). Never strips more than
+    one segment (#159).
+    """
+    head, sep, rest = relative.partition("/")
+    if not sep:
+        return relative, None
+    if not re.fullmatch(r"[0-9]{8}", head):
+        return relative, None
+    try:
+        datetime.strptime(head, "%Y%m%d")
+    except ValueError:
+        return None, head
+    return rest, head
+
+
+def _audit_session_basename_matches(basename):
+    """True for a basename shaped as a documented session/non-session key."""
+    if SESSION_KEY_RE.match(basename):
         return True
-    generic = NON_SESSION_KEY_RE.match(relative)
+    generic = NON_SESSION_KEY_RE.match(basename)
     if not generic:
         return False
     # Mirror the classifier: a NON_SESSION-shaped `session.*` key with no sid
@@ -1521,6 +1547,46 @@ def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
     # non-session shape and stay valid cursor movers.
     event_type, _ = canonical_conflict_type(generic.group("etype"))
     return not (event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS)
+
+
+def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
+    """True for a shaped FLAT session/non-session key (no day segment)."""
+    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
+        return False
+    relative = key[len(audit_prefix):]
+    basename, day = strip_date_segment(relative)
+    if basename is None or day is not None:
+        return False
+    return _audit_session_basename_matches(basename)
+
+
+def is_audit_session_dated_key(key, audit_prefix, heartbeat_prefix):
+    """True for a shaped DATED session/non-session key (valid day segment)."""
+    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
+        return False
+    relative = key[len(audit_prefix):]
+    basename, day = strip_date_segment(relative)
+    if basename is None or day is None:
+        return False
+    return _audit_session_basename_matches(basename)
+
+
+def _audit_key_day(audit_prefix, key):
+    """The UTC calendar day of a shaped audit key: day segment or ``<ts>``.
+
+    A flat key carries no day segment, so its day is the leading eight digits
+    of the shaped basename's ``<ts>``; a dated key uses the validated day
+    segment. Returns ``""`` for an unshaped key (a heartbeat, drift, a
+    malformed day). Used for the dated delta's bounded day selection.
+    """
+    relative = key[len(audit_prefix):] if key.startswith(audit_prefix) else key
+    basename, day = strip_date_segment(relative)
+    if basename is None:
+        return ""
+    if day:
+        return day
+    match = SESSION_KEY_RE.match(basename) or NON_SESSION_KEY_RE.match(basename)
+    return match.group("ts")[:8] if match else ""
 
 
 def is_audit_heartbeat_key(key, heartbeat_prefix):
@@ -1536,7 +1602,7 @@ def is_recording_key(key, recordings_prefix):
 
 
 def key_ts_is_future(now, relative_key, skew_tolerance):
-    """True when a shaped audit key's ``<ts>`` is future (or unparseable).
+    """True when a shaped audit key's ``<ts>`` (or day) is future/unparseable.
 
     A cursor must never advance over a key dated in the future: the key sorts
     above the whole real key space, so the next delta lists an empty tail while
@@ -1548,12 +1614,20 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
     tolerance overflows the ``timedelta`` constructor (``>= ~8.64e13`` s) or
     the ``now + timedelta`` addition (from ~2.5e11 s): the key is rejected (it
     just never moves a cursor) instead of bricking every run with an
-    ``OverflowError`` (round-5 RT5.4; round-6 red-team NIT). Recordings keys
-    carry no ``<ts>`` and never match a family here.
+    ``OverflowError`` (round-5 RT5.4; round-6 red-team NIT). The validated
+    date-partitioned day segment is a second, coarser anchor (#159): a forged
+    ``audit/20991231/<current-ts>.json`` sorts above the real dated space even
+    though its basename ``<ts>`` is current, so the day is future-checked too
+    (tz-aware UTC calendar-date comparison - never a naive-midnight
+    ``strptime`` against an aware ``now``). Recordings keys carry no ``<ts>``
+    and never match a family here.
     """
-    match = (SESSION_KEY_RE.match(relative_key)
-             or NON_SESSION_KEY_RE.match(relative_key)
-             or HEARTBEAT_KEY_RE.match(relative_key))
+    basename, day = strip_date_segment(relative_key)
+    if basename is None:
+        return False
+    match = (SESSION_KEY_RE.match(basename)
+             or NON_SESSION_KEY_RE.match(basename)
+             or HEARTBEAT_KEY_RE.match(basename))
     if not match:
         return False
     try:
@@ -1561,11 +1635,21 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
     except ValueError:
         return True
     try:
-        return moment > now + timedelta(seconds=skew_tolerance)
+        bound = now + timedelta(seconds=skew_tolerance)
     except OverflowError:
         # A tolerance this large is an operator typo, not a bound: reject the
         # key (fail closed) rather than raising before state/verdict land.
         return True
+    if moment > bound:
+        return True
+    if day is not None:
+        try:
+            day_date = datetime.strptime(day, "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        if day_date.date() > bound.date():
+            return True
+    return False
 
 
 # Sid-less session.* event types documented by the shipper contract (Teleport
@@ -2023,6 +2107,113 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
     raise DeltaTooLong("ListObjectsV2 %s exceeded %d pages" % (prefix, max_pages))
 
 
+def list_objects_delimited(config, prefix, start_after="", until=None, max_pages=1000):
+    """ListObjectsV2 with ``delimiter="/"`` -> ``(contents, common_prefixes)``.
+
+    A separate listing helper so the existing dict-shaped callers (the heartbeat
+    tail, the recordings tail, the seed and the sweep) stay untouched (#159).
+    ``contents`` is ``{key: last_modified}`` exactly like :func:`list_objects`;
+    ``common_prefixes`` is the ordered list of ``<Prefix>`` values under
+    ``CommonPrefixes`` (full prefixes, trailing slash included), deduped.
+    ``until`` is an exclusive upper key bound for ``contents``; the same
+    filter also drops a common prefix at/after the bound (``heartbeat/``),
+    so the caller never lists the heartbeat subtree or a past-bound day.
+    The early-stop semantics are :func:`list_objects`': only an ordered page
+    whose ``Contents`` crossed the bound stops the stream - a prefix-only
+    page (empty ``Contents``) must keep paginating, because a nonconformant
+    server could still return an in-bound key on a later page. ``max_pages``
+    bounds the discovery tail; overflow raises :class:`DeltaTooLong`.
+    """
+    objects = {}
+    prefixes = []
+    seen_prefixes = set()
+    token = ""
+    for _ in range(max_pages):
+        params = {"list-type": "2", "prefix": prefix, "delimiter": "/"}
+        if start_after and not token:
+            params["start-after"] = start_after
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
+        truncated = False
+        next_token = ""
+        entries = []
+        page_prefixes = []
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((key, last_modified))
+            elif name == "CommonPrefixes":
+                for field in child:
+                    if local_name(field.tag) == "Prefix":
+                        page_prefixes.append(field.text or "")
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+            elif name == "Error":
+                raise WitnessError("ListObjectsV2 %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and next_token:
+            truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = (
+            until is not None
+            and ordered
+            and bool(keys)
+            and keys[-1] >= until
+            and (not truncated or keys[0] < until)
+        )
+        for key, last_modified in entries:
+            if until is not None and key >= until:
+                if crossed:
+                    # Same priced conformant-ordering trade as list_objects:
+                    # the bound is proven exhausted. Keep the in-bound
+                    # prefixes seen on this page before returning.
+                    for candidate in page_prefixes:
+                        if until is not None and candidate >= until:
+                            continue
+                        if candidate not in seen_prefixes:
+                            seen_prefixes.add(candidate)
+                            prefixes.append(candidate)
+                    return objects, prefixes
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+        for candidate in page_prefixes:
+            if until is not None and candidate >= until:
+                continue
+            if candidate not in seen_prefixes:
+                seen_prefixes.add(candidate)
+                prefixes.append(candidate)
+        if not truncated:
+            return objects, prefixes
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise DeltaTooLong("ListObjectsV2 %s exceeded %d pages" % (prefix, max_pages))
+
+
 def list_objects_range(config, prefix, after, until, max_pages=1000):
     """ListObjectsV2 over the half-open key range (after, until].
 
@@ -2407,7 +2598,15 @@ def _collect_families(config, boundaries=None):
 
 
 def _cursors_from_listings(config, audit_objects, recording_objects, now):
-    """High-water keys for the two audit streams + recordings from a listing.
+    """High-water keys for the dual-layout audit streams + recordings.
+
+    ``audit_session`` is the **flat-layout** high-water key and
+    ``audit_session_dated`` the **dated-layout** one; each is a max over keys
+    of its own layout only (never one max across layouts - a dated key must
+    never become the flat cursor, or the transition-day dated keys below the
+    flat cursor would false-repair into ``mode=sweep``). A legacy state
+    without the dated cursor is valid: the seed or the transition probe
+    populates it.
 
     A cursor advances only over keys matching the family's own grammar
     (is_audit_*_key / is_recording_key) whose key ``<ts>`` is not future-dated
@@ -2431,10 +2630,15 @@ def _cursors_from_listings(config, audit_objects, recording_objects, now):
         key for key in audit_objects
         if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
         and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+    dated_session_keys = [
+        key for key in audit_objects
+        if is_audit_session_dated_key(key, config.audit_prefix, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
     recording_keys = [key for key in recording_objects if is_recording_key(key, config.recordings_prefix)]
     return {
         "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
         "audit_session": max(session_keys) if session_keys else "",
+        "audit_session_dated": max(dated_session_keys) if dated_session_keys else "",
         "recordings": max(recording_keys) if recording_keys else "",
     }
 
@@ -2460,22 +2664,90 @@ def _sample_boundaries(keys, workers):
 
 
 def _list_cold_start_streams(config, window_start):
-    """Window-bounded audit seed: heartbeat + session streams from `window_start`.
+    """Window-bounded audit seed: heartbeat + dual-layout session streams.
 
     Recordings as a whole (a `<sid>.tar` key carries no timestamp) and uploads
     are listed in full by the caller. Versions stay sweep-only, so a seed
-    cannot see a pre-window delete marker - disclosed by compact_blind.
+    cannot see a pre-window delete marker - disclosed by compact_blind. The
+    session stream starts at the window-start **day prefix**
+    (`audit/<YYYYMMDD>/`), not at an `audit/<marker>` timestamp: dated keys of
+    that day sort below their flat keys (`/` < `T`), and the seed must return
+    both layouts from the window start onward.
     """
     marker = window_start.strftime("%Y%m%dT%H%M%SZ")
+    day_prefix = config.audit_prefix + window_start.strftime("%Y%m%d") + "/"
     heartbeat_objects = list_objects(
         config, config.heartbeat_prefix, start_after=config.heartbeat_prefix + marker)
     session_objects = list_objects(
-        config, config.audit_prefix, start_after=config.audit_prefix + marker,
+        config, config.audit_prefix, start_after=day_prefix,
         until=config.heartbeat_prefix.rstrip("/"))
     audit_objects = {}
     audit_objects.update(session_objects)
     audit_objects.update(heartbeat_objects)
     return audit_objects, heartbeat_objects
+
+
+def _delta_dated_listings(config, now, discovered_prefixes, flat_cursor, dated_cursor):
+    """Bounded dated-day listing plan for a delta: ``({day: start_after}, drift)``.
+
+    The plan is the dated cursor's own day resumed with the cursor as its
+    exclusive start, plus the discovered day prefixes that are not below the
+    floor (``day >= day(audit_session_dated)``; with an empty dated cursor the
+    floor is the flat cursor's day) and not future (the day segment later
+    than ``(now + tolerance).date()`` is never listed: it cannot move a cursor
+    and would otherwise satisfy the floor on every run). While the dated
+    cursor is still empty and a flat cursor exists, the flat cursor's own day
+    is added as the transition probe - the first dated keys of the switch day
+    sort below the flat cursor, so the forward discovery cannot see them. Days
+    below the floor are never re-listed (the flat tail re-offers every
+    dual-window day on every run, so re-listing would grow the request cost
+    and re-trigger DeltaTooLong on a large day). Deduped by day; each day is
+    listed by the caller with ``audit/<day>T`` as its ``until`` bound (all
+    dated keys of a day sort before its flat keys) and its own page budget.
+
+    The second return value is the list of **drift prefixes**: a non-heartbeat
+    prefix that is not a valid calendar day is a drift signal without listing
+    its keys (plan §1). A drift prefix above the flat cursor is returned for
+    the caller to inject into the view, so the naming-contract/contract-mismatch
+    classifier judges it from the prefix alone; one at/below the flat cursor is
+    dropped here (like a below-floor day) and stays sweep-bounded - disclosed.
+    """
+    try:
+        bound_date = (now + timedelta(seconds=config.clock_skew_tolerance)).date()
+    except OverflowError:
+        # Absurd operator tolerance: fall back to today's UTC date (fail
+        # closed - only today's days can be non-future) instead of setting
+        # ``bound_date = None`` and silently disabling the future-day
+        # exclusion, which would re-list a forged future day every run.
+        bound_date = now.date()
+    cursor_day = _audit_key_day(config.audit_prefix, dated_cursor) if dated_cursor else ""
+    flat_day = _audit_key_day(config.audit_prefix, flat_cursor) if flat_cursor else ""
+    floor_day = cursor_day or flat_day
+    plan = {}
+    drift_prefixes = []
+    if cursor_day:
+        plan[cursor_day] = dated_cursor
+    elif flat_day:
+        plan[flat_day] = config.audit_prefix + flat_day + "/"
+    for prefix in discovered_prefixes:
+        if not prefix.startswith(config.audit_prefix) or prefix.startswith(config.heartbeat_prefix):
+            continue
+        basename, day = strip_date_segment(prefix[len(config.audit_prefix):])
+        if basename is None or not day:
+            # Not a day: a drift signal judged from the prefix alone, never
+            # listed. Above the flat cursor it must alert in delta instead of
+            # a green no-op; at/below the flat cursor (a nonconformant server
+            # can return it) it stays sweep-bounded and is dropped.
+            if flat_cursor and prefix <= flat_cursor:
+                continue
+            drift_prefixes.append(prefix)
+            continue
+        if floor_day and day < floor_day:
+            continue
+        if datetime.strptime(day, "%Y%m%d").date() > bound_date:
+            continue
+        plan.setdefault(day, config.audit_prefix + day + "/")
+    return plan, drift_prefixes
 
 
 def _delta_repair_sweep(config, observed, now):
@@ -2541,8 +2813,9 @@ def run_checks(config, now, plan):
         view_dirty = True
         cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
     else:
-        # Delta: the retained view plus the three cursored tails (two audit
-        # streams + recordings). Versions are sweep-only, so the retained
+        # Delta: the retained view plus the dual-layout audit tail (the flat
+        # discovery listing + bounded dated-day streams), the heartbeat tail
+        # and the recordings tail. Versions are sweep-only, so the retained
         # hidden set is carried unchanged and a delete marker on an old key
         # lands at the sweep bound. A delta listing that overflows its page
         # bound abandons the delta and runs an exact sweep instead of reading
@@ -2553,13 +2826,31 @@ def run_checks(config, now, plan):
         uploads = list_uploads(config, config.recordings_prefix)
         heartbeat_cursor = cursors.get("audit_heartbeat") or ""
         session_cursor = cursors.get("audit_session") or ""
+        dated_cursor = cursors.get("audit_session_dated") or ""
         recording_cursor = cursors.get("recordings") or ""
+        heartbeat_stem = config.heartbeat_prefix.rstrip("/")
         try:
             new_heartbeat = list_objects(
                 config, config.heartbeat_prefix, start_after=heartbeat_cursor, max_pages=DELTA_MAX_PAGES)
-            new_session = list_objects(
+            # Dated-day discovery rides the flat tail: `delimiter="/"` returns
+            # the flat keys above the flat cursor (normally none once the flat
+            # writer stopped) plus the day prefixes above it, in one page - the
+            # transition day's own prefix sorts below the flat cursor and is
+            # carried by the dated cursor + probe instead.
+            new_session, discovered_prefixes = list_objects_delimited(
                 config, config.audit_prefix, start_after=session_cursor,
-                until=config.heartbeat_prefix.rstrip("/"), max_pages=DELTA_MAX_PAGES)
+                until=heartbeat_stem, max_pages=DELTA_MAX_PAGES)
+            dated_plan, drift_prefixes = _delta_dated_listings(
+                config, now, discovered_prefixes, session_cursor, dated_cursor)
+            dated_listings = {}
+            for day in sorted(dated_plan):
+                day_prefix = config.audit_prefix + day + "/"
+                day_bound = config.audit_prefix + day + "T"
+                if day_bound > heartbeat_stem:
+                    day_bound = heartbeat_stem
+                dated_listings[day] = (dated_plan[day], list_objects(
+                    config, day_prefix, start_after=dated_plan[day],
+                    until=day_bound, max_pages=DELTA_MAX_PAGES))
             new_recordings = list_objects(
                 config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
         except DeltaTooLong as exc:
@@ -2578,7 +2869,9 @@ def run_checks(config, now, plan):
             # re-read or skip keys. The documented trace is preserve-and-repair:
             # discard the delta, rebuild with a full sweep in this run, and
             # report error (never green) so the rebuilt block serves the next
-            # fast run.
+            # fast run. Every dated-day listing is paired with **its own**
+            # start_after bound (the dated cursor's day resumes at the cursor;
+            # a new day starts at its prefix).
             violation = ""
             for key in new_heartbeat:
                 if heartbeat_cursor and key <= heartbeat_cursor:
@@ -2588,6 +2881,16 @@ def run_checks(config, now, plan):
                 for key in new_session:
                     if session_cursor and key <= session_cursor:
                         violation = "session delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if not violation:
+                for day in sorted(dated_listings):
+                    start_after, objects = dated_listings[day]
+                    for key in objects:
+                        if key <= start_after:
+                            violation = "dated delta for %s returned %s at or below its listing bound" % (
+                                day, clip(key, 120))
+                            break
+                    if violation:
                         break
             if not violation:
                 for key in new_recordings:
@@ -2607,12 +2910,21 @@ def run_checks(config, now, plan):
             else:
                 new_audit.update(new_heartbeat)
                 new_audit.update(new_session)
+                for day in dated_listings:
+                    new_audit.update(dated_listings[day][1])
+                # A non-day prefix above the flat cursor is a drift signal
+                # from the prefix alone (plan §1): never list its keys, but
+                # never stay green either - inject the prefix itself so the
+                # classifier raises naming-contract/contract-mismatch.
+                for prefix in drift_prefixes:
+                    new_audit[prefix] = now
                 audit_objects.update(new_audit)
                 recording_objects.update(new_recordings)
-                # Same grammar + future-<ts> filter as _cursors_from_listings:
-                # an unshaped key returned by a tail (an acceptance probe,
+                # Same grammar + future filter as _cursors_from_listings: an
+                # unshaped key returned by a tail (an acceptance probe,
                 # drift), or a shaped key dated in the future (sorting above
-                # the real key space), must never advance the cursor.
+                # the real key space), must never advance a cursor. Each
+                # cursor advances only over its own layout's keys.
                 heartbeat_new = [
                     key for key in new_heartbeat
                     if is_audit_heartbeat_key(key, config.heartbeat_prefix)
@@ -2621,6 +2933,12 @@ def run_checks(config, now, plan):
                     key for key in new_session
                     if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
                     and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+                dated_new = []
+                for day in dated_listings:
+                    for key in dated_listings[day][1]:
+                        if is_audit_session_dated_key(key, config.audit_prefix, config.heartbeat_prefix) \
+                                and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance):
+                            dated_new.append(key)
                 recording_new = [
                     key for key in new_recordings
                     if is_recording_key(key, config.recordings_prefix)]
@@ -2628,6 +2946,8 @@ def run_checks(config, now, plan):
                     cursors["audit_heartbeat"] = max(heartbeat_new)
                 if session_new:
                     cursors["audit_session"] = max(session_new)
+                if dated_new:
+                    cursors["audit_session_dated"] = max(dated_new)
                 if recording_new:
                     cursors["recordings"] = max(recording_new)
                 view_dirty = bool(new_audit or new_recordings)
@@ -2721,7 +3041,15 @@ def run_checks(config, now, plan):
         if key.startswith(config.heartbeat_prefix):
             continue
         relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
-        match = SESSION_KEY_RE.match(relative)
+        # One optional valid `YYYYMMDD/` day segment: both layouts classify
+        # through the same basename grammar. A malformed day segment
+        # (non-calendar 8 digits) is refused by the helper, and a segment of
+        # any other shape (wrong digit count, a `session.*`-named segment)
+        # stays unstripped, so neither can impersonate a valid dated/flat
+        # key; the drift paths below judge such a key like any other unshaped
+        # one.
+        basename, _day = strip_date_segment(relative)
+        match = SESSION_KEY_RE.match(basename) if basename is not None else None
         if match:
             event_type, is_variant = canonical_conflict_type(match.group("etype"))
             sid = match.group("sid").lower()
@@ -2774,7 +3102,7 @@ def run_checks(config, now, plan):
                 # marker anywhere else is naming drift.
                 contract_bad_keys.append(relative)
             continue
-        generic = NON_SESSION_KEY_RE.match(relative)
+        generic = NON_SESSION_KEY_RE.match(basename) if basename is not None else None
         if generic:
             # A replay-conflict variant (`session.rejected_<hash16>`) is the
             # same documented event as its base type, never naming drift.
@@ -2784,7 +3112,7 @@ def run_checks(config, now, plan):
         # Drift is judged by shape (a UUID-shaped sid or a session.* event
         # type), not by one literal substring: a rename that drops
         # "-session." but keeps the sid still fails closed.
-        if UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
+        if basename is None or UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
             contract_bad_keys.append(relative)
         else:
             unrecognized.append(key)
@@ -3288,6 +3616,7 @@ def observed_problem(observed, record_run_seq, config=None, now=None):
     prefixes = {
         "audit_heartbeat": config.heartbeat_prefix if config is not None else "audit/heartbeat/",
         "audit_session": config.audit_prefix if config is not None else "audit/",
+        "audit_session_dated": config.audit_prefix if config is not None else "audit/",
         "recordings": config.recordings_prefix if config is not None else "recordings/",
     }
     for name, prefix in prefixes.items():
@@ -3306,13 +3635,16 @@ def observed_problem(observed, record_run_seq, config=None, now=None):
         # below it (a forged-state false green). Fail closed into repair +
         # sweep.
         return "observed.cursors.audit_session is at/after the heartbeat prefix boundary: %r" % session_cursor
-    # A cursor must also match its family's key grammar (the classifier's flat
-    # layout; extend both together when the date-partitioned/seq-range layout
-    # lands, #159). A forged value below the stem but above the real key space
-    # (`audit/9`, `audit/g`, an acceptance probe) passes the prefix check and
+    # A cursor must also match its family's key grammar (layout-specific:
+    # `audit_session` is flat-only, `audit_session_dated` requires a valid
+    # day segment, #159). A forged value below the stem but above the real
+    # key space (`audit/9`, `audit/g`, an acceptance probe, an undated
+    # `audit/20260925/<key>` in the flat slot) passes the prefix check and
     # would list an empty tail while real keys sit below it (false green), so
-    # it fails closed into the repair + sweep path.
-    for name in ("audit_heartbeat", "audit_session", "recordings"):
+    # it fails closed into the repair + sweep path. An absent dated cursor is
+    # valid legacy state (a pre-#159 block or a flat-only bucket) and skips
+    # every check.
+    for name in ("audit_heartbeat", "audit_session", "audit_session_dated", "recordings"):
         value = cursors.get(name)
         if value is None or value == "":
             continue
@@ -3320,6 +3652,9 @@ def observed_problem(observed, record_run_seq, config=None, now=None):
             shaped = is_audit_heartbeat_key(value, prefixes["audit_heartbeat"])
         elif name == "recordings":
             shaped = is_recording_key(value, prefixes["recordings"])
+        elif name == "audit_session_dated":
+            shaped = is_audit_session_dated_key(
+                value, prefixes["audit_session_dated"], prefixes["audit_heartbeat"])
         else:
             shaped = is_audit_session_key(
                 value, prefixes["audit_session"], prefixes["audit_heartbeat"])

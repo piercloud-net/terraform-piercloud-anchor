@@ -29,6 +29,14 @@ The fixture is JSON:
       "objects_ignore_start_after": true, # optional; ignore start-after and serve
                                           # keys at/below the cursor (nonconformant
                                           # server; a delta must fail closed)
+      "prefixes_ignore_start_after": true, # optional; with delimiter=/, ignore
+                                          # start-after for CommonPrefixes only:
+                                          # prefixes are derived from the
+                                          # UNFILTERED key pool while Contents
+                                          # still honour start-after
+                                          # (nonconformant server; the witness's
+                                          # client-side day filter must stay
+                                          # deterministic under both behaviours)
       "versions_no_istruncated": true,    # optional; omit <IsTruncated> from
                                           # version listings while keeping the
                                           # Next* markers on truncated pages
@@ -53,11 +61,13 @@ A `versions` entry with `delete_marker: true` is served as a `<DeleteMarker>`
 element (a hidden object); the other entries are `<Version>` elements.
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -84,6 +94,31 @@ def iso_from_ago(ago, now=None):
     # not straddle a second boundary).
     moment = (time.time() if now is None else now) - float(ago)
     return datetime.fromtimestamp(moment, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def encode_token(offset, start_after):
+    """Continuation token carrying the offset plus the seed filter.
+
+    The client sends ``start-after`` only on the first page (real B2
+    semantics), so the token has to carry the original filter or a later page
+    would slice the unfiltered list at the same offset; a conformant server
+    resumes the same filtered list. Opaque to the client.
+    """
+    seed = base64.urlsafe_b64encode(start_after.encode("utf-8")).decode("ascii")
+    return "%d.%s" % (offset, seed)
+
+
+def decode_token(token):
+    """Parse an :func:`encode_token` value; ``None`` for anything else."""
+    offset_part, sep, seed_part = token.partition(".")
+    if not sep or not offset_part.isdigit():
+        return None
+    try:
+        seed = base64.urlsafe_b64decode(seed_part.encode("ascii")).decode("utf-8") \
+            if seed_part else ""
+    except ValueError:
+        return None
+    return int(offset_part), seed
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -257,41 +292,105 @@ class Handler(BaseHTTPRequestHandler):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", [""])[0]
         start_after = query.get("start-after", [""])[0]
+        delimiter = query.get("delimiter", [""])[0]
         now = time.time()
-        offset = int(token) if token.isdigit() else 0
-        matching = [
+        offset = 0
+        if token:
+            # A continuation token resumes the SAME filtered list: the seed
+            # filter rides the token because the client only sends
+            # `start-after` on the first page. A token page that recomputed
+            # the list without the seed would slice a different list from the
+            # same offset (a conformant server resumes at the right place).
+            resumed = decode_token(token)
+            if resumed is None:
+                self.record("GET", False, "fixture: malformed continuation token")
+                self.send_body(400, "<Error><Code>InvalidArgument</Code>"
+                                    "<Message>malformed continuation token</Message></Error>")
+                return
+            offset, start_after = resumed
+        pool = [
             obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
         ]
-        # `start-after` is exclusive and seeds the first page only (real B2
-        # semantics, live-verified): a windowed seed lists the tail, and a
-        # continuation token resumes from the same filtered list.
-        if start_after and not FIXTURE.get("objects_ignore_start_after"):
-            matching = [obj for obj in matching if obj["key"] > start_after]
         # Real S3/B2 lists ascending by key. A fixture can opt into fixture
         # order to pin that the witness verdict is independent of the order
         # the listing returns (e.g. `.shell` before `.exec` at the same ts, or
         # a replay-conflict variant before its base).
         if FIXTURE.get("list_order") != "fixture":
-            matching = sorted(matching, key=lambda obj: obj["key"])
+            pool = sorted(pool, key=lambda obj: obj["key"])
+        # `start-after` is exclusive and seeds the first page (real B2
+        # semantics, live-verified): a windowed seed lists the tail, and a
+        # continuation token (above) resumes from the same filtered list.
+        matching = pool
+        if start_after and not FIXTURE.get("objects_ignore_start_after"):
+            matching = [obj for obj in matching if obj["key"] > start_after]
         suppress_token = FIXTURE.get("fail_objects") == "truncated-no-token"
-        page = matching[offset:offset + PAGE_SIZE]
+        empty_token = FIXTURE.get("fail_objects") == "truncated-empty-token"
+        if delimiter and FIXTURE.get("fail_delimited") == "truncated-empty-token":
+            # Guard-mirror tooth (red-team r2j LOW): only delimiter listings
+            # carry the `nonfiltering-prefixes` pin, so the empty-token page
+            # must be reachable without failing the earlier non-delimited
+            # (heartbeat) listing.
+            empty_token = True
+        if delimiter:
+            # `delimiter=/` collapses every key under the same first
+            # delimiter occurrence into a CommonPrefix, and Contents and
+            # CommonPrefixes share the MaxKeys budget. In the conformant
+            # behaviour `start_after` filters prefixes too; the nonconformant
+            # `prefixes_ignore_start_after` fixture derives prefixes from the
+            # UNFILTERED key pool (Contents still honour start-after), which
+            # is the divergence the witness's client-side day filter has to
+            # absorb deterministically.
+            prefix_pool = pool if FIXTURE.get("prefixes_ignore_start_after") else matching
+            allowed = set(id(obj) for obj in matching)
+            entries = []
+            seen_prefixes = set()
+            for obj in prefix_pool:
+                key = obj["key"]
+                position = key[len(prefix):].find(delimiter)
+                if position < 0:
+                    # A direct object under the prefix: Contents are always
+                    # start-after-filtered, even when prefixes are not.
+                    if id(obj) not in allowed:
+                        continue
+                    entries.append((key, "object", obj))
+                    continue
+                common = key[:len(prefix) + position + len(delimiter)]
+                if common in seen_prefixes:
+                    continue
+                if (start_after and not FIXTURE.get("prefixes_ignore_start_after")
+                        and not common > start_after):
+                    continue
+                seen_prefixes.add(common)
+                entries.append((common, "prefix", None))
+        else:
+            entries = [(obj["key"], "object", obj) for obj in matching]
+        page = entries[offset:offset + PAGE_SIZE]
         next_offset = offset + PAGE_SIZE
-        truncated = suppress_token or next_offset < len(matching)
+        truncated = suppress_token or empty_token or next_offset < len(entries)
         next_token = ""
         if truncated and not suppress_token:
-            next_token = "<NextContinuationToken>%d</NextContinuationToken>" % next_offset
-        rows = "".join(
-            "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
-            "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
-            "<StorageClass>STANDARD</StorageClass></Contents>"
-            % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
-            for obj in page
-        )
+            if empty_token:
+                next_token = "<NextContinuationToken></NextContinuationToken>"
+            else:
+                next_token = "<NextContinuationToken>%s</NextContinuationToken>" % xml_escape(
+                    encode_token(next_offset, start_after))
+        rows = ""
+        common_rows = ""
+        for name, kind, obj in page:
+            if kind == "prefix":
+                common_rows += "<CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes>" % xml_escape(name)
+                continue
+            rows += (
+                "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
+                "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
+                "<StorageClass>STANDARD</StorageClass></Contents>"
+                % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
+            )
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
             "<Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount>"
-            "<MaxKeys>%d</MaxKeys><IsTruncated>%s</IsTruncated>%s%s</ListBucketResult>"
+            "<MaxKeys>%d</MaxKeys><IsTruncated>%s</IsTruncated>%s%s%s</ListBucketResult>"
             % (
                 xml_escape(FIXTURE.get("bucket", "")),
                 xml_escape(prefix),
@@ -300,9 +399,102 @@ class Handler(BaseHTTPRequestHandler):
                 "true" if truncated else "false",
                 next_token,
                 rows,
+                common_rows,
             )
         )
-        self.record("GET", True, "list-type=2 prefix=%s" % prefix)
+        note = "list-type=2 prefix=%s" % prefix
+        if delimiter and FIXTURE.get("prefixes_ignore_start_after"):
+            # Pin the nonconformant behaviour in the request log: the served
+            # CommonPrefixes include prefixes at/below start_after (derived
+            # from the unfiltered pool). A harness tooth asserts this, so a
+            # regression to the conformant branch cannot silently re-vacuum
+            # the client-floor-filter tooth (red-team r2 LOW). Derive the
+            # list from the SERIALIZED response body, not the pre-slice
+            # `entries` (red-team r2b LOW) and not the in-memory `page`
+            # either (red-team r2c LOW): a serialization-layer filter that
+            # drops the prefix from the wire would otherwise leave the pin
+            # green while the response no longer carries it. Parse the body
+            # as XML, exactly as the witness's own ListObjectsV2 parse does
+            # (red-team r2d LOW): a raw-substring regex is XML-blind, so
+            # inert markup (e.g. a comment-wrapped <CommonPrefixes> row)
+            # kept the pin green while the client parsed no prefix at all.
+            # Mirror `list_objects_delimited` (scripts/010-provision.sh):
+            # DIRECT children of the root, matched by local name. A nested
+            # row (red-team r2e LOW) is invisible to the client and must be
+            # invisible to the pin too; a wrong-namespace row IS visible to
+            # the local-name client, so the pin must see it too (the r2d
+            # strict-{ns} pin missed it — r2f trust NIT).
+            served = []
+            root = ET.fromstring(body)
+
+            def _client_accepts_page(node):
+                # Mirror list_objects_delimited's fail-closed guards (red-team
+                # r2g NIT / functional r2f residual + r2h LOW, refined r2j):
+                # the client raises on a non-ListBucketResult root, a direct
+                # <Error> child, a truncated page without a non-empty
+                # NextContinuationToken, and a kept Contents entry whose
+                # LastModified is missing or unparseable. The pin must not
+                # read prefixes out of a body the client would refuse.
+                # Token fidelity (red-team r2j LOW): the client takes the
+                # LAST token element's text (`next_token = child.text or ""`)
+                # and treats empty text as no token; mere element presence is
+                # not a token.
+                # Contents fidelity (red-team r2j NIT): the client drops
+                # empty/missing-Key rows before touching LastModified, so the
+                # mirror does too. The LastModified leg stays stricter than
+                # the client for rows at/after the client's `until` bound
+                # (the mock cannot see `until`): a false-red only, never a
+                # green-forge; no current fixture puts a Contents row on a
+                # pin-read (non-filtering delimiter) page (m-badlm no-op).
+                if node.tag.rsplit("}", 1)[-1] != "ListBucketResult":
+                    return False
+                truncated = False
+                next_token = ""
+                for child in node:
+                    name = child.tag.rsplit("}", 1)[-1]
+                    if name == "Error":
+                        return False
+                    if name == "IsTruncated":
+                        truncated = (child.text or "").strip().lower() == "true"
+                    elif name == "NextContinuationToken":
+                        next_token = child.text or ""
+                    elif name == "Contents":
+                        key = ""
+                        last_modified = None
+                        for field in child:
+                            field_name = field.tag.rsplit("}", 1)[-1]
+                            if field_name == "Key":
+                                key = field.text or ""
+                            elif field_name == "LastModified":
+                                last_modified = field.text
+                        if not key:
+                            continue
+                        if last_modified is None:
+                            return False
+                        try:
+                            value = last_modified.strip()
+                            if value.endswith("Z"):
+                                value = value[:-1] + "+00:00"
+                            datetime.fromisoformat(value)
+                        except ValueError:
+                            return False
+                if not truncated and next_token:
+                    truncated = True
+                return not (truncated and not next_token)
+
+            if _client_accepts_page(root):
+                for child in root:
+                    if child.tag.rsplit("}", 1)[-1] != "CommonPrefixes":
+                        continue
+                    for field in child:
+                        if field.tag.rsplit("}", 1)[-1] == "Prefix":
+                            served.append(field.text or "")
+            served.sort()
+            # JSON, not a comma join (red-team r2f LOW): a served prefix may
+            # itself contain a comma, so a comma-joined note could forge the
+            # exact below-flat marker while the wire carried only a variant.
+            note += " nonfiltering-prefixes=%s" % json.dumps(served)
+        self.record("GET", True, note)
         self.send_body(200, body)
 
     def handle_versions(self, query):
