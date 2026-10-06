@@ -214,7 +214,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=942
+MIN_CHECKS=959
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -242,10 +242,13 @@ audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 9a2fe50
+# were generated from the real builder at cad0p/pc-admin @ 44cfa8f
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key/
-# split_audit_date_segment, the full-SHA pin in shipper_keys.py; the pinned
-# point (pc-admin #39) made the full-key helpers prefix-aware (`audit/`
+# split_audit_date_segment + parse_audit_key_full, the full-SHA pin in
+# shipper_keys.py; the pinned point (pc-admin #39 r3) `\Z`-anchored the
+# full-key basename regexes (a trailing newline after `.json` refuses the
+# parse and is returned unchanged by the variant builder — never laundered),
+# on top of the prefix-aware full-key helpers (`audit/`
 # default): only one leading valid day segment is stripped after the prefix,
 # the remainder must be a bare basename, and a foreign prefix or residual path
 # segment refuses instead of being laundered into a flat parse or variant; the
@@ -585,11 +588,13 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
 # instead of shrinking the matrix silently (red-team round-2 LOW M10). Update
 # this pin together with the matrix.
 if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 15
+        or len(vectors["full_key_refusals"]) != 3
         or len(vectors["refusals"]) != 17):
     raise SystemExit(
-        "vector matrix size changed: %d vectors / %d segments / %d refusals "
-        "(pinned 32/15/17) - update this pin together with the matrix"
-        % (len(vectors["vectors"]), len(vectors["date_segments"]), len(vectors["refusals"])))
+        "vector matrix size changed: %d vectors / %d segments / %d full_key_refusals / %d refusals "
+        "(pinned 32/15/3/17) - update this pin together with the matrix"
+        % (len(vectors["vectors"]), len(vectors["date_segments"]),
+           len(vectors["full_key_refusals"]), len(vectors["refusals"])))
 
 # Matrix content pin (red-team round-3 LOW): a coherent same-size rewrite
 # (both event.sid and replica_args[2], or an entry swap) must fail loudly.
@@ -597,7 +602,7 @@ if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 15
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "3fe6d705b75ab0ca2e8a4f42738b3680c6bd98cf06cf3a3da604fd81e60b03da"
+MATRIX_SHA256 = "94b46ab4dd95b47d2b056d83fcf6434f586108fd2079e9a8470dc08ad04a8bcf"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -681,17 +686,34 @@ for segment in vectors["date_segments"]:
     if list(got) != [segment["relative"], segment["day"]]:
         raise SystemExit("%s: expected %r got %r" % (
             segment["name"], [segment["relative"], segment["day"]], list(got)))
+for entry in vectors["full_key_refusals"]:
+    # Full-key trailing newline (pc-admin #39 r3, \Z full-key anchors): the
+    # basename parse refuses and disambiguate_key returns the key unchanged —
+    # never laundered into a variant through the capture-group rebuild.
+    key = entry["key"]
+    prefix = entry.get("prefix", "audit/")
+    relative, _day = replica.split_date_segment(key, prefix)
+    basename = None if relative is None else relative[len(prefix):]
+    parsed = None
+    if basename is not None:
+        parsed = (replica.SESSION_KEY_PARSE_RE.match(basename)
+                  or replica.OTHER_KEY_PARSE_RE.match(basename))
+    if parsed is not None:
+        raise SystemExit("%s: trailing-newline key parsed" % entry["name"])
+    if replica.disambiguate_key(key, b"x", prefix) != key:
+        raise SystemExit("%s: trailing-newline key was laundered into a variant" % entry["name"])
 for refusal in vectors["refusals"]:
     try:
         replay(refusal["replica_args"])
     except ValueError:
         continue
     raise SystemExit("refusal accepted: %s" % refusal["name"])
-print("vectors=%d segments=%d refusals=%d pin=%s source=%s" % (
-    len(vectors["vectors"]), len(vectors["date_segments"]), len(vectors["refusals"]),
+print("vectors=%d segments=%d full_key_refusals=%d refusals=%d pin=%s source=%s" % (
+    len(vectors["vectors"]), len(vectors["date_segments"]),
+    len(vectors["full_key_refusals"]), len(vectors["refusals"]),
     vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=32 segments=15 refusals=17 pin=9a2fe505b892411d25f731c2cf4e6361967fb911 source=9a2fe505b892" ]]; then
+)" && [[ "$matrix_out" == "vectors=32 segments=15 full_key_refusals=3 refusals=17 pin=44cfa8fa7af786f3ba38775e29c21f764db34979 source=44cfa8fa7af7" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
@@ -5960,6 +5982,7 @@ fi
 # never silently classified, never allowed to move either cursor.
 DL_FLAT_OK="$(key session.start 20260925T130000Z "${DL_SID}" 1 shell)"
 DL_CAL_BAD="audit/20260932/20260925T130000Z-session.start.${DL_SID}.7.shell.json"
+DL_CAL_BAD_MARKERLESS="audit/20260932/20260925T130000Z-user.login.10.json"
 DL_SHORT_DAY="audit/2026092/20260925T130000Z-user.login.8.json"
 DL_IMPERSONATE="audit/session.start/20260925T130000Z-session.start.${DL_SID2}.9.shell.json"
 dl_drift_dir="${WORK}/state-159-drift"
@@ -5969,9 +5992,10 @@ fixture <<JSON
   {"key":"${DL_HEARTBEAT}","ago":60},
   {"key":"${DL_FLAT_OK}","ago":300},
   {"key":"${DL_CAL_BAD}","ago":299},
-  {"key":"${DL_SHORT_DAY}","ago":298},
-  {"key":"${DL_IMPERSONATE}","ago":297},
-  {"key":"recordings/${DL_SID}.tar","ago":296}],
+  {"key":"${DL_CAL_BAD_MARKERLESS}","ago":298},
+  {"key":"${DL_SHORT_DAY}","ago":297},
+  {"key":"${DL_IMPERSONATE}","ago":296},
+  {"key":"recordings/${DL_SID}.tar","ago":295}],
  "uploads":[]}
 JSON
 start_mock
@@ -5980,6 +6004,11 @@ is "dated drift: exit 1 (drift alerts)" "1" "${CASE_RC}"
 case "${CASE_DETAIL}" in
   *naming-contract*) ok "dated drift: the malformed/impersonating session-shaped keys are naming-contract" ;;
   *) bad "dated drift naming-contract detail: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *"naming-contract: 3 audit key(s)"*)
+    ok "dated drift: the marker-less malformed-day key is naming-contract (basename-None clause)" ;;
+  *) bad "dated drift marker-less naming-contract count: ${CASE_DETAIL}" ;;
 esac
 case "${CASE_DETAIL}" in
   *contract-mismatch*) ok "dated drift: the wrong-length numeric segment is contract-mismatch" ;;
@@ -6207,6 +6236,48 @@ if grep -q 'prefix=audit/20991231/' "${WORK}/requests-159-future-heavy.log" \
   bad "heavy future day: the delta enumerated the future day"
 else
   ok "heavy future day: the future day is never listed in delta"
+fi
+# Clock-skew overflow bound: an absurd operator tolerance overflows the
+# ``timedelta`` constructor, and the future-day exclusion must fall back to
+# today's date (fail closed) instead of silently disabling itself and
+# re-listing a forged future day on every run. The cursor validator rejects
+# every non-empty cursor under the same tolerance, so the observer has to be
+# a valid state with no cursors (the sweep of an empty prefix): the delta
+# plan alone can then see the fallback.
+dl_skew_overflow_dir="${WORK}/state-159-skew-overflow"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"objects":[],"uploads":[]}
+JSON
+start_mock
+run_case "${dl_skew_overflow_dir}"
+is "skew overflow: the empty warm sweep alerts heartbeat-missing (control)" "alert" "${CASE_STATE}"
+SKEW_FUTURE_1="audit/20991231/20260925T120000Z-user.login.1.json"
+SKEW_FUTURE_2="audit/20991231/20260925T120100Z-user.login.2.json"
+SKEW_FUTURE_3="audit/20991231/20260925T120200Z-user.login.3.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${SKEW_FUTURE_1}","ago":30},
+  {"key":"${SKEW_FUTURE_2}","ago":30},
+  {"key":"${SKEW_FUTURE_3}","ago":30}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-skew-overflow.log"
+: >"${REQUEST_LOG}"
+start_mock
+RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS=999999999999999' run_delta "${dl_skew_overflow_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "skew overflow: the run stays a delta (no forced sweep)" "delta" \
+  "$(state_field observed.coverage.mode)"
+is "skew overflow: the future day never moves the dated cursor" "" \
+  "$(state_field observed.cursors.audit_session_dated)"
+if grep -q 'prefix=audit/20991231/' "${WORK}/requests-159-skew-overflow.log" \
+   || grep -q 'prefix=audit%2F20991231%2F' "${WORK}/requests-159-skew-overflow.log"; then
+  bad "skew overflow: the overflow disabled the future-day exclusion"
+else
+  ok "skew overflow: the future day stays excluded on overflow"
 fi
 
 # (6) Empty dated cursor: a first dated day ABOVE the flat cursor is listed
@@ -6491,11 +6562,14 @@ case "${CASE_DETAIL}" in
   *) bad "writer revert sweep detail: ${CASE_DETAIL}" ;;
 esac
 
-# (8) Prefix drift: a non-day prefix above the flat cursor is never listed in
-# delta (its keys classify at the sweep), and a date-impersonating prefix is
-# not stripped into a flat parse.
-DL_PREFIX_DRIFT="audit/notaday/20260925T130000Z-session.start.${DL_SID2}.1.shell.json"
-DL_PREFIX_IMPERSONATE="audit/session.data/20260925T130000Z-session.start.${DL_SID2}.2.shell.json"
+# (8) Prefix drift: a non-day prefix returned by discovery above the flat
+# cursor (it must sort below the heartbeat-stem bound) is a drift signal
+# raised from the prefix alone in delta (its keys are never listed: they
+# classify at the sweep), and a date-impersonating prefix is not stripped
+# into a flat parse. A non-day prefix at/above the heartbeat stem is outside
+# the discovery bound and stays sweep-bounded.
+DL_PREFIX_DRIFT="audit/fooday/20260925T130000Z-session.start.${DL_SID2}.1.shell.json"
+DL_PREFIX_IMPERSONATE="audit/evil.session.start/20260925T130000Z-session.start.${DL_SID2}.2.shell.json"
 dl_prefix_dir="${WORK}/state-159-prefix-drift"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
@@ -6524,10 +6598,16 @@ REQUEST_LOG="${WORK}/requests-159-prefix-drift.log"
 start_mock
 run_delta "${dl_prefix_dir}"
 REQUEST_LOG="${SAVED_REQUEST_LOG}"
-is "prefix drift: the delta stays a green no-op (drift does not repair)" "ok" "${CASE_STATE}"
-is "prefix drift: the run stays a delta" "delta" "$(state_field observed.coverage.mode)"
-if grep -qE 'prefix=audit(%2F|/)notaday(%2F|/)' "${WORK}/requests-159-prefix-drift.log" \
-   || grep -qE 'prefix=audit(%2F|/)session\.data(%2F|/)' "${WORK}/requests-159-prefix-drift.log"; then
+is "prefix drift: the delta raises the drift finding from the prefix alone" "alert" "${CASE_STATE}"
+is "prefix drift: exit 1 (drift, not a repair)" "1" "${CASE_RC}"
+is "prefix drift: the run stays a delta (no repair)" "delta" "$(state_field observed.coverage.mode)"
+is "prefix drift: no repair record" "" "$(state_field repaired)"
+case "${CASE_DETAIL}" in
+  *contract-mismatch*) ok "prefix drift: the delta detail names the prefix-alone contract-mismatch" ;;
+  *) bad "prefix drift delta detail: ${CASE_DETAIL}" ;;
+esac
+if grep -qE 'prefix=audit(%2F|/)fooday(%2F|/)' "${WORK}/requests-159-prefix-drift.log" \
+   || grep -qE 'prefix=audit(%2F|/)evil\.session\.start(%2F|/)' "${WORK}/requests-159-prefix-drift.log"; then
   bad "prefix drift: the delta listed a malformed/impersonating prefix"
 else
   ok "prefix drift: malformed/impersonating prefixes are never listed in delta"
@@ -6540,6 +6620,67 @@ case "${CASE_DETAIL}" in
   *naming-contract*) ok "prefix drift: the sweep names naming-contract" ;;
   *) bad "prefix drift sweep detail: ${CASE_DETAIL}" ;;
 esac
+
+# (9) Dated-listing nonconformance guard: a server that returns a dated key
+# at/below the dated listing's own start-after bound (the dated cursor on the
+# cursor day) must fail closed into the repair + full-sweep + error trace,
+# never a green delta; a conformant server (start-after excludes the cursor
+# key and anything below it) stays green on the same keys.
+DL_DNC_SID="${DL_SID2}"
+DL_DNC_CURSOR="$(dated_key session.start 20260925T140000Z "${DL_DNC_SID}" 1 shell)"
+DL_DNC_BELOW="$(dated_key user.login 20260925T124500Z "" 8)"
+dl_dnc_dir="${WORK}/state-159-dated-nonconf"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_DNC_CURSOR}","ago":300},
+  {"key":"recordings/${DL_DNC_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${dl_dnc_dir}"
+is "dated nonconformance: the warm sweep is green" "ok" "${CASE_STATE}"
+is "dated nonconformance: the sweep seeds the dated cursor" \
+  "${DL_DNC_CURSOR}" "$(state_field observed.cursors.audit_session_dated)"
+DL_DNC_HB2="audit/heartbeat/$(audit_stamp -30).json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"objects_ignore_start_after":true,
+ "objects":[
+  {"key":"${DL_DNC_HB2}","ago":30},
+  {"key":"${DL_DNC_CURSOR}","ago":300},
+  {"key":"${DL_DNC_BELOW}","ago":1200},
+  {"key":"recordings/${DL_DNC_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-dated-nonconf.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${dl_dnc_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "dated nonconformance: exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "dated nonconformance: error verdict" "error" "${CASE_STATE}"
+is "dated nonconformance: the record is marked repaired" "True" "$(state_field repaired)"
+is "dated nonconformance: the repair ran a full sweep" "sweep" "$(state_field observed.coverage.mode)"
+case "${CASE_DETAIL}" in
+  *"at or below its listing bound"*) ok "dated nonconformance: detail names the dated listing bound" ;;
+  *) bad "dated nonconformance detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${DL_DNC_HB2}","ago":30},
+  {"key":"${DL_DNC_CURSOR}","ago":300},
+  {"key":"${DL_DNC_BELOW}","ago":1200},
+  {"key":"recordings/${DL_DNC_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${dl_dnc_dir}"
+is "dated nonconformance (conformant control): the delta stays green" "ok" "${CASE_STATE}"
+is "dated nonconformance (conformant control): the run stays a delta" "delta" \
+  "$(state_field observed.coverage.mode)"
 
 # ---- (g) the key is never printed ----------------------------------------
 if grep -q 'SENTINEL' "${WORK}/witness.out" "${WORK}/witness.err" "${WORK}/state/verdict.log" "${WORK}/state/state.json" 2>/dev/null; then

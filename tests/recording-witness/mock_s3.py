@@ -30,7 +30,10 @@ The fixture is JSON:
                                           # keys at/below the cursor (nonconformant
                                           # server; a delta must fail closed)
       "prefixes_ignore_start_after": true, # optional; with delimiter=/, ignore
-                                          # start-after for CommonPrefixes too
+                                          # start-after for CommonPrefixes only:
+                                          # prefixes are derived from the
+                                          # UNFILTERED key pool while Contents
+                                          # still honour start-after
                                           # (nonconformant server; the witness's
                                           # client-side day filter must stay
                                           # deterministic under both behaviours)
@@ -58,6 +61,7 @@ A `versions` entry with `delete_marker: true` is served as a `<DeleteMarker>`
 element (a hidden object); the other entries are `<Version>` elements.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -89,6 +93,31 @@ def iso_from_ago(ago, now=None):
     # not straddle a second boundary).
     moment = (time.time() if now is None else now) - float(ago)
     return datetime.fromtimestamp(moment, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def encode_token(offset, start_after):
+    """Continuation token carrying the offset plus the seed filter.
+
+    The client sends ``start-after`` only on the first page (real B2
+    semantics), so the token has to carry the original filter or a later page
+    would slice the unfiltered list at the same offset; a conformant server
+    resumes the same filtered list. Opaque to the client.
+    """
+    seed = base64.urlsafe_b64encode(start_after.encode("utf-8")).decode("ascii")
+    return "%d.%s" % (offset, seed)
+
+
+def decode_token(token):
+    """Parse an :func:`encode_token` value; ``None`` for anything else."""
+    offset_part, sep, seed_part = token.partition(".")
+    if not sep or not offset_part.isdigit():
+        return None
+    try:
+        seed = base64.urlsafe_b64decode(seed_part.encode("ascii")).decode("utf-8") \
+            if seed_part else ""
+    except ValueError:
+        return None
+    return int(offset_part), seed
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -264,36 +293,57 @@ class Handler(BaseHTTPRequestHandler):
         start_after = query.get("start-after", [""])[0]
         delimiter = query.get("delimiter", [""])[0]
         now = time.time()
-        offset = int(token) if token.isdigit() else 0
-        matching = [
+        offset = 0
+        if token:
+            # A continuation token resumes the SAME filtered list: the seed
+            # filter rides the token because the client only sends
+            # `start-after` on the first page. A token page that recomputed
+            # the list without the seed would slice a different list from the
+            # same offset (a conformant server resumes at the right place).
+            resumed = decode_token(token)
+            if resumed is None:
+                self.record("GET", False, "fixture: malformed continuation token")
+                self.send_body(400, "<Error><Code>InvalidArgument</Code>"
+                                    "<Message>malformed continuation token</Message></Error>")
+                return
+            offset, start_after = resumed
+        pool = [
             obj for obj in FIXTURE.get("objects", []) if obj["key"].startswith(prefix)
         ]
-        # `start-after` is exclusive and seeds the first page only (real B2
-        # semantics, live-verified): a windowed seed lists the tail, and a
-        # continuation token resumes from the same filtered list.
-        if start_after and not FIXTURE.get("objects_ignore_start_after"):
-            matching = [obj for obj in matching if obj["key"] > start_after]
         # Real S3/B2 lists ascending by key. A fixture can opt into fixture
         # order to pin that the witness verdict is independent of the order
         # the listing returns (e.g. `.shell` before `.exec` at the same ts, or
         # a replay-conflict variant before its base).
         if FIXTURE.get("list_order") != "fixture":
-            matching = sorted(matching, key=lambda obj: obj["key"])
+            pool = sorted(pool, key=lambda obj: obj["key"])
+        # `start-after` is exclusive and seeds the first page (real B2
+        # semantics, live-verified): a windowed seed lists the tail, and a
+        # continuation token (above) resumes from the same filtered list.
+        matching = pool
+        if start_after and not FIXTURE.get("objects_ignore_start_after"):
+            matching = [obj for obj in matching if obj["key"] > start_after]
         suppress_token = FIXTURE.get("fail_objects") == "truncated-no-token"
         if delimiter:
             # `delimiter=/` collapses every key under the same first
             # delimiter occurrence into a CommonPrefix, and Contents and
-            # CommonPrefixes share the MaxKeys budget. `start_after` filters
-            # prefixes too (the conformant behaviour); a fixture can pin the
-            # nonconformant server with `prefixes_ignore_start_after`, where
-            # the witness's own client-side day filter has to stay
-            # deterministic.
+            # CommonPrefixes share the MaxKeys budget. In the conformant
+            # behaviour `start_after` filters prefixes too; the nonconformant
+            # `prefixes_ignore_start_after` fixture derives prefixes from the
+            # UNFILTERED key pool (Contents still honour start-after), which
+            # is the divergence the witness's client-side day filter has to
+            # absorb deterministically.
+            prefix_pool = pool if FIXTURE.get("prefixes_ignore_start_after") else matching
+            allowed = set(id(obj) for obj in matching)
             entries = []
             seen_prefixes = set()
-            for obj in matching:
+            for obj in prefix_pool:
                 key = obj["key"]
                 position = key[len(prefix):].find(delimiter)
                 if position < 0:
+                    # A direct object under the prefix: Contents are always
+                    # start-after-filtered, even when prefixes are not.
+                    if id(obj) not in allowed:
+                        continue
                     entries.append((key, "object", obj))
                     continue
                 common = key[:len(prefix) + position + len(delimiter)]
@@ -311,7 +361,8 @@ class Handler(BaseHTTPRequestHandler):
         truncated = suppress_token or next_offset < len(entries)
         next_token = ""
         if truncated and not suppress_token:
-            next_token = "<NextContinuationToken>%d</NextContinuationToken>" % next_offset
+            next_token = "<NextContinuationToken>%s</NextContinuationToken>" % xml_escape(
+                encode_token(next_offset, start_after))
         rows = ""
         common_rows = ""
         for name, kind, obj in page:

@@ -7,7 +7,7 @@ Dev tool, not run in CI. The harness (`run-test.sh`) loads the checked-in
 provenance:
 
     python3 tests/recording-witness/generate_shipper_vectors.py \
-        --pc-admin ../pc-admin          # a checkout whose HEAD is 9a2fe50
+        --pc-admin ../pc-admin          # a checkout whose HEAD is 44cfa8f
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree
@@ -32,12 +32,17 @@ current output), **flat legacy** vectors (the same real-builder basenames
 under the pre-#30 `audit/<basename>` layout, built with the replica's
 `flat=True` opt-in), and the date-segment vectors.
 
-The pin is the **prefix-aware full-key SHA**: the builder layout last changed
-at 9a2fe50 (pc-admin #39: `split_audit_date_segment`/`parse_audit_key_full`/
-`disambiguate_audit_key` take the shipper's configured `prefix` and refuse a
-foreign prefix or a residual path segment after the prefix/day; exactly one
-leading valid `YYYYMMDD/` is stripped and the remainder must be a bare
-basename). The previous grammar point was c0ce2f1 (pc-admin #30:
+The pin is the **prefix-aware full-key SHA with anchored key
+type/full-key regexes**. The builder layout last changed at 44cfa8f
+(pc-admin #39 r3: the full-key basename regexes are `\Z`-anchored, so a
+trailing newline after `.json` refuses the parse and is returned unchanged by
+`disambiguate_audit_key` — pre-fix `$` matched before the newline and the
+capture-group variant rebuild dropped it; the prefix-aware helpers themselves
+landed at 9a2fe50 (pc-admin #39: `split_audit_date_segment`/
+`parse_audit_key_full`/`disambiguate_audit_key` take the shipper's configured
+`prefix` and refuse a foreign prefix or a residual path segment after the
+prefix/day; exactly one leading valid `YYYYMMDD/` is stripped and the
+remainder must be a bare basename). The previous grammar point was c0ce2f1 (pc-admin #30:
 `build_audit_key` emits `audit/YYYYMMDD/<basename>`
 and `split_audit_date_segment` refuses an all-digit segment that is not a real
 8-digit calendar date). The point before that was 25f7922 (pc-admin #20:
@@ -70,7 +75,9 @@ import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from shipper_keys import PINNED_PC_ADMIN_SHA, audit_key, disambiguate_key, split_date_segment  # noqa: E402
+from shipper_keys import (PINNED_PC_ADMIN_SHA, SESSION_KEY_PARSE_RE,
+                          OTHER_KEY_PARSE_RE, audit_key, disambiguate_key,
+                          split_date_segment)  # noqa: E402
 
 TS = "20260925T100008Z"
 EVENT_TIME = "2026-09-25T10:00:08Z"
@@ -479,6 +486,48 @@ def build_vectors(b2):
         prefix="custom/audit/",
     )
 
+    # Full-key trailing-newline refusal (pc-admin #39 r3 @ 44cfa8f): both
+    # full-key basename regexes are ``\Z``-anchored, so ``…json\n`` refuses
+    # the parse and ``disambiguate_audit_key`` returns the key unchanged.
+    # Pre-fix ``$`` matched before the newline, the parse succeeded, and the
+    # capture-group variant rebuild dropped the newline — laundering a key
+    # the witness reads as contract-mismatch/naming-contract drift. Dated,
+    # flat and session basenames are all pinned; the replica is asserted to
+    # refuse/return-unchanged at generation time too.
+    full_key_refusals = []
+
+    def full_key_refusal_vector(name, base_key):
+        full = base_key + "\n"
+        assert b2.parse_audit_key_full(full) == (None, None), \
+            "the real full-key parser accepted a trailing-newline key: %s" % name
+        assert b2.disambiguate_audit_key(full, b"x") == full, \
+            "the real variant builder laundered a trailing-newline key: %s" % name
+        assert b2.split_audit_date_segment(full, "audit/") == split_date_segment(full), \
+            "the real date-segment split diverged from the replica on %s" % name
+        relative, _ = split_date_segment(full)
+        basename = relative[len("audit/"):]
+        assert SESSION_KEY_PARSE_RE.match(basename) is None \
+            and OTHER_KEY_PARSE_RE.match(basename) is None, \
+            "the replica parsed a trailing-newline basename: %s" % name
+        assert disambiguate_key(full, b"x") == full, \
+            "the replica laundered a trailing-newline key: %s" % name
+        full_key_refusals.append({"name": name, "key": full, "prefix": "audit/"})
+
+    full_key_refusal_vector(
+        "dated user.login full key with a trailing newline (\\Z full-key anchors)",
+        real_key(b2, {"time": EVENT_TIME, "event": "user.login", "sid": LSID}, None, 5),
+    )
+    full_key_refusal_vector(
+        "flat legacy user.login full key with a trailing newline (\\Z full-key anchors)",
+        layout_expected(
+            real_key(b2, {"time": EVENT_TIME, "event": "user.login", "sid": LSID}, None, 5),
+            "flat"),
+    )
+    full_key_refusal_vector(
+        "dated session.start full key with a trailing newline (\\Z full-key anchors)",
+        real_key(b2, {"time": EVENT_TIME, "event": "session.start", "sid": LSID}, None, 0),
+    )
+
     # Cross-repo seed (pc-admin @ a7035a9): a rebuilt audit file that replays a
     # taken key with DIFFERENT bytes ships under `disambiguate_audit_key` — the
     # event type gains `_<sha256[:16]>`; a session lifecycle variant drops its
@@ -604,7 +653,12 @@ def build_vectors(b2):
         raise AssertionError("replica unexpectedly accepted refusal vector: %s" % refusal["name"])
     return {
         "pinned_pc_admin_sha": PINNED_PC_ADMIN_SHA,
-        "grammar_note": "builder layout last changed at 9a2fe50 (pc-admin #39: "
+        "grammar_note": "builder layout last changed at 44cfa8f (pc-admin #39 r3: "
+                        "the full-key basename regexes are \\Z-anchored, so a "
+                        "trailing-newline key refuses the parse and is returned "
+                        "unchanged by disambiguate_audit_key - never laundered "
+                        "through the capture-group rebuild; the prefix-aware "
+                        "helpers landed at 9a2fe50 (pc-admin #39: "
                         "split_audit_date_segment/parse_audit_key_full/"
                         "disambiguate_audit_key take the configured `prefix` and refuse "
                         "a foreign prefix or a residual path segment after the "
@@ -636,6 +690,7 @@ def build_vectors(b2):
         "generated_by": "tests/recording-witness/generate_shipper_vectors.py against pc-admin scripts/lib/b2_client.py",
         "vectors": vectors,
         "date_segments": date_segments,
+        "full_key_refusals": full_key_refusals,
         "refusals": refusals,
     }
 

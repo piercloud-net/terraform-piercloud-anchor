@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 r"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 9a2fe505b892411d25f731c2cf4e6361967fb911 —
-the **prefix-aware full-key SHA**: pc-admin #30 made `build_audit_key` emit
+PINNED AGAINST: cad0p/pc-admin @ 44cfa8fa7af786f3ba38775e29c21f764db34979 —
+the **prefix-aware full-key SHA with `\Z`-anchored key regexes**: pc-admin #30 made `build_audit_key` emit
 ``audit/YYYYMMDD/<basename>`` (the day derived from the same UTC instant as
 ``<ts>``); pc-admin #39 made the full-key helpers
 (``split_audit_date_segment``/``parse_audit_key_full``/``disambiguate_audit_key``)
@@ -17,8 +17,14 @@ non-calendar all-digit day keeps the preserved ``(None, segment)`` refusal shape
 Flat legacy keys (``audit/<basename>``) remain accepted through the dual window
 and are built by the replica's ``flat=True`` opt-in; the builder default is
 dated, and ``disambiguate_audit_key`` keeps the passed prefix, so a custom-prefix
-variant round-trips. The previous grammar point was
-c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd (the #30 date-partition SHA above), and
+variant round-trips. The full-key basename regexes are ``\Z``-anchored
+(pc-admin #39 r3 @ ``44cfa8f``): a trailing newline after ``.json`` (dated,
+flat or session) refuses the parse and ``disambiguate_audit_key`` returns the
+key unchanged — before the anchor, Python's ``$`` matched before the newline
+and the capture-group variant rebuild dropped it, laundering a key the witness
+reads as ``contract-mismatch``/``naming-contract`` drift. The previous grammar
+point was 9a2fe50 (the prefix-aware full-key helpers themselves), and before
+that c0ce2f1567af64dbc2de09eb45e9e36c4b2c48fd (the #30 date-partition SHA above), and
 before that 25f79223cadd2a0ca6781d575215ebd2a7c0ddc8 (pc-admin #20 anchored the audit-key type
 regexes at `\Z`; Python's `$` also matches before a trailing newline, so a type
 like `user.login\n` would pass and build a key with an embedded newline the
@@ -89,6 +95,12 @@ real builder DOES emit on its documented path is reproduced faithfully):
   regexes, pc-admin #20): the real builder sanitizes it to `unknown`; the
   replica refuses it so a fixture can never pin a key with an embedded
   newline the witness reads as `contract-mismatch` drift.
+- A full object key with a trailing newline after `.json` is out of grammar
+  (`\Z`-anchored full-key regexes, pc-admin #39 r3 @ `44cfa8f`): the basename
+  parse refuses it and `disambiguate_key` returns the key unchanged, never
+  laundering `…json\n` into a documented variant through the capture-group
+  rebuild (the class the witness reads as `contract-mismatch`/
+  `naming-contract` drift).
 - An event type longer than 128 chars is truncated to the cap with a trailing
   separator dropped and `_<sha256[:8]>` appended (an underscore segment inside
   the witness's `[A-Za-z0-9_]+` type grammar): the cap keeps B2 keys bounded
@@ -126,7 +138,7 @@ import re
 import sys
 from datetime import datetime
 
-PINNED_PC_ADMIN_SHA = "9a2fe505b892411d25f731c2cf4e6361967fb911"
+PINNED_PC_ADMIN_SHA = "44cfa8fa7af786f3ba38775e29c21f764db34979"
 # Date-partition grammar (pc-admin #30): ``audit/YYYYMMDD/<basename>``. The
 # segment must be a real calendar date; a non-calendar all-digit segment is
 # malformed and refused, never stripped (mirrors
@@ -167,13 +179,17 @@ EVENT_TYPE_HASH_LENGTH = 8
 # unchanged). The witness canonicalizes the suffix back to the base type and
 # treats the variant as the same event identity.
 CONFLICT_HASH_LENGTH = 16
+# ``\Z``, not ``$``: Python's ``$`` also matches before a trailing newline, so
+# a full key ``…json\n`` parsed as a valid basename and the variant builder
+# rebuilt it from its capture groups, dropping the newline (pc-admin #39 r3;
+# the same trailing-newline class as the type regexes / anchors #151/#152).
 SESSION_KEY_PARSE_RE = re.compile(
     r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>session\.[A-Za-z0-9_]+)\.(?P<sid>"
     + UUID_PATTERN
-    + r")\.(?P<seq>[0-9]{1,18})(?:\.(?P<mode>shell|exec))?\.json$"
+    + r")\.(?P<seq>[0-9]{1,18})(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
 OTHER_KEY_PARSE_RE = re.compile(
-    r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json$"
+    r"^(?P<ts>[0-9]{8}T[0-9]{6}Z)-(?P<type>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
 )
 
 # Session lifecycle events get the `interactive`-derived mode suffix; every
@@ -336,7 +352,9 @@ def disambiguate_key(key, body, prefix="audit/"):
     — never stripped or laundered into a variant — exactly like the pinned
     builder. Returns the key unchanged outside the shipper grammar, exactly
     like the producer (the caller never invents a shape the witness cannot
-    classify).
+    classify). The basename regexes are ``\\Z``-anchored (pc-admin #39 r3), so
+    a trailing newline after ``.json`` refuses and is never rebuilt into a
+    variant from the capture groups.
     """
     relative, day = split_date_segment(key, prefix)
     if relative is None:

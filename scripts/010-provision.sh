@@ -2688,7 +2688,7 @@ def _list_cold_start_streams(config, window_start):
 
 
 def _delta_dated_listings(config, now, discovered_prefixes, flat_cursor, dated_cursor):
-    """Bounded dated-day listing plan for a delta: ``{day: start_after}``.
+    """Bounded dated-day listing plan for a delta: ``({day: start_after}, drift)``.
 
     The plan is the dated cursor's own day resumed with the cursor as its
     exclusive start, plus the discovered day prefixes that are not below the
@@ -2704,39 +2704,50 @@ def _delta_dated_listings(config, now, discovered_prefixes, flat_cursor, dated_c
     and re-trigger DeltaTooLong on a large day). Deduped by day; each day is
     listed by the caller with ``audit/<day>T`` as its ``until`` bound (all
     dated keys of a day sort before its flat keys) and its own page budget.
+
+    The second return value is the list of **drift prefixes**: a non-heartbeat
+    prefix that is not a valid calendar day is a drift signal without listing
+    its keys (plan §1). A drift prefix above the flat cursor is returned for
+    the caller to inject into the view, so the naming-contract/contract-mismatch
+    classifier judges it from the prefix alone; one at/below the flat cursor is
+    dropped here (like a below-floor day) and stays sweep-bounded - disclosed.
     """
     try:
         bound_date = (now + timedelta(seconds=config.clock_skew_tolerance)).date()
     except OverflowError:
-        # Absurd operator tolerance: no future day can be proven here; the
-        # cursor movers' own key_ts_is_future still rejects every key.
-        bound_date = None
+        # Absurd operator tolerance: fall back to today's UTC date (fail
+        # closed - only today's days can be non-future) instead of setting
+        # ``bound_date = None`` and silently disabling the future-day
+        # exclusion, which would re-list a forged future day every run.
+        bound_date = now.date()
     cursor_day = _audit_key_day(config.audit_prefix, dated_cursor) if dated_cursor else ""
     flat_day = _audit_key_day(config.audit_prefix, flat_cursor) if flat_cursor else ""
     floor_day = cursor_day or flat_day
     plan = {}
+    drift_prefixes = []
     if cursor_day:
         plan[cursor_day] = dated_cursor
     elif flat_day:
         plan[flat_day] = config.audit_prefix + flat_day + "/"
     for prefix in discovered_prefixes:
-        if not prefix.startswith(config.audit_prefix):
+        if not prefix.startswith(config.audit_prefix) or prefix.startswith(config.heartbeat_prefix):
             continue
         basename, day = strip_date_segment(prefix[len(config.audit_prefix):])
         if basename is None or not day:
-            # heartbeat/ (until-filtered) or a malformed/unknown prefix: not a
-            # day, so it is never listed here; its keys classify at the sweep.
+            # Not a day: a drift signal judged from the prefix alone, never
+            # listed. Above the flat cursor it must alert in delta instead of
+            # a green no-op; at/below the flat cursor (a nonconformant server
+            # can return it) it stays sweep-bounded and is dropped.
+            if flat_cursor and prefix <= flat_cursor:
+                continue
+            drift_prefixes.append(prefix)
             continue
         if floor_day and day < floor_day:
             continue
-        if bound_date is not None:
-            try:
-                if datetime.strptime(day, "%Y%m%d").date() > bound_date:
-                    continue
-            except ValueError:
-                continue
+        if datetime.strptime(day, "%Y%m%d").date() > bound_date:
+            continue
         plan.setdefault(day, config.audit_prefix + day + "/")
-    return plan
+    return plan, drift_prefixes
 
 
 def _delta_repair_sweep(config, observed, now):
@@ -2829,7 +2840,7 @@ def run_checks(config, now, plan):
             new_session, discovered_prefixes = list_objects_delimited(
                 config, config.audit_prefix, start_after=session_cursor,
                 until=heartbeat_stem, max_pages=DELTA_MAX_PAGES)
-            dated_plan = _delta_dated_listings(
+            dated_plan, drift_prefixes = _delta_dated_listings(
                 config, now, discovered_prefixes, session_cursor, dated_cursor)
             dated_listings = {}
             for day in sorted(dated_plan):
@@ -2901,6 +2912,12 @@ def run_checks(config, now, plan):
                 new_audit.update(new_session)
                 for day in dated_listings:
                     new_audit.update(dated_listings[day][1])
+                # A non-day prefix above the flat cursor is a drift signal
+                # from the prefix alone (plan §1): never list its keys, but
+                # never stay green either - inject the prefix itself so the
+                # classifier raises naming-contract/contract-mismatch.
+                for prefix in drift_prefixes:
+                    new_audit[prefix] = now
                 audit_objects.update(new_audit)
                 recording_objects.update(new_recordings)
                 # Same grammar + future filter as _cursors_from_listings: an
