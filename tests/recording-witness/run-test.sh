@@ -6800,6 +6800,19 @@ fi
 # assignment whose quoted value contains whitespace — `FOO="a b" export …` —
 # is not statically resolvable after the char-level quote strip and stays in
 # the disclosed crafted-edit class, like the `${IFS}` separators.)
+#
+# r20 red-team HIGH + MED (delta re-check): the r19 strip matched only
+# `NAME=`, so append/subscript prefixes (`A+=b declare -x "PATH=…"`,
+# `FOO[0]=bar export "PATH=…"`, `A[0]=1 …`) still shifted the verb past the
+# position class, and a loop-variable binding (`for PATH in /tmp/shad; do …`,
+# also `select PATH`) poisoned PATH outside every branch (both pre-existing;
+# runtime shadow probes confirmed). The strip now matches
+# `NAME(\[sub\])?+=`; the branches also run on each intermediate line — a
+# stripped `PATH=…`/`FOO=bar PATH=…` prefix must not hide its own write,
+# which the final view alone would (the raw-PATH tooth backstops direct
+# `PATH=`/`PATH+=` writes) — and `for`/`select PATH` joins the refusal set.
+# A parameter-rebuilt name (`p=PATH; export "$p"=…`) stays in the disclosed
+# crafted-edit class.
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6810,6 +6823,15 @@ if awk -v q="'" '
       gsub(/(^|[;&|()!{}])[[:space:]]*\}[[:space:]]*/, "; ", s)
     } while (s != prev)
     return s
+  }
+  function path_write(s) {
+    return (s ~ /(^|[;&|()!{}])[[:space:]]*PATH\+?=/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(for|select)[[:space:]]+PATH([^[:alnum:]_]|$)/)
   }
   {
     line = $0
@@ -6823,27 +6845,24 @@ if awk -v q="'" '
     # exposes `command export` after `then` becomes a separator; a
     # `command command …` chain needs one strip per prefix), so run both
     # until the line is stable; `!` joins the position class.
+    hit = 0
     do {
+      if (path_write(line)) hit = 1
       prev = line
       gsub(/(^|[;&|()!{}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
-      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+/, "; ", line)
+      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^[:space:];&|]*[[:space:]]+/, "; ", line)
       line = normalize_cmdpos(line)
     } while (line != prev)
-    if (line ~ /(^|[;&|()!{}])[[:space:]]*PATH\+?=/ ||
-        line ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|()!{}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
+    if (hit || path_write(line)) {
       print FILENAME ":" FNR ": command-position PATH write on the no-quote-strip view: " $0 > "/dev/stderr"
       bad = 1
     }
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a reserved-word/\`!\` position, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
 else
-  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a reserved-word/\`!\` position, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
@@ -6951,6 +6970,14 @@ fi
 # (`FOO=bar trap …`) was the same position-class gap. Closed in place: the
 # allowlist view no longer strips `$`, and the deny view strips
 # `command`/assignment prefixes iteratively before the match.
+#
+# r20 red-team HIGH (delta re-check): the r19 assignment strip matched only
+# `NAME=`, so append/subscript prefixes (`FOO+=bar trap 'exit 0' EXIT`,
+# `FOO[0]=bar trap …`, `A[0]=1 trap …`) still shifted the verb past the
+# position class (pre-existing; runtime rc-rewrite probe confirmed). The strip
+# now matches `NAME(\[sub\])?+=`. (An assignment whose quoted value contains
+# whitespace — `FOO="a b" trap …` — stays in the disclosed crafted-edit
+# class, like the PATH tooth's and the `${IFS}` separators.)
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6982,7 +7009,7 @@ if awk -v q="'" '
     do {
       prev = line
       gsub(/(^|[;&|()!{}])[[:space:]]*command([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
-      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+/, "; ", line)
+      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=[^[:space:];&|]*[[:space:]]+/, "; ", line)
       line = normalize_cmdpos(line)
     } while (line != prev)
     # main-sync fold (2026-10-06, PR #156): the merged #153 acceptance
