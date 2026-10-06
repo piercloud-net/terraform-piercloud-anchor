@@ -96,17 +96,24 @@ if [ -z "$token" ]; then
   echo "::error::${secret_name} is not set — DNS upsert is required on mode=apply (provider=${PROVIDER}). Set the ${secret_name} org secret, then re-dispatch. Refusing to publish a thumbprint against an unverified name."
   exit 1
 fi
-# Header-injection guard: the token lands in an HTTP header FILE, so a
-# whitespace/control character would forge a second header. Tokens never
-# contain one; refuse rather than trust.
-case "$token" in *[[:space:]]*) echo "::error::${secret_name} contains whitespace — refusing to build the auth header."; exit 1 ;; esac
+# Header-injection guard: the token lands in an HTTP header FILE, so a CR/LF
+# (the only bytes that can forge a second header) would break it. Refuse any
+# whitespace or control byte rather than trust.
+case "$token" in *[[:space:][:cntrl:]]*) echo "::error::${secret_name} contains whitespace or a control character — refusing to build the auth header."; exit 1 ;; esac
 echo "::add-mask::$token"
 # Token transport: curl reads the header from a 0600 file (`-H @file`) so the
 # near-account-wide Gcore token never appears in curl's argv (/proc/*/cmdline,
 # core dumps) — the "never argv" invariant holds end to end.
 AUTH_FILE="$(mktemp)"
 chmod 0600 "$AUTH_FILE"
-trap 'rm -f "$AUTH_FILE"' EXIT
+# EXIT covers normal paths; the signal traps also remove the file when a job
+# is cancelled (SIGKILL cannot be trapped — the runner VM teardown is the
+# backstop there).
+cleanup_auth_file() { rm -f "$AUTH_FILE"; }
+trap cleanup_auth_file EXIT
+trap 'cleanup_auth_file; exit 130' INT
+trap 'cleanup_auth_file; exit 143' TERM
+trap 'cleanup_auth_file; exit 129' HUP
 # The auth scheme is a separate constant so no shell print builtin ever
 # carries the scheme literal on its own line (C-A secret-print contract).
 case "$PROVIDER" in
@@ -231,8 +238,9 @@ gcore_upsert_anchor() {
   got_ip="$(jq -r '[(.resource_records // [])[] | (.content // empty) | if type == "array" then .[] else . end] | join(",")' "$tmp")"
   got_ttl="$(jq -r '.ttl // empty' "$tmp")"
   # Boolean read via tostring (never `// empty` — false is empty to jq; CI's
-  # jq-boolean-guard enforces this shape).
-  got_enabled="$(jq -r '(.resource_records[0] // {}) | .enabled | tostring' "$tmp")"
+  # jq-boolean-guard enforces this shape). Read EVERY entry: a single disabled
+  # junk entry alongside the real one must fail the exact-one proof.
+  got_enabled="$(jq -r '[(.resource_records // [])[] | .enabled | tostring] | unique | join(",")' "$tmp")"
   jq '{name: .name, type: .type, ttl: .ttl, resource_records: .resource_records}' "$tmp"
   rm -f "$tmp"
   if [ "$count" != "1" ] || [ "$got_name" != "$fqdn" ] || [ "$got_ip" != "$want_ip" ] || [ "$got_ttl" != "$ANCHOR_TTL" ] || [ "$got_enabled" != "true" ]; then

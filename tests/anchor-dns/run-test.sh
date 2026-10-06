@@ -169,7 +169,7 @@ run_writer() { # $@ = env assignments for the writer; rc echoed; log in $WORK/la
   local rc=0
   (
     unset NET_DNS_PROVIDER NET_DNS_ZONE ANCHOR_TTL CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN
-    unset STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP STUB_CF_WRITE_HTTP STUB_GCORE_WRITE_HTTP STUB_CF_DUPLICATE STUB_GCORE_DUPLICATE
+    unset STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP STUB_CF_WRITE_HTTP STUB_GCORE_WRITE_HTTP STUB_CF_DUPLICATE STUB_GCORE_DUPLICATE STUB_GCORE_BUNDLED
     env "$@" bash "$SCRIPT"
   ) >"$WORK/last.log" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -217,6 +217,7 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcor
 is "gcore create rc" "0" "$rc"
 contains "gcore create verifies" "verified: $T_HOST -> $T_IP (ttl=300, enabled=true)" "$(LOG)"
 is "gcore create writes exactly the anchor record" "$T_HOST" "$(GC_KEYS)"
+lacks "no status record was written on the Gcore path" "status" "$(GC_KEYS)"
 contains "gcore create used POST (404 first)" "POST" "$(cat "$WORK/curl.log")"
 is "gcore create body shape (A content single-element array)" "[\"$T_IP\"]" "$(jq -c --arg n "$T_HOST" '.[$n].resource_records[0].content' "$WORK/gcore-rrsets.json")"
 is "gcore create enabled flag" "true" "$(jq -r --arg n "$T_HOST" '.[$n].resource_records[0].enabled' "$WORK/gcore-rrsets.json")"
@@ -251,6 +252,13 @@ is "missing token wrote nothing" "" "$(CF_KEYS)"
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore)"
 [ "$rc" != "0" ] && ok "missing GCORE_DNS_TOKEN fails closed (rc=$rc)" || bad "missing GCORE_DNS_TOKEN did not fail"
 contains "missing token names GCORE_DNS_TOKEN" "GCORE_DNS_TOKEN is not set" "$(LOG)"
+
+# ---- red: a control byte in the token is refused before any curl ----------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN=$'cf\x01-token')"
+[ "$rc" != "0" ] && ok "control-byte token fails the run (rc=$rc)" || bad "control-byte token did not fail"
+contains "control-byte token message" "whitespace or a control character" "$(LOG)"
+lacks "control-byte token never reaches curl" "hdr " "$(cat "$WORK/headers.log" 2>/dev/null || true)"
 
 # ---- red: bad provider / bad zone ------------------------------------------
 reset_state
@@ -319,7 +327,6 @@ is "gcore TTL floor wrote nothing" "" "$(GC_KEYS)"
 # ---- no per-tenant status record survives ----------------------------------
 contains "writer still derives the anchor name" "derive_anchor_hostname" "$(cat "$SCRIPT")"
 lacks "writer no longer derives a status host" "derive_status_host" "$(cat "$SCRIPT")"
-lacks "no status record was written on the Gcore path" "status" "$(GC_KEYS)"
 
 # ---- static wiring ---------------------------------------------------------
 contains "provision.yml passes GCORE_DNS_TOKEN" 'GCORE_DNS_TOKEN: ${{ secrets.GCORE_DNS_TOKEN }}' "$(cat "$PROV")"
@@ -327,6 +334,12 @@ contains "provision.yml passes the provider switch" 'NET_DNS_PROVIDER: ${{ vars.
 lacks "gcore boolean read never uses the jq alternative on enabled" ".enabled //" "$(cat "$SCRIPT")"
 contains "gcore boolean read uses tostring" ".enabled | tostring" "$(cat "$SCRIPT")"
 contains "anchor TTL constant documented" 'ANCHOR_TTL="${ANCHOR_TTL:-300}"' "$(cat "$SCRIPT")"
+# The line that emits the credential must land in the 0600 header file — a
+# future edit redirecting it to stdout would otherwise be invisible to the
+# contract secret-print grep (which only sees print-builtin+scheme lines).
+auth_print_line="$(grep -F "printf 'Authorization:" "$SCRIPT" || true)"
+contains "auth header printf redirects into the token file" '> "$AUTH_FILE"' "$auth_print_line"
+contains "auth header printf passes the token, never a literal" '"$token"' "$auth_print_line"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
