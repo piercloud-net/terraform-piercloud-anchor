@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=815
+MIN_CHECKS=816
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4767,8 +4767,14 @@ is "absurd clock-skew tolerance: exit 0 (no crash)" "0" "${CASE_RC}"
 is "absurd clock-skew tolerance: ok verdict" "ok" "${CASE_STATE}"
 # The chosen semantics are rejection, not clamp-to-default: no shaped audit
 # key may move a cursor under the absurd tolerance (a clamp fix would move
-# them). Recordings keys carry no `<ts>` and stay cursor movers.
-is "absurd clock-skew tolerance: shaped keys never move a cursor" "" "$(state_field observed.cursors.audit_session)"
+# them). Recordings keys carry no `<ts>` and stay cursor movers. The
+# assertion is composite with the run state so it cannot pass vacuously when
+# the run error-lands (guard removal) with no cursors written; the recordings
+# cursor pins that processing happened at all (a global-reset regression).
+is "absurd clock-skew tolerance: shaped keys never move a cursor on an ok run" \
+  "ok:" "${CASE_STATE}:$(state_field observed.cursors.audit_session)"
+is "absurd clock-skew tolerance: the recordings cursor still advances (no ts)" \
+  "recordings/${SID}.tar" "$(state_field observed.cursors.recordings)"
 
 # Forged state with a future-dated cursor (calendar-valid session-family,
 # calendar-invalid sid-less, future heartbeat): the load guard must reject it
@@ -4998,8 +5004,8 @@ objects = [
     # Date-inert on purpose (round-6 lenses): these 60 keys only need to sit
     # above the session cursor - the `audit/heartbeat/` prefix sorts above
     # every digit-leading `<ts>` key, so their dates never matter (verified:
-    # a 2020-dated copy still passes 814/0); year-9999 keeps the hygiene rule
-    # (no expiring fixture stamps) without changing the scenario.
+    # a 2020-dated copy still passes the full suite); year-9999 keeps the
+    # hygiene rule (no expiring fixture stamps) without changing the scenario.
     {"key": "audit/heartbeat/99991231T%02d0000Z.json" % index, "ago": 60}
     for index in range(60)
 ]
