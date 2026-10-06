@@ -101,7 +101,11 @@ import sys
 
 PINNED_PC_ADMIN_SHA = "25f79223cadd2a0ca6781d575215ebd2a7c0ddc8"
 
-TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z$"
+# ``\Z``, not ``$``: Python's ``$`` also matches before a trailing newline,
+# so a timestamp like ``20260925T100008Z\n`` would pass and build a key with
+# an embedded newline (anchor #155 F2, the same trailing-newline class as the
+# type regexes / anchors #151/#152).
+TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z\Z"
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 TS_RE = re.compile(TS_PATTERN)
 UUID_RE = re.compile(UUID_PATTERN)

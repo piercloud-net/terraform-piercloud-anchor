@@ -10,10 +10,19 @@ provenance:
         --pc-admin ../pc-admin          # a checkout whose HEAD is 25f7922
 
 The script refuses to write unless the pc-admin checkout HEAD is exactly
-`shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex; `--allow-sha-mismatch` only
-for a manual debug run — never commit output from a mismatched checkout; the
-harness asserts the committed file's `source_sha` equals the pin exactly, so
-such a file fails CI). It imports the real `scripts/lib/b2_client.py`, builds
+`shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree
+`scripts/lib/b2_client.py` bytes equal the committed `HEAD:` blob (anchor #155
+F1: `git status` is bypassable with `assume-unchanged`/skip-worktree, so the
+guard compares content, not status; replacement refs are disabled with
+`--no-replace-objects`, since `git replace` can also swap the blob
+`cat-file` returns while HEAD is unchanged — the same local-`.git` class; and
+the compared bytes are compiled directly (`load_module_from_source`), never
+imported through `spec_from_file_location`/`exec_module`, which would execute
+a planted `__pycache__` entry whose header matches the source — round-2
+red-team). `--allow-sha-mismatch` is a manual debug
+run: a non-clean provenance stamps a non-pin `source_sha` (`<head>-debug`), so
+a file generated from unpinned bytes can never pass the harness's exact-pin
+`source_sha` assertion if it is committed. It imports the real `scripts/lib/b2_client.py`, builds
 the golden + boundary matrix through `build_audit_key` and the replay-conflict
 variant matrix through `disambiguate_audit_key`, and self-checks that the
 replica in this directory reproduces every vector before writing.
@@ -41,11 +50,11 @@ a documented non-session shape), keeping the goldens in step.
 """
 
 import argparse
-import importlib.util
 import json
 import os
 import subprocess
 import sys
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -58,10 +67,42 @@ USID = LSID.upper()
 SEQ_MAX = 10 ** 18 - 1
 
 
-def load_module(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def worktree_bytes(repo, relpath):
+    """The worktree bytes at ``relpath`` (hard error if unreadable)."""
+    relpath = relpath.replace(os.sep, "/")
+    try:
+        with open(os.path.join(repo, *relpath.split("/")), "rb") as handle:
+            return handle.read()
+    except OSError as error:
+        raise SystemExit("cannot read %s from %s: %s" % (relpath, repo, error))
+
+
+def committed_blob(repo, relpath):
+    """The committed ``HEAD:`` blob bytes for ``relpath`` (replacement refs off)."""
+    relpath = relpath.replace(os.sep, "/")
+    committed = subprocess.run(
+        ["git", "-C", repo, "--no-replace-objects", "cat-file", "blob", "HEAD:%s" % relpath],
+        capture_output=True)
+    if committed.returncode != 0:
+        raise SystemExit(
+            "pc-admin checkout %s has no %s at HEAD (%s); the pin must name a commit "
+            "that contains it" % (repo, relpath,
+                                  committed.stderr.decode("utf-8", "replace").strip()))
+    return committed.stdout
+
+
+def load_module_from_source(source, path, name):
+    """Execute ``source`` as the module ``name`` — never a cached ``.pyc``.
+
+    ``spec_from_file_location(...).exec_module`` executes a ``__pycache__``
+    entry when its header mtime/size match the source, so a stale or planted
+    pyc could run while the guard vouched for the pinned source bytes (anchor
+    #155 red-team round 2). Compile the exact bytes the caller compared
+    against ``HEAD:`` — the compared provenance is the executed provenance.
+    """
+    module = types.ModuleType(name)
+    module.__file__ = path
+    exec(compile(source, path, "exec"), module.__dict__)
     return module
 
 
@@ -417,6 +458,24 @@ def build_vectors(b2):
     }
 
 
+def blob_matches_head(repo, relpath):
+    """True iff the worktree bytes at ``relpath`` equal the committed HEAD blob.
+
+    The old ``git status --porcelain`` check is bypassable with
+    ``git update-index --assume-unchanged`` (and skip-worktree): the worktree
+    bytes change while status stays clean, so the generator would import
+    unpinned builder bytes while stamping the pin (anchor #155 F1). Compare
+    content instead. ``--no-replace-objects`` closes the sibling bypass: a
+    ``git replace`` ref makes ``cat-file blob HEAD:<path>`` return the
+    replacement bytes while HEAD (the pin check) is unchanged (anchor #155
+    red-team LOW). A path missing from HEAD is a hard error: the pin names
+    a commit that must contain it. The caller compiles the same bytes it
+    compares (``load_module_from_source``), so a planted ``__pycache__`` entry
+    cannot substitute the executed module (anchor #155 red-team round 2).
+    """
+    return worktree_bytes(repo, relpath) == committed_blob(repo, relpath)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pc-admin", default=os.path.join(HERE, "..", "..", "..", "pc-admin"),
@@ -429,7 +488,8 @@ def main():
     repo = os.path.abspath(args.pc_admin)
     head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True,
                           capture_output=True, text=True).stdout.strip()
-    if head != PINNED_PC_ADMIN_SHA and not args.allow_sha_mismatch:
+    provenance_clean = head == PINNED_PC_ADMIN_SHA
+    if not provenance_clean and not args.allow_sha_mismatch:
         raise SystemExit(
             "pc-admin checkout %s is at %s, not the pinned %s; bump the pin deliberately first "
             "(or pass --allow-sha-mismatch for a debug run)" % (repo, head[:12], PINNED_PC_ADMIN_SHA[:12])
@@ -438,18 +498,31 @@ def main():
     # builder bytes while the file would claim the pin (security round-1 LOW
     # on #149). Refuse unless this is an explicit debug run: the pin is a
     # provenance claim about the committed blob, not just the commit id.
-    dirty = subprocess.run(
-        ["git", "-C", repo, "status", "--porcelain", "--", "scripts/lib/b2_client.py"],
-        check=True, capture_output=True, text=True).stdout.strip()
-    if dirty and not args.allow_sha_mismatch:
+    # anchor #155 F1: compare CONTENT, not `git status` — assume-unchanged /
+    # skip-worktree hide a worktree edit from status, and `git replace` can
+    # swap the blob `cat-file` returns; the compare disables replacement refs.
+    # The SAME bytes are then compiled by `load_module_from_source` (never a
+    # cached/planted `__pycache__` entry — anchor #155 red-team round 2), so
+    # the compared provenance is the executed provenance.
+    relpath = "scripts/lib/b2_client.py"
+    builder_source = worktree_bytes(repo, relpath)
+    content_clean = builder_source == committed_blob(repo, relpath)
+    if not content_clean and not args.allow_sha_mismatch:
         raise SystemExit(
-            "pc-admin checkout %s has uncommitted changes in scripts/lib/b2_client.py (%s); "
-            "the vectors must come from the committed blob at the pinned SHA "
-            "(or pass --allow-sha-mismatch for a debug run)" % (repo, dirty.splitlines()[0])
+            "pc-admin checkout %s has scripts/lib/b2_client.py differing from the committed "
+            "blob at HEAD; the vectors must come from the committed bytes at the pinned SHA "
+            "(git status can be bypassed with assume-unchanged/skip-worktree, and "
+            "git replace with a swapped blob). "
+            "(or pass --allow-sha-mismatch for a debug run)" % repo
         )
-    b2 = load_module(os.path.join(repo, "scripts", "lib", "b2_client.py"), "pcadmin_b2_client")
+    provenance_clean = provenance_clean and content_clean
+    b2 = load_module_from_source(builder_source, os.path.join(repo, *relpath.split("/")),
+                                 "pcadmin_b2_client")
     payload = build_vectors(b2)
-    payload["source_sha"] = head
+    # A debug run (unpinned HEAD or uncommitted builder bytes) must never be
+    # committable: stamp a non-pin source_sha so the harness's exact-pin
+    # assertion fails closed if the file is ever committed (anchor #155 F1).
+    payload["source_sha"] = head if provenance_clean else head + "-debug"
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=False)
         handle.write("\n")

@@ -63,7 +63,14 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; golden strings,
+#       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; the generator's
+#       provenance guard compares content, not `git status` — an
+#       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
+#       builder bytes, replacement refs are disabled (`git replace` cannot
+#       swap the compared blob), and the compared bytes are compiled directly
+#       (a planted `__pycache__` entry cannot run) — and the replica `TS_RE`
+#       is `\Z`-anchored, anchor #155;
+#       golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
 #       the over-long event-type truncation cap with its `_<sha256[:8]>`
@@ -189,7 +196,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=842
+MIN_CHECKS=846
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -550,6 +557,17 @@ if replica.UUID_RE.pattern != CANONICAL_UUID_PATTERN:
     raise SystemExit(
         "replica UUID_RE.pattern %r != pinned canonical pattern %r"
         % (replica.UUID_RE.pattern, CANONICAL_UUID_PATTERN))
+# Trailing-newline class (anchor #155 F2): pin the timestamp regex too.
+# Python's `$` also matches before a trailing newline, so a `$`-anchored
+# TS_RE accepts `20260925T100008Z\n` and builds a key with an embedded
+# newline. The real builder's `audit_ts` emits `strftime` output (always
+# newline-free), so this is defense-in-depth symmetry with the `\Z` type
+# anchors (pc-admin #20).
+CANONICAL_TS_PATTERN = r"^[0-9]{8}T[0-9]{6}Z\Z"
+if replica.TS_RE.pattern != CANONICAL_TS_PATTERN:
+    raise SystemExit(
+        "replica TS_RE.pattern %r != pinned canonical pattern %r"
+        % (replica.TS_RE.pattern, CANONICAL_TS_PATTERN))
 
 
 def source_sha_ok(value):
@@ -567,7 +585,10 @@ if not source_sha_ok(source_sha):
         "--allow-sha-mismatch must never be committed" % (source_sha, replica.PINNED_PC_ADMIN_SHA))
 for hostile in (replica.PINNED_PC_ADMIN_SHA[:7], replica.PINNED_PC_ADMIN_SHA[:7] + "!!!",
                 replica.PINNED_PC_ADMIN_SHA + "0", replica.PINNED_PC_ADMIN_SHA + "!!!",
-                replica.PINNED_PC_ADMIN_SHA.upper()):
+                replica.PINNED_PC_ADMIN_SHA.upper(),
+                # anchor #155 F1: a debug run stamps `<pin>-debug`; the
+                # predicate must refuse it, never accept a pin-prefixed stamp.
+                replica.PINNED_PC_ADMIN_SHA + "-debug"):
     if source_sha_ok(hostile):
         raise SystemExit("source_sha predicate accepted a hostile value: %r" % hostile)
 for vector in vectors["vectors"]:
@@ -600,6 +621,103 @@ PY
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
+fi
+
+# F2 tooth (anchor #155): the replica TS_RE must be \Z-anchored. Python's `$`
+# also matches before a trailing newline, so a `$`-anchored revert accepts
+# this timestamp (rc 0) and builds a key with an embedded newline; the tooth
+# then fails.
+if python3 "${HARNESS_DIR}/shipper_keys.py" user.login $'20260925T100008Z\n' "" 1 >/dev/null 2>&1; then
+  bad "replica TS_RE accepted a trailing-newline timestamp (must be \\Z-anchored)"
+else
+  ok "replica TS_RE refuses a trailing-newline timestamp (\\Z-anchored)"
+fi
+
+# F1 tooth (anchor #155): the generator's provenance guard must compare the
+# worktree bytes against the committed HEAD blob, not `git status` —
+# `update-index --assume-unchanged` hides a worktree edit from status while an
+# import still reads the mutated bytes. Prove the helper True on pristine
+# bytes, then mutate + assume-unchanged and prove status is clean AND the
+# helper is False.
+f1_repo="${WORK}/f1-repo"
+mkdir -p "${f1_repo}/scripts/lib"
+git -C "${f1_repo}" init -q
+git -C "${f1_repo}" config user.email "harness@example.invalid"
+git -C "${f1_repo}" config user.name "recording-witness harness"
+# Commit on a scratch branch, never the init default (a protected-branch
+# guard would refuse a fixture commit on `main`).
+git -C "${f1_repo}" checkout -q -b harness-fixture
+printf 'PINNED = 1\n' > "${f1_repo}/scripts/lib/b2_client.py"
+git -C "${f1_repo}" add scripts/lib/b2_client.py
+git -C "${f1_repo}" -c commit.gpgsign=false commit -q -m "pinned bytes"
+f1_helper() {
+  python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import generate_shipper_vectors as g; print(g.blob_matches_head(sys.argv[2], "scripts/lib/b2_client.py"))' "${HARNESS_DIR}" "$1"
+}
+f1_pristine="$(f1_helper "${f1_repo}")"
+printf 'MUTATED = 1\n' > "${f1_repo}/scripts/lib/b2_client.py"
+git -C "${f1_repo}" update-index --assume-unchanged scripts/lib/b2_client.py
+f1_status="$(git -C "${f1_repo}" status --porcelain)"
+f1_mutated="$(f1_helper "${f1_repo}")"
+if [ "$f1_pristine" = "True" ] && [ "$f1_mutated" = "False" ] && [ -z "$f1_status" ]; then
+  ok "generator provenance guard compares content (assume-unchanged edit refused, status clean)"
+else
+  bad "generator provenance guard: pristine=${f1_pristine:-<empty>} mutated=${f1_mutated:-<empty>} status='${f1_status}' (a content compare must catch an assume-unchanged edit)"
+fi
+# Sibling bypass (anchor #155 red-team LOW): a `git replace` ref makes
+# `cat-file blob HEAD:<path>` return the replacement bytes while HEAD (the pin
+# check) is unchanged; `--no-replace-objects` in the helper must keep the
+# compare honest. Replace the committed blob with the mutated worktree blob
+# and require the helper to still report False (a `--no-replace-objects`
+# revert returns True here and fails this tooth).
+git -C "${f1_repo}" replace -f "$(git -C "${f1_repo}" rev-parse HEAD:scripts/lib/b2_client.py)" "$(git -C "${f1_repo}" hash-object -w "${f1_repo}/scripts/lib/b2_client.py")"
+f1_replaced="$(f1_helper "${f1_repo}")"
+if [ "$f1_replaced" = "False" ]; then
+  ok "generator provenance guard refuses a git-replace'd blob (--no-replace-objects)"
+else
+  bad "generator provenance guard: a git replace ref defeated the content compare (helper=${f1_replaced:-<empty>})"
+fi
+# Sibling bypass (anchor #155 red-team round 2): `spec_from_file_location(...)
+# .exec_module` executes a `__pycache__` entry whose header mtime/size match
+# the source, so a planted pyc could run while the guard vouched for the
+# pinned bytes. `load_module_from_source` compiles the given bytes; plant a
+# matching poisoned pyc and require the loader to ignore it.
+f1_pyc_dir="${WORK}/f1-pyc"
+mkdir -p "${f1_pyc_dir}"
+printf 'PINNED = 1\n' > "${f1_pyc_dir}/b2_client.py"
+if python3 -I - "${HARNESS_DIR}" "${f1_pyc_dir}" "${WORK}/f1-pyc-marker" <<'PY'
+import importlib.util
+import marshal
+import os
+import struct
+import sys
+
+harness, root, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, harness)
+import generate_shipper_vectors as g
+
+src = os.path.join(root, "b2_client.py")
+stat = os.stat(src)
+cache = importlib.util.cache_from_source(src)
+os.makedirs(os.path.dirname(cache), exist_ok=True)
+poison = "open(%r, 'w').write('tampered')\nPINNED = 999\n" % marker
+code = compile(poison, src, "exec")
+with open(cache, "wb") as handle:
+    handle.write(importlib.util.MAGIC_NUMBER)
+    handle.write(struct.pack("<III", 0, int(stat.st_mtime) & 0xFFFFFFFF, stat.st_size & 0xFFFFFFFF))
+    handle.write(marshal.dumps(code))
+with open(src, "rb") as handle:
+    source = handle.read()
+module = g.load_module_from_source(source, src, "probe")
+if os.path.exists(marker):
+    raise SystemExit("planted pyc executed")
+if module.PINNED != 1:
+    raise SystemExit("module did not come from the source bytes (PINNED=%r)" % (module.PINNED,))
+print("pyc-ignored")
+PY
+then
+  ok "generator loader compiles the compared bytes, never a planted __pycache__ entry"
+else
+  bad "generator loader executed a planted __pycache__ entry (source bytes not compiled)"
 fi
 
 # Canonical-sid oracle: a literal grid cannot enumerate every normalization
