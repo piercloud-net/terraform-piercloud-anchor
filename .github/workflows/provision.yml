@@ -964,6 +964,14 @@ jobs:
           # standing API token.
           ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
+          # CloudFront origin auth (call D): the secret header CloudFront
+          # injects into the origin request — Caddy enforces it on :443 (the
+          # firewall admits only the CloudFront origin-facing ranges + the
+          # main box). MAIN_BOX_IPV4 is the Caddy main-box bypass address
+          # (already a secret for the firewall). Both are required for the
+          # :443 render (fail-closed).
+          CLOUDFRONT_ORIGIN_SECRET: ${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}
+          MAIN_BOX_IPV4: ${{ secrets.MAIN_BOX_IPV4 }}
           # Optional recording-completeness witness (docs/recording-witness.md):
           # KEY is a B2 listFiles application key — the
           # witness lists metadata and never reads object content. All six
@@ -1000,6 +1008,12 @@ jobs:
           # ORIGIN_CA_CERT_PEM is public cert-only material (repo variable) —
           # deliberately NOT masked.
           if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
+          # CloudFront origin secret: masked at first receipt before any use
+          # (repo secrets are auto-masked; the explicit mask covers every
+          # expansion path). The main-box address is masked too (it already
+          # is for the terraform var path).
+          if [ -n "${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}" ]; then echo "::add-mask::${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}"; fi
+          if [ -n "${{ secrets.MAIN_BOX_IPV4 }}" ]; then echo "::add-mask::${{ secrets.MAIN_BOX_IPV4 }}"; fi
           # Recording-witness values: masked at first receipt before any use
           # (repo secrets are auto-masked; the explicit masks cover every
           # expansion path). Never echoed, never logged, never in argv.

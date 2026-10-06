@@ -39,9 +39,14 @@ CADDY_ORIGIN_CRT="/etc/caddy/origin.crt"
 CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
 CADDY_AOP_CA="/etc/caddy/aop-ca.pem"
 CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
-# Cloudflare edge ranges for trusted_proxies (public constants — keep in
-# sync with local.cf_edge_cidrs in main.tf; stale ranges read as edge 403s).
-CF_EDGE_CIDRS="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+# CloudFront origin-facing ranges for the :443 origin leg (call D).
+# Public constants — live ip-ranges.json 2026-10-06 (46 IPv4 + 35 IPv6).
+# Keep in sync with local.cloudfront_origin_facing_cidrs in
+# cloudfront_ranges.tf — tests/edge-origin-auth asserts the two lists are
+# identical. CloudFront is not Cloudflare AOP: the :443 leg is gated by
+# these ranges (firewall) plus the X-Piercloud-Origin secret header
+# (Caddy); neither control alone is auth.
+CLOUDFRONT_ORIGIN_CIDRS="130.176.88.0/21 54.239.134.0/23 52.82.134.0/23 130.176.86.0/23 130.176.140.0/22 130.176.0.0/18 54.239.204.0/22 130.176.160.0/19 70.132.0.0/18 15.158.0.0/16 130.176.136.0/23 54.239.170.0/23 130.176.96.0/19 54.182.184.0/22 204.246.166.0/24 130.176.64.0/21 54.182.172.0/22 205.251.218.0/24 130.176.144.0/20 54.182.176.0/21 130.176.78.0/23 54.182.248.0/22 64.252.128.0/18 54.182.154.0/23 64.252.64.0/18 54.182.144.0/21 54.182.224.0/21 130.176.128.0/21 52.46.0.0/18 3.172.64.0/18 52.82.128.0/23 18.68.0.0/16 54.182.156.0/22 54.182.160.0/21 54.182.240.0/21 130.176.192.0/19 130.176.76.0/24 54.239.208.0/21 54.182.188.0/23 24.110.128.0/17 3.172.0.0/18 130.176.80.0/22 54.182.128.0/20 130.176.72.0/22 13.124.199.0/24 3.29.57.0/26 2600:9000:1000::/36 2600:9000:5200::/40 2600:9000:6000::/36 2406:da11:438:2300::/56 2406:da1e:705:1600::/56 2406:da1c:8d8c:4600::/56 2406:da14:17bd:2f00::/56 2406:da12:4b:c200::/56 2406:da16:c01:c200::/56 2406:da1a:6df:6c00::/56 2406:da1b:e7c:ad00::/56 2406:da18:9fa:1b00::/56 2406:da1c:787:2b00::/56 2406:da19:e19:4a00::/56 2406:da1f:396:9100::/56 2406:da10:847f:a100::/56 2406:da12:8b2e:9c00::/56 2406:da14:80bb:ea00::/56 2600:1f11:e79:a800::/56 2600:1f1a:4568:b500::/56 2a05:d014:1362:b000::/56 2a05:d019:80b:e300::/56 2a05:d016:9ed:de00::/56 2a05:d01a:8a9:be00::/56 2a05:d011:531:1800::/56 2a05:d018:1a3a:2d00::/56 2a05:d01c:343:c300::/56 2a05:d012:581:b400::/56 2a05:d025:e59:fb00::/56 2600:1f17:4356:f100::/56 2600:1f1e:a7:2300::/56 2600:1f18:7530:7200::/56 2600:1f16:1923:3000::/56 2600:1f1c:da:600::/56 2600:1f13:417:4d00::/56"
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
@@ -128,10 +133,11 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
   printf '%s\n' "	servers {"
-  printf '%s\n' "		# Real client IP behind the orange cloud. CF-Connecting-IP only —"
-  printf '%s\n' "		# never X-Forwarded-For (spoofable through the edge)."
-  printf '%s\n' "		trusted_proxies static ${CF_EDGE_CIDRS}"
-  printf '%s\n' "		client_ip_headers CF-Connecting-IP"
+  printf '%s\n' "		# Real client IP behind the CloudFront edge. CloudFront-Viewer-Address"
+  printf '%s\n' "		# only — never X-Forwarded-For (spoofable through the edge); the"
+  printf '%s\n' "		# origin-request policy forwards that header to the origin."
+  printf '%s\n' "		trusted_proxies static ${CLOUDFRONT_ORIGIN_CIDRS}"
+  printf '%s\n' "		client_ip_headers CloudFront-Viewer-Address"
   printf '%s\n' "	}"
   printf '%s\n' "}"
   printf '%s\n' ""
@@ -156,8 +162,8 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "		# list-modules on the v2.11.4 binary; it lives in a third-party xcaddy"
   printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
   printf '%s\n' "		# Flood protection"
-  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
-  printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
+  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus the"
+  printf '%s\n' "		# CloudFront origin gate on :443 when the edge is live (docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
   printf '%s\n' "	}"
   printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
@@ -174,11 +180,29 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	}"
   printf '%s\n' "}"
   if [ -n "${STATUS_HOST:-}" ] && [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
+    # CloudFront origin auth is mandatory for the :443 dashboard block (call
+    # D): fail closed rather than render an unauthenticated origin. The
+    # secret is interpolated into a CEL matcher, so restrict its charset.
+    [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
+    case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
+    [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
+    [[ "${MAIN_BOX_IPV4}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d)."
+    cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
+    cf_cel="${cf_cel%,}"
     printf '%s\n' ""
     printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
     printf '%s\n' "https://${STATUS_HOST} {"
     printf '%s\n' "	header -Server"
     printf '%s\n' "${DASH_TLS_STANZA}"
+    printf '%s\n' "	# CloudFront origin gate (call D): CloudFront is not AOP. Only"
+    printf '%s\n' "	# CloudFront origin-facing peers (or the main box) may reach the"
+    printf '%s\n' "	# dashboard, and CloudFront peers must carry the secret header it"
+    printf '%s\n' "	# injects (it overwrites client-supplied values). The firewall admits"
+    printf '%s\n' "	# the same peer set; this is the in-Caddy second factor."
+    printf '%s\n' "	@not_edge_peer \`!(remote_ip(${cf_cel}, '${MAIN_BOX_IPV4}/32'))\`"
+    printf '%s\n' "	abort @not_edge_peer"
+    printf '%s\n' "	@unauthorized \`!(remote_ip('${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
+    printf '%s\n' "	abort @unauthorized"
     printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
     printf '%s\n' "	@dashtang path /adv* /rec*"
     printf '%s\n' "	handle @dashtang {"
@@ -187,8 +211,8 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "	handle {"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (the"
-    printf '%s\n' "		# rate_limit directive itself is queued: issue #56)."
+    printf '%s\n' "		# allowlist plus the CloudFront origin gate above (the rate_limit"
+    printf '%s\n' "		# directive itself is queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
     printf '%s\n' "}"

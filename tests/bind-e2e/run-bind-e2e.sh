@@ -92,9 +92,9 @@ sed -n "$((b+1)),$((e-1))p" "${PROVISION_SH}" > "${WORK}/render.src"
 source "${WORK}/render.src"
 command -v caddy_status_names >/dev/null || die "extraction did not yield caddy_status_names"
 command -v render_caddyfile >/dev/null || die "extraction did not yield render_caddyfile"
-# Production firewall constant, extracted — never retyped, cannot drift.
-eval "$(grep '^CF_EDGE_CIDRS=' "${PROVISION_SH}")"
-[ -n "${CF_EDGE_CIDRS:-}" ] || die "CF_EDGE_CIDRS extraction failed"
+# Production origin-range constant, extracted — never retyped, cannot drift.
+eval "$(grep '^CLOUDFRONT_ORIGIN_CIDRS=' "${PROVISION_SH}")"
+[ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS extraction failed"
 export TENANT_USER TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
 export CADDY_CHALLENGE_DIR="${WORK}/acme-challenge"
 # Bare :port (like production :80): matches ANY Host with plain HTTP, so the
@@ -115,10 +115,14 @@ log "CI Caddyfile rendered (status host: ${STATUS_HOST})"
 # production addressing and validate (never served here).
 ( export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
 export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
 export DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.prodshape" )
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --adapter caddyfile
+grep -q "@unauthorized" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the CloudFront origin gate"
+grep -q "harness-origin-secret" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the origin secret in the gate"
+grep -q "192.0.2.99/32" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the main-box bypass"
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
 
@@ -138,6 +142,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin.key" -out "${WORK}/or
   -days 1 -nodes -subj "/CN=harness-origin" >/dev/null 2>&1 || die "openssl could not mint the harness origin pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # shellcheck disable=SC1090
@@ -156,6 +161,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin-ca.key" -out "${WORK}
   -days 1 -nodes -subj "/CN=harness-origin-ca" >/dev/null 2>&1 || die "openssl could not mint the harness origin-ca pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" ORIGIN_CA_PAIR="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin-ca.crt" CADDY_ORIGIN_KEY="${WORK}/origin-ca.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # The REAL stanza builder (extracted above) must pick up the per-anchor
