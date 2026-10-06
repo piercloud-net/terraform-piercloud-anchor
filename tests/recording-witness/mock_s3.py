@@ -391,7 +391,16 @@ class Handler(BaseHTTPRequestHandler):
                 common_rows,
             )
         )
-        self.record("GET", True, "list-type=2 prefix=%s" % prefix)
+        note = "list-type=2 prefix=%s" % prefix
+        if delimiter and FIXTURE.get("prefixes_ignore_start_after"):
+            # Pin the nonconformant behaviour in the request log: the served
+            # CommonPrefixes include prefixes at/below start_after (derived
+            # from the unfiltered pool). A harness tooth asserts this, so a
+            # regression to the conformant branch cannot silently re-vacuum
+            # the client-floor-filter tooth (red-team r2 LOW).
+            served = sorted(name for name, kind, _obj in entries if kind == "prefix")
+            note += " nonfiltering-prefixes=%s" % ",".join(served)
+        self.record("GET", True, note)
         self.send_body(200, body)
 
     def handle_versions(self, query):

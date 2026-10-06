@@ -214,7 +214,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=959
+MIN_CHECKS=961
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -6401,6 +6401,27 @@ if violations:
 print("below-flat day not listed (non-filtering server, client filter)")
 PY
 then ok "empty cursor below: the non-filtering server is filtered client-side (same decision)"; else bad "empty cursor below non-filtering request shape failed"; fi
+# Pin the mock itself: the non-filtering fixture must really have SERVED the
+# below-flat prefix (from the unfiltered pool) while Contents stayed filtered.
+# Without this, a mock regression to the conformant branch would re-vacuum
+# the client-floor-filter tooth (red-team r2 LOW).
+if python3 - "${WORK}/requests-159-below-nonfilter.log" <<'PY'
+import json
+import sys
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+served = []
+for entry in entries:
+    note = entry.get("note", "")
+    if "nonfiltering-prefixes=" in note:
+        served += note.split("nonfiltering-prefixes=", 1)[1].split(",")
+if "audit/20260925/" in served:
+    print("non-filtering server served the below-flat day prefix (mock pinned)")
+    sys.exit(0)
+print("SERVED %r" % served)
+sys.exit(1)
+PY
+then ok "empty cursor below: the mock really served the below-flat prefix (non-filtering pinned)"; else bad "empty cursor below non-filtering mock pin failed"; fi
 force_sweep_state "${dl_below_dir}"
 start_mock
 run_delta "${dl_below_dir}"
@@ -6625,17 +6646,21 @@ esac
 # at/below the dated listing's own start-after bound (the dated cursor on the
 # cursor day) must fail closed into the repair + full-sweep + error trace,
 # never a green delta; a conformant server (start-after excludes the cursor
-# key and anything below it) stays green on the same keys.
+# key and anything below it) stays green on the same keys. The session is a
+# completed exec pair with NO tar, so the recordings cursor stays empty and
+# the recordings guard cannot backstop the assertions (red-team r2 LOW): only
+# the dated guard can produce the fail-closed trace.
 DL_DNC_SID="${DL_SID2}"
-DL_DNC_CURSOR="$(dated_key session.start 20260925T140000Z "${DL_DNC_SID}" 1 shell)"
+DL_DNC_START="$(dated_key session.start 20260925T140000Z "${DL_DNC_SID}" 1 exec)"
+DL_DNC_CURSOR="$(dated_key session.end 20260925T140100Z "${DL_DNC_SID}" 2 exec)"
 DL_DNC_BELOW="$(dated_key user.login 20260925T124500Z "" 8)"
 dl_dnc_dir="${WORK}/state-159-dated-nonconf"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
   {"key":"${DL_HEARTBEAT}","ago":60},
-  {"key":"${DL_DNC_CURSOR}","ago":300},
-  {"key":"recordings/${DL_DNC_SID}.tar","ago":296}],
+  {"key":"${DL_DNC_START}","ago":301},
+  {"key":"${DL_DNC_CURSOR}","ago":300}],
  "uploads":[]}
 JSON
 start_mock
@@ -6643,14 +6668,16 @@ run_case "${dl_dnc_dir}"
 is "dated nonconformance: the warm sweep is green" "ok" "${CASE_STATE}"
 is "dated nonconformance: the sweep seeds the dated cursor" \
   "${DL_DNC_CURSOR}" "$(state_field observed.cursors.audit_session_dated)"
+is "dated nonconformance: no recordings cursor (dated-guard isolation)" "" \
+  "$(state_field observed.cursors.recordings)"
 DL_DNC_HB2="audit/heartbeat/$(audit_stamp -30).json"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,"objects_ignore_start_after":true,
  "objects":[
   {"key":"${DL_DNC_HB2}","ago":30},
+  {"key":"${DL_DNC_START}","ago":301},
   {"key":"${DL_DNC_CURSOR}","ago":300},
-  {"key":"${DL_DNC_BELOW}","ago":1200},
-  {"key":"recordings/${DL_DNC_SID}.tar","ago":296}],
+  {"key":"${DL_DNC_BELOW}","ago":1200}],
  "uploads":[]}
 JSON
 SAVED_REQUEST_LOG="${REQUEST_LOG}"
@@ -6671,9 +6698,9 @@ fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
   {"key":"${DL_DNC_HB2}","ago":30},
+  {"key":"${DL_DNC_START}","ago":301},
   {"key":"${DL_DNC_CURSOR}","ago":300},
-  {"key":"${DL_DNC_BELOW}","ago":1200},
-  {"key":"recordings/${DL_DNC_SID}.tar","ago":296}],
+  {"key":"${DL_DNC_BELOW}","ago":1200}],
  "uploads":[]}
 JSON
 start_mock
