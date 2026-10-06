@@ -1545,10 +1545,11 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
     clock-skew tolerance the LastModified checks use. A calendar-invalid
     ``<ts>`` (the shape regex accepts any digits, e.g. ``99999999T999999Z``)
     parses to nothing and is rejected too - fail closed. An absurd operator
-    tolerance (``>= ~8.64e13`` s) overflows the ``timedelta`` constructor: the
-    key is rejected (it just never moves a cursor) instead of bricking every
-    run with an ``OverflowError`` (round-5 RT5.4). Recordings keys carry no
-    ``<ts>`` and never match a family here.
+    tolerance overflows the ``timedelta`` constructor (``>= ~8.64e13`` s) or
+    the ``now + timedelta`` addition (from ~2.5e11 s): the key is rejected (it
+    just never moves a cursor) instead of bricking every run with an
+    ``OverflowError`` (round-5 RT5.4; round-6 red-team NIT). Recordings keys
+    carry no ``<ts>`` and never match a family here.
     """
     match = (SESSION_KEY_RE.match(relative_key)
              or NON_SESSION_KEY_RE.match(relative_key)
