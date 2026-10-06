@@ -6860,10 +6860,29 @@ fi
 # fail-closed) and each variant matched, and a nameref declaration whose
 # target is PATH is refused. A command-word brace-comma (`{h,}ash`,
 # `{t,}rap`, `{s,}leep()`) is NOT a gap: bash expands the alternatives as
-# separate arguments of the first word, so it neither hashes, traps nor
-# defines (runtime-probed). Deliberate fail-closed over-refusals: a
+# separate arguments of the first word — `{t,}rap …` installs `trap -- 'rap'
+# …` (no handler subversion) and `{h,}ash -p …` invokes the hash builtin with
+# a shifted name argument (no lookup poisoning) — so command lookup is
+# unaffected (runtime-probed). Deliberate fail-closed over-refusals: a
 # `declare x=PATH` (literal string assignment) and a brace-expansion
 # overflow.
+#
+# r24 red-team + trust HIGH (r23 delta re-check): the r23 brace-comma closure
+# was unsound — `expand_braces` omitted `post` from its local-parameter list,
+# so recursion clobbered the global and every sibling alternative after the
+# first got a truncated suffix (variants silently dropped; the 64-variant cap
+# never fired: `export {x,}{PATH,x}=/tmp/shad`, a 7-group payload and a
+# 125-variant line all suite-green, all runtime-effective), and the depth
+# guard returned "" without setting `expand_over`, so a deeply nested payload
+# was dropped fail-open. The r23 nameref closure was also incomplete: a
+# two-step target (`declare -n p` then `p=PATH` then `p=…`) evaded the
+# same-line `[name]=PATH` regex. Closed: `post` is a function local, a
+# depth-cap hit sets `expand_over` (the caller's `hit = expand_over` refuses
+# fail-closed), and ANY nameref declaration is refused
+# (`declare`/`typeset`/`local` with an option token containing `n`) — the
+# shipped span has zero namerefs, so this is a deliberate fail-closed
+# over-refusal (`declare -n foo=BAR` included); the one-line
+# `declare -n p=PATH` target rule stays as a belt.
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6875,8 +6894,9 @@ if awk -v q="'" '
     } while (s != prev)
     return s
   }
-  function expand_braces(s, depth,   m, pre, grp, inner, alts, n, i, out) {
-    if (depth > 6 || expand_over) return ""
+  function expand_braces(s, depth,   m, pre, grp, inner, alts, n, i, out, post) {
+    if (depth > 6) { expand_over = 1; return "" }
+    if (expand_over) return ""
     m = match(s, /\{[^{}]*,[^{}]*\}/)
     if (m == 0) return s "\n"
     pre = substr(s, 1, m - 1)
@@ -6901,6 +6921,7 @@ if awk -v q="'" '
             s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*let([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH(\[[^]]*\])?[[:space:]]*\+?=/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+-[A-Za-z]*n[A-Za-z]*([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(for|select)[[:space:]]+PATH([^[:alnum:]_]|$)/)
   }
   {
@@ -6949,9 +6970,9 @@ if awk -v q="'" '
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref target, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref declaration, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
 else
-  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref target, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a \`readonly\` declaration, a \`let\` arithmetic assignment, a locale-quoted (\`$"PATH"\`) or brace-comma-expanded token, a nameref declaration, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
