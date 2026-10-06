@@ -6829,6 +6829,21 @@ fi
 # lines in the shipped span (ANSI escapes, Python list literals); and an
 # absurd assignment-prefix chain (5k+ `A=1 ` prefixes) makes the strip loop
 # quadratic (DoS-only; rewrites are monotone, so it terminates).
+#
+# r22 red-team HIGH (r21 delta re-check; the lens ended without a report, its
+# driver results recovered and re-verified by the orchestrator): two more
+# single-line PATH-write spellings evaded both teeth — `readonly 'PATH'=…` /
+# `readonly 'PATH'+=…` (the declaration branch listed declare/typeset/local/
+# export only, and the raw backstop's quoted-span strip hid the quoted token)
+# and `let 'PATH=5'` (arithmetic assignment; `let` was in no branch). Both
+# runtime-proven: PATH becomes `/tmp/shad` / `5`, command lookup fails, and
+# `systemctl` resolves into the crafted dir (or not at all) — the drain gate
+# can report not-drained while the service is up (the r20/r21 HIGH class).
+# Closed: `readonly` joins the declaration branch and a `let` branch matches
+# an assignment-shaped `PATH[sub]+=` token (the existing quote/`$`-expansion
+# strips run first, so quoted and `command`-prefixed forms are caught).
+# Deliberate fail-closed over-refusal: a `let` arithmetic comparison
+# (`let PATH == 5`) also matches.
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6845,8 +6860,9 @@ if awk -v q="'" '
             s ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export|readonly)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*let([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH(\[[^]]*\])?[[:space:]]*\+?=/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(for|select)[[:space:]]+PATH([^[:alnum:]_]|$)/)
   }
   {
@@ -6876,9 +6892,9 @@ if awk -v q="'" '
   }
   END { exit bad ? 1 : 0 }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
+  ok "run-once: no command-position PATH write is hidden behind quoted tokens, a \`builtin\`/\`command\` prefix, an array-writing builtin (\`mapfile\`/\`readarray\`), a \`readonly\` declaration, a \`let\` arithmetic assignment, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a multi-line quote desync (incl. \`unset -- PATH\` and quoted/\`declare\` forms, issue #143)"
 else
-  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
+  bad "run-once: a command-position PATH write (quoted token, \`builtin\`/\`command\` prefix, \`mapfile\`/\`readarray\`, \`unset -- PATH\`, \`declare -x PATH=…\`, a \`readonly\` declaration, a \`let\` arithmetic assignment, a reserved-word/\`!\` position, an append/subscript assignment prefix, a \`for\`/\`select\` loop-variable binding, or a desync-hidden assignment) appeared in the provision script — a prepended shadow binary could misreport the drain state (issue #143)"
 fi
 # r11 red-team HIGH (V1) + r12 red-team HIGH: `hash -p /bin/true systemctl`
 # (one line before the witness span) poisoned command lookup for every later
