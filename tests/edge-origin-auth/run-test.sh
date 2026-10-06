@@ -104,10 +104,13 @@ export MAIN_BOX_IPV4="1.2.3.4.5"
 expect_fail "five-octet MAIN_BOX_IPV4 refuses" "not a bare IPv4"
 
 export MAIN_BOX_IPV4=$'1.2.3.4\n5.6.7.8'
-expect_fail "multiline MAIN_BOX_IPV4 refuses" "not a bare IPv4"
+expect_fail "multiline MAIN_BOX_IPV4 refuses" "digits and dots only"
 
 export MAIN_BOX_IPV4="1.2.3.04"
 expect_fail "leading-zero octet MAIN_BOX_IPV4 refuses" "not a bare IPv4"
+
+export MAIN_BOX_IPV4=$'192.0.2.99\n'
+expect_fail "trailing-newline MAIN_BOX_IPV4 refuses" "digits and dots only"
 
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="${MAIN_BOX}"
 saved_cidrs="${CLOUDFRONT_ORIGIN_CIDRS}"
@@ -183,6 +186,7 @@ fi
 # ---- render custody -------------------------------------------------------
 has "${PROVISION_SH}" 'install -m 0600 /dev/null "$TMP_CADDY"' "rendered Caddyfile pre-created root-only"
 has "${PROVISION_SH}" 'chmod 600 "${CADDY_CONFIG}"' "unchanged render re-asserts 0600 on the live Caddyfile"
+has "${PROVISION_SH}" '"PRIVATE KEY"*)' "AOP bundle rejects key-bearing PEMs (it is written world-readable)"
 has "${PROVISION_SH}" 'rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate' "validate failure removes the rendered file"
 
 # ---- pipeline wiring ------------------------------------------------------

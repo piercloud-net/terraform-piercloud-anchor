@@ -186,11 +186,13 @@ render_caddyfile() { # print the Caddyfile to stdout
     [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
     case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
     [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
-    # Bare single-line IPv4, octets 0-255, no leading zeros: variables.tf
-    # validates the same address for the firewall variable via cidrhost, and
-    # Caddy's netip rejects leading zeros — reject them here rather than
-    # fail later at `caddy validate`. A console hand-run sets this secret
-    # without terraform, so the two peers must not drift.
+    # Bare single-line IPv4, octets 0-255, no leading zeros, no stray
+    # whitespace: variables.tf validates the same address for the firewall
+    # variable via cidrhost, and Caddy's netip rejects leading zeros — reject
+    # both here rather than fail later at `caddy validate` (a trailing
+    # newline splits the rendered CEL matcher). A console hand-run sets this
+    # secret without terraform, so the two peers must not drift.
+    case "${MAIN_BOX_IPV4}" in *[!0-9.]*) die "MAIN_BOX_IPV4 must be digits and dots only (no whitespace or newlines)." ;; esac
     printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 || NR > 1 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i ~ /^0[0-9]/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255, no leading zeros)."
     [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
     cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
@@ -1030,10 +1032,12 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine).
+# AOP bundle (public cert material — world-readable is fine; a key-bearing
+# bundle is refused below rather than written 644).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"BEGIN CERTIFICATE"*) ;; *) die "CF_AOP_CA_PEM does not look like a PEM certificate bundle";; esac
+  case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"

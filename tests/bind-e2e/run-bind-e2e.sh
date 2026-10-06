@@ -256,8 +256,9 @@ PY
 assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
 # Production-shape render: the real 81-prefix CLOUDFRONT_ORIGIN_CIDRS (the
 # value extracted from 010 above, no test override) must adapt to the same
-# gate order — the served matrix below uses a test-scoped range, so this is
-# the only CI exercise of the production CEL list.
+# gate order AND actually carry the production prefixes — the served matrix
+# below uses a test-scoped range, and `caddy adapt` is CEL-blind, so the
+# presence tooth below is what keeps a leaked override from passing.
 ( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
   export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
   export CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
@@ -267,6 +268,8 @@ assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
 HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate.prod" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.prod.json" \
   || die "production-shape gate render does not adapt"
 assert_gate_order "${WORK}/Caddyfile.gate.prod.json" "${GATE_HOST%:*}"
+grep -q '130.176.88.0/21' "${WORK}/Caddyfile.gate.prod" || die "production-shape gate render does not carry the production ranges"
+if grep -q '127.0.0.3/32' "${WORK}/Caddyfile.gate.prod"; then die "production-shape gate render carries the test range"; fi
 mkdir -p "${WORK}/gate-stub" && printf 'STUBOK' > "${WORK}/gate-stub/index.html"
 python3 -m http.server "${GATE_STUB_PORT}" --bind 127.0.0.1 --directory "${WORK}/gate-stub" >"${WORK}/gate-stub.log" 2>&1 &
 GATE_STUB_PID=$!
