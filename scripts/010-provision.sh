@@ -1060,9 +1060,8 @@ TMP_CADDY="${CADDY_CONFIG}.new"
 # Pre-create root-only BEFORE the render: the :443 render carries the
 # X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
 # rejection may leave it readable beyond root. The mode assumes the pinned
-# Caddy image runs as root (the Renovate-watched tag) — a bump to a
-# non-root USER would make the bind-mounted file unreadable on recreate;
-# verify on every bump.
+# container runs as root — a Renovate bump to a non-root USER would make the
+# bind-mounted file unreadable on recreate; verify on every bump.
 install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
 CADDY_RESTART=0
