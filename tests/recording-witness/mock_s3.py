@@ -65,6 +65,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -398,11 +399,13 @@ class Handler(BaseHTTPRequestHandler):
             # from the unfiltered pool). A harness tooth asserts this, so a
             # regression to the conformant branch cannot silently re-vacuum
             # the client-floor-filter tooth (red-team r2 LOW). Derive the
-            # list from the SERIALIZED page, not the pre-slice `entries`
-            # (red-team r2b LOW): a serialization-layer filter that drops the
-            # prefix from the response would otherwise leave the pin green
-            # while the response no longer carries it.
-            served = sorted(name for name, kind, _obj in page if kind == "prefix")
+            # list from the SERIALIZED response body, not the pre-slice
+            # `entries` (red-team r2b LOW) and not the in-memory `page`
+            # either (red-team r2c LOW): a serialization-layer filter that
+            # drops the prefix from the wire would otherwise leave the pin
+            # green while the response no longer carries it.
+            served = sorted(re.findall(
+                r"<CommonPrefixes><Prefix>(.*?)</Prefix></CommonPrefixes>", body))
             note += " nonfiltering-prefixes=%s" % ",".join(served)
         self.record("GET", True, note)
         self.send_body(200, body)
