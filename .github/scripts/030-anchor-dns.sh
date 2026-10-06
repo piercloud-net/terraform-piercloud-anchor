@@ -148,7 +148,7 @@ cf_upsert_anchor() {
 # single string in the array), GET returns 404 for a missing rrset.
 # ---------------------------------------------------------------------------
 gcore_upsert_anchor() {
-  local fqdn body tmp code verify
+  local fqdn body tmp code
   local got_name got_ip got_ttl got_enabled
   local auth=(-sS -H "Authorization: APIKey $token" -H "Content-Type: application/json")
   fqdn="${record}.${ZONE}"
