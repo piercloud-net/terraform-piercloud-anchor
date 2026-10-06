@@ -38,13 +38,20 @@
 #       NUL-delimited scan must not truncate at the field split, and a
 #       JSON-named symlink refuses too (the closure mirrors the pathspecs)
 #       (red-team r4 MEDIUM / trust r4 MEDIUM / functional r4 LOW);
+#   (r) a local module source (./… or ../…) refuses — the module tree is
+#       executed by the run but is outside the counted set (red-team r5
+#       MEDIUM, latent — no module blocks in-tree today);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
-#       form (arithmetic/printf/read/declare/let/unset/eval/source), every
-#       non-call COUNT mention is a read, exactly one `-eq 0` with no
-#       widened/decoy comparison, an option/continuation/quote/newline-tolerant
-#       no-fetch with no git alias, and the banner job's single fetch-depth: 0;
-#       ci.yml gates AND runs this harness.
+#       form (arithmetic/export/read/declare/let/unset/eval/source/printf -v),
+#       every non-call COUNT mention is a read, no double-quote-spliced
+#       identifier, exactly one `-eq 0` with no widened/decoy comparison, an
+#       option/continuation/quote/newline-tolerant no-fetch-or-pull with no
+#       git alias and no fetch/pull assignment, and the banner job's single
+#       fetch-depth: 0; ci.yml gates AND runs this harness. Residual: deep
+#       variable indirection (`cmd=git; $cmd fetch`, `git${IFS}fetch`) is out
+#       of a textual pin's reach — the pin is a regression tripwire, the
+#       review is the backstop.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -167,6 +174,22 @@ ln -s payload/evil.sh main.tf.json
 git_c add -A
 git_c commit -qm "JSON-named symlink in a counted path"
 git_c push -q origin jsonsymlink
+
+git_c checkout -qb modulesrc main
+mkdir -p modules/m
+printf 'module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "local module source"
+git_c push -q origin modulesrc
+
+git_c checkout -qb modulesrcjson main
+mkdir -p modules/m
+printf '{"module":{"m":{"source":"./modules/m"}}}\n' > main.tf.json
+printf '{}\n' > modules/m/main.tf.json
+git_c add -A
+git_c commit -qm "JSON local module source"
+git_c push -q origin modulesrcjson
 
 git_c checkout -q main
 printf 'name: moved\n' > .github/workflows/moved.yml
@@ -357,6 +380,23 @@ out="$(bash "$SCRIPT" main 2>"$WORK/jsonsymlink.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON-named symlink: rc non-zero"; else bad "JSON-named symlink: rc=$rc"; fi
 is "JSON-named symlink: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/jsonsymlink.err"; then ok "JSON-named symlink: ::error:: annotation"; else bad "JSON-named symlink: no ::error::"; fi
+
+# --- (r) a local module source refuses --------------------------------------
+# A referenced local module tree is executed by `tofu` but is outside the
+# counted set; certifying it would be a false UNCHANGED (red-team r5 MEDIUM,
+# latent — no module blocks in-tree today). Native and JSON HCL both refuse.
+git_c checkout -q modulesrc
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/modulesrc.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "local module source: rc non-zero"; else bad "local module source: rc=$rc"; fi
+is "local module source: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/modulesrc.err"; then ok "local module source: ::error:: annotation"; else bad "local module source: no ::error::"; fi
+git_c checkout -q modulesrcjson
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
+is "JSON local module source: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
 git_c checkout -q behind
 
 # --- (e) wiring --------------------------------------------------------------
@@ -388,19 +428,31 @@ call_line='COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"'
 if [ "$(grep -cF "$call_line" <<<"$banner_active")" = "1" ]; then ok "the banner step calls the diff script (exact active call line)"; else bad "the banner step call line is missing, duplicated, or only commented"; fi
 if [ "$(grep -oF 'COUNT=' <<<"$banner_active" | grep -c .)" = "1" ]; then ok "COUNT is assigned exactly once in the banner step"; else bad "the banner step has extra COUNT assignments or aliases"; fi
 if [ "$(grep -cE 'COUNT[[:space:]]*[+*/%^-]?=' <<<"$banner_active")" = "1" ]; then ok "COUNT is assigned exactly once (space/compound-tolerant spelling)"; else bad "the banner step carries a COUNT assignment beyond the single call line"; fi
-if grep -qE '\(\([^)]*COUNT|printf[[:space:]]+-v[[:space:]]+COUNT|(^|[^[:alnum:]_])(read|declare|let|unset)[[:space:]][^;]*COUNT|(^|[^[:alnum:]_])(eval|source)([[:space:]]|$)|^[[:space:]]*\.[[:space:]]' <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/printf/read/declare/let/unset/eval/source)"; else ok "no COUNT override form in the banner step"; fi
+if grep -qE '\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+-v|^[[:space:]]*\.[[:space:]]' <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
 stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
 if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
 if [ "$(grep -oE '\-eq[[:space:]]+0' <<<"$banner_active" | grep -c .)" = "1" ] && ! grep -qE '\-(ge|gt|le|lt|ne)[[:space:]]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0 (no widened/decoy comparison)"; else bad "the COUNT comparison is missing, widened, or decoyed"; fi
-no_fetch_re="(^|[^[:alnum:]_])[\"']?git[\"']?([[:space:]]+[^[:space:];&|]+)*[[:space:]]+fetch"
-if grep -qE "$no_fetch_re" <<<"$prov_active" || grep -qE "$no_fetch_re" <<<"$prov_flat"; then bad "provision.yml still carries a fetch"; else ok "provision.yml carries no fetch (continuation-, option-, quote-, newline- and whitespace-tolerant)"; fi
+no_fetch_re="(^|[^[:alnum:]_])[\"']?git[\"']?([[:space:]]+[^[:space:];&|]+)*[[:space:]]+[\"']?(fetch|pull)[\"']?"
+if grep -qE "$no_fetch_re" <<<"$prov_active" || grep -qE "$no_fetch_re" <<<"$prov_flat"; then bad "provision.yml still carries a fetch/pull"; else ok "provision.yml carries no fetch/pull (continuation-, option-, quote-, newline- and whitespace-tolerant)"; fi
 if printf 'git -c protocol.version=2 fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches global-option variants"; else bad "the no-fetch pin misses global-option variants"; fi
 if printf 'git \\\nfetch origin main --depth=1\n' | join_continuations | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches continuation variants"; else bad "the no-fetch pin misses continuation variants"; fi
 if printf '"git" fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches quoted git"; else bad "the no-fetch pin misses quoted git"; fi
+if printf 'git "fetch" origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches quoted fetch"; else bad "the no-fetch pin misses quoted fetch"; fi
+if printf 'git pull origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches pull"; else bad "the no-fetch pin misses pull"; fi
 if printf 'DECOY="$(git\nfetch origin main --depth=1)"\n' | tr '\n' ' ' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches multi-line command substitutions"; else bad "the no-fetch pin misses multi-line command substitutions"; fi
 if grep -qE 'alias\.' <<<"$prov_active"; then bad "provision.yml carries a git alias (a fetch can hide behind one)"; else ok "provision.yml carries no git alias"; fi
 alias_probe='git -c alias.f=fetch f'
 if grep -qE "$no_fetch_re" <<<"$alias_probe" || ! grep -qE 'alias\.' <<<"$alias_probe"; then bad "an alias-spelled fetch would evade the no-fetch pins"; else ok "an alias-spelled fetch is refused by the alias pin"; fi
+splice_re='[[:alnum:]_]"{1,2}[[:alnum:]_]'
+if grep -qE "$splice_re" <<<"$banner_active"; then bad "the banner step carries a double-quote-spliced identifier (a COUNT override can hide behind one)"; else ok "no double-quote-spliced identifier in the banner step"; fi
+if grep -qE "$splice_re" <<<"$prov_active"; then bad "provision.yml carries a double-quote-spliced identifier (a fetch can hide behind one)"; else ok "no double-quote-spliced identifier in provision.yml"; fi
+assign_re="=[[:space:]]*[\"']?(fetch|pull)([^[:alnum:]_]|$)"
+if grep -qE "$assign_re" <<<"$prov_active"; then bad "provision.yml assigns fetch/pull to a variable (an indirect fetch)"; else ok "provision.yml does not assign fetch/pull to a variable"; fi
+override_re='\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+-v'
+if grep -qE "$override_re" <<< 'printf -vCOUNT "%s" 0'; then ok "the override pin matches an attached printf -v target"; else bad "the override pin misses an attached printf -v target"; fi
+if grep -qE "$override_re" <<< 'export "COU""NT=0"'; then ok "the override pin matches a spliced export"; else bad "the override pin misses a spliced export"; fi
+if grep -qE "$splice_re" <<< 'COU""NT=0'; then ok "the splice pin matches a spliced identifier"; else bad "the splice pin misses a spliced identifier"; fi
+if grep -qE "$assign_re" <<< 'f=fetch; git $f'; then ok "the assignment pin matches a fetch alias"; else bad "the assignment pin misses a fetch alias"; fi
 if [ "$(grep -c 'fetch-depth:' <<<"$banner_job")" = "1" ] && grep -q 'fetch-depth: 0' <<<"$banner_job"; then ok "the banner job keeps the single full-history checkout"; else bad "the banner job lost fetch-depth: 0 or gained a decoy"; fi
 if grep -qF 'tests/(banner-workflow-diff|' "$CI"; then ok "ci.yml path gate includes the harness"; else bad "ci.yml path gate does not include the harness"; fi
 if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml run list includes the harness"; else bad "ci.yml run list does not include the harness"; fi

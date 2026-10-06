@@ -34,6 +34,10 @@
 #     the producer and the pipeline's rc 141 silently skips the guard at
 #     listing scale, and whitespace/C-quoted path rendering (`x main.tf`)
 #     defeats an awk `$4` field split (functional r3 LOW, red-team r4 MEDIUM).
+#   * A local module source (./… or ../…) is executed code outside the counted
+#     set: the script refuses rather than certify (red-team r5 MEDIUM, latent
+#     today — no module blocks in-tree). Add the module tree to the pathspecs
+#     before dispatching.
 #   * A diff that cannot be computed is a loud error, never a silent
 #     "0 files changed": the card's UNCHANGED verdict is a security signal
 #     and an undeterminable count must fail closed.
@@ -90,6 +94,15 @@ while IFS= read -r -d '' entry; do
 done < <(git -C "$top" ls-files -s -z)
 if [ -n "$symlink_hit" ]; then
   echo "::error::symlink '$symlink_hit' is in the run's code surface — refusing a banner verdict" >&2
+  exit 1
+fi
+# A local module source (./… or ../…) is executed code outside the counted
+# set: refuse rather than certify (red-team r5 MEDIUM, latent today — the
+# repo has no module blocks). Covers native HCL (`source = "./x"`) and JSON
+# HCL (`"source": "./x"`). Extend the pathspecs with the module tree before
+# dispatching.
+if git grep -qE "(^|[[:space:]\"])source[\"']?[[:space:]]*(=|:)[[:space:]]*\"\.\.?/" -- ':(top,glob)*.tf' ':(top,glob)*.tf.json'; then
+  echo "::error::a local module source (./ or ../) is executed code outside the counted set — refusing a banner verdict; add the module tree to the pathspecs" >&2
   exit 1
 fi
 if ! changed="$(git diff --name-only "$base" HEAD -- "${pathspecs[@]}")"; then
