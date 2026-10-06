@@ -1544,8 +1544,11 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
     only by the sweep interval (round-4 RT4.1). The bound is the same
     clock-skew tolerance the LastModified checks use. A calendar-invalid
     ``<ts>`` (the shape regex accepts any digits, e.g. ``99999999T999999Z``)
-    parses to nothing and is rejected too - fail closed. Recordings keys carry
-    no ``<ts>`` and never match a family here.
+    parses to nothing and is rejected too - fail closed. An absurd operator
+    tolerance (``>= ~8.64e13`` s) overflows the ``timedelta`` constructor: the
+    key is rejected (it just never moves a cursor) instead of bricking every
+    run with an ``OverflowError`` (round-5 RT5.4). Recordings keys carry no
+    ``<ts>`` and never match a family here.
     """
     match = (SESSION_KEY_RE.match(relative_key)
              or NON_SESSION_KEY_RE.match(relative_key)
@@ -1556,7 +1559,12 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
         moment = datetime.strptime(match.group("ts"), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return True
-    return moment > now + timedelta(seconds=skew_tolerance)
+    try:
+        return moment > now + timedelta(seconds=skew_tolerance)
+    except OverflowError:
+        # A tolerance this large is an operator typo, not a bound: reject the
+        # key (fail closed) rather than raising before state/verdict land.
+        return True
 
 
 # Sid-less session.* event types documented by the shipper contract (Teleport
