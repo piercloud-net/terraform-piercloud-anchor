@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - *(a2)* Recording-completeness witness (list-only) (closes #141)
 - *(witness)* Detect hidden objects (delete markers) (closes #145)
 - *(witness)* Finding-signature change-trigger + quiet pin for known finding sets (closes #147)
+- *(witness)* Dual-layout audit keys — date-partitioned strip + bounded delta streams (closes #168)
 
 ### 🐛 Bug Fixes
 
