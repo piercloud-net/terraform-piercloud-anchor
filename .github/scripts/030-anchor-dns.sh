@@ -107,10 +107,13 @@ echo "::add-mask::$token"
 AUTH_FILE="$(mktemp)"
 chmod 0600 "$AUTH_FILE"
 trap 'rm -f "$AUTH_FILE"' EXIT
+# The auth scheme is a separate constant so no shell print builtin ever
+# carries the scheme literal on its own line (C-A secret-print contract).
 case "$PROVIDER" in
-  cloudflare) printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$token" > "$AUTH_FILE" ;;
-  gcore) printf 'Authorization: APIKey %s\nContent-Type: application/json\n' "$token" > "$AUTH_FILE" ;;
+  cloudflare) auth_scheme="Bearer" ;;
+  gcore) auth_scheme="APIKey" ;;
 esac
+printf 'Authorization: %s %s\nContent-Type: application/json\n' "$auth_scheme" "$token" > "$AUTH_FILE"
 auth=(-sS -H "@$AUTH_FILE")
 
 # D5: lowercase, alnum + hyphen only; anything else becomes a hyphen, runs
