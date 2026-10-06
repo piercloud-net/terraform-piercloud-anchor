@@ -416,16 +416,49 @@ class Handler(BaseHTTPRequestHandler):
             # strict-{ns} pin missed it — r2f trust NIT).
             served = []
             root = ET.fromstring(body)
-            # Mirror the client's fail-closed guards (red-team r2g NIT /
-            # functional r2f residual): `list_objects_delimited` raises when
-            # the root is not ListBucketResult or an <Error> child is
-            # present, so the pin must not read prefixes out of a body the
-            # client would refuse. Without this, a root-name-corrupted body
-            # with a direct CommonPrefixes child let the pin tooth pass
-            # while the client failed closed (no suite-green vacuity, but
-            # the standalone fidelity claim was wrong).
-            if (root.tag.rsplit("}", 1)[-1] == "ListBucketResult"
-                    and not any(child.tag.rsplit("}", 1)[-1] == "Error" for child in root)):
+
+            def _client_accepts_page(node):
+                # Mirror list_objects_delimited's fail-closed guards (red-team
+                # r2g NIT / functional r2f residual + r2h LOW): the client
+                # raises on a non-ListBucketResult root, a direct <Error>
+                # child, a Contents entry whose LastModified is missing or
+                # unparseable, and a truncated page with no
+                # NextContinuationToken. The pin must not read prefixes out
+                # of a body the client would refuse. The LastModified leg is
+                # defensive: no current fixture produces a Contents row on a
+                # pin-read (non-filtering delimiter) page, so it is not
+                # mutation-exercised (m-badlm is a no-op); it is also
+                # stricter than the client for entries its start-after
+                # filter would drop — fail-safe either way.
+                if node.tag.rsplit("}", 1)[-1] != "ListBucketResult":
+                    return False
+                truncated = False
+                next_token = False
+                for child in node:
+                    name = child.tag.rsplit("}", 1)[-1]
+                    if name == "Error":
+                        return False
+                    if name == "IsTruncated":
+                        truncated = (child.text or "").strip().lower() == "true"
+                    elif name == "NextContinuationToken":
+                        next_token = True
+                    elif name == "Contents":
+                        last_modified = None
+                        for field in child:
+                            if field.tag.rsplit("}", 1)[-1] == "LastModified":
+                                last_modified = field.text
+                        if last_modified is None:
+                            return False
+                        try:
+                            value = last_modified.strip()
+                            if value.endswith("Z"):
+                                value = value[:-1] + "+00:00"
+                            datetime.fromisoformat(value)
+                        except ValueError:
+                            return False
+                return not (truncated and not next_token)
+
+            if _client_accepts_page(root):
                 for child in root:
                     if child.tag.rsplit("}", 1)[-1] != "CommonPrefixes":
                         continue

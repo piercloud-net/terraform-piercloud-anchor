@@ -6432,6 +6432,13 @@ for entry in entries:
     # comma-bearing prefix forge the exact below-flat marker.
     served = json.loads(note.split("nonfiltering-prefixes=", 1)[1])
     served_seen.append(served)
+    # Element-wise membership needs a validated list (red-team r2h LOW): a
+    # JSON *string* payload (e.g. json.dumps(",".join(served))) would make
+    # `x in served` a substring test, so a comma-join channel wrapped in a
+    # JSON string could still satisfy the tooth.
+    if not isinstance(served, list) or not all(isinstance(item, str) for item in served):
+        print("served channel is not a JSON list of strings: %r" % (served,))
+        sys.exit(1)
     # The comma-bearing prefix must survive the channel as ONE element
     # (red-team r2g LOW): a comma join would split it into extra tokens
     # (json.loads rejects the joined note outright), so this pins the
