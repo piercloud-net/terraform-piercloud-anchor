@@ -66,7 +66,9 @@
 #       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; the generator's
 #       provenance guard compares content, not `git status` — an
 #       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
-#       builder bytes — and the replica `TS_RE` is `\Z`-anchored, anchor #155;
+#       builder bytes, and replacement refs are disabled (`git replace`
+#       cannot swap the compared blob) — and the replica `TS_RE` is
+#       `\Z`-anchored, anchor #155;
 #       golden strings,
 #       refusal teeth, and the checked-in golden+boundary+variant vector
 #       matrix generated from the real builder — never hand-written — incl.
@@ -193,7 +195,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=844
+MIN_CHECKS=845
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -659,6 +661,19 @@ if [ "$f1_pristine" = "True" ] && [ "$f1_mutated" = "False" ] && [ -z "$f1_statu
   ok "generator provenance guard compares content (assume-unchanged edit refused, status clean)"
 else
   bad "generator provenance guard: pristine=${f1_pristine:-<empty>} mutated=${f1_mutated:-<empty>} status='${f1_status}' (a content compare must catch an assume-unchanged edit)"
+fi
+# Sibling bypass (anchor #155 red-team LOW): a `git replace` ref makes
+# `cat-file blob HEAD:<path>` return the replacement bytes while HEAD (the pin
+# check) is unchanged; `--no-replace-objects` in the helper must keep the
+# compare honest. Replace the committed blob with the mutated worktree blob
+# and require the helper to still report False (a `--no-replace-objects`
+# revert returns True here and fails this tooth).
+git -C "${f1_repo}" replace -f "$(git -C "${f1_repo}" rev-parse HEAD:scripts/lib/b2_client.py)" "$(git -C "${f1_repo}" hash-object -w "${f1_repo}/scripts/lib/b2_client.py")"
+f1_replaced="$(f1_helper "${f1_repo}")"
+if [ "$f1_replaced" = "False" ]; then
+  ok "generator provenance guard refuses a git-replace'd blob (--no-replace-objects)"
+else
+  bad "generator provenance guard: a git replace ref defeated the content compare (helper=${f1_replaced:-<empty>})"
 fi
 
 # Canonical-sid oracle: a literal grid cannot enumerate every normalization

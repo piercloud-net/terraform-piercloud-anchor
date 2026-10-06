@@ -13,7 +13,9 @@ The script refuses to write unless the pc-admin checkout HEAD is exactly
 `shipper_keys.PINNED_PC_ADMIN_SHA` (full 40-hex) **and** the worktree
 `scripts/lib/b2_client.py` bytes equal the committed `HEAD:` blob (anchor #155
 F1: `git status` is bypassable with `assume-unchanged`/skip-worktree, so the
-guard compares content, not status). `--allow-sha-mismatch` is a manual debug
+guard compares content, not status; replacement refs are disabled with
+`--no-replace-objects`, since `git replace` can also swap the blob
+`cat-file` returns while HEAD is unchanged — the same local-`.git` class). `--allow-sha-mismatch` is a manual debug
 run: a non-clean provenance stamps a non-pin `source_sha` (`<head>-debug`), so
 a file generated from unpinned bytes can never pass the harness's exact-pin
 `source_sha` assertion if it is committed. It imports the real `scripts/lib/b2_client.py`, builds
@@ -427,12 +429,15 @@ def blob_matches_head(repo, relpath):
     ``git update-index --assume-unchanged`` (and skip-worktree): the worktree
     bytes change while status stays clean, so the generator would import
     unpinned builder bytes while stamping the pin (anchor #155 F1). Compare
-    content instead. A path missing from HEAD is a hard error: the pin names
+    content instead. ``--no-replace-objects`` closes the sibling bypass: a
+    ``git replace`` ref makes ``cat-file blob HEAD:<path>`` return the
+    replacement bytes while HEAD (the pin check) is unchanged (anchor #155
+    red-team LOW). A path missing from HEAD is a hard error: the pin names
     a commit that must contain it.
     """
     relpath = relpath.replace(os.sep, "/")
     committed = subprocess.run(
-        ["git", "-C", repo, "cat-file", "blob", "HEAD:%s" % relpath],
+        ["git", "-C", repo, "--no-replace-objects", "cat-file", "blob", "HEAD:%s" % relpath],
         capture_output=True)
     if committed.returncode != 0:
         raise SystemExit(
