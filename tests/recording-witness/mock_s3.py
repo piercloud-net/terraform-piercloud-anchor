@@ -409,10 +409,11 @@ class Handler(BaseHTTPRequestHandler):
             # inert markup (e.g. a comment-wrapped <CommonPrefixes> row)
             # kept the pin green while the client parsed no prefix at all.
             # Mirror `list_objects_delimited` (scripts/010-provision.sh):
-            # DIRECT children of the root, matched by local name
-            # (namespace-agnostic) — a nested row (red-team r2e LOW) or a
-            # wrong-namespace row is invisible to the client and must be
-            # invisible to the pin too.
+            # DIRECT children of the root, matched by local name. A nested
+            # row (red-team r2e LOW) is invisible to the client and must be
+            # invisible to the pin too; a wrong-namespace row IS visible to
+            # the local-name client, so the pin must see it too (the r2d
+            # strict-{ns} pin missed it — r2f trust NIT).
             served = []
             for child in ET.fromstring(body):
                 if child.tag.rsplit("}", 1)[-1] != "CommonPrefixes":
