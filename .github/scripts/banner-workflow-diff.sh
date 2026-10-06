@@ -19,17 +19,21 @@
 #   * The counted set is the run's executed code surface: `.github/workflows`,
 #     `.github/scripts`, the provisioning scripts the workflow runs or sources
 #     (`scripts/lib/*` is sourced by the provision job; `scripts/010-provision.sh`
-#     runs on the host), and the root HCL the run applies (`*.tf`, `*.tfvars`,
-#     `.terraform.lock.hcl`; `:(glob)` keeps it top-level-only — the examples
-#     are not executed) (red-team r1/r2/r3 MEDIUM/HIGH, functional r3 MEDIUM).
+#     runs on the host), and the root HCL the run applies (`*.tf`, `*.tf.json`,
+#     `*.tfvars`, `*.tfvars.json`, `.terraform.lock.hcl`; `:(glob)` keeps it
+#     top-level-only — the examples are not executed). JSON-syntax HCL is a
+#     full member of the root module to OpenTofu, so it is counted like native
+#     HCL (red-team r1/r2/r3/r4 HIGH/MEDIUM, functional r3/r4 MEDIUM).
 #   * Pathspecs are `:(top)`-anchored: a non-root cwd must not silently narrow
 #     the diff to zero (functional r2 / red-team r2 LOW).
 #   * A symlink anywhere in the counted set's closure (at, above, or inside a
 #     counted path) can resolve an executed file outside the diff; the script
-#     refuses rather than certify (red-team r2/r3 MEDIUM). The scan is a
-#     while-read loop, never `... | grep -q`: under `pipefail` an early
-#     `grep -q` exit SIGPIPEs the producer and the pipeline's rc 141 silently
-#     skips the guard at listing scale (functional r3 LOW).
+#     refuses rather than certify (red-team r2/r3/r4 MEDIUM, functional r4 LOW).
+#     The scan is a while-read loop over NUL-delimited `ls-files -s -z` output,
+#     never `... | grep -q`: under `pipefail` an early `grep -q` exit SIGPIPEs
+#     the producer and the pipeline's rc 141 silently skips the guard at
+#     listing scale, and whitespace/C-quoted path rendering (`x main.tf`)
+#     defeats an awk `$4` field split (functional r3 LOW, red-team r4 MEDIUM).
 #   * A diff that cannot be computed is a loud error, never a silent
 #     "0 files changed": the card's UNCHANGED verdict is a security signal
 #     and an undeterminable count must fail closed.
@@ -53,7 +57,9 @@ pathspecs=(
   ':(top)scripts/lib'
   ':(top)scripts/010-provision.sh'
   ':(top,glob)*.tf'
+  ':(top,glob)*.tf.json'
   ':(top,glob)*.tfvars'
+  ':(top,glob)*.tfvars.json'
   ':(top).terraform.lock.hcl'
 )
 # A path in the counted closure: the path itself, an ancestor, or a child.
@@ -63,20 +69,25 @@ counted_closure() {
     scripts|scripts/lib|scripts/lib/*|scripts/010-provision.sh) return 0 ;;
   esac
   case "$1" in
-    *.tf|*.tfvars|.terraform.lock.hcl)
+    *.tf|*.tf.json|*.tfvars|*.tfvars.json|.terraform.lock.hcl)
       [ "${1%/*}" = "$1" ] && return 0 ;;
   esac
   return 1
 }
 symlink_hit=""
 top="$(git rev-parse --show-toplevel)"
-while IFS= read -r link; do
+while IFS= read -r -d '' entry; do
+  case "$entry" in
+    120000\ *) ;;
+    *) continue ;;
+  esac
+  link="${entry#*$'\t'}"
   [ -n "$link" ] || continue
   if counted_closure "$link"; then
     symlink_hit="$link"
     break
   fi
-done < <(git -C "$top" ls-files -s | awk '$1 == "120000" { print $4 }')
+done < <(git -C "$top" ls-files -s -z)
 if [ -n "$symlink_hit" ]; then
   echo "::error::symlink '$symlink_hit' is in the run's code surface — refusing a banner verdict" >&2
   exit 1

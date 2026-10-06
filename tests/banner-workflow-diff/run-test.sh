@@ -31,10 +31,20 @@
 #       2000-symlink farm still refuses (the while-read scan is not defeated by
 #       listing size) (red-team r3 MEDIUM / functional r3 LOW);
 #   (n) a scripts/010-provision.sh change is counted (functional r3 LOW);
+#   (p) JSON-syntax root HCL (main.tf.json / *.auto.tfvars.json) is counted —
+#       OpenTofu loads it as part of the root module (red-team r4 HIGH /
+#       functional r4 MEDIUM);
+#   (q) a symlink whose name carries whitespace still refuses — the
+#       NUL-delimited scan must not truncate at the field split, and a
+#       JSON-named symlink refuses too (the closure mirrors the pathspecs)
+#       (red-team r4 MEDIUM / trust r4 MEDIUM / functional r4 LOW);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
-#       exactly one COUNT= token, exactly one `-eq 0` with no widened/decoy
-#       comparison, an option/continuation-tolerant no-fetch, and the banner
-#       job's single fetch-depth: 0; ci.yml gates AND runs this harness.
+#       exactly one COUNT= token (space/compound-tolerant), no COUNT override
+#       form (arithmetic/printf/read/declare/let/unset/eval/source), every
+#       non-call COUNT mention is a read, exactly one `-eq 0` with no
+#       widened/decoy comparison, an option/continuation/quote/newline-tolerant
+#       no-fetch with no git alias, and the banner job's single fetch-depth: 0;
+#       ci.yml gates AND runs this harness.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -90,14 +100,27 @@ git_c add -A
 git_c commit -qm "symlink in the counted set"
 git_c push -q origin symlink
 
-# A root-HCL change, an example-tree .tf change, an ancestor symlink, the 010
-# provisioning script, and a large symlink farm: counted-set / closure teeth
-# (red-team r3, functional r3).
+# A root-HCL change, a JSON-syntax root-HCL change, an example-tree .tf change,
+# an ancestor symlink, the 010 provisioning script, a large symlink farm, and
+# a spaced-name symlink: counted-set / closure teeth (red-team r3/r4,
+# functional r3/r4, trust r4).
 git_c checkout -qb hcl main
 printf '# root hcl\n' > main.tf
 git_c add -A
 git_c commit -qm "root HCL change"
 git_c push -q origin hcl
+
+git_c checkout -qb hcljson main
+printf '{"resource":{}}\n' > main.tf.json
+git_c add -A
+git_c commit -qm "JSON-syntax root HCL change"
+git_c push -q origin hcljson
+
+git_c checkout -qb varsjson main
+printf '{"tenant":"x"}\n' > prod.auto.tfvars.json
+git_c add -A
+git_c commit -qm "JSON-syntax auto tfvars change"
+git_c push -q origin varsjson
 
 git_c checkout -qb example main
 mkdir -p examples/quickstart
@@ -128,6 +151,22 @@ for i in $(seq 1 2000); do ln -s ../../payload/run.sh ".github/scripts/farm-$i.s
 git_c add -A
 git_c commit -qm "symlink farm"
 git_c push -q origin farm
+
+git_c checkout -qb spaced main
+mkdir -p payload
+printf '#!/usr/bin/env bash\necho payload\n' > payload/evil.sh
+ln -s payload/evil.sh "evil .tf"
+git_c add -A
+git_c commit -qm "symlink with whitespace in a counted path"
+git_c push -q origin spaced
+
+git_c checkout -qb jsonsymlink main
+mkdir -p payload
+printf '#!/usr/bin/env bash\necho payload\n' > payload/evil.sh
+ln -s payload/evil.sh main.tf.json
+git_c add -A
+git_c commit -qm "JSON-named symlink in a counted path"
+git_c push -q origin jsonsymlink
 
 git_c checkout -q main
 printf 'name: moved\n' > .github/workflows/moved.yml
@@ -193,8 +232,8 @@ is "at tip: rc" "0" "$rc"
 is "at tip: count 0" "0" "$count"
 
 # --- (g) the sourced provisioning script is part of the counted set ---------
-# provision.yml sources scripts/lib/naming.sh (line 527): a change there must
-# move the verdict (red-team r2 MEDIUM).
+# provision.yml sources scripts/lib/naming.sh: a change there must move the
+# verdict (red-team r2 MEDIUM).
 cd "$CLONE"
 git_c checkout -q sourced
 rc=0
@@ -285,23 +324,59 @@ out="$(bash "$SCRIPT" main 2>"$WORK/farm.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "symlink farm: rc non-zero"; else bad "symlink farm: rc=$rc"; fi
 is "symlink farm: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/farm.err"; then ok "symlink farm: ::error:: annotation"; else bad "symlink farm: no ::error::"; fi
+
+# --- (p) JSON-syntax HCL is part of the executed root module ----------------
+# OpenTofu loads main.tf.json and *.auto.tfvars.json exactly like native HCL;
+# a JSON-only change must move the verdict (red-team r4 HIGH / functional r4
+# MEDIUM).
+git_c checkout -q hcljson
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "JSON HCL: a main.tf.json change is counted" "1" "$count"
+is "JSON HCL: rc" "0" "$rc"
+git_c checkout -q varsjson
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "JSON tfvars: a prod.auto.tfvars.json change is counted" "1" "$count"
+is "JSON tfvars: rc" "0" "$rc"
+
+# --- (q) a whitespace-bearing symlink name still refuses --------------------
+# `git ls-files -s` renders `120000 … 0\tevil .tf`; an awk `$4` split yields
+# `evil` and the closure misses it, while the target-only change stays
+# invisible to the diff -> false UNCHANGED. The NUL-delimited scan must
+# refuse (red-team r4 MEDIUM / trust r4 MEDIUM / functional r4 LOW).
+git_c checkout -q spaced
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/spaced.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "spaced symlink: rc non-zero"; else bad "spaced symlink: rc=$rc"; fi
+is "spaced symlink: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/spaced.err"; then ok "spaced symlink: ::error:: annotation"; else bad "spaced symlink: no ::error::"; fi
+git_c checkout -q jsonsymlink
+rc=0
+out="$(bash "$SCRIPT" main 2>"$WORK/jsonsymlink.err")" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "JSON-named symlink: rc non-zero"; else bad "JSON-named symlink: rc=$rc"; fi
+is "JSON-named symlink: no count on stdout" "" "$out"
+if grep -q '::error::' "$WORK/jsonsymlink.err"; then ok "JSON-named symlink: ::error:: annotation"; else bad "JSON-named symlink: no ::error::"; fi
 git_c checkout -q behind
 
 # --- (e) wiring --------------------------------------------------------------
 # Comment- and continuation-proof pins: a commented-out call line, a second
 # `COUNT=` assignment (incl. `export`/`declare`/same-line/`if`), a widened or
-# decoy comparison, a `git \`-continued or option-bearing `fetch`, or a shallow
-# checkout with a decoy `fetch-depth: 0` must redden (functional r1/r2/r3,
-# red-team r1/r2/r3). Backslash continuations are joined and full-line/inline
-# comments stripped first, so only ACTIVE code satisfies a pin.
+# decoy comparison, a `git \`-continued, option-bearing, quoted, aliased or
+# multi-line-command-substitution `fetch`, or a shallow checkout with a decoy
+# `fetch-depth: 0` must redden (functional r1/r2/r3/r4, red-team
+# r1/r2/r3/r4). Backslash continuations are joined and full-line comments
+# stripped first, so only ACTIVE code satisfies a pin — an in-string `#` must
+# not hide a fetch from the scan (functional r4 LOW).
 # The pins below are deliberately exact: a comment mentioning the script, the
 # `--depth 1` spelling, or one half of the ci.yml wiring must not satisfy them
 # (functional r1 LOWs / red-team r1 MEDIUM-LOW).
 PROV="$REPO_ROOT/.github/workflows/provision.yml"
 CI="$REPO_ROOT/.github/workflows/ci.yml"
 join_continuations() { awk '{ if (sub(/\\$/, "")) printf "%s ", $0; else print }'; }
-strip_comments() { sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]+#.*$//'; }
+strip_comments() { sed -E 's/^[[:space:]]*#.*$//'; }
 prov_active="$(join_continuations < "$PROV" | strip_comments)"
+prov_flat="$(tr '\n' ' ' <<<"$prov_active")"
 # The verdict pins are scoped to the banner job/step, so a `COUNT=` assignment
 # in another job (e.g. the DNS job's list_count) is neither counted nor
 # satisfying (red-team r2/r3 MEDIUM).
@@ -312,10 +387,20 @@ if [ -n "$banner_job" ] && [ -n "$banner_step" ]; then ok "the banner job and st
 call_line='COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"'
 if [ "$(grep -cF "$call_line" <<<"$banner_active")" = "1" ]; then ok "the banner step calls the diff script (exact active call line)"; else bad "the banner step call line is missing, duplicated, or only commented"; fi
 if [ "$(grep -oF 'COUNT=' <<<"$banner_active" | grep -c .)" = "1" ]; then ok "COUNT is assigned exactly once in the banner step"; else bad "the banner step has extra COUNT assignments or aliases"; fi
+if [ "$(grep -cE 'COUNT[[:space:]]*[+*/%^-]?=' <<<"$banner_active")" = "1" ]; then ok "COUNT is assigned exactly once (space/compound-tolerant spelling)"; else bad "the banner step carries a COUNT assignment beyond the single call line"; fi
+if grep -qE '\(\([^)]*COUNT|printf[[:space:]]+-v[[:space:]]+COUNT|(^|[^[:alnum:]_])(read|declare|let|unset)[[:space:]][^;]*COUNT|(^|[^[:alnum:]_])(eval|source)([[:space:]]|$)|^[[:space:]]*\.[[:space:]]' <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/printf/read/declare/let/unset/eval/source)"; else ok "no COUNT override form in the banner step"; fi
+stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
+if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
 if [ "$(grep -oE '\-eq[[:space:]]+0' <<<"$banner_active" | grep -c .)" = "1" ] && ! grep -qE '\-(ge|gt|le|lt|ne)[[:space:]]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0 (no widened/decoy comparison)"; else bad "the COUNT comparison is missing, widened, or decoyed"; fi
-if grep -qE 'git([[:space:]]+[^[:space:]]+)*[[:space:]]+fetch' <<<"$prov_active"; then bad "provision.yml still carries a fetch"; else ok "provision.yml carries no fetch (continuation-, option- and whitespace-tolerant)"; fi
-if printf 'git -c protocol.version=2 fetch origin main --depth=1\n' | grep -qE 'git([[:space:]]+[^[:space:]]+)*[[:space:]]+fetch'; then ok "the no-fetch pin matches global-option variants"; else bad "the no-fetch pin misses global-option variants"; fi
-if printf 'git \\\nfetch origin main --depth=1\n' | join_continuations | grep -qE 'git([[:space:]]+[^[:space:]]+)*[[:space:]]+fetch'; then ok "the no-fetch pin matches continuation variants"; else bad "the no-fetch pin misses continuation variants"; fi
+no_fetch_re="(^|[^[:alnum:]_])[\"']?git[\"']?([[:space:]]+[^[:space:];&|]+)*[[:space:]]+fetch"
+if grep -qE "$no_fetch_re" <<<"$prov_active" || grep -qE "$no_fetch_re" <<<"$prov_flat"; then bad "provision.yml still carries a fetch"; else ok "provision.yml carries no fetch (continuation-, option-, quote-, newline- and whitespace-tolerant)"; fi
+if printf 'git -c protocol.version=2 fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches global-option variants"; else bad "the no-fetch pin misses global-option variants"; fi
+if printf 'git \\\nfetch origin main --depth=1\n' | join_continuations | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches continuation variants"; else bad "the no-fetch pin misses continuation variants"; fi
+if printf '"git" fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches quoted git"; else bad "the no-fetch pin misses quoted git"; fi
+if printf 'DECOY="$(git\nfetch origin main --depth=1)"\n' | tr '\n' ' ' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches multi-line command substitutions"; else bad "the no-fetch pin misses multi-line command substitutions"; fi
+if grep -qE 'alias\.' <<<"$prov_active"; then bad "provision.yml carries a git alias (a fetch can hide behind one)"; else ok "provision.yml carries no git alias"; fi
+alias_probe='git -c alias.f=fetch f'
+if grep -qE "$no_fetch_re" <<<"$alias_probe" || ! grep -qE 'alias\.' <<<"$alias_probe"; then bad "an alias-spelled fetch would evade the no-fetch pins"; else ok "an alias-spelled fetch is refused by the alias pin"; fi
 if [ "$(grep -c 'fetch-depth:' <<<"$banner_job")" = "1" ] && grep -q 'fetch-depth: 0' <<<"$banner_job"; then ok "the banner job keeps the single full-history checkout"; else bad "the banner job lost fetch-depth: 0 or gained a decoy"; fi
 if grep -qF 'tests/(banner-workflow-diff|' "$CI"; then ok "ci.yml path gate includes the harness"; else bad "ci.yml path gate does not include the harness"; fi
 if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml run list includes the harness"; else bad "ci.yml run list does not include the harness"; fi
