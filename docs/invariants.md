@@ -13,14 +13,15 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 ## Invariant 2 — the anchor is a key-holder, never an access-path
 
 > The anchor holds **no credential that reaches the user's main box** — no
-> SSH keys, no Teleport tokens, no API tokens, no agent sockets. Its only
+> SSH keys, no Teleport tokens, no API tokens, no agent sockets. Its
 > cross-box interactions are answering clevis's TCP/80 challenges from the
-> main-box IP, plus serving the dashboard and ACME challenges to the
+> main-box IP, serving the dashboard and ACME challenges to the
 > platform edge ranges on TCP/80 (Cloudflare today; ACME) and the CloudFront
 > origin-facing ranges + main box on TCP/443 (the dashboard leg; Caddy
 > additionally requires the X-Piercloud-Origin secret header from every
 > `:443` peer except the main box and loopback `127.0.0.1/32`/`::1/128`
-> (the on-box probes) — call D) (narrow firewall rules; no SSH inbound
+> (the on-box probes) — call D), plus probing the tenant's public endpoints
+> for availability (narrow firewall rules; no SSH inbound
 > from the main box either). Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
 > per-event via SCP password-reset + re-dispatch; netcup console/rescue as
