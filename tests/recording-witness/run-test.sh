@@ -5708,8 +5708,9 @@ chmod +x "${FAKEBIN}/systemctl"
 # The drain-bound tooth drives all 3600 wait-idle polls; FAKE_SLEEP_NOWAIT
 # removes the wall-clock cost while keeping the iteration count (and with it
 # the bound) exercised, and FAKE_SLEEP_COUNT_FILE + FAKE_SLEEP_ARGS_FILE pin
-# the sleep count and its argument (`/usr/bin/env sleep 1`) so a bound
-# regression that keeps the poll count (a deleted `/usr/bin/env sleep 1`, a shortened sleep, fewer
+# the sleep count and its argument (`1`; the `/usr/bin/env` shape is pinned
+# statically by the drain-loop tooth) so a bound regression that keeps the
+# poll count (a deleted `/usr/bin/env sleep 1`, a shortened sleep, fewer
 # iterations with an early break) still fails. Every other test sleeps for real.
 cat >"${FAKEBIN}/sleep" <<'FAKESLEEP'
 #!/usr/bin/env bash
@@ -6079,11 +6080,16 @@ unset FAKE_ACTIVE_STATE
 # counter off 0; one that loops without the bound hangs this check instead of
 # failing it.
 # The 3600-iteration drain wait forks the fake scripts 7200 times, which
-# dominates the suite runtime; the same counting/serving logic as bash
-# FUNCTIONS keeps the iteration, count, argument and interleaving proofs
-# intact without the process spawn cost. Only ActiveState is served (the
-# only call the wait makes); every other subcommand delegates to the fake
-# script on PATH. Unset after the tooth so the other tests use the script.
+# dominates the suite runtime. The drain sleep is `/usr/bin/env sleep 1`
+# (the #143 hardening), and `/usr/bin/env` resolves `sleep` through PATH, so
+# the `sleep()` function below is BYPASSED for the drain path — the
+# `${FAKEBIN}/sleep` script carries the iteration/count/argument/interleaving
+# teeth (and the 7200 forks remain; the absolute-path call is a shadowing
+# defence, not a spawn optimisation). The function stays for any direct
+# `sleep` call in sourced code. The `systemctl()` function serves only
+# ActiveState (the only call the wait makes); every other subcommand
+# delegates to the fake script on PATH. Unset after the tooth so the other
+# tests use the script.
 sleep() {
   if [ -n "${FAKE_SLEEP_COUNT_FILE:-}" ]; then
     seen="$(cat "${FAKE_SLEEP_COUNT_FILE}" 2>/dev/null || echo 0)"
@@ -6610,6 +6616,15 @@ fi
 # quoted, subshell or multiline `exit 1`, a tab-indented or trailing-comment
 # rewrite — fails closed. The `exit "1"` rewrite is a DELIBERATE
 # over-refusal (a valid fail-closed body that no longer matches the pin).
+#
+# r18 red-team HIGH: the #153 acceptance functions
+# (`recording_witness_run_once`/`_accept`/`_timer_start`/`_timer_stop`) are
+# extracted-and-sourced from the marker span only, so a post-END redefinition
+# (`recording_witness_run_once() { return 0; }` inserted after
+# `# --- END RECORDING WITNESS ---`) is invisible to every behavior tooth
+# while it overrides the real function on-box (a no-op `run_once` bypasses
+# the acceptance's witness run; a no-op `timer_start` leaves the timer
+# stopped after a failed acceptance). They join the exactly-once count.
 if awk -v q="'" '
   function keyword_defs(line, name) {
     return gsub("(^|[^[:alnum:]_])function[[:space:]]+" name "([^[:alnum:]_]|$)", "F", line)
@@ -6626,7 +6641,7 @@ if awk -v q="'" '
     return keyword_defs(line, name) + paren_defs(s, name)
   }
   BEGIN {
-    n = split("recording_witness_service_drained recording_witness_wait_idle die", names, " ")
+    n = split("recording_witness_service_drained recording_witness_wait_idle die recording_witness_run_once recording_witness_accept recording_witness_timer_start recording_witness_timer_stop", names, " ")
     die_line = "die()  { printf " q "\\n\\033[1;31mFAIL:\\033[0m %s\\n" q " \"$*\" >&2; exit 1; }"
   }
   FNR == 1 { file = FILENAME; seen[file] = 1 }
@@ -6662,9 +6677,9 @@ if awk -v q="'" '
     exit bad ? 1 : 0
   }
 ' "${PROVISION}" "${PROVISION_JOINED}"; then
-  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\` and \`die\` are each defined exactly once (occurrence-counted) and the \`die\` definition is the exact shipped fail-closed line (issue #143)"
+  ok "run-once: \`recording_witness_service_drained\`, \`recording_witness_wait_idle\`, \`die\` and the four #153 acceptance functions (\`recording_witness_run_once\`/\`recording_witness_accept\`/\`recording_witness_timer_start\`/\`recording_witness_timer_stop\`) are each defined exactly once (occurrence-counted) and the \`die\` definition is the exact shipped fail-closed line (issue #143)"
 else
-  bad "run-once: a drain-path function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`) is defined zero or multiple times (per occurrence) or the \`die\` definition is not the exact shipped line (a dead, quoted, subshell or multiline rewrite fails closed; issue #143)"
+  bad "run-once: a drain-path or acceptance function (\`recording_witness_service_drained\`/\`recording_witness_wait_idle\`/\`die\`/\`recording_witness_run_once\`/\`recording_witness_accept\`/\`recording_witness_timer_start\`/\`recording_witness_timer_stop\`) is defined zero or multiple times (per occurrence) or the \`die\` definition is not the exact shipped line (a dead, quoted, subshell or multiline rewrite fails closed; issue #143)"
 fi
 # r15 red-team HIGH: the multi-line single-quote desync. `s='` on one line,
 # then `' ; die() { :; } ; : '`, then `'` — bash pairs the quotes ACROSS the
@@ -6705,6 +6720,17 @@ if awk -v q="'" '
     hd += h
     h = gsub(/(^|[^[:alnum:]_])recording_witness_wait_idle[[:space:]]*\([[:space:]]*\)/, "F", line)
     hi += h
+    # r18 red-team HIGH: the four #153 acceptance functions join the
+    # no-quote-strip count (a desync-hidden post-END redefinition would
+    # otherwise override the span-sourced one on-box).
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_run_once[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hr += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_accept[[:space:]]*\([[:space:]]*\)/, "F", line)
+    ha += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_timer_start[[:space:]]*\([[:space:]]*\)/, "F", line)
+    hts += h
+    h = gsub(/(^|[^[:alnum:]_])recording_witness_timer_stop[[:space:]]*\([[:space:]]*\)/, "F", line)
+    htp += h
     # main-sync fold (2026-10-06, PR #156): a `.`-preceded `name()` cannot
     # shadow the bare name (it defines the dotted word; embedded Python
     # `threading.local()` is the false positive this excludes).
@@ -6718,16 +6744,16 @@ if awk -v q="'" '
       print "die definitions in the no-quote-strip view: " c " (expected exactly 1, the pinned shipped line)" > "/dev/stderr"
       bad = 1
     }
-    if (hd != 1 || hi != 1) {
-      print "drain-helper definitions in the no-quote-strip view: service_drained=" hd " wait_idle=" hi " (expected exactly 1 each)" > "/dev/stderr"
+    if (hd != 1 || hi != 1 || hr != 1 || ha != 1 || hts != 1 || htp != 1) {
+      print "drain-path definitions in the no-quote-strip view: service_drained=" hd " wait_idle=" hi " run_once=" hr " accept=" ha " timer_start=" hts " timer_stop=" htp " (expected exactly 1 each)" > "/dev/stderr"
       bad = 1
     }
     exit bad ? 1 : 0
   }
 ' "${PROVISION_CODE}"; then
-  ok "run-once: no load-bearing definition spelling is hidden behind a multi-line quote desync (a definition scan without quote stripping finds only the pinned \`die\` + the two drain helpers, and no keyword-form definition, issue #143)"
+  ok "run-once: no load-bearing definition spelling is hidden behind a multi-line quote desync (a definition scan without quote stripping finds only the pinned \`die\` + the two drain helpers + the four #153 acceptance functions, and no keyword-form definition, issue #143)"
 else
-  bad "run-once: a load-bearing definition spelling (incl. the drain helpers or any \`function NAME\` keyword form) appears in code only when quote stripping is skipped — a multi-line quote desync can execute a definition the per-line scanners hide (issue #143)"
+  bad "run-once: a load-bearing definition spelling (incl. the drain helpers, the #153 acceptance functions, or any \`function NAME\` keyword form) appears in code only when quote stripping is skipped — a multi-line quote desync can execute a definition the per-line scanners hide (issue #143)"
 fi
 # r16 red-team HIGH: the PATH tooth strips quoted spans, so a quoted token
 # (`printf -v 'PATH'`, `declare -x "PATH=…"`, `unset -v 'PATH'`,
@@ -6781,8 +6807,16 @@ if awk -v q="'" '
     gsub(/\\/, "", line)
     gsub(/\$\{[^}]*\}/, "", line)
     gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, "", line)
-    gsub(/(^|[;&|(){}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
-    line = normalize_cmdpos(line)
+    # r18 red-team HIGH: the prefix strip and the reserved-word normalizer
+    # feed each other (`if true; then command export "PATH=…"; fi` only
+    # exposes `command export` after `then` becomes a separator; a
+    # `command command …` chain needs one strip per prefix), so run both
+    # until the line is stable; `!` joins the position class.
+    do {
+      prev = line
+      gsub(/(^|[;&|()!{}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
+      line = normalize_cmdpos(line)
+    } while (line != prev)
     if (line ~ /(^|[;&|()!{}])[[:space:]]*PATH\+?=/ ||
         line ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
         line ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
@@ -6917,9 +6951,21 @@ if awk -v q="'" '
     line = normalize_cmdpos(line)
     # main-sync fold (2026-10-06, PR #156): the merged #153 acceptance
     # installs and clears its EXIT trap, so pin exactly those two shipped
-    # forms (anchored: a combined or rewritten line stays refused).
-    pinned_trap = (line ~ /^[[:space:]]*trap[[:space:]]+recording_witness_timer_start[[:space:]]+EXIT[[:space:]]*$/ ||
-                   line ~ /^[[:space:]]*trap[[:space:]]+-[[:space:]]+EXIT[[:space:]]*$/)
+    # forms (anchored: a combined or rewritten line stays refused). The
+    # allowlist reads a quote/backslash-stripped but expansion-PRESERVED view
+    # (r18 red-team HIGH + functional LOW): the main view drops `${x}`/`$x`,
+    # so an expansion-rebuilt action or sigspec
+    # (`trap "recording_witness_timer_start${x}" EXIT`,
+    # `trap '…' EX${x:-$(cmd)}IT`) would read as the pinned form while its
+    # runtime effect is attacker-controlled (`x="; exit 0; :"` rewrites the
+    # process rc; a substitution runs arbitrary root commands). The shipped
+    # lines carry no expansion.
+    pinned_view = $0
+    gsub(/[$"]/, "", pinned_view)
+    gsub(q, "", pinned_view)
+    gsub(/\\/, "", pinned_view)
+    pinned_trap = (pinned_view ~ /^[[:space:]]*trap[[:space:]]+recording_witness_timer_start[[:space:]]+EXIT[[:space:]]*$/ ||
+                   pinned_view ~ /^[[:space:]]*trap[[:space:]]+-[[:space:]]+EXIT[[:space:]]*$/)
     if (!pinned_trap &&
         (line ~ /(^|[;&|()!])[[:space:]]*(builtin|enable|trap|eval)([^[:alnum:]_]|$)/ ||
          line ~ /(^|[;&|()!])[[:space:]]*command[[:space:]]+(builtin|enable|trap|eval)([^[:alnum:]_]|$)/)) {
