@@ -6862,7 +6862,7 @@ is "dated nonconformance (conformant control): the run stays a delta" "delta" \
 # sequence-gap only BETWEEN intervals, sequence-duplicate is overlap
 # detection; range-on-lifecycle, mode-on-range and reversed ranges are
 # naming-contract drift that never moves a cursor (a no-mode lifecycle range
-# isolates the lifecycle branch; a duplicate never suppresses a concurrent
+# pins the lifecycle branch; a duplicate never suppresses a concurrent
 # gap); an event missing *inside* a declared range is invisible list-only
 # (the disclosed loss).
 R29_SID="5f5f5f5f-5f5f-4f5f-8f5f-5f5f5f5f5f5f"
@@ -7035,7 +7035,7 @@ is "ranges: a lifecycle range never moves the cursor" "${R29_LR_START}" \
   "$(state_field observed.cursors.audit_session_dated)"
 
 # The `.shell` marker above is refused independently by the mode-on-range
-# rule, so a no-mode lifecycle range is the only shape that isolates the
+# rule, so a no-mode lifecycle range is the only shape that pins the
 # lifecycle branch (red-team FIX-1). The crafted key is the NEWEST: a
 # regression that collects it would absorb the 2-4 hole (green) and win the
 # dated cursor.
