@@ -786,8 +786,17 @@ ssh_base() {
   # "$@" is load-bearing: without it every remote command is silently
   # ignored (the runner would "succeed" while installing, capturing, and
   # locking nothing). Stdin still flows to the remote command (bash -s).
+  # Keepalives (#162): the 010 pipe goes silent for minutes during the
+  # witness acceptance (systemctl start of the oneshot unit + the drain
+  # poll), and an idle stateful path drops a silent session
+  # (`client_loop: send disconnect: Broken pipe`, exit 255).
+  # ServerAliveInterval=30 keeps the path warm; ServerAliveCountMax=6
+  # fails a genuinely dead peer in ~180s instead of hanging for hours.
+  # The other ssh calls in this script (the wait_ssh probe and
+  # lock-password) are short-lived and do not need it.
   sshpass -e ssh -p "${ANCHOR_SSH_PORT:-22}" \
     -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
     -o BatchMode=no "root@${ANCHOR_HOST}" "$@"
 }
 

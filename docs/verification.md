@@ -69,7 +69,7 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] Dispatch `provision.yml` `mode=apply` from the reviewed branch and approve the device flow (§5).
 - [ ] Anchor target is API-derived: the A-record value and the A1 SSH target equal the `GET /servers/{id}` address (resolve log) — no pasted-IP override exists.
 - [ ] Fail-closed proof: a temporarily set non-matching `ANCHOR_IPV4` fails the run closed at the resolve step (no SSH/DNS action; the secret is removed afterwards). The log names the candidate count, never the address values.
-- [ ] Run log assertions all pass: firewall policy created/attached; A1 window opened then closed (swept pre + post); tang thumbprint printed; Caddy + Gatus deployed; DNS upsert + verify-after-write; device-grant teardown revoked.
+- [ ] Run log assertions all pass: firewall policy created/attached; A1 window opened then closed (swept pre + post); tang thumbprint printed; Caddy + Gatus deployed; DNS upsert + verify-after-write; device-grant teardown revoked; the long-lived A1 SSH carries keepalives (`ServerAliveInterval=30`/`ServerAliveCountMax=6`) so a silent witness acceptance cannot drop the session (issue #162).
 - [ ] `dig +short anchor-01-<tenant>.piercloud.net` returns the anchor IPv4 (DNS-only record — clevis must reach tang directly, no edge in front).
 - [ ] `curl -s -o /dev/null -w '%{http_code}' http://anchor-01-<tenant>.piercloud.net/adv` prints `200` from the main box, and times out from an unlisted address (the firewall actually gates tang).
 - [ ] `curl -s -o /dev/null -w '%{http_code}' https://status-<tenant>.piercloud.net/` prints `200`, and the statuses API returns data.
