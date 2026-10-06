@@ -6668,7 +6668,7 @@ run_case "${dl_dnc_dir}"
 is "dated nonconformance: the warm sweep is green" "ok" "${CASE_STATE}"
 is "dated nonconformance: the sweep seeds the dated cursor" \
   "${DL_DNC_CURSOR}" "$(state_field observed.cursors.audit_session_dated)"
-is "dated nonconformance: no recordings cursor (dated-guard isolation)" "" \
+is "dated nonconformance: no recordings cursor (dated-guard separation)" "" \
   "$(state_field observed.cursors.recordings)"
 DL_DNC_HB2="audit/heartbeat/$(audit_stamp -30).json"
 fixture <<JSON
