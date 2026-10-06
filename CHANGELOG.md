@@ -79,6 +79,10 @@ All notable changes to this project will be documented in this file.
 - *(verification)* /impl checklist + portable CfT PierCloud browser tooling (closes #116)
 - One line per paragraph in README + component READMEs (closes #112)
 
+### ⚡ Performance
+
+- *(witness)* Delta cursors + 6h sweeps + fast acceptance — witness in seconds (closes #153)
+
 ### ⚙️ Miscellaneous Tasks
 
 - Relicense MIT -> Apache-2.0 ([#6](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/6))
@@ -86,6 +90,7 @@ All notable changes to this project will be documented in this file.
 - Mock-tang bind-proof e2e through real Caddy render (closes #57)
 - External-watch — GitHub-side cron probes the public dashboard (closes #94)
 - API-derived anchor IP + multi-IPv4 fail-loud (closes #124)
+- Allow the Gcore DNS API endpoint in the contract allowlist (closes #157)
 
 
 ## [Unreleased]
