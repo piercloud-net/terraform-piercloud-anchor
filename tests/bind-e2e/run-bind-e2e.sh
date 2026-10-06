@@ -22,6 +22,11 @@ PROVISION_SH="${REPO_ROOT}/scripts/010-provision.sh"
 CADDY_PORT="${CADDY_PORT:-18080}"
 MOCK_PORT="${MOCK_PORT:-18081}"
 STUB_PORT="${STUB_PORT:-18082}"
+# Gate-proof ports (call D): a dedicated dashboard render + stub, served
+# before the main .ci serve so no other Caddy holds the admin endpoint.
+GATE_TLS_PORT="${GATE_TLS_PORT:-18443}"
+GATE_HTTP_PORT="${GATE_HTTP_PORT:-18084}"
+GATE_STUB_PORT="${GATE_STUB_PORT:-18085}"
 AOP_SNI="prodprobe.status.piercloud.net"
 TENANT_USER="${TENANT_USER:-citest}"
 CADDY_VERSION="2.11.4"
@@ -38,6 +43,8 @@ die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   # Best-effort teardown in reverse bring-up order; never masks the failure.
   [ -n "${RT_PID:-}" ] && kill "${RT_PID}" 2>/dev/null || true
+  [ -n "${GATE_PID:-}" ] && kill "${GATE_PID}" 2>/dev/null || true
+  [ -n "${GATE_STUB_PID:-}" ] && kill "${GATE_STUB_PID}" 2>/dev/null || true
   cryptsetup close real-tang 2>/dev/null || true
   [ -n "${CADDY_PID:-}" ] && kill "${CADDY_PID}" 2>/dev/null || true
   [ -n "${AOP_CADDY_PID:-}" ] && kill "${AOP_CADDY_PID}" 2>/dev/null || true
@@ -179,6 +186,102 @@ if grep -vE '^[[:space:]]*#' "${WORK}/Caddyfile.origin-ca" | grep -q "on_demand"
 fi
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.origin-ca" --adapter caddyfile
 log "Per-anchor origin-ca render validates (real pair + AOP stanza compiled)"
+
+# ---------------------------------------------------------------- 3e. gate
+# CloudFront origin gate (call D) — request-level proof. Caddy 2.11.4 adapts
+# `abort` AFTER `handle`, so a site-level gate would sit behind the dashboard
+# catch-all handle and never execute; the gate lives INSIDE that handle
+# (scripts/010-provision.sh) and this section proves it BOTH ways: the
+# adapted route order, then a served peer/header matrix. Loopback is exempt
+# (the on-box probes connect from it), so the matrix uses MAIN_BOX_IPV4=
+# 127.0.0.2 and a test-scoped admitted range 127.0.0.3/32 (production
+# carries the 81 public AWS prefixes; the render reads CLOUDFRONT_ORIGIN_CIDRS).
+log "Gate: adapted route order + served peer/header matrix"
+GATE_HOST="gateprobe.status.piercloud.net:${GATE_TLS_PORT}"
+# The cert SAN must cover the site host or Caddy falls back to ACME (which
+# would hang/fail here): mint it for the exact host.
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/gate.key" -out "${WORK}/gate.crt" \
+  -days 1 -nodes -subj "/CN=${GATE_HOST%:*}" -addext "subjectAltName=DNS:${GATE_HOST%:*}" >/dev/null 2>&1 \
+  || die "openssl could not mint the gate pair"
+( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
+  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_CIDRS="127.0.0.3/32" CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
+  export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.gate" )
+# Serve copy: one global option added so the test binds no privileged :80
+# (Caddy's auto HTTP->HTTPS redirect listener); the dashboard block under
+# test is byte-identical to the render.
+awk 'NR == 1 { print; next } /^\{$/ { print; print "\tauto_https disable_redirects"; next } { print }' \
+  "${WORK}/Caddyfile.gate" > "${WORK}/Caddyfile.gate.serve"
+HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.json" \
+  || die "gate render does not adapt"
+python3 - "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}" <<'PY' || die "adapted route order puts the origin gate behind the catch-all handle (dead code)"
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+host = sys.argv[2]
+site = None
+for srv in cfg["apps"]["http"]["servers"].values():
+    for rt in srv.get("routes", []):
+        for m in rt.get("match", []):
+            if host in m.get("host", []):
+                site = rt
+if site is None:
+    print(f"dashboard route for {host} not found")
+    sys.exit(1)
+catchall = None
+for grp in site["handle"][0]["routes"]:
+    h0 = grp["handle"][0]
+    if "match" not in grp and h0.get("handler") == "subroute":
+        catchall = grp
+if catchall is None:
+    print("catch-all handle group not found")
+    sys.exit(1)
+inner = [r["handle"][0] for r in catchall["handle"][0]["routes"]]
+kinds = ["abort" if h.get("handler") == "static_response" and h.get("abort") else h.get("handler") for h in inner]
+if kinds.count("abort") < 2 or "reverse_proxy" not in kinds:
+    print(f"gate handlers missing from the catch-all handle: {kinds}")
+    sys.exit(1)
+if kinds.index("reverse_proxy") < max(i for i, k in enumerate(kinds) if k == "abort"):
+    print(f"gate aborts after the reverse_proxy: {kinds}")
+    sys.exit(1)
+print(f"adapted gate order OK: {kinds}")
+PY
+mkdir -p "${WORK}/gate-stub" && printf 'STUBOK' > "${WORK}/gate-stub/index.html"
+python3 -m http.server "${GATE_STUB_PORT}" --bind 127.0.0.1 --directory "${WORK}/gate-stub" >"${WORK}/gate-stub.log" 2>&1 &
+GATE_STUB_PID=$!
+HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.gate.serve" --adapter caddyfile >"${WORK}/caddy-gate.log" 2>&1 &
+GATE_PID=$!
+ok=0
+for i in $(seq 1 30); do
+  if curl -skf --max-time 3 --interface 127.0.0.2 --resolve "${GATE_HOST}:127.0.0.1" "https://${GATE_HOST}/" -o /dev/null; then ok=1; break; fi
+  sleep 1
+done
+[ "${ok}" = "1" ] || { tail -20 "${WORK}/caddy-gate.log"; kill "${GATE_PID}" "${GATE_STUB_PID}" 2>/dev/null || true; die "gate test Caddy did not serve the dashboard"; }
+gate_expect() { # $1 label, $2 source interface, $3 want (ok|abort); rest = extra curl args
+  local label="$1" iface="$2" want="$3"; shift 3
+  local code rc
+  # An abort gives curl a non-zero rc (empty reply / stream error) — capture
+  # it instead of letting `set -e` kill the harness before the assertion.
+  set +e
+  code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --interface "${iface}" --resolve "${GATE_HOST}:127.0.0.1" "$@" "https://${GATE_HOST}/" 2>/dev/null)"
+  rc=$?
+  set -e
+  case "${want}" in
+    ok)    [ "${code}" = "200" ] && log "gate OK: ${label}" || die "gate: ${label} expected 200, got ${code} (curl rc ${rc})" ;;
+    abort) { [ "${code}" != "200" ] || [ "${rc}" -ne 0 ]; } && log "gate OK: ${label} (aborted, http ${code}, curl rc ${rc})" || die "gate: ${label} expected an abort, got 200" ;;
+  esac
+}
+gate_expect "main box, no header passes"          127.0.0.2 ok
+gate_expect "admitted peer, no header aborts"     127.0.0.3 abort
+gate_expect "admitted peer, wrong header aborts"  127.0.0.3 abort -H 'X-Piercloud-Origin: wrong'
+gate_expect "admitted peer, secret passes"        127.0.0.3 ok    -H 'X-Piercloud-Origin: harness-origin-secret'
+gate_expect "outside peer, secret aborts"         127.0.0.4 abort -H 'X-Piercloud-Origin: harness-origin-secret'
+gate_expect "outside peer, no header aborts"      127.0.0.4 abort
+gate_expect "loopback, no header passes"          127.0.0.1 ok
+kill "${GATE_PID}" "${GATE_STUB_PID}" 2>/dev/null || true
+wait "${GATE_PID}" 2>/dev/null || true
+log "Gate matrix passed (adapted order + 7 request cases)"
 
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"

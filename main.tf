@@ -112,15 +112,10 @@ resource "netcup_scp_user_firewall_policy" "tang" {
         sources           = ["${var.allow_main_box_ipv4}/32"]
       },
     ],
-    var.allow_main_box_ipv6 != null ? [
-      {
-        action            = "ACCEPT"
-        direction         = "INGRESS"
-        protocol          = "TCP"
-        destination_ports = "443"
-        sources           = ["${var.allow_main_box_ipv6}/128"]
-      },
-    ] : [],
+    # No main-box IPv6 :443 rule: the Caddy gate exempts the v4
+    # MAIN_BOX_IPV4/32 only (call D), so a v6 peer would be
+    # firewall-admitted and Caddy-aborted — dead and misleading.
+    # allow_main_box_ipv6 stays the :80 tang path (its documented scope).
     [
       for cidr in local.cloudfront_origin_facing_cidrs : {
         action            = "ACCEPT"

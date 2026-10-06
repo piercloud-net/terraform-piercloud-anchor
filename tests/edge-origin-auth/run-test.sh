@@ -97,6 +97,18 @@ expect_fail "secret outside [A-Za-z0-9._-] refuses" "must match [A-Za-z0-9._-]+"
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="1.2.3"
 expect_fail "short MAIN_BOX_IPV4 refuses" "not a bare IPv4"
 
+export MAIN_BOX_IPV4="999.999.999.999"
+expect_fail "out-of-range MAIN_BOX_IPV4 refuses" "not a bare IPv4"
+
+export MAIN_BOX_IPV4="1.2.3.4.5"
+expect_fail "five-octet MAIN_BOX_IPV4 refuses" "not a bare IPv4"
+
+export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="${MAIN_BOX}"
+saved_cidrs="${CLOUDFRONT_ORIGIN_CIDRS}"
+CLOUDFRONT_ORIGIN_CIDRS=""
+expect_fail "empty CLOUDFRONT_ORIGIN_CIDRS refuses" "CLOUDFRONT_ORIGIN_CIDRS is empty"
+CLOUDFRONT_ORIGIN_CIDRS="${saved_cidrs}"
+
 # ---- happy-path render + gate content -------------------------------------
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="${MAIN_BOX}"
 ( render_443 ) > "${WORK}/Caddyfile.443" || die "happy-path render failed"
@@ -108,14 +120,27 @@ has "${WORK}/Caddyfile.443" 'client_ip_headers CloudFront-Viewer-Address' "clien
 
 not_edge_line="$(grep -m1 '@not_edge_peer' "${WORK}/Caddyfile.443" || true)"
 case "${not_edge_line}" in
-  *"!(remote_ip(${cf_cel}, '${MAIN_BOX}/32'))"*) ok "not_edge_peer matcher lists all 81 ranges + the main box" ;;
+  *"!(remote_ip(${cf_cel}, '127.0.0.1/32', '${MAIN_BOX}/32'))"*) ok "not_edge_peer matcher lists all 81 ranges + loopback + the main box" ;;
   *) bad "not_edge_peer matcher shape (got: $(printf '%s' "${not_edge_line}" | tail -c 200))" ;;
 esac
 unauth_line="$(grep -m1 '@unauthorized' "${WORK}/Caddyfile.443" || true)"
 case "${unauth_line}" in
-  *"!(remote_ip('${MAIN_BOX}/32') || header({'X-Piercloud-Origin':'${SECRET}'}))"*) ok "unauthorized matcher = main-box bypass OR the secret header" ;;
+  *"!(remote_ip('127.0.0.1/32', '${MAIN_BOX}/32') || header({'X-Piercloud-Origin':'${SECRET}'}))"*) ok "unauthorized matcher = loopback/main-box bypass OR the secret header" ;;
   *) bad "unauthorized matcher shape (got: $(printf '%s' "${unauth_line}" | tail -c 200))" ;;
 esac
+
+# The gate must sit INSIDE the catch-all handle: Caddy adapts `abort` after
+# `handle`, so a site-level gate is dead code (tests/bind-e2e pins the
+# adapted route order; this pins the text-level placement everywhere else).
+awk '/^https:\/\//{f=1} f{print}' "${WORK}/Caddyfile.443" > "${WORK}/dash.block"
+catchall_line="$(grep -n -m1 '^	handle {$' "${WORK}/dash.block" | cut -d: -f1 || true)"
+gate_line="$(grep -n -m1 '@not_edge_peer' "${WORK}/dash.block" | cut -d: -f1 || true)"
+proxy_line="$(grep -n -m1 'reverse_proxy 127.0.0.1:' "${WORK}/dash.block" | cut -d: -f1 || true)"
+if [ -n "${catchall_line}" ] && [ -n "${gate_line}" ] && [ -n "${proxy_line}" ] && [ "${catchall_line}" -lt "${gate_line}" ] && [ "${gate_line}" -lt "${proxy_line}" ]; then
+  ok "gate sits inside the catch-all handle, before the proxy"
+else
+  bad "gate placement (catch-all=${catchall_line} gate=${gate_line} proxy=${proxy_line})"
+fi
 
 # ---- sync tooth: 010 constant == cloudfront_ranges.tf ---------------------
 tf_list="$(awk '/cloudfront_origin_facing_cidrs = \[/{f=1;next} f&&/^ *\]/{f=0} f' "${RANGES_TF}" \
@@ -143,6 +168,15 @@ if grep -A2 'destination_ports = "443"' "${MAIN_TF}" | grep -Fq 'allow_main_box_
 else
   bad "main-box :443 bypass rule missing"
 fi
+if grep -A2 'destination_ports = "443"' "${MAIN_TF}" | grep -Fq 'allow_main_box_ipv6'; then
+  bad "main.tf admits a main-box IPv6 peer on :443 with no Caddy counterpart"
+else
+  ok "no main-box IPv6 :443 rule (the Caddy bypass is v4-only)"
+fi
+
+# ---- render custody -------------------------------------------------------
+has "${PROVISION_SH}" 'install -m 0600 /dev/null "$TMP_CADDY"' "rendered Caddyfile pre-created root-only"
+has "${PROVISION_SH}" 'rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate' "validate failure removes the rendered file"
 
 # ---- pipeline wiring ------------------------------------------------------
 has "${PROV}" 'CLOUDFRONT_ORIGIN_SECRET: ${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}' "provision.yml passes CLOUDFRONT_ORIGIN_SECRET"
@@ -153,6 +187,11 @@ has "${ANCHOR_020}" "CLOUDFRONT_ORIGIN_SECRET='\$(q \"\${CLOUDFRONT_ORIGIN_SECRE
 has "${ANCHOR_020}" "MAIN_BOX_IPV4='\$(q \"\${MAIN_BOX_IPV4:-}\")'" "020 exports MAIN_BOX_IPV4"
 has "${CI}" 'tests/edge-origin-auth/run-test.sh' "ci.yml runs this harness"
 has "${CI}" 'edge-origin-auth|origin-ca|recording-witness)/' "ci.yml path gate includes edge-origin-auth (witness pin intact)"
+gate_line_ci="$(grep -m1 'tests/(anchor-ip-selection' "${CI}" || true)"
+case "${gate_line_ci}" in
+  *'.*\.tf$'*) ok "ci.yml unit-tests gate runs on .tf-only changes" ;;
+  *) bad "ci.yml unit-tests gate skips .tf-only changes (the sync tooth would not run)" ;;
+esac
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

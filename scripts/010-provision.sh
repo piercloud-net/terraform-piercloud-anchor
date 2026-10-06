@@ -186,7 +186,11 @@ render_caddyfile() { # print the Caddyfile to stdout
     [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
     case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
     [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
-    [[ "${MAIN_BOX_IPV4}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d)."
+    # Bare IPv4, octets 0-255: mirrors variables.tf's cidrhost validation for
+    # the firewall variable — a console hand-run sets this secret without
+    # terraform, and the two peers must not drift.
+    printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255)."
+    [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
     cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
     cf_cel="${cf_cel%,}"
     printf '%s\n' ""
@@ -194,21 +198,28 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "https://${STATUS_HOST} {"
     printf '%s\n' "	header -Server"
     printf '%s\n' "${DASH_TLS_STANZA}"
-    printf '%s\n' "	# CloudFront origin gate (call D): CloudFront is not AOP. Only"
-    printf '%s\n' "	# CloudFront origin-facing peers (or the main box) may reach the"
-    printf '%s\n' "	# dashboard, and CloudFront peers must carry the secret header it"
-    printf '%s\n' "	# injects (it overwrites client-supplied values). The firewall admits"
-    printf '%s\n' "	# the same peer set; this is the in-Caddy second factor."
-    printf '%s\n' "	@not_edge_peer \`!(remote_ip(${cf_cel}, '${MAIN_BOX_IPV4}/32'))\`"
-    printf '%s\n' "	abort @not_edge_peer"
-    printf '%s\n' "	@unauthorized \`!(remote_ip('${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
-    printf '%s\n' "	abort @unauthorized"
     printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
     printf '%s\n' "	@dashtang path /adv* /rec*"
     printf '%s\n' "	handle @dashtang {"
     printf '%s\n' "		abort"
     printf '%s\n' "	}"
     printf '%s\n' "	handle {"
+    printf '%s\n' "		# CloudFront origin gate (call D): CloudFront is not AOP. Only"
+    printf '%s\n' "		# CloudFront origin-facing peers (or the main box / loopback) may"
+    printf '%s\n' "		# reach the dashboard, and CloudFront peers must carry the secret"
+    printf '%s\n' "		# header it injects (it overwrites client-supplied values). The"
+    printf '%s\n' "		# firewall admits the same peer set; this is the in-Caddy second"
+    printf '%s\n' "		# factor. INSIDE the catch-all handle on purpose: Caddy 2.11.4"
+    printf '%s\n' "		# adapts \`abort\` AFTER \`handle\`, so a site-level gate would sit"
+    printf '%s\n' "		# behind this handle and never run (tests/bind-e2e pins the"
+    printf '%s\n' "		# adapted route order; tests/edge-origin-auth pins the text)."
+    printf '%s\n' "		# 127.0.0.1/32 is exempt: the on-box probes below reach the"
+    printf '%s\n' "		# dashboard via --resolve …:127.0.0.1, and only local processes"
+    printf '%s\n' "		# can source from loopback."
+    printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '${MAIN_BOX_IPV4}/32'))\`"
+    printf '%s\n' "		abort @not_edge_peer"
+    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
+    printf '%s\n' "		abort @unauthorized"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
     printf '%s\n' "		# allowlist plus the CloudFront origin gate above (the rate_limit"
@@ -1044,6 +1055,10 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
+# Pre-create root-only BEFORE the render: the :443 render carries the
+# X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
+# rejection may leave it readable beyond root.
+install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
 CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
@@ -1062,7 +1077,7 @@ else
     CADDY_VAL_ARGS="${CADDY_VAL_ARGS} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
   fi
   # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
-  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"
+  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
   mv "$TMP_CADDY" "${CADDY_CONFIG}"
   log "Caddyfile installed (rendered from dispatch env)"
   CADDY_RESTART=1
@@ -1329,9 +1344,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge re-enable AOP (docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge re-enable AOP (docs/dr.md). A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
