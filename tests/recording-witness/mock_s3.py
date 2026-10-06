@@ -404,15 +404,23 @@ class Handler(BaseHTTPRequestHandler):
             # either (red-team r2c LOW): a serialization-layer filter that
             # drops the prefix from the wire would otherwise leave the pin
             # green while the response no longer carries it. Parse the body
-            # as XML, exactly as an S3 client does (red-team r2d LOW): a
-            # raw-substring regex is XML-blind, so inert markup (e.g. a
-            # comment-wrapped <CommonPrefixes> row) kept the pin green while
-            # the client parsed no prefix at all.
-            ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
-            served = sorted(
-                el.text or ""
-                for el in ET.fromstring(body).findall(f".//{ns}CommonPrefixes/{ns}Prefix")
-            )
+            # as XML, exactly as the witness's own ListObjectsV2 parse does
+            # (red-team r2d LOW): a raw-substring regex is XML-blind, so
+            # inert markup (e.g. a comment-wrapped <CommonPrefixes> row)
+            # kept the pin green while the client parsed no prefix at all.
+            # Mirror `list_objects_delimited` (scripts/010-provision.sh):
+            # DIRECT children of the root, matched by local name
+            # (namespace-agnostic) — a nested row (red-team r2e LOW) or a
+            # wrong-namespace row is invisible to the client and must be
+            # invisible to the pin too.
+            served = []
+            for child in ET.fromstring(body):
+                if child.tag.rsplit("}", 1)[-1] != "CommonPrefixes":
+                    continue
+                for field in child:
+                    if field.tag.rsplit("}", 1)[-1] == "Prefix":
+                        served.append(field.text or "")
+            served.sort()
             note += " nonfiltering-prefixes=%s" % ",".join(served)
         self.record("GET", True, note)
         self.send_body(200, body)
