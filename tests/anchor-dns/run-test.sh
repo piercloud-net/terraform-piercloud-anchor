@@ -48,7 +48,11 @@ while [ "$i" -lt "${#args[@]}" ]; do
     --data) i=$((i + 1)); data="${args[$i]}" ;;
     -o) i=$((i + 1)); out="${args[$i]}" ;;
     -w) i=$((i + 1)); wfmt="${args[$i]}" ;;
-    -H) i=$((i + 1)) ;; # header value; not inspected by the stub
+    -H) i=$((i + 1)); hv="${args[$i]}"
+        case "$hv" in
+          @*) [ -f "${hv#@}" ] && sed 's/^/hdr /' "${hv#@}" >> "$DIR/headers.log" ;;
+          *) printf 'hdr %s\n' "$hv" >> "$DIR/headers.log" ;;
+        esac ;;
     -sS | -s | -S | -f | -k | --fail) ;;
     http://* | https://*) url="$a" ;;
   esac
@@ -86,11 +90,16 @@ if [[ "$url" == *"api.cloudflare.com"* ]]; then
         if [ -n "${STUB_CF_MISMATCH:-}" ]; then
           rec="$(printf '%s' "$rec" | jq -c '.content = "203.0.113.99"')"
         fi
-        emit 200 "{\"result\":[$rec]}"
+        if [ -n "${STUB_CF_DUPLICATE:-}" ]; then
+          emit 200 "{\"result\":[$rec,$rec]}"
+        else
+          emit 200 "{\"result\":[$rec]}"
+        fi
       else
         emit 200 '{"result":[]}'
       fi
     else
+      if [ -n "${STUB_CF_WRITE_HTTP:-}" ]; then emit "$STUB_CF_WRITE_HTTP" '{"success":false}'; exit 0; fi
       jq -c --argjson d "$data" '.[$d.name] = {id: "rec1", name: $d.name, type: $d.type, content: $d.content, ttl: $d.ttl, proxied: $d.proxied}' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
       emit 200 '{"success":true}'
     fi
@@ -119,11 +128,15 @@ if [[ "$url" == *"api.gcore.com"* ]]; then
             if [ -n "${STUB_GCORE_MISMATCH:-}" ]; then
               rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content = ["203.0.113.99"]')"
             fi
+            if [ -n "${STUB_GCORE_DUPLICATE:-}" ]; then
+              rr="$(printf '%s' "$rr" | jq -c '.resource_records += [.resource_records[0]]')"
+            fi
             emit 200 "$rr"
           else
             emit 404 '{"error":"not found"}'
           fi ;;
         PUT | POST)
+          if [ -n "${STUB_GCORE_WRITE_HTTP:-}" ]; then emit "$STUB_GCORE_WRITE_HTTP" '{"error":"stub"}'; exit 0; fi
           jq -c --argjson d "$data" --arg n "$fqdn" '.[$n] = {name: $n, type: "A", ttl: $d.ttl, resource_records: $d.resource_records}' "$GC" > "$GC.tmp" && mv "$GC.tmp" "$GC"
           emit 200 '{"ok":true}' ;;
         *) emit 500 '{"error":"stub-curl: unhandled method"}' ;;
@@ -147,11 +160,13 @@ reset_state() {
   : > "$WORK/curl.log"
   : > "$WORK/curl-data.log"
   : > "$WORK/zones.log"
+  : > "$WORK/headers.log"
 }
 run_writer() { # $@ = env assignments for the writer; rc echoed; log in $WORK/last.log
   local rc=0
   (
-    unset NET_DNS_PROVIDER NET_DNS_ZONE CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP
+    unset NET_DNS_PROVIDER NET_DNS_ZONE ANCHOR_TTL CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN
+    unset STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP STUB_CF_WRITE_HTTP STUB_GCORE_WRITE_HTTP STUB_CF_DUPLICATE STUB_GCORE_DUPLICATE
     env "$@" bash "$SCRIPT"
   ) >"$WORK/last.log" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -171,8 +186,9 @@ T_HOST="anchor-01-pier.piercloud.net"
 reset_state
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token")"
 is "cloudflare create rc" "0" "$rc"
-contains "cloudflare create verifies" "verified: $T_HOST -> $T_IP (proxied=false)" "$(LOG)"
+contains "cloudflare create verifies" "verified: $T_HOST -> $T_IP (proxied=false, ttl=300)" "$(LOG)"
 is "cloudflare create writes exactly the anchor record" "$T_HOST" "$(CF_KEYS)"
+lacks "cloudflare create wrote no status record" "status" "$(CF_KEYS)"
 contains "cloudflare create used POST (no record existed)" "POST" "$(cat "$WORK/curl.log")"
 lacks "cloudflare create did not PUT" "PUT" "$(cat "$WORK/curl.log")"
 is "cloudflare create zone resolved" "piercloud.net" "$(cat "$WORK/zones.log")"
@@ -240,7 +256,7 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=bogu
 contains "unknown provider message" "is not one of cloudflare|gcore" "$(LOG)"
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_ZONE="bad zone" CLOUDFLARE_DNS_TOKEN="cf-token")"
 [ "$rc" != "0" ] && ok "invalid zone fails closed (rc=$rc)" || bad "invalid zone did not fail"
-contains "invalid zone message" "NET_DNS_ZONE is empty or invalid" "$(LOG)"
+contains "invalid zone message" "is not a valid zone name" "$(LOG)"
 
 # ---- green: zone override (canary-proof path) ------------------------------
 reset_state
@@ -249,17 +265,58 @@ is "canary zone override rc" "0" "$rc"
 contains "canary zone resolved on Gcore" "pc-canary.com" "$(cat "$WORK/zones.log")"
 is "canary zone record key" "anchor-01-pier.pc-canary.com" "$(GC_KEYS)"
 
+# ---- auth header shape + mask-first ordering -------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token")"
+is "cloudflare auth run rc" "0" "$rc"
+contains "cloudflare sends Authorization: Bearer" "hdr Authorization: Bearer cf-token" "$(cat "$WORK/headers.log")"
+contains "cloudflare sends the JSON content type" "hdr Content-Type: application/json" "$(cat "$WORK/headers.log")"
+head -n1 "$WORK/last.log" | grep -q '::add-mask::' && ok "mask line precedes every curl" || bad "mask line is not first (token could reach logs/curl before masking)"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+is "gcore auth run rc" "0" "$rc"
+contains "gcore sends Authorization: APIKey" "hdr Authorization: APIKey gc-token" "$(cat "$WORK/headers.log")"
+
+# ---- red: rejected write (HTTP 500) must not reach verify ------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token" STUB_CF_WRITE_HTTP=500)"
+[ "$rc" != "0" ] && ok "cloudflare write 500 fails the run (rc=$rc)" || bad "cloudflare write 500 did not fail"
+contains "cloudflare write 500 message" "cloudflare write (POST) returned HTTP 500" "$(LOG)"
+lacks "cloudflare write 500 never reaches verify" "verified:" "$(LOG)"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_WRITE_HTTP=500)"
+[ "$rc" != "0" ] && ok "gcore write 500 fails the run (rc=$rc)" || bad "gcore write 500 did not fail"
+contains "gcore write 500 message" "gcore write (POST) returned HTTP 500" "$(LOG)"
+lacks "gcore write 500 never reaches verify" "verified:" "$(LOG)"
+
+# ---- red: a stale duplicate record in the rrset ---------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" CLOUDFLARE_DNS_TOKEN="cf-token" STUB_CF_DUPLICATE=1)"
+[ "$rc" != "0" ] && ok "cloudflare duplicate-record rrset fails the run (rc=$rc)" || bad "cloudflare duplicate-record rrset did not fail"
+contains "cloudflare duplicate message names the count" "2 record(s)" "$(LOG)"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_DUPLICATE=1)"
+[ "$rc" != "0" ] && ok "gcore duplicate-record rrset fails the run (rc=$rc)" || bad "gcore duplicate-record rrset did not fail"
+contains "gcore duplicate message names the count" "2 record(s)" "$(LOG)"
+
+# ---- red: Gcore TTL floor is exercised ------------------------------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" ANCHOR_TTL=60)"
+[ "$rc" != "0" ] && ok "gcore TTL floor fails the run (rc=$rc)" || bad "gcore TTL floor did not fail"
+contains "gcore TTL floor message" "below the Gcore Free floor of 120s" "$(LOG)"
+is "gcore TTL floor wrote nothing" "" "$(GC_KEYS)"
+
 # ---- no per-tenant status record survives ----------------------------------
 contains "writer still derives the anchor name" "derive_anchor_hostname" "$(cat "$SCRIPT")"
 lacks "writer no longer derives a status host" "derive_status_host" "$(cat "$SCRIPT")"
-lacks "no status record was written on the CF path" "status" "$(jq -r 'keys | join(",")' "$WORK/cf-records.json")"
+lacks "no status record was written on the Gcore path" "status" "$(GC_KEYS)"
 
 # ---- static wiring ---------------------------------------------------------
 contains "provision.yml passes GCORE_DNS_TOKEN" 'GCORE_DNS_TOKEN: ${{ secrets.GCORE_DNS_TOKEN }}' "$(cat "$PROV")"
 contains "provision.yml passes the provider switch" 'NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}' "$(cat "$PROV")"
 lacks "gcore boolean read never uses the jq alternative on enabled" ".enabled //" "$(cat "$SCRIPT")"
 contains "gcore boolean read uses tostring" ".enabled | tostring" "$(cat "$SCRIPT")"
-contains "anchor TTL constant documented" "ANCHOR_TTL=300" "$(cat "$SCRIPT")"
+contains "anchor TTL constant documented" 'ANCHOR_TTL="${ANCHOR_TTL:-300}"' "$(cat "$SCRIPT")"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
