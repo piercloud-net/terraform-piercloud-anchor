@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=810
+MIN_CHECKS=814
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4528,7 +4528,11 @@ done
 # not a documented non-session event; the predicate used to accept ANY
 # NON_SESSION match, so a drift key (sorting above the real key space) could
 # move the cursor and, forged into state, blind the delta green.
-drift_key="audit/20270101T000000Z-session.start.0.json"
+# Past-dated on purpose: a future-dated drift key would be rejected by the
+# round-5 future-<ts> filter before the classifier mirror runs, masking the
+# drift tooth (round-5 RT5.2). Keep it non-future so the mirror is the only
+# defense.
+drift_key="audit/$(audit_stamp -10)-session.start.0.json"
 drift_dir="${WORK}/state-drift-cursor"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
@@ -4557,7 +4561,7 @@ data["observed"]["cursors"]["audit_session"] = sys.argv[2]
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(data, handle)
 PY
-DRIFT_HIDDEN_TS="$(audit_stamp -5)"
+DRIFT_HIDDEN_TS="$(audit_stamp -100)" # below the drift key: the forged-cursor blind-tail premise
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
@@ -4573,6 +4577,10 @@ run_delta "${drift_dir}"
 is "drift session cursor (forged): exit 2 (repair, never a green tail)" "2" "${CASE_RC}"
 is "drift session cursor (forged): error verdict" "error" "${CASE_STATE}"
 is "drift session cursor (forged): the record is marked repaired" "True" "$(state_field repaired)"
+case "${CASE_DETAIL}" in
+  *"key grammar"*) ok "drift session cursor (forged): detail names the key-grammar violation" ;;
+  *) bad "drift session cursor (forged) detail: ${CASE_DETAIL}" ;;
+esac
 
 # The drift mirror must not over-reject the documented sid-less session event:
 # `session.rejected` and its replay-conflict variant keep the non-session
@@ -4671,10 +4679,12 @@ is "heartbeat merge filter: the unshaped key never forces a repair" "delta" "$(s
 # sits below it - green until the sweep. A future-<ts> key must never move a
 # cursor, and a persisted future cursor must fail closed into repair + sweep.
 # The calendar-invalid shape (`99999999T999999Z`) parses to nothing and is
-# rejected too.
+# rejected too. The fixtures are year-9999 on purpose: a hardcoded 2027 stamp
+# would stop being future-dated on 2027-01-01 and fail these checks with no
+# code change (round-5 RT5.1 time bomb).
 future_dir="${WORK}/state-future-cursor"
-FUT_KEY="audit/20270101T000000Z-user.login.1.json"
-FUT_HB_KEY="audit/heartbeat/20270101T000000Z.json"
+FUT_KEY="audit/99991231T235959Z-user.login.1.json"
+FUT_HB_KEY="audit/heartbeat/99991231T235959Z.json"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
@@ -4714,6 +4724,47 @@ is "future-ts keys: the delta merge keeps the session cursor on the newest real 
   "audit/${FUT_HIDDEN_TS}-session.start.${NL_HIDDEN_SID}.0.json" "$(state_field observed.cursors.audit_session)"
 is "future-ts keys: the delta merge keeps the heartbeat cursor on the real heartbeat" \
   "audit/heartbeat/${DELTA_HEARTBEAT_TS}.json" "$(state_field observed.cursors.audit_heartbeat)"
+
+# RT5.3: the tolerance scale must be pinned. A key dated within the
+# clock-skew tolerance may move a cursor; one beyond must not - an inflated
+# tolerance would pick the further-future key, an over-strict all-future
+# rejection would keep the real key. Non-session keys on purpose: a future
+# `session.start` beyond the tolerance also trips the collection-time
+# clock-skew error.
+bound_dir="${WORK}/state-bound-cursor"
+BOUND_IN_KEY="audit/$(audit_stamp 60)-user.login.1.json"
+BOUND_OUT_KEY="audit/$(audit_stamp 1000)-user.login.2.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"${BOUND_IN_KEY}","ago":60},
+  {"key":"${BOUND_OUT_KEY}","ago":60},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${bound_dir}"
+is "clock-skew bound: a within-tolerance future key may move the session cursor" \
+  "${BOUND_IN_KEY}" "$(state_field observed.cursors.audit_session)"
+
+# RT5.4: an absurd operator tolerance (timedelta overflow, >= ~8.64e13 s)
+# must not brick the run: every key is simply rejected (never moves a
+# cursor) and the run still lands a verdict.
+overflow_dir="${WORK}/state-overflow-tolerance"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS=999999999999999' run_delta "${overflow_dir}"
+is "absurd clock-skew tolerance: exit 0 (no crash)" "0" "${CASE_RC}"
+is "absurd clock-skew tolerance: ok verdict" "ok" "${CASE_STATE}"
 
 # Forged state with a future-dated cursor (calendar-valid session-family,
 # calendar-invalid sid-less, future heartbeat): the load guard must reject it
