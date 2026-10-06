@@ -6871,8 +6871,10 @@ fi
 # was unsound — `expand_braces` omitted `post` from its local-parameter list,
 # so recursion clobbered the global and every sibling alternative after the
 # first got a truncated suffix (variants silently dropped; the 64-variant cap
-# never fired: `export {x,}{PATH,x}=/tmp/shad`, a 7-group payload and a
-# 125-variant line all suite-green, all runtime-effective), and the depth
+# never fired: `export {x,}{PATH,x}=/tmp/shad`, the 7-group and nested
+# payloads were suite-green and PATH-effective, and a 125-variant line was a
+# suite-green cap-bypass carrier — no expansion of it is exactly `PATH`), and
+# the depth
 # guard returned "" without setting `expand_over`, so a deeply nested payload
 # was dropped fail-open. The r23 nameref closure was also incomplete: a
 # two-step target (`declare -n p` then `p=PATH` then `p=…`) evaded the
