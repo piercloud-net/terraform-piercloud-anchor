@@ -6813,6 +6813,22 @@ fi
 # `PATH=`/`PATH+=` writes) — and `for`/`select PATH` joins the refusal set.
 # A parameter-rebuilt name (`p=PATH; export "$p"=…`) stays in the disclosed
 # crafted-edit class.
+#
+# r21 red-team HIGH (delta re-check): the documented PATH-write classes had
+# single-line gaps — an array-element assignment (`PATH[0]=/tmp/shad`,
+# `PATH[$i]=`, `PATH[0]+=`), a `declare -- PATH` (the option class required a
+# letter after `-`), and a separated mapfile/readarray option argument
+# (`mapfile -O 0 PATH`, `mapfile -n 1 PATH`) all evaded both PATH teeth
+# (pre-existing; runtime array-PATH probe confirmed). Closed: the assignment
+# branch accepts `PATH[sub]+=`, the declare/nameref option class accepts
+# `--`, and the mapfile/readarray branch accepts arbitrary separated tokens.
+# Disclosed residuals (pre-existing): a physical newline inside a subscript
+# (`A[x` ⏎ `]=v trap …`, `PATH[0` ⏎ `]=…`) defeats every per-line tooth — the
+# scanner joins backslash continuations but not bracket state, and a per-line
+# bracket-balance guard would over-refuse the 31 legitimate unbalanced-bracket
+# lines in the shipped span (ANSI escapes, Python list literals); and an
+# absurd assignment-prefix chain (5k+ `A=1 ` prefixes) makes the strip loop
+# quadratic (DoS-only; rewrites are monotone, so it terminates).
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6825,12 +6841,12 @@ if awk -v q="'" '
     return s
   }
   function path_write(s) {
-    return (s ~ /(^|[;&|()!{}])[[:space:]]*PATH\+?=/ ||
+    return (s ~ /(^|[;&|()!{}])[[:space:]]*PATH(\[[^]]*\])?\+?=/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(export|unset)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
-            s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(declare|typeset|local|export)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+            s ~ /(^|[;&|()!{}])[[:space:]]*(mapfile|readarray)([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
             s ~ /(^|[;&|()!{}])[[:space:]]*(for|select)[[:space:]]+PATH([^[:alnum:]_]|$)/)
   }
   {
@@ -7059,16 +7075,21 @@ fi
 # The tooth now reads PROVISION_CODE (quote-aware comment stripping), drops
 # quoted spans (so quoted prose is not code), and adds the `printf -v PATH`
 # and `read … PATH` forms.
+# r21 red-team HIGH (delta re-check): the raw backstop's `PATH=` branch also
+# missed the array-element form (`PATH[0]=`/`PATH[0]+=`); it now matches
+# `PATH(\[sub\])?+=` and accepts `--` in the declare/nameref option class.
+# (The cmdpos tooth carries the full r21 closure; this view stays a subset.)
+
 if awk -v q="'" '
   {
     line = $0
     gsub(/"[^"]*"/, "", line)
     gsub(q "[^" q "]*" q, "", line)
-    if (line ~ /(^|[^[:alnum:]_])PATH\+?=/ ||
+    if (line ~ /(^|[^[:alnum:]_])PATH(\[[^]]*\])?\+?=/ ||
         line ~ /(^|[^[:alnum:]_])export[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
         line ~ /(^|[^[:alnum:]_])unset([[:space:]]+-[A-Za-z]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
         line ~ /(^|[^[:alnum:]_])printf[[:space:]]+-v[[:space:]]*PATH([^[:alnum:]_]|$)/ ||
-        line ~ /(^|[^[:alnum:]_])(declare|typeset|local|export)([[:space:]]+-[A-Za-z]+)*[[:space:]]+-[A-Za-z]*n[A-Za-z]*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
+        line ~ /(^|[^[:alnum:]_])(declare|typeset|local|export)([[:space:]]+(-[A-Za-z]+|--))*[[:space:]]+-[A-Za-z]*n[A-Za-z]*[[:space:]]+PATH([^[:alnum:]_]|$)/ ||
         line ~ /(^|[^[:alnum:]_])read([[:space:]]+[^[:space:];&|]+)*[[:space:]]+PATH([^[:alnum:]_]|$)/) {
       print FILENAME ":" FNR ": PATH assignment/export/unset: " $0 > "/dev/stderr"
       bad = 1
