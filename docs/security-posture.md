@@ -17,7 +17,7 @@ There are **no other standing credentials** in the module surface: no SSH keys, 
 
 ## CI-side DNS-write credentials
 
-The `anchor-dns` job (`.github/workflows/provision.yml` → `.github/scripts/030-anchor-dns.sh`) is the one workflow that consumes a DNS-write credential. Both DNS secrets below are **org secrets scoped to all repositories** (repo-level placement or selected-repository scoping is possible; all-repos is the current choice), so they are readable by any workflow in this repo — the controls are scope, custody and retirement, not visibility:
+The `anchor-dns` job (`.github/workflows/provision.yml` → `.github/scripts/030-anchor-dns.sh`) is the one workflow that consumes a DNS-write credential. Both DNS secrets below are **org secrets scoped to all repositories** (repo-level placement or selected-repository scoping is possible; all-repos is the current choice), so they are readable by any workflow in any repository in the org — the controls are scope, custody and retirement, not visibility:
 
 | Secret | Scope | Custody / rotation | Retirement |
 |---|---|---|---|

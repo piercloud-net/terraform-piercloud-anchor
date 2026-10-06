@@ -134,6 +134,9 @@ if [[ "$url" == *"api.gcore.com"* ]]; then
             if [ -n "${STUB_GCORE_BUNDLED:-}" ]; then
               rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content += ["203.0.113.99"]')"
             fi
+            if [ -n "${STUB_GCORE_JUNK_ENTRY:-}" ]; then
+              rr="$(printf '%s' "$rr" | jq -c '.resource_records += [{content:[],enabled:false}]')"
+            fi
             emit 200 "$rr"
           else
             emit 404 '{"error":"not found"}'
@@ -169,7 +172,7 @@ run_writer() { # $@ = env assignments for the writer; rc echoed; log in $WORK/la
   local rc=0
   (
     unset NET_DNS_PROVIDER NET_DNS_ZONE ANCHOR_TTL CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN
-    unset STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP STUB_CF_WRITE_HTTP STUB_GCORE_WRITE_HTTP STUB_CF_DUPLICATE STUB_GCORE_DUPLICATE STUB_GCORE_BUNDLED
+    unset STUB_CF_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_HTTP STUB_CF_WRITE_HTTP STUB_GCORE_WRITE_HTTP STUB_CF_DUPLICATE STUB_GCORE_DUPLICATE STUB_GCORE_BUNDLED STUB_GCORE_JUNK_ENTRY
     env "$@" bash "$SCRIPT"
   ) >"$WORK/last.log" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -316,6 +319,12 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcor
 [ "$rc" != "0" ] && ok "gcore bundled-content rrset fails the run (rc=$rc)" || bad "gcore bundled-content rrset did not fail"
 contains "gcore bundled-content message names both addresses" "2 record(s)" "$(LOG)"
 contains "gcore bundled-content message shows the stale address" "203.0.113.99" "$(LOG)"
+# Junk entry: an extra disabled empty-content entry contributes no address
+# (count stays 1) but must still fail the enabled-every-entry read.
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_JUNK_ENTRY=1)"
+[ "$rc" != "0" ] && ok "gcore disabled junk entry fails the run (rc=$rc)" || bad "gcore disabled junk entry did not fail"
+contains "gcore disabled junk entry message shows both enabled values" "false,true" "$(LOG)"
 
 # ---- red: Gcore TTL floor is exercised ------------------------------------
 reset_state
@@ -329,8 +338,8 @@ contains "writer still derives the anchor name" "derive_anchor_hostname" "$(cat 
 lacks "writer no longer derives a status host" "derive_status_host" "$(cat "$SCRIPT")"
 
 # ---- static wiring ---------------------------------------------------------
-contains "provision.yml passes GCORE_DNS_TOKEN" "GCORE_DNS_TOKEN: \${{ vars.NET_DNS_PROVIDER == 'gcore'" "$(cat "$PROV")"
-contains "provision.yml gates CLOUDFLARE_DNS_TOKEN off the gcore path" "CLOUDFLARE_DNS_TOKEN: \${{ vars.NET_DNS_PROVIDER != 'gcore'" "$(cat "$PROV")"
+contains "provision.yml passes GCORE_DNS_TOKEN" "GCORE_DNS_TOKEN: \${{ vars.NET_DNS_PROVIDER == 'gcore' && secrets.GCORE_DNS_TOKEN || '' }}" "$(cat "$PROV")"
+contains "provision.yml gates CLOUDFLARE_DNS_TOKEN off the gcore path" "CLOUDFLARE_DNS_TOKEN: \${{ vars.NET_DNS_PROVIDER != 'gcore' && secrets.CLOUDFLARE_DNS_TOKEN || '' }}" "$(cat "$PROV")"
 contains "provision.yml passes the provider switch" 'NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}' "$(cat "$PROV")"
 lacks "gcore boolean read never uses the jq alternative on enabled" ".enabled //" "$(cat "$SCRIPT")"
 contains "gcore boolean read uses tostring" ".enabled | tostring" "$(cat "$SCRIPT")"
