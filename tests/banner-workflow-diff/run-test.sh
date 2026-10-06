@@ -5,17 +5,21 @@
 #
 # Runs the REAL shipped script (.github/scripts/banner-workflow-diff.sh)
 # against synthetic repositories (tmp clones; no network, no credentials):
-#   (a) behind-main branch with one workflow change on the branch -> count 1,
-#       rc 0 (the #130 regression: the pre-fix shallow fetch + three-dot diff
-#       died with exit 128 on exactly this shape);
+#   (a) behind-main branch with one workflow change + one CI-script change on
+#       the branch -> count 2, rc 0 (the #130 regression: the pre-fix shallow
+#       fetch + three-dot diff died with exit 128 on exactly this shape);
+#   (f) tag shadowing: a tag literally named origin/<base> must not win over
+#       refs/remotes/origin/<base> — the pre-fix unqualified form collapses to
+#       a false UNCHANGED (red-team r1 HIGH);
 #   (b) the pre-fix form reproduces the exit-128 failure (the tooth that
-#       motivates the fix — a re-introduced `--depth=1` fetch reddens (a));
+#       motivates the fix — a re-introduced shallow fetch reddens (a)); an
+#       externally grafted ref fails loud, never a silent 0;
 #   (c) an unrelated-history branch (no merge base) -> rc non-zero, an
 #       ::error:: on stderr, and NO count on stdout (a silent "0" would be a
 #       false UNCHANGED verdict);
 #   (d) a branch at the base tip -> count 0;
-#   (e) wiring: provision.yml calls the script and no longer carries the
-#       inline shallow fetch; ci.yml gates and runs this harness.
+#   (e) wiring: provision.yml carries the exact call and no fetch; ci.yml
+#       gates AND runs this harness (two separate pins).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -29,7 +33,7 @@ ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi; }
 
-git_c() { git -c user.email=harness@example.invalid -c user.name=harness -c commit.gpgsign=false "$@"; }
+git_c() { git -c user.email=harness@example.invalid -c user.name=harness -c commit.gpgsign=false -c tag.gpgsign=false -c tag.forceSignAnnotated=false "$@"; }
 
 # --- synthetic origin: main (base + a later move) + a behind-main branch ----
 ORIGIN="$WORK/origin.git"
@@ -39,8 +43,9 @@ SEED="$WORK/seed"
 git_c init -q "$SEED"
 cd "$SEED"
 git_c remote add origin "$ORIGIN"
-mkdir -p .github/workflows
+mkdir -p .github/workflows .github/scripts
 printf 'name: base\n' > .github/workflows/base.yml
+printf '#!/usr/bin/env bash\necho base\n' > .github/scripts/base.sh
 git_c add -A
 git_c commit -qm "base"
 git_c branch -M main
@@ -48,8 +53,9 @@ git_c push -q origin main
 
 git_c checkout -qb behind
 printf 'name: branch\n' > .github/workflows/branch.yml
+printf '#!/usr/bin/env bash\necho branch\n' > .github/scripts/branch.sh
 git_c add -A
-git_c commit -qm "branch workflow change"
+git_c commit -qm "branch workflow + CI-script change"
 git_c push -q origin behind
 
 git_c checkout -q main
@@ -65,8 +71,18 @@ cd "$CLONE"
 git_c checkout -q behind
 rc=0
 count="$(bash "$SCRIPT" main)" || rc=$?
-is "behind-main: the count is the branch's own change" "1" "$count"
+is "behind-main: the count is the branch's own workflow + CI-script change" "2" "$count"
 is "behind-main: rc" "0" "$rc"
+
+# --- (f) tag shadowing: a tag named origin/main must not win -----------------
+git_c tag origin/main
+old_base="$(git merge-base "origin/main" HEAD 2>/dev/null || true)"
+old_count="$(git diff --name-only "$old_base" HEAD -- .github/workflows .github/scripts 2>/dev/null | grep -c . || true)"
+is "tag shadow (pre-fix form): collapses to a false 0" "0" "$old_count"
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "tag shadow: the remote-tracking ref still wins" "2" "$count"
+is "tag shadow: rc" "0" "$rc"
 
 # --- (b) the pre-fix form reproduces the exit-128 failure -------------------
 OLD="$WORK/old"
@@ -106,11 +122,16 @@ is "at tip: rc" "0" "$rc"
 is "at tip: count 0" "0" "$count"
 
 # --- (e) wiring --------------------------------------------------------------
+# The pins below are deliberately exact: a comment mentioning the script, the
+# `--depth 1` spelling, or one half of the ci.yml wiring must not satisfy them
+# (functional r1 LOWs / red-team r1 MEDIUM-LOW).
 PROV="$REPO_ROOT/.github/workflows/provision.yml"
 CI="$REPO_ROOT/.github/workflows/ci.yml"
-if grep -q 'banner-workflow-diff.sh' "$PROV"; then ok "provision.yml calls the diff script"; else bad "provision.yml does not call the diff script"; fi
-if grep -q 'depth=1' "$PROV"; then bad "provision.yml still carries a shallow fetch"; else ok "provision.yml carries no shallow fetch"; fi
-if grep -q 'banner-workflow-diff' "$CI"; then ok "ci.yml gates and runs this harness"; else bad "ci.yml does not gate/run this harness"; fi
+if grep -qF 'COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"' "$PROV"; then ok "provision.yml calls the diff script (exact call line)"; else bad "provision.yml does not call the diff script (exact call line)"; fi
+prov_code="$(grep -vE '^[[:space:]]*#' "$PROV" || true)"
+if grep -q 'git fetch' <<<"$prov_code"; then bad "provision.yml still carries a fetch"; else ok "provision.yml carries no fetch"; fi
+if grep -qF 'tests/(banner-workflow-diff|' "$CI"; then ok "ci.yml path gate includes the harness"; else bad "ci.yml path gate does not include the harness"; fi
+if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml run list includes the harness"; else bad "ci.yml run list does not include the harness"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

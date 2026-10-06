@@ -81,7 +81,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Approval card — head SHA + compare link + workflow-path file count
+      - name: Approval card — head SHA + compare link + workflow/CI-script file count
         id: banner
         env:
           HEAD_SHA: ${{ github.sha }}
@@ -92,9 +92,11 @@ jobs:
           set -euo pipefail
           SHORT="$(echo "$HEAD_SHA" | cut -c1-7)"
           # The count comes from .github/scripts/banner-workflow-diff.sh:
-          # no shallow fetch (it grafts origin/$BASE_REF and kills the merge
-          # base on a behind-main branch — #130), and an undeterminable
-          # count fails the step loud instead of reporting a false UNCHANGED.
+          # no fetch (a shallow fetch grafts the base ref and kills the merge
+          # base on a behind-main branch — #130), the remote-tracking ref is
+          # fully qualified (tag shadowing), the counted set is the
+          # workflow/CI-script surface, and an undeterminable count fails the
+          # step loud instead of reporting a false UNCHANGED.
           COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"
           DIFF_LINK="${{ github.server_url }}/${{ github.repository }}/compare/$BASE_REF...$HEAD_SHA"
           echo "head_short=$SHORT" >> "$GITHUB_OUTPUT"
@@ -104,19 +106,19 @@ jobs:
             echo "### Approval card (C-E) for \`$TENANT_USER\`"
             echo ""
             echo "head: \`$SHORT\` (\`$HEAD_SHA\`) — [compare-diff]($DIFF_LINK)"
-            echo "workflow-path files changed: \`$COUNT\`"
+            echo "workflow/CI-script files changed: \`$COUNT\`"
             echo ""
             # Anti-phishing line, carried verbatim on every approval card.
             echo "we will never email or message you a code to re-confirm."
             echo ""
             if [ "$COUNT" -eq 0 ]; then
               echo "workflows_changed=false" >> "$GITHUB_OUTPUT"
-              echo "🟢 UNCHANGED — workflows under .github/workflows match $BASE_REF."
-              echo "piercloud: apply ready for $TENANT_USER @$SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
+              echo "🟢 UNCHANGED — no .github workflow/CI-script changes vs this head's merge base with $BASE_REF."
+              echo "piercloud: apply ready for $TENANT_USER @$SHORT. No workflow/CI-script changes. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
             else
               echo "workflows_changed=true" >> "$GITHUB_OUTPUT"
-              echo "🔴 CHANGED — $COUNT file(s) under .github/workflows differ from $BASE_REF."
-              echo "piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->$HEAD_SHA, $COUNT files incl. provision.yml). Do NOT approve. Open $DIFF_LINK or ask the operator what changed. Nothing runs until you approve."
+              echo "🔴 CHANGED — $COUNT .github workflow/CI-script file(s) differ from this head's merge base with $BASE_REF."
+              echo "piercloud STOP: workflow/CI-script files in ${{ github.repository }} changed since your last approval (<old>->$HEAD_SHA, $COUNT files incl. provision.yml). Do NOT approve. Open $DIFF_LINK or ask the operator what changed. Nothing runs until you approve."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
           # Last-approved pin via actions:read stays backend mechanics (open
@@ -165,9 +167,9 @@ jobs:
             exit 0
           fi
           if [ "$WORKFLOW_FILES" -eq 0 ]; then
-            MSG="piercloud: apply ready for $TENANT_USER @$HEAD_SHORT. Workflows unchanged. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
+            MSG="piercloud: apply ready for $TENANT_USER @$HEAD_SHORT. No workflow/CI-script changes. Approve: $RUN_URL code XXXX-XXXX (expires 10 min). We never email codes."
           else
-            MSG="piercloud STOP: workflows in ${{ github.repository }} changed since your last approval (<old>->${{ github.sha }}, $WORKFLOW_FILES files incl. provision.yml). Do NOT approve. Open ${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }} or ask the operator what changed. Nothing runs until you approve."
+            MSG="piercloud STOP: workflow/CI-script files in ${{ github.repository }} changed since your last approval (<old>->${{ github.sha }}, $WORKFLOW_FILES files incl. provision.yml). Do NOT approve. Open ${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }} or ask the operator what changed. Nothing runs until you approve."
           fi
           # Empty token = no header at all (ntfy.sh 401s on an empty Basic).
           # --fail: a rejected push fails the step instead of dying silently.

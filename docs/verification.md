@@ -85,6 +85,12 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] The fail path is reproduced locally against fixtures (`tests/retention-cap/run-test.sh`) — red with `file:line` on a >90 fixture.
 - [ ] No live `mode=apply` unless provisioning behaviour changed; say that explicitly in the PR (the thumbprint upload is apply-gated and shares the same action + value).
 
+### Banner / CI-workflow change (`.github/scripts/banner-workflow-diff.sh`, workflow steps)
+
+- [ ] CI green; `tests/banner-workflow-diff/run-test.sh` runs the real shipped script against synthetic behind-main / grafted / unrelated-history / tag-shadowed repositories and pins the `provision.yml` call + no-fetch and the `ci.yml` gate + run list.
+- [ ] A real `provision.yml` dispatch from a behind-main branch carrying the fix (a scratch branch based below `main`) renders the approval card instead of dying with exit 128 — capture the banner job log (the card + count) and cancel the run after the banner job; no provisioning behaviour changed, and the banner job needs no device approval.
+- [ ] No live `mode=apply` unless provisioning behaviour changed; say that explicitly in the PR.
+
 ### Dashboard / edge
 
 - [ ] `https://status-<tenant>.piercloud.net/` is `200` over TLS; the certificate chain is valid well beyond the window (`external-watch.yml` asserts HTTP 200, live statuses data, and ≥14 days of cert validity).
