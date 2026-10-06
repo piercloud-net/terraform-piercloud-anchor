@@ -63,7 +63,8 @@
 #       whose sid has no audit events at all alerts session-start-missing past
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
-#       (shipper_keys.py, pinned to cad0p/pc-admin @ 25f7922; the generator's
+#       (shipper_keys.py, pinned to the SHA in PINNED_PC_ADMIN_SHA, currently
+#       cad0p/pc-admin @ 262e98c; the generator's
 #       provenance guard compares content, not `git status` — an
 #       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
 #       builder bytes, replacement refs are disabled (`git replace` cannot
@@ -6371,6 +6372,7 @@ fixture <<JSON
   {"key":"${DL_HEARTBEAT}","ago":60},
   {"key":"${DL_BELOW_FLAT_LATE}","ago":300},
   {"key":"${DL_BELOW_DATED}","ago":1200},
+  {"key":"audit/20260925,x/20260925T130000Z-user.login.000001.json","ago":1200},
   {"key":"recordings/${DL_SID}.tar","ago":296}],
  "uploads":[]}
 JSON
@@ -6430,6 +6432,14 @@ for entry in entries:
     # comma-bearing prefix forge the exact below-flat marker.
     served = json.loads(note.split("nonfiltering-prefixes=", 1)[1])
     served_seen.append(served)
+    # The comma-bearing prefix must survive the channel as ONE element
+    # (red-team r2g LOW): a comma join would split it into extra tokens
+    # (json.loads rejects the joined note outright), so this pins the
+    # channel's injectivity against the payload that motivated the JSON
+    # encoding — exercised through the mock's real emission.
+    if "audit/20260925,x/" not in served:
+        print("comma-bearing served prefix missing from the pin channel: %r" % served)
+        sys.exit(1)
     if below in served:
         print("non-filtering server served the below-flat day prefix (mock pinned)")
         sys.exit(0)

@@ -415,12 +415,23 @@ class Handler(BaseHTTPRequestHandler):
             # the local-name client, so the pin must see it too (the r2d
             # strict-{ns} pin missed it — r2f trust NIT).
             served = []
-            for child in ET.fromstring(body):
-                if child.tag.rsplit("}", 1)[-1] != "CommonPrefixes":
-                    continue
-                for field in child:
-                    if field.tag.rsplit("}", 1)[-1] == "Prefix":
-                        served.append(field.text or "")
+            root = ET.fromstring(body)
+            # Mirror the client's fail-closed guards (red-team r2g NIT /
+            # functional r2f residual): `list_objects_delimited` raises when
+            # the root is not ListBucketResult or an <Error> child is
+            # present, so the pin must not read prefixes out of a body the
+            # client would refuse. Without this, a root-name-corrupted body
+            # with a direct CommonPrefixes child let the pin tooth pass
+            # while the client failed closed (no suite-green vacuity, but
+            # the standalone fidelity claim was wrong).
+            if (root.tag.rsplit("}", 1)[-1] == "ListBucketResult"
+                    and not any(child.tag.rsplit("}", 1)[-1] == "Error" for child in root)):
+                for child in root:
+                    if child.tag.rsplit("}", 1)[-1] != "CommonPrefixes":
+                        continue
+                    for field in child:
+                        if field.tag.rsplit("}", 1)[-1] == "Prefix":
+                            served.append(field.text or "")
             served.sort()
             # JSON, not a comma join (red-team r2f LOW): a served prefix may
             # itself contain a comma, so a comma-joined note could forge the
