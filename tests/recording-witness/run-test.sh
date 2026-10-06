@@ -215,7 +215,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=961
+MIN_CHECKS=965
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -6464,6 +6464,50 @@ case "${CASE_DETAIL}" in
 esac
 is "empty cursor below: the sweep seeds the dated cursor" \
   "${DL_BELOW_DATED}" "$(state_field observed.cursors.audit_session_dated)"
+
+# Guard-mirror fidelity (red-team r2j LOW): a delimiter page whose
+# <NextContinuationToken> element is present but EMPTY is refused by the
+# client (`next_token = child.text or ""`), so the pin must refuse it too
+# and log no served prefixes. Pre-fix, mere element presence counted as a
+# token and the pin read prefixes from a body the client fails closed on.
+# `fail_delimited` scopes the empty token to the delimiter listing so the
+# earlier non-delimited (heartbeat) listing still succeeds and the pin is
+# actually reached.
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-159-empty-token.log"
+: >"${REQUEST_LOG}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"prefixes_ignore_start_after":true,
+ "fail_delimited":"truncated-empty-token",
+ "objects":[
+  {"key":"${DL_HEARTBEAT}","ago":60},
+  {"key":"${DL_BELOW_FLAT_LATE}","ago":300},
+  {"key":"${DL_BELOW_DATED}","ago":1200},
+  {"key":"recordings/${DL_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${dl_below_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "empty continuation token: the delta fails closed" "2" "${CASE_RC}"
+is "empty continuation token: error verdict" "error" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"truncated without a continuation token"*) ok "empty-token truncation detail is explicit" ;; *) bad "empty-token truncation detail: ${CASE_DETAIL}" ;; esac
+if python3 - "${WORK}/requests-159-empty-token.log" <<'PY'
+import json
+import sys
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+for entry in entries:
+    note = entry.get("note", "")
+    if "nonfiltering-prefixes=" not in note:
+        continue
+    served = json.loads(note.split("nonfiltering-prefixes=", 1)[1])
+    if served:
+        print("empty-token page: the mock pinned served prefixes the client refuses: %r" % (served,))
+        sys.exit(1)
+print("empty-token page: the mock refused to pin served prefixes")
+PY
+then ok "empty-token page: the mock refused to pin served prefixes"; else bad "empty-token page: the mock pinned served prefixes the client refuses"; fi
 
 # (7) Bounded day selection: a discovered day BELOW the dated cursor is not
 # re-listed (request-count pin); a late dated key on a below-cursor day is

@@ -324,6 +324,13 @@ class Handler(BaseHTTPRequestHandler):
         if start_after and not FIXTURE.get("objects_ignore_start_after"):
             matching = [obj for obj in matching if obj["key"] > start_after]
         suppress_token = FIXTURE.get("fail_objects") == "truncated-no-token"
+        empty_token = FIXTURE.get("fail_objects") == "truncated-empty-token"
+        if delimiter and FIXTURE.get("fail_delimited") == "truncated-empty-token":
+            # Guard-mirror tooth (red-team r2j LOW): only delimiter listings
+            # carry the `nonfiltering-prefixes` pin, so the empty-token page
+            # must be reachable without failing the earlier non-delimited
+            # (heartbeat) listing.
+            empty_token = True
         if delimiter:
             # `delimiter=/` collapses every key under the same first
             # delimiter occurrence into a CommonPrefix, and Contents and
@@ -359,11 +366,14 @@ class Handler(BaseHTTPRequestHandler):
             entries = [(obj["key"], "object", obj) for obj in matching]
         page = entries[offset:offset + PAGE_SIZE]
         next_offset = offset + PAGE_SIZE
-        truncated = suppress_token or next_offset < len(entries)
+        truncated = suppress_token or empty_token or next_offset < len(entries)
         next_token = ""
         if truncated and not suppress_token:
-            next_token = "<NextContinuationToken>%s</NextContinuationToken>" % xml_escape(
-                encode_token(next_offset, start_after))
+            if empty_token:
+                next_token = "<NextContinuationToken></NextContinuationToken>"
+            else:
+                next_token = "<NextContinuationToken>%s</NextContinuationToken>" % xml_escape(
+                    encode_token(next_offset, start_after))
         rows = ""
         common_rows = ""
         for name, kind, obj in page:
@@ -419,21 +429,27 @@ class Handler(BaseHTTPRequestHandler):
 
             def _client_accepts_page(node):
                 # Mirror list_objects_delimited's fail-closed guards (red-team
-                # r2g NIT / functional r2f residual + r2h LOW): the client
-                # raises on a non-ListBucketResult root, a direct <Error>
-                # child, a Contents entry whose LastModified is missing or
-                # unparseable, and a truncated page with no
-                # NextContinuationToken. The pin must not read prefixes out
-                # of a body the client would refuse. The LastModified leg is
-                # defensive: no current fixture produces a Contents row on a
-                # pin-read (non-filtering delimiter) page, so it is not
-                # mutation-exercised (m-badlm is a no-op); it is also
-                # stricter than the client for entries its start-after
-                # filter would drop — fail-safe either way.
+                # r2g NIT / functional r2f residual + r2h LOW, refined r2j):
+                # the client raises on a non-ListBucketResult root, a direct
+                # <Error> child, a truncated page without a non-empty
+                # NextContinuationToken, and a kept Contents entry whose
+                # LastModified is missing or unparseable. The pin must not
+                # read prefixes out of a body the client would refuse.
+                # Token fidelity (red-team r2j LOW): the client takes the
+                # LAST token element's text (`next_token = child.text or ""`)
+                # and treats empty text as no token; mere element presence is
+                # not a token.
+                # Contents fidelity (red-team r2j NIT): the client drops
+                # empty/missing-Key rows before touching LastModified, so the
+                # mirror does too. The LastModified leg stays stricter than
+                # the client for rows at/after the client's `until` bound
+                # (the mock cannot see `until`): a false-red only, never a
+                # green-forge; no current fixture puts a Contents row on a
+                # pin-read (non-filtering delimiter) page (m-badlm no-op).
                 if node.tag.rsplit("}", 1)[-1] != "ListBucketResult":
                     return False
                 truncated = False
-                next_token = False
+                next_token = ""
                 for child in node:
                     name = child.tag.rsplit("}", 1)[-1]
                     if name == "Error":
@@ -441,12 +457,18 @@ class Handler(BaseHTTPRequestHandler):
                     if name == "IsTruncated":
                         truncated = (child.text or "").strip().lower() == "true"
                     elif name == "NextContinuationToken":
-                        next_token = True
+                        next_token = child.text or ""
                     elif name == "Contents":
+                        key = ""
                         last_modified = None
                         for field in child:
-                            if field.tag.rsplit("}", 1)[-1] == "LastModified":
+                            field_name = field.tag.rsplit("}", 1)[-1]
+                            if field_name == "Key":
+                                key = field.text or ""
+                            elif field_name == "LastModified":
                                 last_modified = field.text
+                        if not key:
+                            continue
                         if last_modified is None:
                             return False
                         try:
@@ -456,6 +478,8 @@ class Handler(BaseHTTPRequestHandler):
                             datetime.fromisoformat(value)
                         except ValueError:
                             return False
+                if not truncated and next_token:
+                    truncated = True
                 return not (truncated and not next_token)
 
             if _client_accepts_page(root):
