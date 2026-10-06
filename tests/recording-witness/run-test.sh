@@ -189,7 +189,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=814
+MIN_CHECKS=815
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -4765,6 +4765,10 @@ start_mock
 RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS=999999999999999' run_delta "${overflow_dir}"
 is "absurd clock-skew tolerance: exit 0 (no crash)" "0" "${CASE_RC}"
 is "absurd clock-skew tolerance: ok verdict" "ok" "${CASE_STATE}"
+# The chosen semantics are rejection, not clamp-to-default: no shaped audit
+# key may move a cursor under the absurd tolerance (a clamp fix would move
+# them). Recordings keys carry no `<ts>` and stay cursor movers.
+is "absurd clock-skew tolerance: shaped keys never move a cursor" "" "$(state_field observed.cursors.audit_session)"
 
 # Forged state with a future-dated cursor (calendar-valid session-family,
 # calendar-invalid sid-less, future heartbeat): the load guard must reject it
@@ -4991,7 +4995,12 @@ import sys
 # > DELTA_MAX_PAGES (50) new heartbeat keys above the cursor with page_size=1:
 # the delta tail overflows, falls back to a sweep, and versions are denied.
 objects = [
-    {"key": "audit/heartbeat/20270101T%02d0000Z.json" % index, "ago": 60}
+    # Date-inert on purpose (round-6 lenses): these 60 keys only need to sit
+    # above the session cursor - the `audit/heartbeat/` prefix sorts above
+    # every digit-leading `<ts>` key, so their dates never matter (verified:
+    # a 2020-dated copy still passes 814/0); year-9999 keeps the hygiene rule
+    # (no expiring fixture stamps) without changing the scenario.
+    {"key": "audit/heartbeat/99991231T%02d0000Z.json" % index, "ago": 60}
     for index in range(60)
 ]
 objects.append({"key": "audit/20260925T135000Z-session.start.9f8c4b1e-0d2a-4f7e-9c11-2b3d4e5f6a70.0.json", "ago": 300})
