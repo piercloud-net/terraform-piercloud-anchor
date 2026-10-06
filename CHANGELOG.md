@@ -58,6 +58,7 @@ All notable changes to this project will be documented in this file.
 - *(witness)* Close the run-once race against the timer's immediate first fire (closes #143)
 - *(provision)* SSH keepalives on the A1 long-lived connection (closes #162)
 - *(witness)* Harden the vector-generator provenance guard + \Z-anchor the replica TS_RE (closes #155)
+- *(witness)* Bound the delta session listing at the heartbeat stem (closes #161)
 
 ### 💼 Other
 
