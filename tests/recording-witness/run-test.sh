@@ -6789,6 +6789,17 @@ fi
 # stripped view, so a quoted option/name (`declare "-A" "${b}SH_CMDS[…]"`
 # rebuilding `BASH_CMDS`) hid from it — the hash tooth now also reads its
 # quote/expansion-stripped joined view for that clause.
+#
+# r19 red-team HIGH: an assignment word before the prefix chain
+# (`FOO=bar export "PATH=…"`, `FOO=bar command export …`, `! FOO=bar export`,
+# `time FOO=bar export`, `FOO=bar command printf -v "PATH"`,
+# `FOO=bar declare -x "PATH=…"`, `FOO=bar mapfile -t "PATH"`) shifted the
+# verb past the position class with every static tooth green while the
+# assignment poisoned PATH on-box. The loop now also strips assignment words
+# at a command position, so the verb lands where the branches match. (An
+# assignment whose quoted value contains whitespace — `FOO="a b" export …` —
+# is not statically resolvable after the char-level quote strip and stays in
+# the disclosed crafted-edit class, like the `${IFS}` separators.)
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6815,6 +6826,7 @@ if awk -v q="'" '
     do {
       prev = line
       gsub(/(^|[;&|()!{}])[[:space:]]*(builtin|command)([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
+      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+/, "; ", line)
       line = normalize_cmdpos(line)
     } while (line != prev)
     if (line ~ /(^|[;&|()!{}])[[:space:]]*PATH\+?=/ ||
@@ -6930,6 +6942,15 @@ fi
 # `time trap …`). The tooth now reads PROVISION_CODE (quote-aware comment
 # stripping) and runs the reserved-word normalizer before the match, so
 # `then`/`do`/`else`/`elif`/`time`/`{`/`}` all count as command positions.
+#
+# r19 red-team HIGH + functional MED (delta re-check): the main-sync allowlist
+# collapsed a brace-less `$name` to its name — `trap "$…timer_start" EXIT`
+# (value `…; :`) read as the pinned literal and ran an arbitrary EXIT action —
+# and the deny branch missed repeated `command` prefixes
+# (`command command trap …`, `command -p command trap …`); an assignment word
+# (`FOO=bar trap …`) was the same position-class gap. Closed in place: the
+# allowlist view no longer strips `$`, and the deny view strips
+# `command`/assignment prefixes iteratively before the match.
 if awk -v q="'" '
   function normalize_cmdpos(s,   prev) {
     do {
@@ -6949,19 +6970,37 @@ if awk -v q="'" '
     gsub(q, "", line)
     gsub(/\\/, "", line)
     line = normalize_cmdpos(line)
+    # r19 red-team HIGH: a repeated `command` prefix (`command command trap
+    # …`, `command -p command trap …`) shifted the verb past the single
+    # `command` branch, and an assignment word (`FOO=bar trap …`) shifted it
+    # past the position class; both ran an arbitrary EXIT trap with every
+    # static tooth green (the crafted line is in-span — it can replace the
+    # shipped trap). Strip `command` prefixes (with their options) and
+    # assignment words at a command position, iterating with the
+    # reserved-word normalizer like the PATH tooth (r18), so the verb lands
+    # where the deny branch matches.
+    do {
+      prev = line
+      gsub(/(^|[;&|()!{}])[[:space:]]*command([[:space:]]+-[^[:space:];&|]+)*[[:space:]]+/, "; ", line)
+      gsub(/(^|[;&|()!{}])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+/, "; ", line)
+      line = normalize_cmdpos(line)
+    } while (line != prev)
     # main-sync fold (2026-10-06, PR #156): the merged #153 acceptance
     # installs and clears its EXIT trap, so pin exactly those two shipped
     # forms (anchored: a combined or rewritten line stays refused). The
-    # allowlist reads a quote/backslash-stripped but expansion-PRESERVED view
+    # allowlist reads a quote/backslash-stripped, expansion-PRESERVED view
     # (r18 red-team HIGH + functional LOW): the main view drops `${x}`/`$x`,
-    # so an expansion-rebuilt action or sigspec
-    # (`trap "recording_witness_timer_start${x}" EXIT`,
-    # `trap '…' EX${x:-$(cmd)}IT`) would read as the pinned form while its
-    # runtime effect is attacker-controlled (`x="; exit 0; :"` rewrites the
-    # process rc; a substitution runs arbitrary root commands). The shipped
-    # lines carry no expansion.
+    # so an expansion-rebuilt action or sigspec would read as the pinned
+    # form while its runtime effect is attacker-controlled (`x="; exit 0; :"`
+    # rewrites the process rc; a substitution runs arbitrary root commands).
+    # `$` is never stripped from this view (r19 functional MED + red-team
+    # HIGH): stripping it glued a brace-less `$name` onto the pinned word
+    # (`trap "recording_witness_timer_$start" EXIT` read as the literal
+    # action), so a braced (`${x}`), brace-less (`$start`, incl. a rebuilt
+    # sigspec `EX$IT`) or command-substitution spelling stays visible and
+    # fails the anchored match. The shipped lines carry no expansion.
     pinned_view = $0
-    gsub(/[$"]/, "", pinned_view)
+    gsub(/"/, "", pinned_view)
     gsub(q, "", pinned_view)
     gsub(/\\/, "", pinned_view)
     pinned_trap = (pinned_view ~ /^[[:space:]]*trap[[:space:]]+recording_witness_timer_start[[:space:]]+EXIT[[:space:]]*$/ ||
