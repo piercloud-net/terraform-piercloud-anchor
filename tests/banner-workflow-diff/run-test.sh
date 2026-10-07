@@ -55,7 +55,8 @@
 #       blocks in the counted root HCL today; the example tree has one,
 #       unexecuted; fail-closed over-refusals: a non-block first-token
 #       `module` (e.g. `module = 3`), any `*/`-before-`module` line incl.
-#       heredoc/string text, a line ending in the literal `"module"`);
+#       heredoc/string text, a comment/heredoc/string carrying `"module":`,
+#       a line ending in the literal `"module"`);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
 #       form (arithmetic/export/read/declare/let/unset/readonly/typeset/
@@ -65,9 +66,12 @@
 #       option/continuation/quote/newline/backslash-splice-tolerant
 #       no-fetch-or-pull with no git alias and no fetch/pull assignment, and
 #       the banner job's single fetch-depth: 0; ci.yml gates AND runs this
-#       harness. Residual: single-quote splicing (`COU'NT=0`), deep variable
-#       indirection (`cmd=git; $cmd fetch`, `git${IFS}fetch`) and an escaped
-#       JSON module key (`"\u006dodule"`) are out of a textual pin's reach —
+#       harness. Residual: single-quote splicing is not executable as a bare
+#       assignment (a syntax error / `COUNT=0: command not found`; the
+#       executable keyword forms are caught by the override pins), deep
+#       variable indirection (`cmd=git; $cmd fetch`, `git${IFS}fetch`) and an
+#       escaped JSON module key (`"\u006dodule"`) are out of a textual pin's
+#       reach —
 #       the pin is a regression tripwire, the review is the backstop.
 set -euo pipefail
 
@@ -367,6 +371,28 @@ printf 'locals {\n  description = <<EOT\n*/ module is mentioned in this heredoc 
 git_c add -A
 git_c commit -qm "heredoc line with a comment close before a module token (fail-closed refusal)"
 git_c push -q origin moduleheredocclose
+
+git_c checkout -qb modulecloseattached main
+mkdir -p modules/m
+printf '/*c*/module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "comment close attached to the module token (no gap)"
+git_c push -q origin modulecloseattached
+
+git_c checkout -qb moduleclosetab main
+mkdir -p modules/m
+printf '/*c*/\tmodule "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "comment close with a tab gap before the module token"
+git_c push -q origin moduleclosetab
+
+git_c checkout -qb modulecolonprose main
+printf '# "module": key-like text in a comment\n' > main.tf
+git_c add -A
+git_c commit -qm "comment carrying a JSON-key-shaped string (fail-closed refusal)"
+git_c push -q origin modulecolonprose
 
 git_c checkout -qb moduleindented main
 mkdir -p modules/m
@@ -711,13 +737,24 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
-for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose; do
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose; do
   git_c checkout -q "$variant"
   rc=0
   out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
   if [ "$rc" -ne 0 ]; then ok "$variant: rc non-zero"; else bad "$variant: rc=$rc"; fi
   is "$variant: no count on stdout" "" "$out"
   if grep -q '::error::' "$WORK/$variant.err"; then ok "$variant: ::error:: annotation"; else bad "$variant: no ::error::"; fi
+done
+# The close-leg fixtures must exercise the close leg, not the first leg: a
+# payload rewrite to a first-token `module` would keep the refusal green while
+# silently dropping the close-leg coverage (red-team r5g LOW).
+for variant in moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached moduleclosetab modulebomcomment; do
+  git_c checkout -q "$variant"
+  if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)' -- main.tf; then
+    bad "$variant: fixture is first-leg-detectable (close-leg coverage lost)"
+  else
+    ok "$variant: fixture exercises the close leg only"
+  fi
 done
 git_c checkout -q modprose
 rc=0
@@ -791,10 +828,15 @@ if grep -qE "$override_re" <<<"$banner_active"; then bad "the banner step carrie
 # The shipped check must consume the shared `override_re` (the probes below
 # pin its content; this pins the call site — red-team r5f LOW: an inline
 # literal minus `[\\]?` at the call site stayed 159/0).
-if [ "$(grep -cE '^if grep -qE "[$]override_re" <<<"\$banner_active"; then bad' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
-  ok "the shipped override check consumes override_re (the call site is pinned)"
+# The shipped check must consume the shared `override_re`, and it must be the
+# only `banner_active` override test in the file: a dead/decoy copy of the
+# pinned line must not keep a weakened (inline-literal) call site green
+# (red-team r5f LOW; red-team r5g LOW — the decoy shape).
+ov_uses="$(grep -E 'grep -qE .*banner_active' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh" | grep -v 'grep -c' | grep -v 'splice_re' | wc -l | tr -d ' ')"
+if [ "$ov_uses" = "1" ] && [ "$(grep -cE '^if grep -qE "[$]override_re" <<<"\$banner_active"; then bad' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the shipped override check consumes override_re (the call site is pinned, no decoy)"
 else
-  bad "the shipped override check does not consume the shared override_re"
+  bad "the shipped override check does not consume the shared override_re (or a decoy copy exists)"
 fi
 stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
 if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
