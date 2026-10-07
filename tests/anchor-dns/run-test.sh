@@ -408,8 +408,14 @@ is "in-zone STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
 reset_state
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="1.2.3.4" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
 [ "$rc" != "0" ] && ok "IPv4-literal STATUS_EDGE_DOMAIN fails closed (rc=$rc)" || bad "IPv4-literal STATUS_EDGE_DOMAIN did not fail"
-contains "IPv4-literal STATUS_EDGE_DOMAIN message" "is an IPv4 literal" "$(LOG)"
+contains "IPv4-literal STATUS_EDGE_DOMAIN message" "numeric dotted name" "$(LOG)"
 is "IPv4-literal STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
+# A 5-label numeric name is not a dotted quad but is still an address literal.
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="1.2.3.4.5" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+[ "$rc" != "0" ] && ok "numeric-name STATUS_EDGE_DOMAIN fails closed (rc=$rc)" || bad "numeric-name STATUS_EDGE_DOMAIN did not fail"
+contains "numeric-name STATUS_EDGE_DOMAIN message" "numeric dotted name" "$(LOG)"
+is "numeric-name STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
 reset_state
 _long_label="$(printf 'a%.0s' {1..64}).cloudfront.net"
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$_long_label" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
@@ -437,7 +443,8 @@ rc="$(run_writer TENANT_USER=$'a\nb' ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_
 contains "newline TENANT_USER message" "is not a DNS label" "$(LOG)"
 is "newline TENANT_USER wrote nothing" "" "$(GC_KEYS)"
 
-# ---- red: missing token per provider (fail-closed, names the secret) ------reset_state
+# ---- red: missing token per provider (fail-closed, names the secret) ------
+reset_state
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP")"
 [ "$rc" != "0" ] && ok "missing CLOUDFLARE_DNS_TOKEN fails closed (rc=$rc)" || bad "missing CLOUDFLARE_DNS_TOKEN did not fail"
 contains "missing token names CLOUDFLARE_DNS_TOKEN" "CLOUDFLARE_DNS_TOKEN is not set" "$(LOG)"

@@ -92,11 +92,11 @@ fi
 PROVIDER="${NET_DNS_PROVIDER:-cloudflare}"
 case "$PROVIDER" in
   cloudflare | gcore) ;;
-  *) echo "::error::NET_DNS_PROVIDER='$PROVIDER' is not one of cloudflare|gcore — refusing to guess a provider."; exit 1 ;;
+  *) printf '::error::NET_DNS_PROVIDER=%q is not one of cloudflare|gcore — refusing to guess a provider.\n' "$PROVIDER"; exit 1 ;;
 esac
 
 ANCHOR_TTL="${ANCHOR_TTL:-300}" # DNS-only record TTL; Gcore Free rejects TTL < 120 s at the API.
-case "$ANCHOR_TTL" in '' | *[!0-9]*) echo "::error::ANCHOR_TTL='$ANCHOR_TTL' is not an integer."; exit 1 ;; esac
+case "$ANCHOR_TTL" in '' | *[!0-9]*) printf '::error::ANCHOR_TTL=%q is not an integer.\n' "$ANCHOR_TTL"; exit 1 ;; esac
 
 CF_API="https://api.cloudflare.com/client/v4"
 GCORE_API="https://api.gcore.com"
@@ -162,8 +162,14 @@ if ! [[ "$status_edge_domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0
   printf '::error::STATUS_EDGE_DOMAIN=%q is not a valid hostname (lowercase alnum/hyphen labels, no trailing dot) — refusing to write it.\n' "$status_edge_domain"
   exit 1
 fi
+# Any all-numeric dotted name is an address literal in some notation (dotted
+# quad, or a partial/5-label form); a CNAME target must be a DNS name.
+if [[ "$status_edge_domain" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+  echo "::error::STATUS_EDGE_DOMAIN is a numeric dotted name (an IP address literal) — a CNAME target must be a DNS name."
+  exit 1
+fi
 # RFC 1035 bounds: a regex-legal but over-long name fails at the API (or is
-# partially accepted); the target must also be a NAME, never an address literal.
+# partially accepted) — refuse it before any auth file exists.
 if [ "${#status_edge_domain}" -gt 253 ]; then
   echo "::error::STATUS_EDGE_DOMAIN is longer than 253 characters — not a valid DNS name."
   exit 1
@@ -175,10 +181,6 @@ for _edge_label in "${_edge_labels[@]}"; do
     exit 1
   fi
 done
-if [[ "$status_edge_domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "::error::STATUS_EDGE_DOMAIN is an IPv4 literal — a CNAME target must be a DNS name."
-  exit 1
-fi
 
 # D5: lowercase, alnum + hyphen only; anything else becomes a hyphen, runs
 # collapse, edges trim. Empty after cleaning = refuse.
