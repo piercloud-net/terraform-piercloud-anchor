@@ -126,10 +126,12 @@ fi
 # a textual scan's reach; the gate over-refuses (fail-closed) any line whose
 # first token is `module` even when it is not a block (e.g. a `module = 3`
 # local), any line where a `*/` precedes a `module` token (incl. heredoc/string
-# text like `*/ module …`), any line whose comment/heredoc/string text carries
-# `"module":` (the JSON-key leg is unanchored so minified JSON is caught), and
-# a line ending in the literal string `"module"` — the review is the backstop
-# (trust r5f/r5g LOW, red-team r5f LOW, functional r5g LOW).
+# text like `*/ module …`), any line carrying `"module":` outside a JSON key —
+# comment/heredoc/string text or a valid expression (`x = true ? "module" : "y"`,
+# `x = { "module": true }`; the JSON-key leg is unanchored so minified JSON is
+# caught) — and a line ending in the literal string `"module"` — the review is
+# the backstop (trust r5f/r5g/r5h LOW, red-team r5f/r5h LOW, functional r5g/r5h
+# LOW).
 if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
    || git grep -qE $'^\xef\xbb\xbf[[:space:]]*module([^[:alnum:]_]|$)' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
   echo "::error::a module block exists in the counted root HCL — its source tree is executed code outside the counted set; add it to the pathspecs and relax this gate deliberately" >&2
