@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""Replica of the pc-admin shipper's audit-key grammar (b2_client.build_audit_key).
 
-PINNED AGAINST: cad0p/pc-admin @ 807bfd454b204aa1e197275b312a8fb7c2272274 —
+PINNED AGAINST: cad0p/pc-admin @ 1b9946cbbad50c8822fad8f23eed9d8770181496 —
 the **seq-range grammar** (pc-admin #29): the optional inclusive range token
 ``<seq-start>-<seq-end>`` on batched (non-lifecycle) keys, built by
 ``build_audit_range_key`` and preserved by ``disambiguate_audit_key`` (a
@@ -156,7 +156,7 @@ import re
 import sys
 from datetime import datetime
 
-PINNED_PC_ADMIN_SHA = "807bfd454b204aa1e197275b312a8fb7c2272274"
+PINNED_PC_ADMIN_SHA = "1b9946cbbad50c8822fad8f23eed9d8770181496"
 # Date-partition grammar (pc-admin #30): ``audit/YYYYMMDD/<basename>``. The
 # segment must be a real calendar date; a non-calendar all-digit segment is
 # malformed and refused, never stripped (mirrors

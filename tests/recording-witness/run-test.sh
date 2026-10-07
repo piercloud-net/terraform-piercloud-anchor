@@ -64,7 +64,7 @@
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
 #       (shipper_keys.py, pinned to the SHA in PINNED_PC_ADMIN_SHA, currently
-#       cad0p/pc-admin @ 807bfd4; the generator's
+#       cad0p/pc-admin @ 1b9946c; the generator's
 #       provenance guard compares content, not `git status` — an
 #       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
 #       builder bytes, replacement refs are disabled (`git replace` cannot
@@ -273,7 +273,7 @@ audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 807bfd4
+# were generated from the real builder at cad0p/pc-admin @ 1b9946c
 # (pc-admin #29: the optional inclusive seq-range token on batched
 # non-lifecycle keys, `build_audit_range_key` + the parser's `seq_end` + the
 # range-preserving `disambiguate_audit_key`); the previous grammar point was
@@ -674,7 +674,7 @@ if (len(vectors["vectors"]) != 39 or len(vectors["date_segments"]) != 15
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "3e44d69921770ad0cf1c6e9e4d4ab637aa0a98ad406899efe4324f3bda3f83be"
+MATRIX_SHA256 = "f6533f04839c8b4f32417fa09d45cc5a22797130b8d8fe15b80b850dc6d98cc8"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -786,7 +786,7 @@ print("vectors=%d segments=%d full_key_refusals=%d refusals=%d pin=%s source=%s"
     len(vectors["full_key_refusals"]), len(vectors["refusals"]),
     vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=39 segments=15 full_key_refusals=4 refusals=22 pin=807bfd454b204aa1e197275b312a8fb7c2272274 source=807bfd454b20" ]]; then
+)" && [[ "$matrix_out" == "vectors=39 segments=15 full_key_refusals=4 refusals=22 pin=1b9946cbbad50c8822fad8f23eed9d8770181496 source=1b9946cbbad5" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
