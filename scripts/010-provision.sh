@@ -1240,6 +1240,23 @@ if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   if [ -n "${caddy_pid}" ] && ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"; then
     CADDY_MOUNT_STALE=1
   fi
+  # The deployed PEMs are bind-mounted FILES too (same class): a container
+  # created before a PEM's inode last changed keeps reading the OLD bytes and
+  # `caddy reload` cannot fix it — live 2026-10-07: the 4-block chain install
+  # landed on the host while the container still served the leaf-only inode
+  # (CloudFront 502 with a green run). Compare the container's view through
+  # its root; divergence = recreate once.
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ "${ORIGIN_TLS}" = "1" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_CRT}" "${CADDY_ORIGIN_CRT}" \
+       || ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_KEY}" "${CADDY_ORIGIN_KEY}"; then
+      CADDY_MOUNT_STALE=1
+    fi
+  fi
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ -n "${AOP_TLS}" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/aop-ca.pem" "${CADDY_AOP_CA}"; then
+      CADDY_MOUNT_STALE=1
+    fi
+  fi
 fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   CADDY_RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' caddy) # ci-allowlist: code — docker inspect field name, not a live reference.
