@@ -12,8 +12,10 @@
 # flat `<site>-<tenant>` one label deep; the anchor stays
 # anchor-01-<tenant>.piercloud.net (NN=01; -02+ is a future multi-anchor
 # case), the dashboard is NESTED under the platform status namespace:
-# <tenant>.status.piercloud.net (covered by the `*.status.piercloud.net`
-# wildcard + the CloudFront edge; the anchor's public cert SAN).
+# <tenant>.status.piercloud.net (written as an explicit CNAME to the
+# CloudFront edge — STATUS_EDGE_DOMAIN; the `_acme-challenge.<tenant>.status`
+# node is an ENT that blocks wildcard synthesis on RFC 4592-strict providers,
+# so the explicit record is the durable form; also the anchor's cert SAN).
 #
 # validate_tenant_username is deliberately strict and fails closed on the
 # LOWERCASED RAW value: the sanitizer maps `.pier`, `pier-`, `pier--carlo`

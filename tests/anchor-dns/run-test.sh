@@ -9,7 +9,10 @@
 # record types, zone override, provider switch. Red: verify-after-write
 # mismatch (both providers, both record types), Gcore GET non-200, missing
 # token per provider (fail-closed, names the org secret), missing/invalid
-# STATUS_EDGE_DOMAIN (fail-closed, nothing written), rejected writes, stale
+# STATUS_EDGE_DOMAIN (fail-closed, nothing written), semantic target rejects
+# (in-zone, IPv4 literal, over-long label), a newline value that cannot forge
+# a workflow command, a derived-name guard on hostile TENANT_USER, second-write
+# failure (A landed, CNAME rejected), rejected writes, stale
 # rrset shapes, bad provider, bad zone. Static wiring: the writer derives
 # the status host, provision.yml passes the provider switch + both tokens +
 # STATUS_EDGE_DOMAIN, and the Gcore boolean read uses tostring (the repo's
@@ -89,26 +92,50 @@ if [[ "$url" == *"api.cloudflare.com"* ]]; then
   esac
   if [[ "$url" == *"/zones/zone-cf/dns_records"* ]]; then
     if [[ "$url" == *"?"* ]]; then
-      name="${url#*name=}"
-      rec="$(jq -c --arg n "$name" '.[$n] // empty' "$CF")"
-      if [ -n "$rec" ]; then
-        if [ -n "${STUB_CF_MISMATCH:-}" ]; then
-          rec="$(printf '%s' "$rec" | jq -c '.content = "203.0.113.99"')"
-        fi
-        if [ -n "${STUB_CF_CNAME_MISMATCH:-}" ] && [[ "$name" == *.status.* ]]; then
-          rec="$(printf '%s' "$rec" | jq -c '.content = "203.0.113.99"')"
-        fi
-        if [ -n "${STUB_CF_DUPLICATE:-}" ]; then
-          emit 200 "{\"result\":[$rec,$rec]}"
+      # Parse type= and name= (either order) and honor BOTH: the stub keys
+      # records by name/type, so a writer that drops `type=` (or queries the
+      # wrong type) sees the real-API shape — all records for the name, or
+      # none — and must fail its own exact-one verify. (The pre-fold stub keyed
+      # by name only and accepted the drift.)
+      q_type=""; q_name=""
+      [[ "$url" =~ [\?\&]type=([A-Za-z0-9]+) ]] && q_type="${BASH_REMATCH[1]}"
+      [[ "$url" =~ [\?\&]name=([^&]+) ]] && q_name="${BASH_REMATCH[1]}"
+      if [ -z "$q_name" ]; then emit 500 '{"error":"stub-curl: CF query without name"}'; exit 0; fi
+      if [ -n "$q_type" ]; then
+        rec="$(jq -c --arg k "$q_name/$q_type" '.[$k] // empty' "$CF")"
+        if [ -n "$rec" ]; then
+          if [ -n "${STUB_CF_MISMATCH:-}" ]; then
+            rec="$(printf '%s' "$rec" | jq -c '.content = "203.0.113.99"')"
+          fi
+          if [ -n "${STUB_CF_CNAME_MISMATCH:-}" ] && [[ "$q_name" == *.status.* ]]; then
+            rec="$(printf '%s' "$rec" | jq -c '.content = "203.0.113.99"')"
+          fi
+          if [ -n "${STUB_CF_TYPE_LIE:-}" ] && [[ "$q_name" == *.status.* ]]; then
+            rec="$(printf '%s' "$rec" | jq -c '.type = "ZZZ"')"
+          fi
+          if [ -n "${STUB_CF_DOTTED:-}" ]; then
+            # Real CF serves name-valued content with or without the root dot;
+            # the writer's one-dot strip is the contract under test.
+            rec="$(printf '%s' "$rec" | jq -c '.content = (.content + ".")')"
+          fi
+          if [ -n "${STUB_CF_DUPLICATE:-}" ]; then
+            emit 200 "{\"result\":[$rec,$rec]}"
+          else
+            emit 200 "{\"result\":[$rec]}"
+          fi
         else
-          emit 200 "{\"result\":[$rec]}"
+          emit 200 '{"result":[]}'
         fi
       else
-        emit 200 '{"result":[]}'
+        recs="$(jq -c --arg n "$q_name" '[to_entries[] | select(.value.name == $n) | .value]' "$CF")"
+        emit 200 "{\"result\":$recs}"
       fi
     else
       if [ -n "${STUB_CF_WRITE_HTTP:-}" ]; then emit "$STUB_CF_WRITE_HTTP" '{"success":false}'; exit 0; fi
-      jq -c --argjson d "$data" '.[$d.name] = {id: "rec1", name: $d.name, type: $d.type, content: $d.content, ttl: $d.ttl, proxied: $d.proxied}' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+      # Second-write failure knob: fail only the dashboard CNAME write, so
+      # "A upserted + verified, CNAME write rejected" is a tested state.
+      if [ -n "${STUB_CF_FAIL_STATUS_WRITE:-}" ] && [[ "$data" == *".status."* ]]; then emit 500 '{"success":false}'; exit 0; fi
+      jq -c --argjson d "$data" '.[$d.name + "/" + $d.type] = {id: "rec1", name: $d.name, type: $d.type, content: $d.content, ttl: $d.ttl, proxied: $d.proxied}' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
       emit 200 '{"success":true}'
     fi
     exit 0
@@ -128,6 +155,7 @@ if [[ "$url" == *"api.gcore.com"* ]]; then
       rest="${path#*/}" # <fqdn>/<TYPE>
       rrtype="${rest##*/}" # A | CNAME
       fqdn="${rest%/$rrtype}"
+      key="$fqdn/$rrtype"
       case "$rrtype" in
         A | CNAME) ;;
         *) emit 500 '{"error":"stub-curl: unhandled rrset type"}'; exit 0 ;;
@@ -136,13 +164,24 @@ if [[ "$url" == *"api.gcore.com"* ]]; then
       case "$method" in
         GET)
           if [ -n "${STUB_GCORE_HTTP:-}" ]; then emit "$STUB_GCORE_HTTP" '{"error":"stub"}'; exit 0; fi
-          rr="$(jq -c --arg n "$fqdn" '.[$n] // empty' "$GC")"
+          # Keyed by name/type: a GET on the wrong type path must 404 (the
+          # real API addresses an rrset by name/type), so a type regression
+          # cannot read the other record and pass.
+          rr="$(jq -c --arg k "$key" '.[$k] // empty' "$GC")"
           if [ -n "$rr" ]; then
             if [ -n "${STUB_GCORE_MISMATCH:-}" ]; then
               rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content = ["203.0.113.99"]')"
             fi
             if [ -n "${STUB_GCORE_CNAME_MISMATCH:-}" ] && [[ "$fqdn" == *.status.* ]]; then
               rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content = ["203.0.113.99"]')"
+            fi
+            if [ -n "${STUB_GCORE_TYPE_LIE:-}" ] && [[ "$fqdn" == *.status.* ]]; then
+              rr="$(printf '%s' "$rr" | jq -c '.type = "ZZZ"')"
+            fi
+            if [ -n "${STUB_GCORE_DOTTED:-}" ] && [ "$rrtype" = "CNAME" ]; then
+              # Real Gcore may serve name-valued content with a trailing dot;
+              # the writer's one-dot strip is the contract under test.
+              rr="$(printf '%s' "$rr" | jq -c '.resource_records[0].content[0] += "."')"
             fi
             if [ -n "${STUB_GCORE_DUPLICATE:-}" ]; then
               rr="$(printf '%s' "$rr" | jq -c '.resource_records += [.resource_records[0]]')"
@@ -159,7 +198,9 @@ if [[ "$url" == *"api.gcore.com"* ]]; then
           fi ;;
         PUT | POST)
           if [ -n "${STUB_GCORE_WRITE_HTTP:-}" ]; then emit "$STUB_GCORE_WRITE_HTTP" '{"error":"stub"}'; exit 0; fi
-          jq -c --argjson d "$data" --arg n "$fqdn" --arg t "$rrtype" '.[$n] = {name: $n, type: $t, ttl: $d.ttl, resource_records: $d.resource_records}' "$GC" > "$GC.tmp" && mv "$GC.tmp" "$GC"
+          # Second-write failure knob: fail only the dashboard CNAME write.
+          if [ -n "${STUB_GCORE_FAIL_STATUS_WRITE:-}" ] && [[ "$fqdn" == *.status.* ]]; then emit 500 '{"error":"stub"}'; exit 0; fi
+          jq -c --argjson d "$data" --arg n "$fqdn" --arg t "$rrtype" '.[$n + "/" + $t] = {name: $n, type: $t, ttl: $d.ttl, resource_records: $d.resource_records}' "$GC" > "$GC.tmp" && mv "$GC.tmp" "$GC"
           emit 200 '{"ok":true}' ;;
         *) emit 500 '{"error":"stub-curl: unhandled method"}' ;;
       esac
@@ -189,6 +230,7 @@ run_writer() { # $@ = env assignments for the writer; rc echoed; log in $WORK/la
   (
     unset NET_DNS_PROVIDER NET_DNS_ZONE ANCHOR_TTL CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN STATUS_EDGE_DOMAIN
     unset STUB_CF_MISMATCH STUB_CF_CNAME_MISMATCH STUB_GCORE_MISMATCH STUB_GCORE_CNAME_MISMATCH STUB_GCORE_HTTP STUB_CF_WRITE_HTTP STUB_GCORE_WRITE_HTTP STUB_CF_DUPLICATE STUB_GCORE_DUPLICATE STUB_GCORE_BUNDLED STUB_GCORE_JUNK_ENTRY
+    unset STUB_CF_TYPE_LIE STUB_GCORE_TYPE_LIE STUB_CF_DOTTED STUB_GCORE_DOTTED STUB_CF_FAIL_STATUS_WRITE STUB_GCORE_FAIL_STATUS_WRITE
     env "$@" bash "$SCRIPT"
   ) >"$WORK/last.log" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -212,18 +254,18 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$
 is "cloudflare create rc" "0" "$rc"
 contains "cloudflare create verifies the anchor" "verified: $T_HOST A -> $T_IP (proxied=false, ttl=300)" "$(LOG)"
 contains "cloudflare create verifies the dashboard CNAME" "verified: $T_STATUS CNAME -> $T_EDGE (proxied=false, ttl=300)" "$(LOG)"
-is "cloudflare create writes exactly both records" "$T_HOST,$T_STATUS" "$(CF_KEYS)"
+is "cloudflare create writes exactly both records" "$T_HOST/A,$T_STATUS/CNAME" "$(CF_KEYS)"
 contains "cloudflare create used POST (no record existed)" "POST" "$(cat "$WORK/curl.log")"
 lacks "cloudflare create did not PUT" "PUT" "$(cat "$WORK/curl.log")"
 is "cloudflare create zone resolved" "piercloud.net" "$(sort -u "$WORK/zones.log")"
 
 # ---- green: Cloudflare overwrite ------------------------------------------
 reset_state
-jq -n --arg n "$T_HOST" '{($n): {id:"rec1",name:$n,type:"A",content:"198.51.100.7",ttl:300,proxied:false}}' > "$WORK/cf-records.json"
+jq -n --arg k "$T_HOST/A" --arg n "$T_HOST" '{($k): {id:"rec1",name:$n,type:"A",content:"198.51.100.7",ttl:300,proxied:false}}' > "$WORK/cf-records.json"
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" CLOUDFLARE_DNS_TOKEN="cf-token")"
 is "cloudflare overwrite rc" "0" "$rc"
 contains "cloudflare overwrite PUT" "PUT" "$(cat "$WORK/curl.log")"
-is "cloudflare overwrite final address" "$T_IP" "$(jq -r --arg n "$T_HOST" '.[$n].content' "$WORK/cf-records.json")"
+is "cloudflare overwrite final address" "$T_IP" "$(jq -r --arg k "$T_HOST/A" '.[$k].content' "$WORK/cf-records.json")"
 contains "cloudflare overwrite logs the old address" "record exists (198.51.100.7)" "$(LOG)"
 
 # ---- red: Cloudflare verify mismatch --------------------------------------
@@ -238,29 +280,62 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$
 is "gcore create rc" "0" "$rc"
 contains "gcore create verifies the anchor" "verified: $T_HOST A -> $T_IP (ttl=300, enabled=true)" "$(LOG)"
 contains "gcore create verifies the dashboard CNAME" "verified: $T_STATUS CNAME -> $T_EDGE (ttl=300, enabled=true)" "$(LOG)"
-is "gcore create writes exactly both records" "$T_HOST,$T_STATUS" "$(GC_KEYS)"
+is "gcore create writes exactly both records" "$T_HOST/A,$T_STATUS/CNAME" "$(GC_KEYS)"
 contains "gcore create used POST (404 first)" "POST" "$(cat "$WORK/curl.log")"
-is "gcore create body shape (A content single-element array)" "[\"$T_IP\"]" "$(jq -c --arg n "$T_HOST" '.[$n].resource_records[0].content' "$WORK/gcore-rrsets.json")"
-is "gcore create enabled flag" "true" "$(jq -r --arg n "$T_HOST" '.[$n].resource_records[0].enabled' "$WORK/gcore-rrsets.json")"
-is "gcore create CNAME body shape" "[\"$T_EDGE\"]" "$(jq -c --arg n "$T_STATUS" '.[$n].resource_records[0].content' "$WORK/gcore-rrsets.json")"
+# Order contract: the anchor A is written before the dashboard CNAME (the
+# load-bearing record first; the CNAME is renewal-proofing).
+a_at="$(grep -n "/${T_HOST}/A" "$WORK/curl.log" | head -1 | cut -d: -f1)"
+c_at="$(grep -n "/${T_STATUS}/CNAME" "$WORK/curl.log" | head -1 | cut -d: -f1)"
+if [ -n "$a_at" ] && [ -n "$c_at" ] && [ "$a_at" -lt "$c_at" ]; then
+  ok "gcore create writes the anchor A before the dashboard CNAME"
+else
+  bad "gcore create order (A at ${a_at:-none}, CNAME at ${c_at:-none})"
+fi
+is "gcore create body shape (A content single-element array)" "[\"$T_IP\"]" "$(jq -c --arg k "$T_HOST/A" '.[$k].resource_records[0].content' "$WORK/gcore-rrsets.json")"
+is "gcore create enabled flag" "true" "$(jq -r --arg k "$T_HOST/A" '.[$k].resource_records[0].enabled' "$WORK/gcore-rrsets.json")"
+is "gcore create CNAME body shape" "[\"$T_EDGE\"]" "$(jq -c --arg k "$T_STATUS/CNAME" '.[$k].resource_records[0].content' "$WORK/gcore-rrsets.json")"
+
+# ---- green: a root-dotted served CNAME content is normalized --------------
+# Gcore/CF may serve name-valued content with a trailing root dot; the writer
+# strips ONE dot before comparing. A writer without the strip fails here.
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_DOTTED=1)"
+is "gcore dotted-content run rc" "0" "$rc"
+contains "gcore dotted-content verifies the CNAME" "verified: $T_STATUS CNAME -> $T_EDGE" "$(LOG)"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" CLOUDFLARE_DNS_TOKEN="cf-token" STUB_CF_DOTTED=1)"
+is "cloudflare dotted-content run rc" "0" "$rc"
+contains "cloudflare dotted-content verifies the CNAME" "verified: $T_STATUS CNAME -> $T_EDGE" "$(LOG)"
 
 # ---- green: Gcore overwrite (200 -> PUT) ----------------------------------
 reset_state
-jq -n --arg n "$T_HOST" '{($n): {name:$n,type:"A",ttl:300,resource_records:[{content:["198.51.100.7"],enabled:true}]}}' > "$WORK/gcore-rrsets.json"
+jq -n --arg k "$T_HOST/A" --arg n "$T_HOST" '{($k): {name:$n,type:"A",ttl:300,resource_records:[{content:["198.51.100.7"],enabled:true}]}}' > "$WORK/gcore-rrsets.json"
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
 is "gcore overwrite rc" "0" "$rc"
 contains "gcore overwrite PUT" "PUT" "$(cat "$WORK/curl.log")"
-is "gcore overwrite final address" "$T_IP" "$(jq -r --arg n "$T_HOST" '.[$n].resource_records[0].content[0]' "$WORK/gcore-rrsets.json")"
+is "gcore overwrite final address" "$T_IP" "$(jq -r --arg k "$T_HOST/A" '.[$k].resource_records[0].content[0]' "$WORK/gcore-rrsets.json")"
 
 # ---- green: Gcore CNAME overwrite (200 -> PUT) ----------------------------
 # The dashboard CNAME takes the same overwrite path (exact-one verify) as the
 # A record; a drifted old target must be replaced, not appended.
 reset_state
-jq -n --arg n "$T_STATUS" '{($n): {name:$n,type:"CNAME",ttl:300,resource_records:[{content:["d222222bcdef8.cloudfront.net"],enabled:true}]}}' > "$WORK/gcore-rrsets.json"
+jq -n --arg k "$T_STATUS/CNAME" --arg n "$T_STATUS" '{($k): {name:$n,type:"CNAME",ttl:300,resource_records:[{content:["d222222bcdef8.cloudfront.net"],enabled:true}]}}' > "$WORK/gcore-rrsets.json"
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
 is "gcore CNAME overwrite rc" "0" "$rc"
 contains "gcore CNAME overwrite logs the old target" "record exists" "$(LOG)"
-is "gcore CNAME overwrite final target" "$T_EDGE" "$(jq -r --arg n "$T_STATUS" '.[$n].resource_records[0].content[0]' "$WORK/gcore-rrsets.json")"
+is "gcore CNAME overwrite final target" "$T_EDGE" "$(jq -r --arg k "$T_STATUS/CNAME" '.[$k].resource_records[0].content[0]' "$WORK/gcore-rrsets.json")"
+
+# ---- green: Cloudflare CNAME overwrite (200 -> PUT) -----------------------
+# Both records pre-present on Cloudflare: the run must PUT both and leave the
+# drifted CNAME target replaced (the A path alone does not exercise this).
+reset_state
+jq -n --arg ak "$T_HOST/A" --arg an "$T_HOST" --arg ck "$T_STATUS/CNAME" --arg cn "$T_STATUS" \
+  '{($ak): {id:"rec1",name:$an,type:"A",content:"198.51.100.7",ttl:300,proxied:false},
+    ($ck): {id:"rec2",name:$cn,type:"CNAME",content:"d222222bcdef8.cloudfront.net",ttl:300,proxied:false}}' > "$WORK/cf-records.json"
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" CLOUDFLARE_DNS_TOKEN="cf-token")"
+is "cloudflare CNAME overwrite rc" "0" "$rc"
+is "cloudflare CNAME overwrite final target" "$T_EDGE" "$(jq -r --arg k "$T_STATUS/CNAME" '.[$k].content' "$WORK/cf-records.json")"
+is "cloudflare CNAME overwrite kept the anchor" "$T_IP" "$(jq -r --arg k "$T_HOST/A" '.[$k].content' "$WORK/cf-records.json")"
 
 # ---- red: Gcore verify mismatch -------------------------------------------
 reset_state
@@ -282,6 +357,16 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$
 [ "$rc" != "0" ] && ok "gcore CNAME verify mismatch fails the run (rc=$rc)" || bad "gcore CNAME verify mismatch did not fail"
 contains "gcore CNAME verify mismatch message" "verify-after-write mismatch" "$(LOG)"
 contains "gcore CNAME verify mismatch names the status record" "$T_STATUS CNAME" "$(LOG)"
+
+# ---- red: a served type lie fails verify (both providers) -----------------
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" CLOUDFLARE_DNS_TOKEN="cf-token" STUB_CF_TYPE_LIE=1)"
+[ "$rc" != "0" ] && ok "cloudflare served type lie fails the run (rc=$rc)" || bad "cloudflare served type lie did not fail"
+contains "cloudflare served type lie message" "verify-after-write mismatch" "$(LOG)"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_TYPE_LIE=1)"
+[ "$rc" != "0" ] && ok "gcore served type lie fails the run (rc=$rc)" || bad "gcore served type lie did not fail"
+contains "gcore served type lie message" "verify-after-write mismatch" "$(LOG)"
 
 # ---- red: Gcore initial GET non-200 ---------------------------------------
 reset_state
@@ -310,8 +395,49 @@ for bad_edge in "d111.cloudfront.net." "evil.example.com/path" "UPPER.example.co
   is "invalid STATUS_EDGE_DOMAIN '$bad_edge' wrote nothing" "" "$(GC_KEYS)"
 done
 
-# ---- red: missing token per provider (fail-closed, names the secret) ------
+# ---- red: semantic target rejects (fail closed, nothing written) ----------
+# A regex-valid target can still be wrong: an in-zone name loops the dashboard
+# back into the firewall-closed box (and would still verify green), an IPv4
+# literal is not a CNAME target, and an over-long label fails at the API
+# after the auth file exists.
 reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_STATUS" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+[ "$rc" != "0" ] && ok "in-zone STATUS_EDGE_DOMAIN fails closed (rc=$rc)" || bad "in-zone STATUS_EDGE_DOMAIN did not fail"
+contains "in-zone STATUS_EDGE_DOMAIN message" "points inside piercloud.net" "$(LOG)"
+is "in-zone STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="1.2.3.4" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+[ "$rc" != "0" ] && ok "IPv4-literal STATUS_EDGE_DOMAIN fails closed (rc=$rc)" || bad "IPv4-literal STATUS_EDGE_DOMAIN did not fail"
+contains "IPv4-literal STATUS_EDGE_DOMAIN message" "is an IPv4 literal" "$(LOG)"
+is "IPv4-literal STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
+reset_state
+_long_label="$(printf 'a%.0s' {1..64}).cloudfront.net"
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$_long_label" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+[ "$rc" != "0" ] && ok "over-long-label STATUS_EDGE_DOMAIN fails closed (rc=$rc)" || bad "over-long-label STATUS_EDGE_DOMAIN did not fail"
+contains "over-long-label STATUS_EDGE_DOMAIN message" "label longer than 63 characters" "$(LOG)"
+is "over-long-label STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
+
+# ---- red: a newline value cannot forge a workflow command ------------------
+# Raw interpolation would put "::warning::FORGED" at the start of a line and
+# GitHub would treat it as a real annotation; the %q echo must render it
+# escaped, so no log line STARTS with the forged command.
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN=$'d111.cloudfront.net\n::warning::FORGED' NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+[ "$rc" != "0" ] && ok "newline STATUS_EDGE_DOMAIN fails closed (rc=$rc)" || bad "newline STATUS_EDGE_DOMAIN did not fail"
+contains "newline STATUS_EDGE_DOMAIN message" "is not a valid hostname" "$(LOG)"
+grep -q '^::warning::FORGED' "$WORK/last.log" && bad "newline STATUS_EDGE_DOMAIN forged a workflow command" || ok "newline STATUS_EDGE_DOMAIN cannot forge a workflow command"
+is "newline STATUS_EDGE_DOMAIN wrote nothing" "" "$(GC_KEYS)"
+
+# ---- red: a hostile TENANT_USER cannot survive into a derived name --------
+# sanitize_tenant is tr+sed (line-oriented): a newline survives into the
+# derived name and would build a broken URL after the auth file exists.
+reset_state
+rc="$(run_writer TENANT_USER=$'a\nb' ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token")"
+[ "$rc" != "0" ] && ok "newline TENANT_USER fails closed (rc=$rc)" || bad "newline TENANT_USER did not fail"
+contains "newline TENANT_USER message" "is not a DNS label" "$(LOG)"
+is "newline TENANT_USER wrote nothing" "" "$(GC_KEYS)"
+
+# ---- red: missing token per provider (fail-closed, names the secret) ------reset_state
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP")"
 [ "$rc" != "0" ] && ok "missing CLOUDFLARE_DNS_TOKEN fails closed (rc=$rc)" || bad "missing CLOUDFLARE_DNS_TOKEN did not fail"
 contains "missing token names CLOUDFLARE_DNS_TOKEN" "CLOUDFLARE_DNS_TOKEN is not set" "$(LOG)"
@@ -341,7 +467,7 @@ reset_state
 rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" NET_DNS_ZONE=pc-canary.com)"
 is "canary zone override rc" "0" "$rc"
 contains "canary zone resolved on Gcore" "pc-canary.com" "$(cat "$WORK/zones.log")"
-is "canary zone record keys" "anchor-01-pier.pc-canary.com,pier.status.pc-canary.com" "$(GC_KEYS)"
+is "canary zone record keys" "anchor-01-pier.pc-canary.com/A,pier.status.pc-canary.com/CNAME" "$(GC_KEYS)"
 
 # ---- auth header shape + mask-first ordering -------------------------------
 reset_state
@@ -366,6 +492,25 @@ rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$
 [ "$rc" != "0" ] && ok "gcore write 500 fails the run (rc=$rc)" || bad "gcore write 500 did not fail"
 contains "gcore write 500 message" "gcore write (POST) returned HTTP 500" "$(LOG)"
 lacks "gcore write 500 never reaches verify" "verified:" "$(LOG)"
+
+# ---- red: the dashboard CNAME write failing after the A landed -------------
+# The A upserts + verifies, then the CNAME write is rejected. The run must
+# fail (never emit a thumbprint against a half-written dashboard) while the
+# A stays correct and no CNAME is stored.
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" CLOUDFLARE_DNS_TOKEN="cf-token" STUB_CF_FAIL_STATUS_WRITE=1)"
+[ "$rc" != "0" ] && ok "cloudflare second-write failure fails the run (rc=$rc)" || bad "cloudflare second-write failure did not fail"
+contains "cloudflare second-write failure message" "cloudflare write (POST) returned HTTP 500" "$(LOG)"
+contains "cloudflare second-write failure kept the anchor verified" "verified: $T_HOST A -> $T_IP" "$(LOG)"
+is "cloudflare second-write failure left the anchor correct" "$T_IP" "$(jq -r --arg k "$T_HOST/A" '.[$k].content' "$WORK/cf-records.json")"
+is "cloudflare second-write failure wrote no CNAME" "null" "$(jq -r --arg k "$T_STATUS/CNAME" '.[$k] // "null"' "$WORK/cf-records.json")"
+reset_state
+rc="$(run_writer TENANT_USER="$T_USER" ANCHOR_IPV4="$T_IP" STATUS_EDGE_DOMAIN="$T_EDGE" NET_DNS_PROVIDER=gcore GCORE_DNS_TOKEN="gc-token" STUB_GCORE_FAIL_STATUS_WRITE=1)"
+[ "$rc" != "0" ] && ok "gcore second-write failure fails the run (rc=$rc)" || bad "gcore second-write failure did not fail"
+contains "gcore second-write failure message" "gcore write (POST) returned HTTP 500" "$(LOG)"
+contains "gcore second-write failure kept the anchor verified" "verified: $T_HOST A -> $T_IP" "$(LOG)"
+is "gcore second-write failure left the anchor correct" "$T_IP" "$(jq -r --arg k "$T_HOST/A" '.[$k].resource_records[0].content[0]' "$WORK/gcore-rrsets.json")"
+is "gcore second-write failure wrote no CNAME" "null" "$(jq -r --arg k "$T_STATUS/CNAME" '.[$k] // "null"' "$WORK/gcore-rrsets.json")"
 
 # ---- red: a stale duplicate record in the rrset ---------------------------
 reset_state

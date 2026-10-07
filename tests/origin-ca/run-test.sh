@@ -953,7 +953,7 @@ edge_prove_case "prove: missing CF tuple dies" "1" "nocftuple" "1" "cannot prove
 edge_prove_case "prove: absent x-cache dies with the cache remedy" "1" "nocache" "1" "no explicit x-cache: Miss" "yes"
 edge_prove_case "prove: pop-only failure dies with the tuple message" "1" "nopop" "1" "cannot prove it came through the distribution" "yes"
 edge_prove_case "prove: via-only failure dies with the tuple message" "1" "novia" "1" "cannot prove it came through the distribution" "yes"
-edge_prove_case "prove: unresolvable dies" "1" "rc6,rc6,rc6" "1" "bring the platform records up first" "yes"
+edge_prove_case "prove: unresolvable dies" "1" "rc6,rc6,rc6" "1" "let the run write them, then re-dispatch" "yes"
 edge_prove_case "prove: transport failure dies" "1" "rc7,rc7,rc7" "1" "could not complete" "yes"
 edge_prove_case "prove: 502 dies" "1" "http502,http502,http502" "1" "served chain is incomplete or not leaf-first" "yes"
 edge_prove_case "prove: crafted via text cannot steal the cache die" "1" "http502evil,http502evil,http502evil" "1" "served chain is incomplete or not leaf-first" "yes"

@@ -911,7 +911,7 @@ origin_ca_edge_prove() { # main-flow A2 proof: the public edge must serve the OR
   edge_last="$(printf '%s\n' "${edge_reason}" | tail -n 1)"
   case "${edge_last}" in
     "[resolve]"*)
-      die "A2 edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07); on a first-time/DR dispatch before the platform records exist this probe cannot pass — bring the platform records up first (docs/dr.md), then re-dispatch" ;;
+      die "A2 edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME) and covered by the platform status wildcard (live 2026-10-07); on a first-time/DR dispatch before those records exist this probe cannot pass — let the run write them, then re-dispatch (docs/dr.md)" ;;
     "[cache]"*)
       die "A2 edge pull was served from CloudFront's cache (x-cache: Hit or RefreshHit) — a cached response cannot prove the origin chain. The probe needs an uncacheable response: set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled), or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
     "[nocache]"*)
@@ -1661,7 +1661,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
     case "${dash_code}" in
       301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the DNS stage writes only the anchor record; the dashboard name is covered by the platform status wildcard at the edge (live 2026-10-07))" ;;
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — this run's anchor-dns job writes both the anchor A and the explicit dashboard CNAME, live 2026-10-07)" ;;
       *)
         docker logs caddy 2>&1 | tail -20 || true
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
@@ -1719,9 +1719,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
       fi
-      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
+      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -1756,7 +1756,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # edge path (the platform status wildcard) is not in place yet. Origin TLS
     # is proven by the edge once the platform records exist, so this is loud,
     # not fatal; with a pair selected it stays fail-closed.
-    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the platform status wildcard may not be in place yet (docs/dr.md)"
+    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the explicit dashboard CNAME / the platform status wildcard may not be in place yet (docs/dr.md)"
     log "A2 edge not proven this run (no origin pair selected — auto-TLS/pending; the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes)"
   else
     docker logs caddy 2>&1 | tail -20 || true

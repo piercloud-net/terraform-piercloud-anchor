@@ -65,13 +65,15 @@ jobs:
           # see the header comment. Env knobs exist so the exact code can be
           # extracted and run locally against good/bad URLs.
           set -uo pipefail
-          # Flat name until the A2 cutover: the nested
-          # <tenant>.status.piercloud.net NXDOMAINs until the platform
-          # `*.status` wildcard exists, and this workflow is scheduled — a
-          # default flip now would file an incident every 15 minutes. Set the
-          # STATUS_PROBE_URL repo variable to the nested URL in the same
-          # change that lands the platform records (and before the first
-          # post-merge dispatch that tombstones the flat name).
+          # Post-A2 cutover (2026-10-07): the nested
+          # <tenant>.status.piercloud.net is live — the platform
+          # `*.status` wildcard plus the explicit per-tenant dashboard CNAME
+          # (ENT-proof: the ACME challenge node blocks wildcard synthesis on
+          # RFC 4592-strict providers). The flat `status-<tenant>` form is
+          # tombstoned; the default below is that legacy name only as the
+          # last-resort fallback — every provisioned repo sets
+          # STATUS_PROBE_URL to its nested URL (this repo:
+          # https://pier.status.piercloud.net/).
           URL="${PROBE_URL:-https://status-pier.piercloud.net/}"
           base="${URL%/}"
           host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"

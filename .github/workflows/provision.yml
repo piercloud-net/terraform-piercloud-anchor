@@ -19,7 +19,11 @@
 # — a DNS failure fails the run before any thumbprint goes out, always.
 # A2: the writer is provider-switched (`NET_DNS_PROVIDER` repo variable,
 # cloudflare|gcore) so the `.net` zone move flips it without a code change;
-# the per-tenant dashboard record is gone (platform `*.status` wildcard).
+# it upserts BOTH the anchor A and the explicit per-tenant dashboard CNAME
+# `<tenant>.status` (the ACME challenge node is an ENT — wildcard-only goes
+# dark at every renewal on an RFC 4592-strict provider; see
+# 030-anchor-dns.sh). `STATUS_EDGE_DOMAIN` (CloudFront) is required and the
+# job fails closed without it.
 
 name: provision
 
@@ -1330,7 +1334,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
         with:
           persist-credentials: false
-      - name: Upsert anchor A record + verify-after-write
+      - name: Upsert anchor A + dashboard CNAME + verify-after-write
         run: |
           set -euo pipefail
           # Load-bearing order: this job needs device-flow (A1 close +
