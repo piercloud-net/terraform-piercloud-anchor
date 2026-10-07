@@ -74,7 +74,17 @@ has "${PROVISION_SH}" '&& [ "${GATUS_MOUNT_STALE}" = "0" ]' "Gatus recreate cond
 # and restart must stay unconditional (a CADDY_RESTART/GATUS_RESTART gate
 # would re-open the aborted-reload class: a next dispatch sees identical
 # bytes and reports green while the old config serves).
-has "${PROVISION_SH}" 'docker exec caddy caddy reload --config /etc/caddy/Caddyfile' "Caddy reload stays unconditional"
+#
+# --force is required: the cert FILE is not part of the config JSON, so a
+# chain-only change (same leaf, same Caddyfile) leaves the adapted config
+# byte-identical and Caddy's changeConfig() returns errSameConfig without
+# re-provisioning the TLS app — the bind-mounted PEM is never re-read
+# (caddy.go: "if nothing changed, no need to do a whole reload unless the
+# client forces it"; admin.go maps Cache-Control: must-revalidate to
+# forceReload). Live 2026-10-07: the 4-block chain install plus a no-op
+# reload kept serving the leaf-only cert -> CloudFront 502.
+has "${PROVISION_SH}" 'docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile' "Caddy reload stays unconditional and forced"
+hasnt "${PROVISION_SH}" 'caddy reload --config' "no no-op reload form (force required)"
 has "${PROVISION_SH}" 'docker restart gatus' "Gatus restart stays unconditional"
 hasnt "${PROVISION_SH}" 'CADDY_RESTART' "no CADDY_RESTART gate (reload is unconditional)"
 hasnt "${PROVISION_SH}" 'GATUS_RESTART' "no GATUS_RESTART gate (restart is unconditional)"

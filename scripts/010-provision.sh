@@ -1217,7 +1217,19 @@ fi
 # MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
 # covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
 # (in-place write), so only a reload makes Caddy re-read it.
-docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+#
+# --force is REQUIRED, not cosmetic: the cert FILE is not part of the config
+# JSON, so a chain-only change (same leaf, same Caddyfile) leaves the adapted
+# config byte-identical and Caddy's changeConfig() returns errSameConfig
+# without re-provisioning the TLS app — the bind-mounted PEM is never re-read
+# and the old certificate stays in memory (caddy.go: "if nothing changed, no
+# need to do a whole reload unless the client forces it"; admin.go maps
+# Cache-Control: must-revalidate to forceReload). Live 2026-10-07: the
+# 4-block chain install plus a no-op reload kept serving the leaf-only cert →
+# CloudFront 502 while every loopback probe stayed green. Note the
+# ORIGIN_CERT_CHANGED marker hashes the LEAF only, so it cannot detect a
+# chain-only change; never condition this force on it.
+docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile
 log "Caddy reloaded on new config"
 if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
   # Recorded ONLY after the successful reload (a failed run must re-reload
