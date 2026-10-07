@@ -62,6 +62,7 @@ All notable changes to this project will be documented in this file.
 - *(provision)* SSH keepalives on the A1 long-lived connection (closes #162)
 - *(witness)* Harden the vector-generator provenance guard + \Z-anchor the replica TS_RE (closes #155)
 - *(witness)* Bound the delta session listing at the heartbeat stem (closes #161)
+- *(010)* Force the Caddy reload — a chain-only cert change is never re-read (closes #174)
 
 ### 💼 Other
 
