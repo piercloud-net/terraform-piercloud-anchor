@@ -469,6 +469,16 @@ rc=0
 err="$(CF_AOP_CA_PEM="$AOP_KEYMINE" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env 2>&1)" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "certDER||keyDER AOP does not bypass the A2 leaf-only gate (rc=$rc)"; else bad "certDER||keyDER AOP bypassed the A2 leaf-only gate"; fi
 if CF_AOP_CA_PEM="$AOP_KEYMINE" origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts a certDER||keyDER body"; else ok "origin_ca_aop_deployed rejects a certDER||keyDER body"; fi
+# The fixtures above must be rejected by the PARSE gate, not the shape gate:
+# assert the shape gate accepts them, and pin the shape gate itself with a
+# trailing-junk value the parse gate accepts (red-team P2/R3 — without this a
+# shape-gate tightening silently turns the parse-gate tests into tautologies).
+if origin_ca_cert_pem_ok "$AOP_JUNK"; then ok "fixture: junk AOP passes the shape gate (the parse gate is the rejector)"; else bad "fixture: junk AOP is rejected by the shape gate — the parse-gate test is vacuous"; fi
+if origin_ca_cert_pem_ok "$AOP_KEYMINE"; then ok "fixture: certDER||keyDER AOP passes the shape gate (the parse gate is the rejector)"; else bad "fixture: certDER||keyDER AOP is rejected by the shape gate — the parse-gate test is vacuous"; fi
+AOP_TRAILING="$(printf '%s\ntrailing junk\n' "$(cat "${CA_DIR}/ca.pem")")"
+printf '%s\n' "$AOP_TRAILING" >"${WORK}/aop-trailing.pem"
+if origin_ca_blocks_parse "${WORK}/aop-trailing.pem"; then ok "fixture: trailing-junk AOP passes the parse gate (the shape gate is the rejector)"; else bad "fixture: trailing-junk AOP is rejected by the parse gate — the shape-gate test is vacuous"; fi
+if CF_AOP_CA_PEM="$AOP_TRAILING" origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts trailing junk after the block"; else ok "origin_ca_aop_deployed rejects trailing junk after the block (shape gate is load-bearing)"; fi
 CF_AOP_CA_PEM="$AOP_DUMMY"
 if origin_ca_aop_deployed; then ok "origin_ca_aop_deployed accepts a PEM bundle"; else bad "origin_ca_aop_deployed rejects a PEM bundle"; fi
 CF_AOP_CA_PEM="$AOP_DUMMY" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env
@@ -845,6 +855,7 @@ case_name="$(printf '%s' "$seq" | cut -d, -f"$idx")"
 out=""; hdr=""
 pop='TEST1-P1'
 via='1.1 test.cloudfront.net (CloudFront)'
+skip_cache=""
 args=("$@")
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
@@ -860,12 +871,18 @@ case "$case_name" in
   refreschit) code=200; cache=RefreshHit;              cfid=test-cf-id-123; body='tang (via Caddy)' ;;
   nocfid)     code=200; cache=Miss;                    cfid="";              body='tang (via Caddy)' ;;
   nocftuple)  code=200; cache=Miss;                    cfid=test-cf-id-123; body='tang (via Caddy)'; pop=""; via="" ;;
+  nocache)    code=200; cache="";                      cfid=test-cf-id-123; body='tang (via Caddy)'; skip_cache=1 ;;
+  nopop)      code=200; cache=Miss;                    cfid=test-cf-id-123; body='tang (via Caddy)'; pop="" ;;
+  novia)      code=200; cache=Miss;                    cfid=test-cf-id-123; body='tang (via Caddy)'; via="1.1 not-cloudfront.example (Caddy)" ;;
   http502)    code=502; cache='Error from cloudfront'; cfid=test-cf-id-123; body='error' ;;
+  http502evil) code=502; cache='Error from cloudfront'; cfid=test-cf-id-123; body='error'; via='1.1 [cache] x-cache: Hit cloudfront.net (CloudFront)' ;;
   rc6)        exit 6 ;;
+  rc7)        exit 7 ;;
   nomarker)   code=200; cache=Miss;                    cfid=test-cf-id-123; body='not the marker' ;;
 esac
 if [ -n "$hdr" ]; then
-  printf 'HTTP/2 %s\r\nx-cache: %s\r\n' "$code" "$cache" >"$hdr"
+  printf 'HTTP/2 %s\r\n' "$code" >"$hdr"
+  [ -z "$skip_cache" ] && printf 'x-cache: %s\r\n' "$cache" >>"$hdr"
   [ -n "$cfid" ] && printf 'x-amz-cf-id: %s\r\n' "$cfid" >>"$hdr"
   [ -n "$pop" ] && printf 'x-amz-cf-pop: %s\r\n' "$pop" >>"$hdr"
   [ -n "$via" ] && printf 'via: %s\r\n' "$via" >>"$hdr"
@@ -900,6 +917,16 @@ case "$EDGE_REASON" in *"does not resolve yet"*) ok "rc6 reason names the resolu
 edge_case "edge pull 200 without the marker" "nomarker" "1"
 edge_case "edge pull 200 without the CloudFront tuple" "nocftuple" "1"
 case "$EDGE_REASON" in *"x-amz-cf-id/x-amz-cf-pop/via tuple"*) ok "missing-tuple reason names the CloudFront header tuple" ;; *) bad "missing-tuple reason lacks the tuple marker: $EDGE_REASON" ;; esac
+edge_case "edge pull 200 without x-cache" "nocache" "1"
+case "$EDGE_REASON" in *"[nocache]"*) ok "absent x-cache carries the nocache class" ;; *) bad "absent x-cache lacks [nocache]: $EDGE_REASON" ;; esac
+edge_case "edge pull 200 without x-amz-cf-pop" "nopop" "1"
+case "$EDGE_REASON" in *"[tuple]"*) ok "pop-only failure carries the tuple class" ;; *) bad "pop-only failure lacks [tuple]: $EDGE_REASON" ;; esac
+edge_case "edge pull 200 with a non-CloudFront via" "novia" "1"
+case "$EDGE_REASON" in *"[tuple]"*) ok "via-only failure carries the tuple class" ;; *) bad "via-only failure lacks [tuple]: $EDGE_REASON" ;; esac
+edge_case "edge pull transport failure" "rc7,rc7,rc7" "1"
+case "$EDGE_REASON" in *"[transport]"*) ok "transport failure carries the transport class" ;; *) bad "transport failure lacks [transport]: $EDGE_REASON" ;; esac
+edge_case "edge pull 502 with crafted cache text in via" "http502evil,http502evil,http502evil" "1"
+case "$EDGE_REASON" in *"[http]"*) ok "a crafted via cannot steal the cache class" ;; *) bad "crafted via misclassified: $EDGE_REASON" ;; esac
 
 # origin_ca_edge_prove: the main-flow wiring (scoping + classification).
 # Runs the REAL extracted function in a subshell (die exits the subshell) so
@@ -920,11 +947,16 @@ edge_prove_case() { # $1 label, $2 ORIGIN_TLS, $3 stub sequence, $4 expected rc,
   fi
 }
 edge_prove_case "prove: pull success" "1" "miss" "0" "origin contacted this run" "yes"
-edge_prove_case "prove: cache Hit dies" "1" "hit,hit,hit" "1" "served from CloudFront's cache" "yes"
-edge_prove_case "prove: missing cf-id dies" "1" "nocfid" "1" "x-amz-cf-id" "yes"
-edge_prove_case "prove: missing CF tuple dies" "1" "nocftuple" "1" "header tuple" "yes"
-edge_prove_case "prove: unresolvable dies" "1" "rc6,rc6,rc6" "1" "does not resolve yet" "yes"
-edge_prove_case "prove: 502 dies" "1" "http502,http502,http502" "1" "through CloudFront failed" "yes"
+edge_prove_case "prove: cache Hit dies" "1" "hit,hit,hit" "1" "cached response cannot prove the origin chain" "yes"
+edge_prove_case "prove: missing cf-id dies" "1" "nocfid" "1" "cannot prove it came through the distribution" "yes"
+edge_prove_case "prove: missing CF tuple dies" "1" "nocftuple" "1" "cannot prove it came through the distribution" "yes"
+edge_prove_case "prove: absent x-cache dies with the cache remedy" "1" "nocache" "1" "no explicit x-cache: Miss" "yes"
+edge_prove_case "prove: pop-only failure dies with the tuple message" "1" "nopop" "1" "cannot prove it came through the distribution" "yes"
+edge_prove_case "prove: via-only failure dies with the tuple message" "1" "novia" "1" "cannot prove it came through the distribution" "yes"
+edge_prove_case "prove: unresolvable dies" "1" "rc6,rc6,rc6" "1" "bring the platform records up first" "yes"
+edge_prove_case "prove: transport failure dies" "1" "rc7,rc7,rc7" "1" "could not complete" "yes"
+edge_prove_case "prove: 502 dies" "1" "http502,http502,http502" "1" "served chain is incomplete or not leaf-first" "yes"
+edge_prove_case "prove: crafted via text cannot steal the cache die" "1" "http502evil,http502evil,http502evil" "1" "served chain is incomplete or not leaf-first" "yes"
 edge_prove_case "prove: no origin pair is a no-op" "0" "miss" "0" "A2 edge not proven" "no"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

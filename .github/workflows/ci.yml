@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Maintainer-triggered fallback: re-verify a ref when GitHub's event
+  # delivery is degraded (or to re-run the required checks on a head).
+  workflow_dispatch:
 
 permissions:
   contents: read

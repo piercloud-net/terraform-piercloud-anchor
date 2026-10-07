@@ -803,7 +803,7 @@ origin_ca_probe_and_mark() { # $1 = host; asserts the served pair FIRST, then se
 }
 
 origin_ca_edge_pull() { # $1 = host -> 0 when the public edge served the ORIGIN this run (200 + marker, from CloudFront, not a cache Hit)
-  local host="$1" attempt stamp rc code cache cfid pop via via_ok body hdr errf hint attempts why
+  local host="$1" attempt stamp rc code cache cfid pop via via_ok body hdr errf hint attempts why why_class
   stamp="$(date +%s)-$$"
   body="$(mktemp)" || return 1
   hdr="$(mktemp)" || { rm -f "$body"; return 1; }
@@ -827,11 +827,11 @@ origin_ca_edge_pull() { # $1 = host -> 0 when the public edge served the ORIGIN 
       "https://${host}/api/v1/endpoints/statuses?pc_chain_probe=${stamp}-${attempt}" 2>"$errf")" || rc=$?
     cache="$(awk '/^[Xx]-[Cc]ache:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
     # CloudFront's response header tuple: x-amz-cf-id (a per-response id),
-    # x-amz-cf-pop (the PoP that served it) and a via ending in
-    # cloudfront.net. These are forgeable by anyone who can answer for the
-    # name with a trusted cert, so the tuple raises the bar (and a cache Hit
-    # is never accepted) without cryptographically pinning the distribution;
-    # the docs carry the honest claim.
+    # x-amz-cf-pop (the PoP that served it) and a via naming a
+    # cloudfront.net distribution. These are forgeable by anyone who can
+    # answer for the name with a trusted cert, so the tuple raises the bar
+    # (and a cache Hit is never accepted) without cryptographically pinning
+    # the distribution; the docs carry the honest claim.
     cfid="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Ii][Dd]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
     pop="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Pp][Oo][Pp]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
     via="$(awk '/^[Vv]ia:/ { gsub(/\r/, ""); print; exit }' "$hdr" 2>/dev/null || true)"
@@ -853,31 +853,41 @@ origin_ca_edge_pull() { # $1 = host -> 0 when the public edge served the ORIGIN 
     fi
   done
   hint="$(tr '\n' ' ' <"$errf" 2>/dev/null | cut -c1-160)"
-  # Name the last attempt's first failed condition so the caller's classifier
-  # stays deterministic (it reads the FINAL line only).
+  # Name the last attempt's first failed condition AND a stable class token.
+  # The token is emitted by this script as the FIRST field of the final line
+  # (the caller prefix-matches it), so header values echoed later on the line
+  # cannot steer the classification.
+  why_class="generic"
   why="no clean origin response"
   if [ "$rc" -eq 6 ]; then
+    why_class="resolve"
     why="does not resolve yet (curl exit 6)"
   elif [ "$rc" -ne 0 ]; then
+    why_class="transport"
     why="curl exit ${rc}"
   elif [ "$code" != "200" ]; then
+    why_class="http"
     why="HTTP ${code:-000} through the edge"
   elif ! grep -q 'tang (via Caddy)' "$body" 2>/dev/null; then
+    why_class="marker"
     why="HTTP 200 without the dashboard body marker"
   elif [ "${cache:-}" = "Hit" ] || [ "${cache:-}" = "RefreshHit" ]; then
+    why_class="cache"
     why="served from cache (x-cache: ${cache}) — the origin was not contacted"
   elif [ "${cache:-}" != "Miss" ]; then
+    why_class="nocache"
     why="x-cache: ${cache:-absent} (not a Miss from CloudFront)"
   elif [ -z "$cfid" ] || [ -z "$pop" ] || [ "$via_ok" != "1" ]; then
+    why_class="tuple"
     why="HTTP 200 + marker without CloudFront's x-amz-cf-id/x-amz-cf-pop/via tuple"
   fi
   rm -f "$body" "$hdr" "$errf"
   if [ "$rc" -eq 6 ]; then
-    printf 'https://%s/ does not resolve yet (curl exit 6; attempts: %s)\n' "$host" "${attempts:-none}" >&2
+    printf '[resolve] https://%s/ does not resolve yet (curl exit 6; attempts: %s)\n' "$host" "${attempts:-none}" >&2
     return 1
   fi
-  printf 'no attempt got a clean origin response (%s; curl exit %s, HTTP %s, x-cache: %s, x-amz-cf-id: %s, x-amz-cf-pop: %s, via: %s; attempts: %s; stderr: %s)\n' \
-    "$why" "${rc:-0}" "${code:-000}" "${cache:-unknown}" "${cfid:-missing}" "${pop:-missing}" "${via:-none}" "${attempts:-none}" "${hint:-none}" >&2
+  printf '[%s] no attempt got a clean origin response (%s; curl exit %s, HTTP %s, x-cache: %s, x-amz-cf-id: %s, x-amz-cf-pop: %s, via: %s; attempts: %s; stderr: %s)\n' \
+    "$why_class" "$why" "${rc:-0}" "${code:-000}" "${cache:-unknown}" "${cfid:-missing}" "${pop:-missing}" "${via:-none}" "${attempts:-none}" "${hint:-none}" >&2
   return 1
 }
 
@@ -895,18 +905,21 @@ origin_ca_edge_prove() { # main-flow A2 proof: the public edge must serve the OR
     log "A2 edge pull through CloudFront serves ${STATUS_HOST} (OK; HTTP 200 + dashboard marker, origin contacted this run)"
     return 0
   fi
-  # Classify on the FINAL reason line: earlier per-attempt Hit notices are
-  # diagnostics and must not mislabel a chain failure as a cache hit.
+  # Prefix-match the stable class token origin_ca_edge_pull emits first on the
+  # final line — never the echoed header values (a crafted via/x-cache value
+  # must not steer the die message).
   edge_last="$(printf '%s\n' "${edge_reason}" | tail -n 1)"
   case "${edge_last}" in
-    *"does not resolve yet"*)
+    "[resolve]"*)
       die "A2 edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07); on a first-time/DR dispatch before the platform records exist this probe cannot pass — bring the platform records up first (docs/dr.md), then re-dispatch" ;;
-    *"x-cache: Hit"*|*"x-cache: RefreshHit"*)
-      die "A2 edge pull was served from CloudFront's cache (x-cache: Hit or RefreshHit) — a cached response cannot prove the origin chain. The probe needs an uncacheable response: set the distribution's cache policy for the statuses path to forward query strings / TTL 0 (CachingDisabled), or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
-    *"x-amz-cf-id: missing"*)
-      die "A2 edge pull got a 200 but no x-amz-cf-id header — the response did not come from CloudFront (DNS rebind / another host with a cert for the name), so the origin leg is unproven. Check that ${STATUS_HOST} resolves to the distribution and re-dispatch. Detail: ${edge_reason}" ;;
-    *"x-amz-cf-id/x-amz-cf-pop/via tuple"*)
-      die "A2 edge pull got a 200 + marker but the response does not carry CloudFront's header tuple (x-amz-cf-id + x-amz-cf-pop + a via ending in cloudfront.net). The probe cannot prove the origin leg through the distribution; check that ${STATUS_HOST} resolves to the distribution and re-dispatch. Detail: ${edge_reason}" ;;
+    "[cache]"*)
+      die "A2 edge pull was served from CloudFront's cache (x-cache: Hit or RefreshHit) — a cached response cannot prove the origin chain. The probe needs an uncacheable response: set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled), or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[nocache]"*)
+      die "A2 edge pull got no explicit x-cache: Miss from the edge (the header was absent or carried another value) — a response the distribution did not just fetch from the origin cannot prove the origin chain. Set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled) — forwarding query strings alone still allows a Hit — or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[tuple]"*)
+      die "A2 edge pull got a 200 + marker but the response cannot prove it came through the distribution (missing x-amz-cf-id / x-amz-cf-pop / a via naming a cloudfront.net distribution). The tuple is a response-forgery barrier, not cryptographic proof; check that ${STATUS_HOST} resolves to the distribution and re-dispatch. Detail: ${edge_reason}" ;;
+    "[transport]"*)
+      die "A2 edge pull could not complete (the request failed at the transport layer — see Detail for the curl exit) — check the anchor's egress DNS/TLS to the public edge and re-dispatch. Detail: ${edge_reason}" ;;
     *)
       die "A2 edge pull through CloudFront failed — the served chain is incomplete or not leaf-first (CloudFront drops the connection with 502), the platform *.status records/distribution are absent, the origin gate (X-Piercloud-Origin) or firewall allowlist does not admit CloudFront, or the dashboard body marker is missing. Local :443 handshakes fine, so this is the edge leg: set ORIGIN_CA_CERT_PEM to the issued leaf-first chain and re-dispatch (docs/dr.md). Detail: ${edge_reason}" ;;
   esac
@@ -1326,7 +1339,7 @@ origin_ca_select_pair
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
-  origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies) — refusing to deploy it (garbage must not disable the A2 chain gates)"
+  origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"

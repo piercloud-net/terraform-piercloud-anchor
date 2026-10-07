@@ -92,6 +92,7 @@ has "${PROVISION_SH}" 'stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-' "recreate
 # would re-open the aborted-reload class: a next dispatch sees identical
 # bytes and reports green while the old config serves).
 has "${PROVISION_SH}" 'docker exec caddy caddy reload --config /etc/caddy/Caddyfile' "Caddy reload stays unconditional"
+has "${PROVISION_SH}" 'caddy reload failed' "a failed Caddy reload dies (no silent green)"
 has "${PROVISION_SH}" 'docker restart gatus' "Gatus restart stays unconditional"
 hasnt "${PROVISION_SH}" 'CADDY_RESTART' "no CADDY_RESTART gate (reload is unconditional)"
 hasnt "${PROVISION_SH}" 'GATUS_RESTART' "no GATUS_RESTART gate (restart is unconditional)"
