@@ -225,7 +225,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1009
+MIN_CHECKS=1010
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -6995,6 +6995,30 @@ JSON
 start_mock
 run_case "${WORK}/state-159p2-degenerate-range"
 is "ranges: the degenerate [N, N] range -> ok" "ok" "${CASE_STATE}"
+
+# A range whose START is seq 0 (the real `build_audit_range_key` floor) must
+# be accepted green by the live witness too (delta-2 red-team F1): the
+# replica golden for the seq-0 range pins the built key shape only, so a live
+# regression refusing seq-0 ranges (the red-team `mseq0` mutant in
+# `_audit_range_is_drift`) would otherwise leave the suite green. The span is
+# intentionally NON-degenerate (0-1, start 2, end 3) so the tooth isolates
+# the seq-0 START rather than re-testing the `[N, N]` degeneracy pinned above.
+R29_S0_START="$(dated_key session.start 20260925T153800Z "${R29_SID}" 2 shell)"
+R29_S0_RANGE="$(dated_range_key 1 session.data 20260925T153810Z "${R29_SID}" 0)"
+R29_S0_END="$(dated_key session.end 20260925T153820Z "${R29_SID}" 3 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_S0_START}","ago":300},
+  {"key":"${R29_S0_RANGE}","ago":299},
+  {"key":"${R29_S0_END}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-seq0-range"
+is "ranges: a seq-0 range start (the build_audit_range_key floor) -> ok" "ok" "${CASE_STATE}"
 
 R29_VB_BODY='{"event":"session.data","seq":2,"v":"r29-base"}'
 R29_VB_START="$(dated_key session.start 20260925T154000Z "${R29_SID}" 1 shell)"
