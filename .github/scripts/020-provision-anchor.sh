@@ -120,13 +120,14 @@
 #                            Values are single-quote escaped into the piped
 #                            env prefix below — never argv, never logged.
 #                            Docs: docs/recording-witness.md.
-#   ORIGIN_CA_CERT_PEM      operator-planted per-anchor Cloudflare Origin CA
-#                            certificate (repo VARIABLE, cert-only public
-#                            material — NO key material ever travels; the key
-#                            is generated on the box by scripts/010). Empty =
-#                            nothing to install this run (the box keeps its
-#                            current pair); the CSR comes back as the run
-#                            artifact for operator-side signing.
+#   ORIGIN_CA_CERT_PEM      operator-planted per-anchor public certificate
+#                            chain, leaf first (repo VARIABLE, cert-only
+#                            public material — the chain is required, CloudFront
+#                            502s without the intermediate; NO key material ever
+#                            travels; the key is generated on the box by
+#                            scripts/010). Empty = nothing to install this run
+#                            (the box keeps its current pair); the CSR comes
+#                            back as the run artifact for operator-side signing.
 #   CF_AOP_CA_PEM            optional zone-level AOP client-auth bundle (repo
 #                            secret, masked at birth in the workflow like the
 #                            root password). Deployed cert material for

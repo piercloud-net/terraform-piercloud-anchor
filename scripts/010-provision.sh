@@ -492,17 +492,25 @@ origin_ca_generate() { # ensure key+CSR; the key is never regenerated while a ce
   log "per-anchor Origin CA CSR ready (publish it for signing; the key stays on this box)"
 }
 
-origin_ca_cert_pem_ok() { # $1 = PEM text -> exactly one bounded certificate, no leading/trailing junk
-  local pem="$1" bytes begins ends junk
+origin_ca_cert_pem_ok() { # $1 = PEM text -> a bounded leaf-first certificate chain, no framing junk
+  local pem="$1" bytes begins ends
   begins="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
   ends="$(printf '%s\n' "$pem" | grep -c -- '-----END CERTIFICATE-----' || true)"
-  # Multi-cert blobs must be rejected: only the first block would be
-  # validated/hashed while the whole blob got installed.
-  [ "$begins" = "1" ] && [ "$ends" = "1" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----BEGIN CERTIFICATE-----/{exit} {print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----END CERTIFICATE-----/{f=1; next} f{print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
+  # A chain is REQUIRED for the A2 CloudFront origin leg: CloudFront drops the
+  # TCP connection (502, X-Cache: Error from cloudfront) when the intermediate
+  # is missing. Accept 1..8 blocks — the validator below checks the FIRST
+  # block as the leaf, so a chain pasted in the wrong order fails its SAN
+  # check; framing junk and oversized material still fail closed. Bounded at
+  # 16 KiB: a 4-block LE chain is ~5 KiB.
+  [ "$begins" = "$ends" ] || return 1
+  [ "${begins:-0}" -ge 1 ] && [ "${begins:-0}" -le 8 ] || return 1
+  printf '%s\n' "$pem" | awk '
+    /-----BEGIN CERTIFICATE-----/ { if (inblk) bad = 1; inblk = 1; seen = 1; next }
+    /-----END CERTIFICATE-----/   { if (!inblk) bad = 1; inblk = 0; next }
+    { if (!seen) { if ($0 !~ /^[[:space:]]*$/) before = 1 }
+      else if (!inblk) { if ($0 !~ /^[[:space:]]*$/) after = 1 } }
+    END { exit (bad || before || after) }
+  ' || return 1
   bytes="$(printf '%s' "$pem" | wc -c | tr -d ' ')"
   [ "${bytes:-0}" -gt 0 ] && [ "${bytes:-0}" -le 16384 ]
 }
