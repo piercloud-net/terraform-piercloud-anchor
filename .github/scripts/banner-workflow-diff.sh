@@ -39,14 +39,17 @@
 #   * A module block in the counted root HCL refuses: its source tree may be
 #     local/executed code the diff cannot see, and source-value matching is
 #     evadable (attached `=`, comments, `\uNNNN` escapes, absolute paths), so
-#     the gate is the block statement itself — a line whose first non-comment
-#     token is `module` (native HCL, incl. `module/*c*/"m"`, `module"m"`, a
-#     leading block comment `/*c*/ module "m"`, a BOM prefix) or the `"module"`
-#     key (JSON HCL, incl. a key split from its colon) — never the bare word in
-#     prose (a description/comment containing "module" must not refuse;
-#     functional r5c/r5c-delta HIGH/MEDIUM, red-team r5c/r5c-delta MEDIUM).
-#     Registry-only modules refuse too (fail-closed): extend the pathspecs and
-#     relax this gate deliberately.
+#     the gate is the block statement itself — a native line whose first
+#     non-comment token is `module` (`module/*c*/"m"`, `module"m"`, a leading
+#     block comment `/*c*/ module "m"`, an indented line), any line where a
+#     comment close (`*/`, incl. a `*` run like `/***/` and a multi-line
+#     comment whose text precedes the close) directly precedes the `module`
+#     token, a BOM-prefixed `module` token, or the `"module"` key (JSON HCL,
+#     incl. a key split from its colon) — never the bare word in prose (a
+#     description/comment containing "module" must not refuse; functional
+#     r5c/r5c-delta/r5f HIGH/MEDIUM, red-team r5c/r5c-delta/r5f MEDIUM, trust
+#     r5f MEDIUM). Registry-only modules refuse too (fail-closed): extend the
+#     pathspecs and relax this gate deliberately.
 #   * A diff that cannot be computed is a loud error, never a silent
 #     "0 files changed": the card's UNCHANGED verdict is a security signal
 #     and an undeterminable count must fail closed.
@@ -120,11 +123,13 @@ fi
 # and relax this gate deliberately.
 # Residual: an escaped JSON KEY (`"\u006dodule"`; a source-VALUE escape like
 # `source = "\u002e/x"` is covered because the block itself is seen) is out of
-# a textual scan's reach; a block-comment/heredoc line whose first token is
-# `module` and a line ending in the literal string `"module"` over-refuse
-# (fail-closed) — the review is the backstop.
-if git grep -qE '^[[:space:]]*(/\*([^*]|[*]+[^*/])*\*/[[:space:]]*|\*/[[:space:]]*)*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
-   || git grep -qE $'^\xef\xbb\xbf[[:space:]]*(/\*([^*]|[*]+[^*/])*\*/[[:space:]]*|\*/[[:space:]]*)*module([^[:alnum:]_]|$)' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
+# a textual scan's reach; the gate over-refuses (fail-closed) any line whose
+# first token is `module` even when it is not a block (e.g. a `module = 3`
+# local), any line where a `*/` precedes a `module` token (incl. heredoc/string
+# text like `*/ module …`), and a line ending in the literal string `"module"`
+# — the review is the backstop (trust r5f LOW, red-team r5f LOW).
+if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
+   || git grep -qE $'^\xef\xbb\xbf[[:space:]]*module([^[:alnum:]_]|$)' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
   echo "::error::a module block exists in the counted root HCL — its source tree is executed code outside the counted set; add it to the pathspecs and relax this gate deliberately" >&2
   exit 1
 fi

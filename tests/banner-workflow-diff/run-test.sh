@@ -44,14 +44,18 @@
 #   (r) a module block in the counted root HCL refuses — its source tree is
 #       executed by the run but may be outside the counted set; the gate is the
 #       block statement itself (line-anchored `module` token: attached `=`,
-#       attached label, leading inline/multi-line block comments, indentation,
-#       a BOM prefix, JSON split keys and spaced colons, source-value escapes
-#       covered; `.tf`/`.tf.json`/`.tofu`/`.tofu.json` included), while a
-#       non-module `source` (attribute, comment or heredoc text) and the bare
-#       word "module" in prose do not refuse (red-team r5/r5b/r5c/r5c-delta
-#       MEDIUM, trust r5b/r5c-delta MEDIUM/LOW, functional r5b/r5c/r5c-delta
-#       HIGH/MEDIUM/LOW; latent — no module blocks in the counted root HCL
-#       today; the example tree has one, unexecuted);
+#       attached label, leading inline/multi-line block comments incl. `*` runs
+#       and text before the close, indentation, a BOM prefix, a comment close
+#       directly before the token, JSON split keys and spaced colons,
+#       source-value escapes covered; `.tf`/`.tf.json`/`.tofu`/`.tofu.json`
+#       included), while a non-module `source` (attribute, comment or heredoc
+#       text) and the bare word "module" in prose do not refuse (red-team
+#       r5/r5b/r5c/r5c-delta/r5f MEDIUM, trust r5b/r5c-delta/r5f MEDIUM/LOW,
+#       functional r5b/r5c/r5c-delta/r5f HIGH/MEDIUM/LOW; latent — no module
+#       blocks in the counted root HCL today; the example tree has one,
+#       unexecuted; fail-closed over-refusals: a non-block first-token
+#       `module` (e.g. `module = 3`), any `*/`-before-`module` line incl.
+#       heredoc/string text, a line ending in the literal `"module"`);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
 #       form (arithmetic/export/read/declare/let/unset/readonly/typeset/
@@ -319,6 +323,50 @@ printf '# module\n' > modules/m/main.tf
 git_c add -A
 git_c commit -qm "multi-line leading block-comment module block"
 git_c push -q origin moduleleadcommentnl
+
+git_c checkout -qb moduleclosecomment main
+mkdir -p modules/m
+printf '/* c\ncontinued text */ module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "multi-line comment close before the module token"
+git_c push -q origin moduleclosecomment
+
+git_c checkout -qb modulestars main
+mkdir -p modules/m
+printf '/***/ module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "comment close with a star run before the module token"
+git_c push -q origin modulestars
+
+git_c checkout -qb modulestarspace main
+mkdir -p modules/m
+printf '/* **/ module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "comment close with a spaced star run before the module token"
+git_c push -q origin modulestarspace
+
+git_c checkout -qb modulebomcomment main
+mkdir -p modules/m
+printf '\xef\xbb\xbf/*c*/ module "m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "BOM before a comment-prefixed module block"
+git_c push -q origin modulebomcomment
+
+git_c checkout -qb moduleattr main
+printf 'locals {\n  module = 3\n}\n' > main.tf
+git_c add -A
+git_c commit -qm "non-block first-token module attribute (fail-closed refusal)"
+git_c push -q origin moduleattr
+
+git_c checkout -qb moduleheredocclose main
+printf 'locals {\n  description = <<EOT\n*/ module is mentioned in this heredoc line\nEOT\n}\n' > main.tf
+git_c add -A
+git_c commit -qm "heredoc line with a comment close before a module token (fail-closed refusal)"
+git_c push -q origin moduleheredocclose
 
 git_c checkout -qb moduleindented main
 mkdir -p modules/m
@@ -663,7 +711,7 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
-for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleindented modulejsonspaced; do
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose; do
   git_c checkout -q "$variant"
   rc=0
   out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
@@ -740,6 +788,14 @@ if [ "$(grep -oF 'COUNT=' <<<"$banner_active" | grep -c .)" = "1" ]; then ok "CO
 if [ "$(grep -cE 'COUNT[[:space:]]*[+*/%^-]?=' <<<"$banner_active")" = "1" ]; then ok "COUNT is assigned exactly once (space/compound-tolerant spelling)"; else bad "the banner step carries a COUNT assignment beyond the single call line"; fi
 override_re="\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\\]?[\"']?-v|^[[:space:]]*\.[[:space:]]"
 if grep -qE "$override_re" <<<"$banner_active"; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
+# The shipped check must consume the shared `override_re` (the probes below
+# pin its content; this pins the call site — red-team r5f LOW: an inline
+# literal minus `[\\]?` at the call site stayed 159/0).
+if [ "$(grep -cE '^if grep -qE "[$]override_re" <<<"\$banner_active"; then bad' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the shipped override check consumes override_re (the call site is pinned)"
+else
+  bad "the shipped override check does not consume the shared override_re"
+fi
 stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
 if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
 if [ "$(grep -oE '\-eq[[:space:]]+0' <<<"$banner_active" | grep -c .)" = "1" ] && ! grep -qE '\-(ge|gt|le|lt|ne)[[:space:]]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0 (no widened/decoy comparison)"; else bad "the COUNT comparison is missing, widened, or decoyed"; fi
