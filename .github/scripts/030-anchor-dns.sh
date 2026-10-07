@@ -10,15 +10,27 @@
 #
 # WHAT IT DOES: derives the flat anchor name from TENANT_USER (D5:
 # `anchor-01-<sanitized>.piercloud.net`; NN=01 — a second operator anchor
-# for one alias (-02+) is a future multi-anchor case, not handled here),
-# resolves the zone, creates or overwrites the anchor A record to the exact
-# anchor IPv4 (TTL 300, DNS-only), then re-reads the record and fails unless
-# the rrset is EXACTLY one record with the wanted name + address (+ ttl;
-# + the enabled flag on Gcore) — a stale extra record fails closed. A2
-# (2026-09-30): the per-tenant dashboard record is GONE — the nested
-# `<tenant>.status.piercloud.net` dashboard is covered by the platform
-# `*.status.piercloud.net` wildcard (one platform record for the whole
-# fleet, never one per tenant).
+# for one alias (-02+) is a future multi-anchor case, not handled here) and
+# the nested dashboard name (`<sanitized>.status.piercloud.net`), resolves
+# the zone, then upserts BOTH records (TTL 300, DNS-only):
+#   1. the anchor A record -> the exact anchor IPv4 (clevis bind-by-name);
+#   2. the dashboard CNAME -> STATUS_EDGE_DOMAIN (the CloudFront distribution).
+# After each write it re-reads the rrset and fails unless it is EXACTLY one
+# record with the wanted name + content (+ ttl; + the enabled flag on Gcore)
+# — a stale extra record fails closed.
+#
+# WHY THE DASHBOARD CNAME EXISTS (2026-10-07): the `*.status.piercloud.net`
+# wildcard alone is not enough on an RFC 4592-strict provider. During every
+# ACME DNS-01 issuance/renewal the challenge node
+# `_acme-challenge.<tenant>.status.piercloud.net` exists, which makes
+# `<tenant>.status.piercloud.net` an empty non-terminal — wildcard synthesis
+# stops (NODATA) and the dashboard goes dark for the node's lifetime.
+# Cloudflare masked this (its wildcard resolves these names anyway); Gcore,
+# the post-B `.net` provider, is strict (live: the carried
+# placeholder node darkened pier.status.piercloud.net until deleted). An
+# explicit CNAME answers the name directly, so a challenge node can never
+# block it. Cost = one record per tenant (Gcore is uncapped; "zero per-tenant
+# dashboard records" was an artifact of the Cloudflare 200-record cap).
 #
 # PROVIDER SWITCH (A2): NET_DNS_PROVIDER=cloudflare|gcore (default
 # cloudflare). `piercloud.net` moves from Cloudflare to Gcore at the B
@@ -35,6 +47,11 @@
 # token reaches curl through a 0600 header FILE (`-H @file`), never argv):
 #   TENANT_USER            repo tenant username, e.g. "pier" -> anchor-01-pier.
 #   ANCHOR_IPV4            exact anchor IPv4 the A record must carry.
+#   STATUS_EDGE_DOMAIN     CloudFront distribution hostname the dashboard
+#                          CNAME must carry (e.g. d123.cloudfront.net);
+#                          absent = explicit error (fail closed: a run that
+#                          cannot write the dashboard name leaves it
+#                          wildcard-only, i.e. dark at every renewal).
 #   NET_DNS_PROVIDER       cloudflare (default) | gcore.
 #   NET_DNS_ZONE           zone name; default piercloud.net.
 #   ANCHOR_TTL             record TTL; default 300 (Gcore Free floor 120).
@@ -46,11 +63,13 @@
 #                          mode=check never runs this job and never requires
 #                          a token.
 #
-# `proxied:false` on the anchor record is load-bearing: plain-HTTP tang
-# must not sit behind the orange cloud. Gcore is authoritative-only (no
-# proxy concept) — the same DNS-only invariant. `curl -sS` only, no `-v`,
-# no TF_LOG; logs carry jq-selected public fields only (name/type/address/
-# ttl) — never the token and never whole API responses.
+# `proxied:false` on both records is load-bearing: plain-HTTP tang
+# must not sit behind the orange cloud on the anchor record, and every
+# platform name is DNS-only by design (Gcore is authoritative-only — no
+# proxy concept). `curl -sS` only, no `-v`,
+# no TF_LOG; logs carry jq-selected public fields only (name/type/content/
+# ttl/proxied, and the enabled flag on Gcore) — never the token and never
+# whole API responses.
 #
 # No new GitHub Actions needed: curl + jq (preinstalled on runners) suffice.
 
@@ -64,17 +83,20 @@ ZONE="${NET_DNS_ZONE:-piercloud.net}" # public DNS info, not a secret.
 # A real zone: >=2 labels, lowercase alnum/hyphen, no leading/trailing
 # hyphen or dot (`.`/`..`/`-x`/`x.` all fail closed — no curl path tricks).
 if ! [[ "$ZONE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-  echo "::error::NET_DNS_ZONE='$ZONE' is not a valid zone name — refusing to touch an unverified zone."
+  # %q escapes the value for display: a raw value can carry newlines/control
+  # bytes and would otherwise forge `::…::` workflow commands on continuation
+  # lines (log-integrity only; the variable is operator-set).
+  printf '::error::NET_DNS_ZONE=%q is not a valid zone name — refusing to touch an unverified zone.\n' "$ZONE"
   exit 1
 fi
 PROVIDER="${NET_DNS_PROVIDER:-cloudflare}"
 case "$PROVIDER" in
   cloudflare | gcore) ;;
-  *) echo "::error::NET_DNS_PROVIDER='$PROVIDER' is not one of cloudflare|gcore — refusing to guess a provider."; exit 1 ;;
+  *) printf '::error::NET_DNS_PROVIDER=%q is not one of cloudflare|gcore — refusing to guess a provider.\n' "$PROVIDER"; exit 1 ;;
 esac
 
 ANCHOR_TTL="${ANCHOR_TTL:-300}" # DNS-only record TTL; Gcore Free rejects TTL < 120 s at the API.
-case "$ANCHOR_TTL" in '' | *[!0-9]*) echo "::error::ANCHOR_TTL='$ANCHOR_TTL' is not an integer."; exit 1 ;; esac
+case "$ANCHOR_TTL" in '' | *[!0-9]*) printf '::error::ANCHOR_TTL=%q is not an integer.\n' "$ANCHOR_TTL"; exit 1 ;; esac
 
 CF_API="https://api.cloudflare.com/client/v4"
 GCORE_API="https://api.gcore.com"
@@ -123,6 +145,43 @@ esac
 printf 'Authorization: %s %s\nContent-Type: application/json\n' "$auth_scheme" "$token" > "$AUTH_FILE"
 auth=(-sS -H "@$AUTH_FILE")
 
+# Dashboard CNAME target (the platform status edge). Fail closed when absent:
+# without it the dashboard name stays wildcard-only and goes dark at every
+# renewal (the challenge node makes it an ENT — see the header). Validated as
+# a hostname (lowercase, no trailing dot) so it cannot smuggle a path/space
+# into the curl URL. Checked after the credential gate on purpose: a run with
+# no token reports the missing secret first (the actionable error), never the
+# config one.
+status_edge_domain="${STATUS_EDGE_DOMAIN:-}"
+if [ -z "$status_edge_domain" ]; then
+  echo "::error::STATUS_EDGE_DOMAIN is not set — the dashboard CNAME target is required (the CloudFront distribution hostname, e.g. d123.cloudfront.net). Set the repo variable, then re-dispatch."
+  exit 1
+fi
+if ! [[ "$status_edge_domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+  # %q, not the raw value: see the NET_DNS_ZONE branch above.
+  printf '::error::STATUS_EDGE_DOMAIN=%q is not a valid hostname (lowercase alnum/hyphen labels, no trailing dot) — refusing to write it.\n' "$status_edge_domain"
+  exit 1
+fi
+# Any all-numeric dotted name is an address literal in some notation (dotted
+# quad, or a partial/5-label form); a CNAME target must be a DNS name.
+if [[ "$status_edge_domain" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+  echo "::error::STATUS_EDGE_DOMAIN is a numeric dotted name (an IP address literal) — a CNAME target must be a DNS name."
+  exit 1
+fi
+# RFC 1035 bounds: a regex-legal but over-long name fails at the API (or is
+# partially accepted) — refuse it before any auth file exists.
+if [ "${#status_edge_domain}" -gt 253 ]; then
+  echo "::error::STATUS_EDGE_DOMAIN is longer than 253 characters — not a valid DNS name."
+  exit 1
+fi
+IFS='.' read -r -a _edge_labels <<<"$status_edge_domain"
+for _edge_label in "${_edge_labels[@]}"; do
+  if [ "${#_edge_label}" -gt 63 ]; then
+    echo "::error::STATUS_EDGE_DOMAIN has a label longer than 63 characters — not a valid DNS name."
+    exit 1
+  fi
+done
+
 # D5: lowercase, alnum + hyphen only; anything else becomes a hyphen, runs
 # collapse, edges trim. Empty after cleaning = refuse.
 san="$(sanitize_tenant "$alias")"
@@ -131,6 +190,33 @@ if [ -z "$san" ]; then
   exit 1
 fi
 record="$(derive_anchor_hostname "$san")" # NN=01; -02+ is a future multi-anchor case.
+status_record="$(derive_status_host "$san")" # <tenant>.status — the dashboard name (explicit CNAME, see header).
+# Derived-name guard (standalone safety): TENANT_USER's validator runs upstream
+# in the workflow, but `sanitize_tenant` is `tr`+`sed` (line-oriented) so a
+# control byte would survive into a derived name and then into a curl URL,
+# dying with an obscure error after the auth file exists. Refuse here; %q so a
+# hostile value cannot forge a workflow command.
+case "$record" in
+  '' | *[!a-z0-9-]*)
+    printf '::error::derived anchor name=%q is not a DNS label — refusing to build a URL from it.\n' "$record"
+    exit 1 ;;
+esac
+# `status_record` is `<label>.status`, not a single label: validate the exact
+# shape (one lowercase-hyphen label + the fixed `.status` suffix) so a control
+# byte, a stray dot, or a future derive_status_host change fails closed.
+if ! [[ "$status_record" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.status$ ]]; then
+  printf '::error::derived dashboard name=%q is not a <tenant>.status name — refusing to build a URL from it.\n' "$status_record"
+  exit 1
+fi
+# Target semantics: the dashboard CNAME must point OUTSIDE this zone (the
+# platform edge). A regex-valid in-zone target (the record itself, the anchor,
+# the wildcard's own name) would loop or chain the dashboard into the
+# firewall-closed box and still verify green — refuse it here.
+case "$status_edge_domain" in
+  "$ZONE" | *".$ZONE")
+    printf '::error::STATUS_EDGE_DOMAIN=%q points inside %s — the dashboard CNAME must target the platform edge outside the zone.\n' "$status_edge_domain" "$ZONE"
+    exit 1 ;;
+esac
 
 # Write helper: fail on any non-2xx write response (a rejected PUT/POST must
 # never reach the verify step as a silent success).
@@ -146,96 +232,100 @@ assert_write_ok() { # $1 = provider label, $2 = method, $3 = url, $4 = body
 # ---------------------------------------------------------------------------
 # Cloudflare driver (provider=cloudflare; today's production path).
 # ---------------------------------------------------------------------------
-cf_upsert_anchor() {
-  local fqdn existing rec_id rec_ip body verify zone_id
-  local got_name got_ip got_proxied got_ttl count
-  fqdn="${record}.${ZONE}"
+cf_upsert_record() { # $1 = rr_type (A|CNAME), $2 = fqdn, $3 = wanted content, $4 = record comment
+  local rr_type="$1" fqdn="$2" want_content="$3" comment="$4"
+  local existing rec_id rec_content body verify zone_id
+  local got_name got_type got_content got_proxied got_ttl count
   zone_id="$(curl "${auth[@]}" "$CF_API/zones?name=$ZONE" | jq -r '.result[0].id // empty')"
   if [ -z "$zone_id" ]; then
     echo "::error::could not resolve zone id for $ZONE — check the token scope and try again."
     exit 1
   fi
-  echo "record: $fqdn -> $want_ip (provider=cloudflare, proxied=false, ttl=${ANCHOR_TTL})"
-  existing="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
+  echo "record: $fqdn $rr_type -> $want_content (provider=cloudflare, proxied=false, ttl=${ANCHOR_TTL})"
+  existing="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=$rr_type&name=$fqdn")"
   rec_id="$(printf '%s' "$existing" | jq -r '.result[0].id // empty')"
-  rec_ip="$(printf '%s' "$existing" | jq -r '.result[0].content // empty')"
+  rec_content="$(printf '%s' "$existing" | jq -r '.result[0].content // empty')"
   # List-then-write IS the create-or-overwrite: PUT when the name exists,
   # POST when it doesn't.
-  body="$(jq -n --arg name "$fqdn" --arg ip "$want_ip" --argjson ttl "$ANCHOR_TTL" '{type:"A", name:$name, content:$ip, ttl:$ttl, proxied:false, comment:"operator anchor; DNS-only (proxied off)"}')"
+  body="$(jq -n --arg type "$rr_type" --arg name "$fqdn" --arg content "$want_content" --arg comment "$comment" --argjson ttl "$ANCHOR_TTL" '{type:$type, name:$name, content:$content, ttl:$ttl, proxied:false, comment:$comment}')"
   if [ -n "$rec_id" ]; then
-    echo "record exists ($rec_ip) — overwriting to the exact anchor address."
+    echo "record exists ($rec_content) — overwriting to the exact wanted content."
     assert_write_ok cloudflare PUT "$CF_API/zones/$zone_id/dns_records/$rec_id" "$body"
   else
     echo "no record yet — creating."
     assert_write_ok cloudflare POST "$CF_API/zones/$zone_id/dns_records" "$body"
   fi
-  # Verify-after-write: re-read and exact-match the rrset (exactly one A
-  # record) name + address + proxied + ttl, else fail.
-  verify="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=A&name=$fqdn")"
+  # Verify-after-write: re-read and exact-match the rrset (exactly one
+  # record) name + content + proxied + ttl, else fail.
+  verify="$(curl "${auth[@]}" "$CF_API/zones/$zone_id/dns_records?type=$rr_type&name=$fqdn")"
   count="$(printf '%s' "$verify" | jq -r '(.result // []) | length')"
   got_name="$(printf '%s' "$verify" | jq -r '.result[0].name // empty')"
-  got_ip="$(printf '%s' "$verify" | jq -r '.result[0].content // empty')"
+  got_type="$(printf '%s' "$verify" | jq -r '.result[0].type // empty')"
+  got_content="$(printf '%s' "$verify" | jq -r '.result[0].content // empty')"
+  got_content="${got_content%.}" # DNS names compare equal with/without the root dot
   # NOT `.proxied // empty`: jq's alternative operator treats false as empty,
   # so a DNS-only record (proxied=false) read as "" and this check aborted a
   # fully provisioned run (live 2026-09-10, #85). tostring keeps false.
   got_proxied="$(printf '%s' "$verify" | jq -r '(.result[0] // {}) | .proxied | tostring')"
   got_ttl="$(printf '%s' "$verify" | jq -r '(.result[0] // {}) | .ttl | tostring')"
   printf '%s' "$verify" | jq '{name: .result[0].name, type: .result[0].type, content: .result[0].content, ttl: .result[0].ttl, proxied: .result[0].proxied}'
-  if [ "$count" != "1" ] || [ "$got_name" != "$fqdn" ] || [ "$got_ip" != "$want_ip" ] || [ "$got_proxied" != "false" ] || [ "$got_ttl" != "$ANCHOR_TTL" ]; then
-    echo "::error::verify-after-write mismatch: want exactly one $fqdn -> $want_ip (proxied=false, ttl=${ANCHOR_TTL}), zone answers ${count} record(s): $got_name -> $got_ip (proxied=$got_proxied, ttl=${got_ttl:-unknown}). STOP — investigate before any bind-by-name."
+  if [ "$count" != "1" ] || [ "$got_name" != "$fqdn" ] || [ "$got_type" != "$rr_type" ] || [ "$got_content" != "$want_content" ] || [ "$got_proxied" != "false" ] || [ "$got_ttl" != "$ANCHOR_TTL" ]; then
+    echo "::error::verify-after-write mismatch: want exactly one $fqdn $rr_type -> $want_content (proxied=false, ttl=${ANCHOR_TTL}), zone answers ${count} record(s): $got_name $got_type -> $got_content (proxied=$got_proxied, ttl=${got_ttl:-unknown}). STOP — investigate before any bind-by-name."
     exit 1
   fi
-  echo "verified: $fqdn -> $want_ip (proxied=false, ttl=${ANCHOR_TTL})."
+  echo "verified: $fqdn $rr_type -> $want_content (proxied=false, ttl=${ANCHOR_TTL})."
 }
 
 # ---------------------------------------------------------------------------
 # Gcore driver (provider=gcore; the `.net` provider post-B).
 # API (C8-verified 2026-09-29): `Authorization: APIKey <token>`, rrset CRUD
 # by name/type path `/dns/v2/zones/{zone}/{fqdn}/{type}`, body
-# `{ttl, resource_records:[{content:[...], enabled:true}]}` (A content is a
-# single string in the array), GET returns 404 for a missing rrset.
+# `{ttl, resource_records:[{content:[...], enabled:true}]}` (A/CNAME content is
+# a single string in the array), GET returns 404 for a missing rrset.
 # ---------------------------------------------------------------------------
-gcore_upsert_anchor() {
-  local fqdn body tmp code
-  local got_name got_ip got_ttl got_enabled count
-  fqdn="${record}.${ZONE}"
+gcore_upsert_record() { # $1 = rr_type (A|CNAME), $2 = fqdn, $3 = wanted content
+  local rr_type="$1" fqdn="$2" want_content="$3"
+  local body tmp code
+  local got_name got_type got_content got_ttl got_enabled count
   if [ "$ANCHOR_TTL" -lt 120 ]; then
     echo "::error::TTL ${ANCHOR_TTL}s is below the Gcore Free floor of 120s — fix ANCHOR_TTL before writing."
     exit 1
   fi
-  echo "record: $fqdn -> $want_ip (provider=gcore, ttl=${ANCHOR_TTL})"
-  body="$(jq -n --arg ip "$want_ip" --argjson ttl "$ANCHOR_TTL" '{ttl:$ttl, resource_records:[{content:[$ip], enabled:true}]}')"
+  echo "record: $fqdn $rr_type -> $want_content (provider=gcore, ttl=${ANCHOR_TTL})"
+  body="$(jq -n --arg content "$want_content" --argjson ttl "$ANCHOR_TTL" '{ttl:$ttl, resource_records:[{content:[$content], enabled:true}]}')"
   tmp="$(mktemp)"
-  code="$(curl "${auth[@]}" -o "$tmp" -w '%{http_code}' "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/A")"
+  code="$(curl "${auth[@]}" -o "$tmp" -w '%{http_code}' "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/$rr_type")"
   case "$code" in
     200)
-      echo "record exists — overwriting to the exact anchor address."
-      assert_write_ok gcore PUT "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/A" "$body"
+      echo "record exists — overwriting to the exact wanted content."
+      assert_write_ok gcore PUT "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/$rr_type" "$body"
       ;;
     404)
       echo "no record yet — creating."
-      assert_write_ok gcore POST "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/A" "$body"
+      assert_write_ok gcore POST "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/$rr_type" "$body"
       ;;
     *)
       rm -f "$tmp"
-      echo "::error::Gcore GET $fqdn/A returned HTTP ${code} — check the token scope and the zone name, then re-dispatch."
+      echo "::error::Gcore GET $fqdn/$rr_type returned HTTP ${code} — check the token scope and the zone name, then re-dispatch."
       exit 1
       ;;
   esac
   # Verify-after-write: re-read and exact-match the rrset (exactly one
-  # record) name + address + ttl + enabled. The address count flattens
+  # record) name + content + ttl + enabled. The content count flattens
   # every resource_records[].content value: Gcore models an A address as
   # an array inside ONE rrset entry, so counting entries alone would pass
   # a bundled [want, stale] content (count=1).
-  code="$(curl "${auth[@]}" -o "$tmp" -w '%{http_code}' "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/A")"
+  code="$(curl "${auth[@]}" -o "$tmp" -w '%{http_code}' "$GCORE_API/dns/v2/zones/$ZONE/$fqdn/$rr_type")"
   if [ "$code" != "200" ]; then
     rm -f "$tmp"
-    echo "::error::verify-after-write GET $fqdn/A returned HTTP ${code} — cannot prove the record. STOP — investigate before any bind-by-name."
+    echo "::error::verify-after-write GET $fqdn/$rr_type returned HTTP ${code} — cannot prove the record. STOP — investigate before any bind-by-name."
     exit 1
   fi
   count="$(jq -r '[(.resource_records // [])[] | (.content // empty) | if type == "array" then .[] else . end] | length' "$tmp")"
   got_name="$(jq -r '.name // empty' "$tmp" | sed 's/\.$//')"
-  got_ip="$(jq -r '[(.resource_records // [])[] | (.content // empty) | if type == "array" then .[] else . end] | join(",")' "$tmp")"
+  got_type="$(jq -r '.type // empty' "$tmp")"
+  got_content="$(jq -r '[(.resource_records // [])[] | (.content // empty) | if type == "array" then .[] else . end] | join(",")' "$tmp")"
+  got_content="${got_content%.}" # DNS names compare equal with/without the root dot
   got_ttl="$(jq -r '.ttl // empty' "$tmp")"
   # Boolean read via tostring (never `// empty` — false is empty to jq; CI's
   # jq-boolean-guard enforces this shape). Read EVERY entry: a single disabled
@@ -243,14 +333,24 @@ gcore_upsert_anchor() {
   got_enabled="$(jq -r '[(.resource_records // [])[] | .enabled | tostring] | unique | join(",")' "$tmp")"
   jq '{name: .name, type: .type, ttl: .ttl, resource_records: .resource_records}' "$tmp"
   rm -f "$tmp"
-  if [ "$count" != "1" ] || [ "$got_name" != "$fqdn" ] || [ "$got_ip" != "$want_ip" ] || [ "$got_ttl" != "$ANCHOR_TTL" ] || [ "$got_enabled" != "true" ]; then
-    echo "::error::verify-after-write mismatch: want exactly one $fqdn -> $want_ip (ttl=${ANCHOR_TTL}, enabled=true), zone answers ${count} record(s): $got_name -> $got_ip (ttl=${got_ttl:-unknown}, enabled=${got_enabled:-unknown}). STOP — investigate before any bind-by-name."
+  if [ "$count" != "1" ] || [ "$got_name" != "$fqdn" ] || [ "$got_type" != "$rr_type" ] || [ "$got_content" != "$want_content" ] || [ "$got_ttl" != "$ANCHOR_TTL" ] || [ "$got_enabled" != "true" ]; then
+    echo "::error::verify-after-write mismatch: want exactly one $fqdn $rr_type -> $want_content (ttl=${ANCHOR_TTL}, enabled=true), zone answers ${count} record(s): $got_name $got_type -> $got_content (ttl=${got_ttl:-unknown}, enabled=${got_enabled:-unknown}). STOP — investigate before any bind-by-name."
     exit 1
   fi
-  echo "verified: $fqdn -> $want_ip (ttl=${ANCHOR_TTL}, enabled=true)."
+  echo "verified: $fqdn $rr_type -> $want_content (ttl=${ANCHOR_TTL}, enabled=true)."
 }
 
+# Both records, always, in order: the anchor A first (clevis bind-by-name is
+# the load-bearing one), then the dashboard CNAME (renewal-proofing; the
+# wildcard covers it between renewals, but an explicit record is immune to
+# the ACME challenge-node ENT — see the header).
 case "$PROVIDER" in
-  cloudflare) cf_upsert_anchor ;;
-  gcore) gcore_upsert_anchor ;;
+  cloudflare)
+    cf_upsert_record A "${record}.${ZONE}" "$want_ip" "operator anchor; DNS-only (proxied off)"
+    cf_upsert_record CNAME "${status_record}.${ZONE}" "$status_edge_domain" "per-tenant status dashboard; DNS-only (proxied off)"
+    ;;
+  gcore)
+    gcore_upsert_record A "${record}.${ZONE}" "$want_ip"
+    gcore_upsert_record CNAME "${status_record}.${ZONE}" "$status_edge_domain"
+    ;;
 esac
