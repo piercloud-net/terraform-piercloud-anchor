@@ -959,9 +959,9 @@ jobs:
           # tenant pastes nothing, bootstrap stays 1 secret): the per-anchor
           # Origin CA certificate arrives via the cert-only repo VARIABLE
           # (public material — never key material; the key is generated on
-          # the box); CF_AOP_CA_PEM stays the optional zone-AOP client-auth
-          # bundle (repo secret). Deployed material for Caddy's :443, NOT a
-          # standing API token.
+          # the box); CF_AOP_CA_PEM stays the legacy zone-AOP client-auth
+          # bundle (repo secret; A2 retires it — expected unset post-cutover).
+          # Deployed material for Caddy's :443, NOT a standing API token.
           ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
           # CloudFront origin auth (call D): the secret header CloudFront

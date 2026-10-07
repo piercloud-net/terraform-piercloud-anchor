@@ -131,8 +131,11 @@
 #                            secret, masked at birth in the workflow like the
 #                            root password). Deployed cert material for
 #                            Caddy's :443 — NOT a standing API token (the box
-#                            presents, never rewrites the zone). Empty = edge
-#                            auth stays firewall-allowlist + Host binding.
+#                            presents, never rewrites the zone). Empty (the A2
+#                            post-cutover state) = edge auth is the firewall
+#                            allowlist + the X-Piercloud-Origin gate; AOP is
+#                            retired for the :443 origin leg (pre-A2
+#                            Cloudflare-edge rollback only).
 #                            Tang is unaffected either way.
 #   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
 #    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)

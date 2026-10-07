@@ -889,8 +889,9 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "      - \"[RESPONSE_TIME] < 500\"  # Caddy p95>500ms alert, per-probe form (docs: https://gatus.io/docs)"
   printf '%s' "$ENDPOINTS_YAML"
   if [ -n "${STATUS_HOST:-}" ]; then
-    printf '%s\n' "  # Dashboard through the platform status edge (CloudFront at the A2"
-    printf '%s\n' "  # target — the platform status wildcard routes this name): proves edge ->"
+    printf '%s\n' "  # Dashboard through the platform status edge (CloudFront — live"
+    printf '%s\n' "  # 2026-10-07; the anchor-side cutover is the remaining step — the"
+    printf '%s\n' "  # platform status wildcard routes this name): proves edge ->"
     printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
     printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
@@ -917,7 +918,7 @@ else
   # reading the OLD config forever (same class as the Caddyfile below;
   # observed live 2026-10-07). Truncate+rewrite keeps the inode but is not
   # atomic; the post-write cmp catches a short/failed write at run time (a
-  # power loss mid-write is self-healed by the next dispatch).
+  # power loss mid-write is repaired only by the next dispatch).
   cat "$TMP_CFG" >"${GATUS_CONFIG}"
   cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (out of space?) — refusing to restart Gatus on a partial config"
   rm -f "$TMP_CFG"
@@ -1002,7 +1003,8 @@ fi
 # the running Gatus loaded — an aborted restart (SSH drop, SIGKILL) would
 # otherwise stay invisible, and the next dispatch (identical render, fresh
 # mount) would report green while the monitor serves the old config. A
-# restart is cheap and the sqlite history lives in a named volume.
+# restart is cheap (a ~1s monitor blip) and the sqlite history lives in a
+# named volume.
 docker restart gatus >/dev/null
 log "Gatus restarted"
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
@@ -1119,7 +1121,7 @@ else
   # the inode (mode is re-asserted 0600 first so a first install cannot
   # expose the secret-bearing render even transiently) but is not atomic;
   # the post-write cmp catches a short/failed write at run time (a power
-  # loss mid-write is self-healed by the next dispatch).
+  # loss mid-write is repaired only by the next dispatch).
   [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
   chmod 600 "${CADDY_CONFIG}"
   cat "$TMP_CADDY" >"${CADDY_CONFIG}"
@@ -1202,7 +1204,7 @@ fi
 # Always reload: the stale-mount guard compares the MOUNT's bytes, not the
 # loaded config — an aborted reload (SSH drop, SIGKILL between the in-place
 # write and this line) would otherwise stay invisible, and the next dispatch
-# (identical render, fresh mount) would report green while the running Caddy
+# (identical render, equal mount bytes) would report green while the running Caddy
 # serves the old config (a rotated X-Piercloud-Origin secret or a changed
 # MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
 # covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
@@ -1346,7 +1348,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
     case "${dash_code}" in
       301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the DNS stage writes only the anchor record; the dashboard name is covered by the platform status wildcard at the edge buildout)" ;;
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the DNS stage writes only the anchor record; the dashboard name is covered by the platform status wildcard at the edge (live 2026-10-07))" ;;
       *)
         docker logs caddy 2>&1 | tail -20 || true
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
@@ -1404,9 +1406,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (pre-A2 rollback to the Cloudflare edge only: re-enable per docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (pre-A2 rollback to the Cloudflare edge only: re-enable per docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (pre-A2 Cloudflare-edge rollback only: rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. Pre-A2 Cloudflare-edge rollback only: rotate the leaf with 102 --aop --force-aop --apply, then re-dispatch. If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
