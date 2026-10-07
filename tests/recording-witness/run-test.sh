@@ -7001,7 +7001,7 @@ is "ranges: the degenerate [N, N] range -> ok" "ok" "${CASE_STATE}"
 # replica golden for the seq-0 range pins the built key shape only, so a live
 # regression refusing seq-0 ranges (the red-team `mseq0` mutant in
 # `_audit_range_is_drift`) would otherwise leave the suite green. The span is
-# intentionally NON-degenerate (0-1, start 2, end 3) so the tooth isolates
+# intentionally NON-degenerate (0-1, start 2, end 3) so the tooth exercises
 # the seq-0 START rather than re-testing the `[N, N]` degeneracy pinned above.
 R29_S0_START="$(dated_key session.start 20260925T153800Z "${R29_SID}" 2 shell)"
 R29_S0_RANGE="$(dated_range_key 1 session.data 20260925T153810Z "${R29_SID}" 0)"
