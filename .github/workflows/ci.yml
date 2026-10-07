@@ -4,8 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
-  # Maintainer-triggered fallback: re-verify a ref when GitHub's event
-  # delivery is degraded (or to re-run the required checks on a head).
+  # Maintainer-triggered fallback: run CI on a ref when GitHub's event
+  # delivery is degraded. Fresh check runs land on the ref tip; this does
+  # not re-associate checks with an open PR.
   workflow_dispatch:
 
 permissions:
