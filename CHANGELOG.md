@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 - *(witness)* Dual-layout audit keys — date-partitioned strip + bounded delta streams (closes #168)
 - *(witness)* Seq-range interval continuity — phase 2 (closes #159)
 - *(a2)* Nested status host + provider-switched DNS writer + CloudFront origin auth (closes #166)
+- *(provision)* Run-name + dispatch_intent input for control-plane run discovery (closes #176)
 
 ### 🐛 Bug Fixes
 
@@ -64,6 +65,7 @@ All notable changes to this project will be documented in this file.
 - *(witness)* Bound the delta session listing at the heartbeat stem (closes #161)
 - *(010)* Force the Caddy reload — a chain-only cert change is never re-read (closes #174)
 - *(010)* Enforce the ORIGIN_CA_CERT_PEM chain + prove the A2 edge (closes #172)
+- *(anchor-dns)* Explicit per-tenant dashboard CNAME (wildcard-ENT immunity) (closes #178)
 
 ### 💼 Other
 
