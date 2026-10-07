@@ -913,8 +913,13 @@ if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
   rm -f "$TMP_CFG"
   GATUS_RESTART=0
 else
-  mv "$TMP_CFG" "${GATUS_CONFIG}"
-  log "Gatus config installed (rendered from dispatch env)"
+  # IN-PLACE install: the gatus container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode and the container keeps
+  # reading the OLD config forever (same class as the Caddyfile below;
+  # observed live 2026-10-07).
+  cat "$TMP_CFG" >"${GATUS_CONFIG}"
+  rm -f "$TMP_CFG"
+  log "Gatus config installed in place (rendered from dispatch env)"
   GATUS_RESTART=1
 fi
 
@@ -955,13 +960,26 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
+# Stale-mount guard: the container bind-mounts the config FILE, and a file
+# bind mount pins the inode — a container created before an `mv` install
+# keeps reading the OLD bytes forever (docker restart does not rebind
+# mounts; live 2026-10-07). Compare the container's view through its root
+# to the rendered path; divergence = recreate once. In-place installs keep
+# this guard quiet on every later run.
+GATUS_MOUNT_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
+  gatus_pid="$(docker inspect --format '{{.State.Pid}}' gatus 2>/dev/null || true)"
+  if [ -n "${gatus_pid}" ] && ! cmp -s "/proc/${gatus_pid}/root/config/config.yaml" "${GATUS_CONFIG}"; then
+    GATUS_MOUNT_STALE=1
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
-    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor; then
+    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ]; then
       log "Gatus already running on ${GATUS_IMAGE}"
     else
-      log "Gatus container predates the hostanchor mapping (dual probes need it) - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
+      log "Gatus container predates the hostanchor mapping or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
       docker rm -f gatus >/dev/null
     fi
   else
@@ -1089,8 +1107,18 @@ else
   fi
   # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
   docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
-  mv "$TMP_CADDY" "${CADDY_CONFIG}"
-  log "Caddyfile installed (rendered from dispatch env)"
+  # IN-PLACE install: the caddy container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode, so the container keeps
+  # reading the OLD bytes and `caddy reload` reports "config is unchanged"
+  # (observed live 2026-10-07: the A2 cutover render never reached the
+  # running Caddy and the :80 Host probe aborted). Truncate+rewrite keeps
+  # the inode; mode is re-asserted 0600 first so a first install cannot
+  # expose the secret-bearing render even transiently.
+  [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
+  chmod 600 "${CADDY_CONFIG}"
+  cat "$TMP_CADDY" >"${CADDY_CONFIG}"
+  rm -f "$TMP_CADDY"
+  log "Caddyfile installed in place (rendered from dispatch env)"
   CADDY_RESTART=1
 fi
 # ---------------------------------------------------------------------------
@@ -1111,12 +1139,24 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
 fi
 [ -n "${AOP_TLS}" ] && CADDY_WANT_MOUNTS="${CADDY_WANT_MOUNTS} aop"
 CADDY_HAVE_MOUNTS="$(cat /etc/caddy/.deployed-mounts 2>/dev/null || true)"
+# Stale-mount guard (same rationale as the Gatus block above): the container
+# bind-mounts the Caddyfile FILE; a container created before an `mv` install
+# keeps reading the OLD bytes and the reload silently no-ops ("config is
+# unchanged"). Compare the container's view through its root to the rendered
+# path; divergence = recreate once. In-place installs keep this quiet.
+CADDY_MOUNT_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
+  caddy_pid="$(docker inspect --format '{{.State.Pid}}' caddy 2>/dev/null || true)"
+  if [ -n "${caddy_pid}" ] && ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"; then
+    CADDY_MOUNT_STALE=1
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   CADDY_RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' caddy) # ci-allowlist: code — docker inspect field name, not a live reference.
-  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ]; then
+  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
     log "Caddy already running on ${CADDY_IMAGE}"
   else
-    log "Caddy image or deployed-PEM set changed - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
+    log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f caddy >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "caddy"; then
@@ -1355,7 +1395,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge re-enable AOP (docs/dr.md). A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (pre-A2 rollback to the Cloudflare edge only: re-enable per docs/dr.md)"
       fi
       die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
