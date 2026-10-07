@@ -957,7 +957,8 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           # Operator-plane dashboard-TLS material (set at template time — the
           # tenant pastes nothing, bootstrap stays 1 secret): the per-anchor
-          # Origin CA certificate arrives via the cert-only repo VARIABLE
+          # Origin CA certificate chain (leaf-first) arrives via the cert-only
+          # repo VARIABLE
           # (public material — never key material; the key is generated on
           # the box); CF_AOP_CA_PEM stays the legacy zone-AOP client-auth
           # bundle (repo secret; A2 retires it — expected unset post-cutover).
@@ -1045,7 +1046,7 @@ jobs:
           path: origin-ca.csr
           # 90 = the public-repo cap. Public material (a CSR carries no key):
           # the hand-off for operator-side signing; the signed cert returns
-          # via the cert-only ORIGIN_CA_CERT_PEM variable.
+          # via the cert-only ORIGIN_CA_CERT_PEM variable (leaf-first chain).
           retention-days: 90
           if-no-files-found: warn
 

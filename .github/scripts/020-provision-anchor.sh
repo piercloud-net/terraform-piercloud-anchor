@@ -122,8 +122,10 @@
 #                            Docs: docs/recording-witness.md.
 #   ORIGIN_CA_CERT_PEM      operator-planted per-anchor public certificate
 #                            chain, leaf first (repo VARIABLE, cert-only
-#                            public material — the chain is required, CloudFront
-#                            502s without the intermediate; NO key material ever
+#                            public material — the chain is required and
+#                            enforced (leaf-only/unlinked values fail the
+#                            install gate); CloudFront 502s without the
+#                            intermediate; NO key material ever
 #                            travels; the key is generated on the box by
 #                            scripts/010). Empty = nothing to install this run
 #                            (the box keeps its current pair); the CSR comes

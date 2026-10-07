@@ -11,7 +11,9 @@
 #   - behavioral: an open reader sees new bytes only on an in-place write;
 #   - install shape: 010 writes both configs in place (no mv onto the path);
 #   - stale-mount guard: 010 compares the container's /proc/<pid>/root view
-#     to the rendered path and recreates on divergence (caddy + gatus);
+#     to the rendered path and recreates on divergence (caddy + gatus, plus
+#     the bind-mounted cert/key/AOP PEMs — the live run-E class where the
+#     chain landed on the host while the container served the old inode);
 #   - CI wiring: this harness is listed + path-gated.
 # Cred-free, offline (no docker, no caddy, no network).
 set -euo pipefail
@@ -69,6 +71,21 @@ has "${PROVISION_SH}" 'cmp -s "/proc/${gatus_pid}/root/config/config.yaml" "${GA
 has "${PROVISION_SH}" '&& [ "${CADDY_MOUNT_STALE}" = "0" ]' "Caddy recreate condition includes the stale flag"
 has "${PROVISION_SH}" '&& [ "${GATUS_MOUNT_STALE}" = "0" ]' "Gatus recreate condition includes the stale flag"
 
+# ---- stale-mount guard: the deployed PEM files (same class) ----------------
+# The cert/key/AOP PEMs are bind-mounted FILES too. A container created before
+# a PEM's inode last changed keeps reading the OLD bytes; `caddy reload`
+# reports success and re-reads the stale mount. Live 2026-10-07: the 4-block
+# chain landed on the host while the container still served the leaf-only
+# inode (CloudFront 502 with a green run). The guard must compare the PEMs
+# through the container's root too, and recreate on divergence.
+has "${PROVISION_SH}" 'cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_CRT}" "${CADDY_ORIGIN_CRT}"' "Caddy guard compares the mounted cert view"
+has "${PROVISION_SH}" 'cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_KEY}" "${CADDY_ORIGIN_KEY}"' "Caddy guard compares the mounted key view"
+has "${PROVISION_SH}" 'cmp -s "/proc/${caddy_pid}/root/etc/caddy/aop-ca.pem" "${CADDY_AOP_CA}"' "Caddy guard compares the mounted AOP CA view"
+has "${PROVISION_SH}" '[ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ "${ORIGIN_TLS}" = "1" ]' "PEM guard is scoped to a selected origin pair"
+has "${PROVISION_SH}" '[ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ -n "${AOP_TLS}" ]' "AOP guard is scoped to a deployed AOP bundle"
+has "${PROVISION_SH}" 'CADDY_MOUNT_STALE_REASON="origin-ca cert"' "stale-reason names the diverging PEM"
+has "${PROVISION_SH}" 'stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-' "recreate log carries the stale reason"
+
 # ---- unconditional reload/restart (red-team re-verify F4) ------------------
 # The guard proves the MOUNT, not what the running process loaded; the reload
 # and restart must stay unconditional (a CADDY_RESTART/GATUS_RESTART gate
@@ -85,6 +102,7 @@ has "${PROVISION_SH}" '&& [ "${GATUS_MOUNT_STALE}" = "0" ]' "Gatus recreate cond
 # reload kept serving the leaf-only cert -> CloudFront 502.
 has "${PROVISION_SH}" 'docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile' "Caddy reload stays unconditional and forced"
 hasnt "${PROVISION_SH}" 'caddy reload --config' "no no-op reload form (force required)"
+has "${PROVISION_SH}" 'caddy reload failed' "a failed Caddy reload dies (no silent green)"
 has "${PROVISION_SH}" 'docker restart gatus' "Gatus restart stays unconditional"
 hasnt "${PROVISION_SH}" 'CADDY_RESTART' "no CADDY_RESTART gate (reload is unconditional)"
 hasnt "${PROVISION_SH}" 'GATUS_RESTART' "no GATUS_RESTART gate (restart is unconditional)"

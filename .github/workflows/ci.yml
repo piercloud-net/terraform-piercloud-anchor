@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Maintainer-triggered fallback: run CI on a ref when GitHub's event
+  # delivery is degraded. Fresh check runs land on the ref tip; this does
+  # not re-associate checks with an open PR.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -570,8 +574,9 @@ jobs:
           set -euo pipefail
           # issue #123: the zone-wide shared origin pair is retired. No tracked
           # .tf/.sh/.yml may reference its secret prefix — the per-anchor pair
-          # (key generated on the box, cert returned via the cert-only repo
-          # variable) replaced it. Pattern runs from the contract source
+          # (key generated on the box, leaf-first chain returned via the
+          # cert-only repo variable) replaced it. Pattern runs from the
+          # contract source
           # (/tmp/contract-origin.yml — see the fetch step); files scanned stay
           # on HEAD. A line carrying 'ci-allowlist: <reason>' (10+ chars) is
           # the only escape hatch; the pattern's own defining line uses it.

@@ -16,7 +16,8 @@
 # never sends key material anywhere; it only prints a public thumbprint.
 # Per-anchor Cloudflare Origin CA material (issue #123) follows the same rule:
 # the key is generated ON THIS BOX and never leaves; the CSR is public; the
-# signed cert arrives via ORIGIN_CA_CERT_PEM (cert-only material).
+# signed cert arrives via ORIGIN_CA_CERT_PEM (cert-only material; the
+# leaf-first chain is required and enforced for the A2 CloudFront leg).
 #
 set -euo pipefail
 
@@ -376,7 +377,7 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 # generated ON this box and never leaves it; the CSR is public material
 # published in the run artifact for operator/broker-side signing; the signed
 # cert returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and
-# is validated fail-closed before Caddy may serve it. A2: the dashboard sits
+# is validated fail-closed (leaf + linked chain) before Caddy may serve it. A2: the dashboard sits
 # behind CloudFront, which trusts Mozilla-store CAs only — so the cert is a
 # PUBLIC single-SAN cert for the nested `<tenant>.status.piercloud.net`
 # viewer host (broker-issued via ACME DNS-01; Cloudflare Origin CA is dead
@@ -494,32 +495,128 @@ origin_ca_generate() { # ensure key+CSR; the key is never regenerated while a ce
 
 origin_ca_cert_pem_ok() { # $1 = PEM text -> a bounded leaf-first certificate chain, no framing junk
   local pem="$1" bytes begins ends
-  begins="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
-  ends="$(printf '%s\n' "$pem" | grep -c -- '-----END CERTIFICATE-----' || true)"
-  # A chain is REQUIRED for the A2 CloudFront origin leg: CloudFront drops the
-  # TCP connection (502, X-Cache: Error from cloudfront) when the intermediate
-  # is missing. Accept 1..8 blocks — the validator below checks the FIRST
-  # block as the leaf, so a chain pasted in the wrong order fails its SAN
-  # check; framing junk and oversized material still fail closed. Bounded at
-  # 16 KiB: a 4-block LE chain is ~5 KiB.
+  # Line-anchored markers: an unanchored grep counts the single line
+  # `-----BEGIN CERTIFICATE----------END CERTIFICATE-----` as two blocks
+  # while a PEM parser sees one — the shape gate must count what the parser
+  # counts. The body is constrained to base64/whitespace because Go/Caddy
+  # strip PEM headers while OpenSSL refuses a header-bearing block: an
+  # unconstrained body is a parser differential that must never install.
+  begins="$(printf '%s\n' "$pem" | grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" || true)"
+  ends="$(printf '%s\n' "$pem" | grep -cE -- "^-----END CERTIFICATE-----[[:space:]]*$" || true)"
+  # A chain is REQUIRED for the A2 CloudFront origin leg (enforced in
+  # origin_ca_install_from_env: CloudFront drops the TCP connection — 502,
+  # X-Cache: Error from cloudfront — when the intermediate is missing).
+  # Shape accepts 1..8 blocks: the validator checks the FIRST block as the
+  # leaf, every block must parse, and each hop's signature is verified in
+  # origin_ca_validate_cert. Bounded at 16 KiB: a 4-block LE chain is ~5 KiB.
   [ "$begins" = "$ends" ] || return 1
   [ "${begins:-0}" -ge 1 ] && [ "${begins:-0}" -le 8 ] || return 1
   printf '%s\n' "$pem" | awk '
-    /-----BEGIN CERTIFICATE-----/ { if (inblk) bad = 1; inblk = 1; seen = 1; next }
-    /-----END CERTIFICATE-----/   { if (!inblk) bad = 1; inblk = 0; next }
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { if (inblk) bad = 1; inblk = 1; seen = 1; next }
+    /^-----END CERTIFICATE-----[[:space:]]*$/   { if (!inblk) bad = 1; inblk = 0; next }
     { if (!seen) { if ($0 !~ /^[[:space:]]*$/) before = 1 }
-      else if (!inblk) { if ($0 !~ /^[[:space:]]*$/) after = 1 } }
-    END { exit (bad || before || after) }
+      else if (!inblk) { if ($0 !~ /^[[:space:]]*$/) after = 1 }
+      else if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^[A-Za-z0-9+\/=[:space:]]+$/) bad = 1 }
+    END { if (inblk) bad = 1; exit (bad || before || after) }
   ' || return 1
   bytes="$(printf '%s' "$pem" | wc -c | tr -d ' ')"
   [ "${bytes:-0}" -gt 0 ] && [ "${bytes:-0}" -le 16384 ]
 }
 
+origin_ca_chain_blocks() { # $1 = PEM file -> count of real certificate blocks (line-anchored)
+  grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" "$1" 2>/dev/null || true
+}
+
+origin_ca_block_der_exact() { # $1 = PEM file -> the FIRST block's body decodes to exactly the parsed DER (no trailing bytes)
+  local f="$1" raw der
+  # `openssl x509 -in` ignores bytes after the certificate DER, so a body of
+  # certDER||keyDER parses fine — and Go's non-leaf loader does not parse
+  # chain blocks either, so the trailing bytes would install and be served.
+  # The body must decode to exactly the DER OpenSSL re-encodes.
+  raw="$(awk '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { inblk = 1; next }
+    inblk && /^-----END CERTIFICATE-----[[:space:]]*$/ { exit }
+    inblk { print }
+  ' "$f" 2>/dev/null | tr -d '[:space:]' | base64 -d 2>/dev/null | wc -c | tr -d ' ' || true)"
+  der="$(openssl x509 -in "$f" -outform DER 2>/dev/null | wc -c | tr -d ' ' || true)"
+  [ "${raw:-0}" -gt 0 ] && [ "${der:-0}" -gt 0 ] && [ "$raw" = "$der" ]
+}
+
+origin_ca_blocks_parse() { # $1 = PEM file, $2 = optional split dir (kept when given) -> every block parses as exactly one X.509 cert (no trailing DER)
+  local f="$1" dir="${2:-}" created=0 n i cur
+  [ -s "$f" ] || return 1
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -ge 1 ] || return 1
+  if [ -z "$dir" ]; then
+    dir="$(mktemp -d)" || return 1
+    created=1
+  fi
+  # Split on the (already line-anchored) markers. Every block must parse as an
+  # X.509 certificate: a PEM header line that OpenSSL would skip, a
+  # private-key body re-labelled as CERTIFICATE, or bytes after the DER fails
+  # here (OpenSSL ignores trailing bytes; Go's non-leaf loader does not parse
+  # chain blocks either).
+  awk -v dir="$dir" '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { n++; file = sprintf("%s/block-%02d.pem", dir, n) }
+    n > 0 { print > file }
+  ' "$f" || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+  i=1
+  while [ "$i" -le "$n" ]; do
+    cur="$(printf '%s/block-%02d.pem' "$dir" "$i")"
+    openssl x509 -in "$cur" -noout >/dev/null 2>&1 || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+    origin_ca_block_der_exact "$cur" || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+    i=$((i + 1))
+  done
+  [ "$created" = 1 ] && rm -rf "$dir"
+  return 0
+}
+
+origin_ca_chain_ordered() { # $1 = PEM file -> every block parses; each hop verifies against the next block
+  local f="$1" dir n i cur next cur_fp next_fp
+  [ -s "$f" ] || return 1
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -ge 1 ] || return 1
+  dir="$(mktemp -d)" || return 1
+  origin_ca_blocks_parse "$f" "$dir" || { rm -rf "$dir"; return 1; }
+  # Adjacent-only signature linkage, NO self-signed-tail requirement: the
+  # live LE bundle ends with a cross-signed ISRG Root X2 whose issuer is not
+  # in the file. `-partial_chain` lets the next block act as the trust anchor
+  # for the current one: OpenSSL resolves the anchor by issuer name and then
+  # verifies the signature (same-name/different-key CAs are rejected). A
+  # duplicated block is a degenerate trusted anchor — a cert that IS the
+  # CAfile is accepted for itself — so each hop also requires a CA:TRUE
+  # issuer and a fingerprint that differs from the current block.
+  i=1
+  while [ "$i" -lt "$n" ]; do
+    cur="$(printf '%s/block-%02d.pem' "$dir" "$i")"
+    next="$(printf '%s/block-%02d.pem' "$dir" "$((i + 1))")"
+    openssl x509 -in "$next" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:TRUE' \
+      || { rm -rf "$dir"; return 1; }
+    cur_fp="$(openssl x509 -in "$cur" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+    next_fp="$(openssl x509 -in "$next" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+    [ -n "$cur_fp" ] && [ "$cur_fp" != "$next_fp" ] \
+      || { rm -rf "$dir"; return 1; }
+    # -no-CApath/-no-CAstore keep the explicit -CAfile authoritative: without
+    # them the default system store is also loaded, and a hop could "verify"
+    # against a system root instead of the next block.
+    openssl verify -partial_chain -no-CApath -no-CAstore -CAfile "$next" "$cur" >/dev/null 2>&1 \
+      || { rm -rf "$dir"; return 1; }
+    i=$((i + 1))
+  done
+  rm -rf "$dir"
+  return 0
+}
+
 origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on stderr
-  local cert="$1" key="$2" host="$3" sans start start_epoch now_epoch
+  local cert="$1" key="$2" host="$3" sans start start_epoch now_epoch blocks
   [ -s "$cert" ] || { printf 'cert %s missing or empty' "$cert" >&2; return 1; }
   [ -n "$(origin_ca_cert_hash "$cert")" ] \
     || { printf '%s is not a parseable X.509 certificate' "$cert" >&2; return 1; }
+  # A block whose body carries bytes after the certificate DER parses in
+  # OpenSSL (trailing data is ignored) but is not a single well-formed PEM
+  # certificate — key material smuggled this way must never validate/install.
+  origin_ca_block_der_exact "$cert" \
+    || { printf '%s carries trailing bytes after the certificate DER (not a single well-formed PEM certificate)' "$cert" >&2; return 1; }
   openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 \
     || { printf '%s is expired' "$cert" >&2; return 1; }
   start="$(openssl x509 -in "$cert" -noout -startdate 2>/dev/null | cut -d= -f2)"
@@ -530,25 +627,65 @@ origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on
     || { printf '%s is not yet valid (notBefore %s)' "$cert" "$start" >&2; return 1; }
   sans="$(origin_ca_cert_sans "$cert")"
   [ "$(origin_ca_dns_san_count "$sans")" = "1" ] \
-    || { printf '%s carries %s DNS SAN(s), want exactly one (%s)' "$cert" "$(origin_ca_dns_san_count "$sans")" "$host" >&2; return 1; }
+    || { printf '%s carries %s DNS SAN(s), want exactly one (%s) — the first block must be the leaf (a chain pasted issuer-first fails here)' "$cert" "$(origin_ca_dns_san_count "$sans")" "$host" >&2; return 1; }
   [ "$sans" = "$host" ] || { printf 'cert SAN %s differs from %s' "$sans" "$host" >&2; return 1; }
   [ -n "$(origin_ca_key_pub "$key")" ] && [ "$(origin_ca_key_pub "$key")" = "$(origin_ca_cert_pub "$cert")" ] \
     || { printf 'certificate public key does not match %s' "$key" >&2; return 1; }
+  # A multi-block value must be a real chain, not a leaf followed by bytes:
+  # every block parses and each hop's signature verifies against the next
+  # block. A wrong/absent intermediate otherwise installs, serves, passes the
+  # leaf-only probe and leaves CloudFront 502ing — the exact live incident.
+  blocks="$(origin_ca_chain_blocks "$cert")"
+  if [ "${blocks:-0}" -gt 1 ]; then
+    origin_ca_chain_ordered "$cert" \
+      || { printf '%s is not a linked leaf-first chain (every block must be exactly one X.509 certificate — no trailing bytes after the DER — and each certificate must be issued by the next block; issuer blocks must be CA:TRUE and must not duplicate the current block)' "$cert" >&2; return 1; }
+  fi
+  return 0
+}
+
+origin_ca_aop_deployed() { # 0 when a usable AOP bundle is present (marker-bearing garbage must not bypass the A2 gates)
+  local pem="${CF_AOP_CA_PEM:-}" tmp
+  case "$pem" in
+    *"BEGIN CERTIFICATE"*) ;;
+    *) return 1 ;;
+  esac
+  case "$pem" in
+    *"PRIVATE KEY"*) return 1 ;;
+  esac
+  # Bounded PEM shape AND every block parses as exactly one X.509 cert (no
+  # trailing DER): a marker+base64 non-cert body must not read as "deployed"
+  # and skip the A2 chain/depth gates.
+  origin_ca_cert_pem_ok "$pem" || return 1
+  tmp="$(mktemp)" || return 1
+  printf '%s\n' "$pem" >"$tmp"
+  origin_ca_blocks_parse "$tmp" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
   return 0
 }
 
 origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public material), fail-closed
-  local pem="${ORIGIN_CA_CERT_PEM:-}" tmp reason
+  local pem="${ORIGIN_CA_CERT_PEM:-}" tmp reason blocks
   [ -n "$pem" ] || return 0
   ORIGIN_CA_SUPPLIED=1
   [ -n "${STATUS_HOST:-}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but STATUS_HOST is unset — cannot verify the cert SAN; refusing to install"
   [ -s "${ORIGIN_CA_KEY}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but ${ORIGIN_CA_KEY} is missing — restore the key first (the cert must match it)"
+  # Cert-only, like CF_AOP_CA_PEM: this value is a public repo variable and the
+  # file lands in a bind mount — a private key must never travel here.
+  case "$pem" in *"PRIVATE KEY"*) die "ORIGIN_CA_CERT_PEM must be certificate-only (public material; the private key is generated on this box and never travels) — strip the private key";; esac
   origin_ca_cert_pem_ok "$pem" \
-    || die "ORIGIN_CA_CERT_PEM is not a bounded PEM certificate — refusing to install it"
+    || die "ORIGIN_CA_CERT_PEM is not a bounded leaf-first PEM certificate chain — refusing to install it"
   tmp="$(mktemp)"
   printf '%s\n' "$pem" >"$tmp"
+  blocks="$(origin_ca_chain_blocks "$tmp")"
+  if ! origin_ca_aop_deployed; then
+    # A2: the :443 origin leg is CloudFront (AOP retired). CloudFront drops
+    # the TCP connection (502, X-Cache: Error from cloudfront) when the
+    # intermediate is missing — a leaf-only paste must never install here.
+    [ "${blocks:-0}" -ge 2 ] \
+      || { rm -f "$tmp"; die "ORIGIN_CA_CERT_PEM carries a leaf-only certificate (1 block); the A2 CloudFront origin leg REQUIRES the leaf-first chain (leaf + intermediate(s), as issued — e.g. the lego bundle). A leaf-only cert makes CloudFront answer 502 (X-Cache: Error from cloudfront); a pre-A2 Cloudflare-edge rollback is a code-level revert (see docs/dr.md), not a secret/variable change"; }
+  fi
   if ! reason="$(origin_ca_validate_cert "$tmp" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
     rm -f "$tmp"
     die "ORIGIN_CA_CERT_PEM rejected: ${reason} — keeping the currently served pair untouched"
@@ -558,9 +695,11 @@ origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public ma
   cat "$tmp" >"${ORIGIN_CA_CRT}" \
     || { rm -f "$tmp"; die "in-place write to ${ORIGIN_CA_CRT} failed"; }
   rm -f "$tmp"
-  chmod 0644 "${ORIGIN_CA_CRT}"
+  # 0600: the pinned container reads it as root; the served file must never be
+  # a world-readable key sink (a crafted block could otherwise persist key bytes).
+  chmod 0600 "${ORIGIN_CA_CRT}"
   ORIGIN_CA_CERT_PEM=""
-  log "per-anchor Origin CA certificate installed for ${STATUS_HOST} (sha256 $(origin_ca_cert_hash "${ORIGIN_CA_CRT}"))"
+  log "per-anchor Origin CA certificate installed for ${STATUS_HOST} (${blocks} block(s), leaf sha256 $(origin_ca_cert_hash "${ORIGIN_CA_CRT}"))"
 }
 
 origin_ca_write_hash() { # $1 = cert file -> record the deployed cert hash (after a successful reload)
@@ -579,7 +718,7 @@ origin_ca_mark_active() { # one-way: the per-anchor pair has served on :443
 }
 
 origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDATED before it may be selected
-  local reason
+  local reason blocks
   ORIGIN_TLS=0
   ORIGIN_CA_PAIR=0
   ORIGIN_CERT_CHANGED=0
@@ -594,6 +733,11 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
       if ! reason="$(origin_ca_validate_cert "${ORIGIN_CA_CRT}" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
         die "on-box per-anchor Origin CA pair rejected for ${STATUS_HOST}: ${reason} — refusing to select or serve it (fix the cert, or remove origin-ca.{crt,key} to fall back/pending)"
       fi
+      if ! origin_ca_aop_deployed; then
+        blocks="$(origin_ca_chain_blocks "${ORIGIN_CA_CRT}")"
+        [ "${blocks:-0}" -ge 2 ] \
+          || die "on-box per-anchor pair for ${STATUS_HOST} is leaf-only; the A2 CloudFront origin leg REQUIRES the leaf-first chain (CloudFront answers 502 without the intermediate) — set the ORIGIN_CA_CERT_PEM repo variable to the issued chain and re-dispatch"
+      fi
     else
       warn "STATUS_HOST unset — per-anchor pair validation skipped (no :443 vhost is rendered; re-dispatch with TENANT_USER)"
     fi
@@ -606,6 +750,7 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
     if [ "$(cat "${ORIGIN_CA_HASH}" 2>/dev/null || true)" != "${ORIGIN_CA_HASH_WANT}" ]; then
       ORIGIN_CERT_CHANGED=1
     fi
+    log "per-anchor Origin CA pair selected for ${STATUS_HOST} ($(origin_ca_chain_blocks "${ORIGIN_CA_CRT}") block(s), leaf sha256 ${ORIGIN_CA_HASH_WANT})"
   elif [ "${ORIGIN_CA_SUPPLIED}" = "1" ]; then
     die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not present on the box — refusing to select any fallback"
   elif [ -s "${CADDY_ORIGIN_CRT}" ] && [ -s "${CADDY_ORIGIN_KEY}" ]; then
@@ -655,6 +800,129 @@ origin_ca_probe_and_mark() { # $1 = host; asserts the served pair FIRST, then se
   fi
   origin_ca_mark_active
   return 0
+}
+
+origin_ca_edge_pull() { # $1 = host -> 0 when the public edge served the ORIGIN this run (200 + marker, from CloudFront, not a cache Hit)
+  local host="$1" attempt stamp rc code cache cfid pop via via_ok body hdr errf hint attempts why why_class
+  stamp="$(date +%s)-$$"
+  body="$(mktemp)" || return 1
+  hdr="$(mktemp)" || { rm -f "$body"; return 1; }
+  errf="$(mktemp)" || { rm -f "$body" "$hdr"; return 1; }
+  rc=0
+  code=""
+  cache=""
+  cfid=""
+  pop=""
+  via=""
+  via_ok=0
+  attempts=""
+  for attempt in 1 2 3; do
+    rc=0
+    : >"$errf"
+    # Per-run unique buster: a cache policy that keys the query string gets a
+    # fresh key each attempt; one that ignores it does not — hence a Hit is
+    # treated as an unproven pull, never as success.
+    code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' --max-time 20 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "https://${host}/api/v1/endpoints/statuses?pc_chain_probe=${stamp}-${attempt}" 2>"$errf")" || rc=$?
+    cache="$(awk '/^[Xx]-[Cc]ache:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    # CloudFront's response header tuple: x-amz-cf-id (a per-response id),
+    # x-amz-cf-pop (the PoP that served it) and a via naming a
+    # cloudfront.net distribution. These are forgeable by anyone who can
+    # answer for the name with a trusted cert, so the tuple raises the bar
+    # (and a cache Hit is never accepted) without cryptographically pinning
+    # the distribution; the docs carry the honest claim.
+    cfid="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Ii][Dd]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    pop="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Pp][Oo][Pp]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    via="$(awk '/^[Vv]ia:/ { gsub(/\r/, ""); print; exit }' "$hdr" 2>/dev/null || true)"
+    via_ok=0
+    case "$via" in *cloudfront.net*) via_ok=1 ;; esac
+    attempts="${attempts}${attempt}[rc=${rc:-0},http=${code:-000},cache=${cache:-none},cfid=${cfid:-none}] "
+    # A clean pull needs ALL of: HTTP 200, the dashboard marker, an explicit
+    # Miss (an absent x-cache is not a Miss), and CloudFront's header tuple.
+    if [ "$rc" -eq 0 ] && [ "$code" = "200" ] && grep -q 'tang (via Caddy)' "$body" 2>/dev/null \
+       && [ "${cache:-}" = "Miss" ] && [ -n "$cfid" ] && [ -n "$pop" ] && [ "$via_ok" = "1" ]; then
+      rm -f "$body" "$hdr" "$errf"
+      return 0
+    fi
+    case "${cache:-}" in
+      Hit|RefreshHit) printf 'attempt %s was served from cache (x-cache: %s) — the origin was not proven by this response\n' "$attempt" "$cache" >&2 ;;
+    esac
+    if [ "$attempt" -lt 3 ]; then
+      sleep "${ORIGIN_CA_EDGE_PULL_RETRY_SLEEP:-5}"
+    fi
+  done
+  hint="$(tr '\n' ' ' <"$errf" 2>/dev/null | cut -c1-160)"
+  # Name the last attempt's first failed condition AND a stable class token.
+  # The token is emitted by this script as the FIRST field of the final line
+  # (the caller prefix-matches it), so header values echoed later on the line
+  # cannot steer the classification.
+  why_class="generic"
+  why="no clean origin response"
+  if [ "$rc" -eq 6 ]; then
+    why_class="resolve"
+    why="does not resolve yet (curl exit 6)"
+  elif [ "$rc" -ne 0 ]; then
+    why_class="transport"
+    why="curl exit ${rc}"
+  elif [ "$code" != "200" ]; then
+    why_class="http"
+    why="HTTP ${code:-000} through the edge"
+  elif ! grep -q 'tang (via Caddy)' "$body" 2>/dev/null; then
+    why_class="marker"
+    why="HTTP 200 without the dashboard body marker"
+  elif [ "${cache:-}" = "Hit" ] || [ "${cache:-}" = "RefreshHit" ]; then
+    why_class="cache"
+    why="served from cache (x-cache: ${cache}) — the origin was not contacted"
+  elif [ "${cache:-}" != "Miss" ]; then
+    why_class="nocache"
+    why="x-cache: ${cache:-absent} (not a Miss from CloudFront)"
+  elif [ -z "$cfid" ] || [ -z "$pop" ] || [ "$via_ok" != "1" ]; then
+    why_class="tuple"
+    why="HTTP 200 + marker without CloudFront's x-amz-cf-id/x-amz-cf-pop/via tuple"
+  fi
+  rm -f "$body" "$hdr" "$errf"
+  if [ "$rc" -eq 6 ]; then
+    printf '[resolve] https://%s/ does not resolve yet (curl exit 6; attempts: %s)\n' "$host" "${attempts:-none}" >&2
+    return 1
+  fi
+  printf '[%s] no attempt got a clean origin response (%s; curl exit %s, HTTP %s, x-cache: %s, x-amz-cf-id: %s, x-amz-cf-pop: %s, via: %s; attempts: %s; stderr: %s)\n' \
+    "$why_class" "$why" "${rc:-0}" "${code:-000}" "${cache:-unknown}" "${cfid:-missing}" "${pop:-missing}" "${via:-none}" "${attempts:-none}" "${hint:-none}" >&2
+  return 1
+}
+
+origin_ca_edge_prove() { # main-flow A2 proof: the public edge must serve the ORIGIN this run (no-op without a selected pair)
+  local edge_reason edge_last
+  # Scoped to ORIGIN_TLS (not ORIGIN_CA_PAIR): a legacy pair is dead at
+  # CloudFront too, so those runs must fail closed as well. `curl -f` alone
+  # exits 0 on a 3xx and on a cached error page.
+  if [ "${ORIGIN_TLS}" != "1" ]; then
+    log "A2 edge not proven this run — no origin pair selected (auto-TLS or a suppressed legacy pair); the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes"
+    return 0
+  fi
+  edge_reason=""
+  if edge_reason="$(origin_ca_edge_pull "${STATUS_HOST}" 2>&1)"; then
+    log "A2 edge pull through CloudFront serves ${STATUS_HOST} (OK; HTTP 200 + dashboard marker, origin contacted this run)"
+    return 0
+  fi
+  # Prefix-match the stable class token origin_ca_edge_pull emits first on the
+  # final line — never the echoed header values (a crafted via/x-cache value
+  # must not steer the die message).
+  edge_last="$(printf '%s\n' "${edge_reason}" | tail -n 1)"
+  case "${edge_last}" in
+    "[resolve]"*)
+      die "A2 edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07); on a first-time/DR dispatch before the platform records exist this probe cannot pass — bring the platform records up first (docs/dr.md), then re-dispatch" ;;
+    "[cache]"*)
+      die "A2 edge pull was served from CloudFront's cache (x-cache: Hit or RefreshHit) — a cached response cannot prove the origin chain. The probe needs an uncacheable response: set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled), or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[nocache]"*)
+      die "A2 edge pull got no explicit x-cache: Miss from the edge (the header was absent or carried another value) — a response the distribution did not just fetch from the origin cannot prove the origin chain. Set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled) — forwarding query strings alone still allows a Hit — or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[tuple]"*)
+      die "A2 edge pull got a 200 + marker but the response cannot prove it came through the distribution (missing x-amz-cf-id / x-amz-cf-pop / a via naming a cloudfront.net distribution). The tuple is a response-forgery barrier, not cryptographic proof; check that ${STATUS_HOST} resolves to the distribution and re-dispatch. Detail: ${edge_reason}" ;;
+    "[transport]"*)
+      die "A2 edge pull could not complete (the request failed at the transport layer — see Detail for the curl exit) — check the anchor's egress DNS/TLS to the public edge and re-dispatch. Detail: ${edge_reason}" ;;
+    *)
+      die "A2 edge pull through CloudFront failed — the served chain is incomplete or not leaf-first (CloudFront drops the connection with 502), the platform *.status records/distribution are absent, the origin gate (X-Piercloud-Origin) or firewall allowlist does not admit CloudFront, or the dashboard body marker is missing. Local :443 handshakes fine, so this is the edge leg: set ORIGIN_CA_CERT_PEM to the issued leaf-first chain and re-dispatch (docs/dr.md). Detail: ${edge_reason}" ;;
+  esac
 }
 # --- origin-ca:end ---
 
@@ -939,7 +1207,7 @@ fi
 #    STATUS_HOST the Gatus section just resolved; the CSR is public material
 #    published for operator-side signing; a signed cert returns via the
 #    cert-only ORIGIN_CA_CERT_PEM variable and is validated fail-closed
-#    against the on-box key before it is installed in place. The legacy
+#    (leaf + linked chain) against the on-box key before it is installed. The legacy
 #    shared pair (if present) keeps serving until the per-anchor pair does
 #    (see the pair-selection block in the Caddy section).
 # ---------------------------------------------------------------------------
@@ -1042,8 +1310,9 @@ fi
 #    :443 serves the dashboard for the one explicit status hostname below.
 #
 #    Env in (operator-plane — the tenant pastes nothing, so tenant bootstrap
-#    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert,
-#    cert-only PUBLIC material installed from the repo VARIABLE; key material
+#    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert
+#    chain, leaf-first; cert-only PUBLIC material installed from the repo
+#    VARIABLE; key material
 #    never travels — the key is generated on this box in section (c1)),
 #    CF_AOP_CA_PEM (legacy zone-level Authenticated Origin Pulls bundle for
 #    the pre-A2 Cloudflare edge; A2 retires AOP for the :443 origin leg —
@@ -1069,14 +1338,14 @@ origin_ca_select_pair
 # bundle is refused below rather than written 644).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
-  case "${CF_AOP_CA_PEM}" in *"BEGIN CERTIFICATE"*) ;; *) die "CF_AOP_CA_PEM does not look like a PEM certificate bundle";; esac
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
+  origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
   log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. Pre-A2 Cloudflare-edge rollback only: set CF_AOP_CA_PEM per docs/dr.md)"
+  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md; it is not a secret/variable change)"
 fi
 CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
 if [ "${ORIGIN_TLS}" = "1" ]; then
@@ -1161,10 +1430,33 @@ CADDY_HAVE_MOUNTS="$(cat /etc/caddy/.deployed-mounts 2>/dev/null || true)"
 # unchanged"). Compare the container's view through its root to the rendered
 # path; divergence = recreate once. In-place installs keep this quiet.
 CADDY_MOUNT_STALE=0
+CADDY_MOUNT_STALE_REASON=""
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   caddy_pid="$(docker inspect --format '{{.State.Pid}}' caddy 2>/dev/null || true)"
   if [ -n "${caddy_pid}" ] && ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"; then
     CADDY_MOUNT_STALE=1
+    CADDY_MOUNT_STALE_REASON="Caddyfile"
+  fi
+  # The deployed PEMs are bind-mounted FILES too (same class): a container
+  # created before a PEM's inode last changed keeps reading the OLD bytes and
+  # `caddy reload` cannot fix it — live 2026-10-07: the 4-block chain install
+  # landed on the host while the container still served the leaf-only inode
+  # (CloudFront 502 with a green run). Compare the container's view through
+  # its root; divergence = recreate once.
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ "${ORIGIN_TLS}" = "1" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_CRT}" "${CADDY_ORIGIN_CRT}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="origin-ca cert"
+    elif ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_KEY}" "${CADDY_ORIGIN_KEY}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="origin-ca key"
+    fi
+  fi
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ -n "${AOP_TLS}" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/aop-ca.pem" "${CADDY_AOP_CA}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="AOP CA"
+    fi
   fi
 fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
@@ -1172,7 +1464,7 @@ if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
     log "Caddy already running on ${CADDY_IMAGE}"
   else
-    log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
+    log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container (stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-image/mount-set})" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f caddy >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "caddy"; then
@@ -1229,7 +1521,8 @@ fi
 # CloudFront 502 while every loopback probe stayed green. Note the
 # ORIGIN_CERT_CHANGED marker hashes the LEAF only, so it cannot detect a
 # chain-only change; never condition this force on it.
-docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile
+docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile \
+  || die "caddy reload failed — the running Caddy may still serve the old config (the stale-mount guard only proves the mount bytes); inspect 'docker logs caddy', fix the render, and re-dispatch"
 log "Caddy reloaded on new config"
 if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
   # Recorded ONLY after the successful reload (a failed run must re-reload
@@ -1426,9 +1719,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (pre-A2 rollback to the Cloudflare edge only: re-enable per docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. Pre-A2 Cloudflare-edge rollback only: rotate the leaf with 102 --aop --force-aop --apply, then re-dispatch. If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
+      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -1438,7 +1731,8 @@ if [ -n "${STATUS_HOST:-}" ]; then
       # has SERVED, which is the one-way marker's precondition.
       origin_ca_mark_active
     fi
-    log "edge pull through Cloudflare serves with AOP enforced (OK)"
+    log "edge pull through the public edge serves with AOP enforced (OK)"
+    log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale
@@ -1451,6 +1745,11 @@ if [ -n "${STATUS_HOST:-}" ]; then
       fi
     fi
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
+    # A2 edge pull: the loopback handshake cannot see a missing/broken chain
+    # (CloudFront drops the connection with 502 before it reaches Caddy), so
+    # the public edge must serve the ORIGIN this run. Fail-closed; the
+    # classification and the no-pair no-op live in origin_ca_edge_prove.
+    origin_ca_edge_prove
   elif [ "${ORIGIN_TLS}" != "1" ]; then
     # No origin pair selected (absent, or the one-way marker suppressed the
     # legacy fallback): auto-TLS cannot reliably issue for a name whose public
@@ -1458,6 +1757,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # is proven by the edge once the platform records exist, so this is loud,
     # not fatal; with a pair selected it stays fail-closed.
     log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the platform status wildcard may not be in place yet (docs/dr.md)"
+    log "A2 edge not proven this run (no origin pair selected — auto-TLS/pending; the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes)"
   else
     docker logs caddy 2>&1 | tail -20 || true
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
