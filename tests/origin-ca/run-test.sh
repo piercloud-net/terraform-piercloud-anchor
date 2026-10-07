@@ -381,8 +381,10 @@ printf 'stale placeholder\n' >"${ORIGIN_CA_CRT}"
 chmod 644 "${ORIGIN_CA_CRT}"
 crt_inode_before="$(inode_of "${ORIGIN_CA_CRT}")"
 # AOP mode for the leaf-only install cases: the A2 leg (CF_AOP_CA_PEM unset)
-# requires a chain and is exercised separately below.
-AOP_DUMMY='-----BEGIN CERTIFICATE-----'
+# requires a chain and is exercised separately below. The AOP bundle must be a
+# real bounded PEM — the gate shape-checks it (marker-bearing garbage must not
+# read as "deployed" and skip the A2 chain gates).
+AOP_DUMMY="$(cat "${CA_DIR}/ca.pem")"
 valid_pem="$(cat "${WORK}/cert-valid.pem")"
 CF_AOP_CA_PEM="$AOP_DUMMY" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env
 is "install keeps the destination inode" "$crt_inode_before" "$(inode_of "${ORIGIN_CA_CRT}")"
@@ -426,6 +428,12 @@ rc=0
 err="$(CF_AOP_CA_PEM="not-a-pem" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env 2>&1)" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "garbage AOP does not bypass the A2 leaf-only gate (rc=$rc)"; else bad "garbage AOP bypassed the A2 leaf-only gate"; fi
 if origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts garbage"; else ok "origin_ca_aop_deployed rejects garbage"; fi
+# Marker-bearing garbage (the old substring gate's blind spot) must also read
+# as not-deployed and must not skip the A2 chain/depth gates.
+rc=0
+err="$(CF_AOP_CA_PEM="-----BEGIN CERTIFICATE-----garbage" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env 2>&1)" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "marker-bearing garbage AOP does not bypass the A2 leaf-only gate (rc=$rc)"; else bad "marker-bearing garbage AOP bypassed the A2 leaf-only gate"; fi
+if CF_AOP_CA_PEM="-----BEGIN CERTIFICATE-----garbage" origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts marker-bearing garbage"; else ok "origin_ca_aop_deployed rejects marker-bearing garbage"; fi
 CF_AOP_CA_PEM="$AOP_DUMMY"
 if origin_ca_aop_deployed; then ok "origin_ca_aop_deployed accepts a PEM bundle"; else bad "origin_ca_aop_deployed rejects a PEM bundle"; fi
 CF_AOP_CA_PEM="$AOP_DUMMY" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env

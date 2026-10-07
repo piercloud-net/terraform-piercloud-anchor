@@ -622,16 +622,23 @@ origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on
   blocks="$(origin_ca_chain_blocks "$cert")"
   if [ "${blocks:-0}" -gt 1 ]; then
     origin_ca_chain_ordered "$cert" \
-      || { printf '%s is not a linked leaf-first chain (every block must be exactly one X.509 certificate — no trailing bytes after the DER — and each certificate must be issued by the next block)' "$cert" >&2; return 1; }
+      || { printf '%s is not a linked leaf-first chain (every block must be exactly one X.509 certificate — no trailing bytes after the DER — and each certificate must be issued by the next block; issuer blocks must be CA:TRUE and must not duplicate the current block)' "$cert" >&2; return 1; }
   fi
   return 0
 }
 
-origin_ca_aop_deployed() { # 0 when a usable AOP bundle is present (garbage must not bypass the A2 gates)
+origin_ca_aop_deployed() { # 0 when a usable AOP bundle is present (marker-bearing garbage must not bypass the A2 gates)
   case "${CF_AOP_CA_PEM:-}" in
-    *"BEGIN CERTIFICATE"*) return 0 ;;
+    *"BEGIN CERTIFICATE"*) ;;
     *) return 1 ;;
   esac
+  case "${CF_AOP_CA_PEM:-}" in
+    *"PRIVATE KEY"*) return 1 ;;
+  esac
+  # Bounded PEM shape (line-anchored BEGIN/END, base64-only bodies, 1..8
+  # blocks, <=16 KiB): a marker-bearing garbage value must not read as
+  # "deployed" and skip the A2 chain/depth gates.
+  origin_ca_cert_pem_ok "${CF_AOP_CA_PEM:-}"
 }
 
 origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public material), fail-closed
@@ -1233,8 +1240,8 @@ origin_ca_select_pair
 # bundle is refused below rather than written 644).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
-  case "${CF_AOP_CA_PEM}" in *"BEGIN CERTIFICATE"*) ;; *) die "CF_AOP_CA_PEM does not look like a PEM certificate bundle";; esac
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
+  origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies) — refusing to deploy it (garbage must not disable the A2 chain gates)"
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
