@@ -110,7 +110,7 @@ export ORIGIN_CA_ACTIVE="${ORIGIN_CA_DIR}/.origin-ca-active"
 mkdir -p "${ORIGIN_CA_DIR}"
 # shellcheck disable=SC1090
 source "${WORK}/span.src"
-for fn in origin_ca_generate origin_ca_cert_hash origin_ca_csr_selfcheck origin_ca_validate_cert origin_ca_install_from_env origin_ca_write_hash origin_ca_mark_active origin_ca_chain_ordered origin_ca_block_der_exact origin_ca_aop_deployed origin_ca_edge_pull; do
+for fn in origin_ca_generate origin_ca_cert_hash origin_ca_csr_selfcheck origin_ca_validate_cert origin_ca_install_from_env origin_ca_write_hash origin_ca_mark_active origin_ca_chain_ordered origin_ca_block_der_exact origin_ca_blocks_parse origin_ca_aop_deployed origin_ca_edge_pull origin_ca_edge_prove; do
   declare -f "$fn" >/dev/null || { printf 'FAIL extraction did not yield %s\n' "$fn"; exit 1; }
 done
 
@@ -326,6 +326,27 @@ if origin_ca_chain_ordered "${WORK}/cert-chain-trailing-leaf.pem"; then bad "cha
 if origin_ca_chain_ordered "${WORK}/cert-chain-trailing-issuer.pem"; then bad "chain linkage accepts a trailing-bytes issuer block"; else ok "chain linkage rejects a trailing-bytes issuer block"; fi
 expect_cert_fail "validation rejects a leaf block with trailing bytes" "${WORK}/cert-trailing.pem" "trailing bytes"
 expect_cert_fail "validation rejects a trailing-bytes issuer block" "${WORK}/cert-chain-trailing-issuer.pem" "not a linked"
+# An issuer with NO basicConstraints extension: OpenSSL 3.x with
+# -partial_chain still accepts it as a trust anchor, so the explicit CA:TRUE
+# gate is load-bearing (red-team N2) — the chain must reject it.
+openssl req -new -newkey rsa:2048 -nodes -keyout "${WORK}/nobc-ca.key" -subj "/CN=no-basicconstraints-ca" -out "${WORK}/nobc-ca.csr" >/dev/null 2>&1
+printf 'keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' >"${WORK}/nobc-ca.ext"
+openssl x509 -req -in "${WORK}/nobc-ca.csr" -signkey "${WORK}/nobc-ca.key" -days 2 \
+  -extfile "${WORK}/nobc-ca.ext" -out "${WORK}/nobc-ca.pem" >/dev/null 2>&1
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s\n' "$STATUS_HOST" >"${WORK}/nobc-leaf.ext"
+openssl x509 -req -in "${ORIGIN_CA_CSR}" -CA "${WORK}/nobc-ca.pem" -CAkey "${WORK}/nobc-ca.key" \
+  -days 2 -extfile "${WORK}/nobc-leaf.ext" -out "${WORK}/cert-nobc.pem" >/dev/null 2>&1
+cat "${WORK}/cert-nobc.pem" "${WORK}/nobc-ca.pem" >"${WORK}/cert-chain-nobc.pem"
+if openssl x509 -in "${WORK}/nobc-ca.pem" -noout -text 2>/dev/null | grep -q "Basic Constraints"; then
+  bad "fixture: the no-BC issuer unexpectedly carries basicConstraints"
+else
+  ok "fixture: the no-BC issuer has no basicConstraints extension"
+fi
+if origin_ca_chain_ordered "${WORK}/cert-chain-nobc.pem"; then
+  bad "chain linkage accepts an issuer with no basicConstraints"
+else
+  ok "chain linkage rejects an issuer with no basicConstraints (the CA:TRUE gate is load-bearing)"
+fi
 # A hop must verify against the NEXT BLOCK, not the system trust store:
 # without -no-CApath/-no-CAstore, a self-signed system root as `cur` is
 # anchored by the default store and any CA:TRUE block passes as `next`.
@@ -434,6 +455,20 @@ rc=0
 err="$(CF_AOP_CA_PEM="-----BEGIN CERTIFICATE-----garbage" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env 2>&1)" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "marker-bearing garbage AOP does not bypass the A2 leaf-only gate (rc=$rc)"; else bad "marker-bearing garbage AOP bypassed the A2 leaf-only gate"; fi
 if CF_AOP_CA_PEM="-----BEGIN CERTIFICATE-----garbage" origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts marker-bearing garbage"; else ok "origin_ca_aop_deployed rejects marker-bearing garbage"; fi
+# Well-framed but non-certificate blocks (base64 junk, certDER||keyDER) pass
+# the shape gate and must be rejected by the per-block X.509 parse — a
+# marker+base64 body must not read as "deployed" and skip the A2 gates
+# (red-team N3).
+AOP_JUNK="$(printf -- '-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----')"
+rc=0
+err="$(CF_AOP_CA_PEM="$AOP_JUNK" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env 2>&1)" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "well-framed non-cert AOP does not bypass the A2 leaf-only gate (rc=$rc)"; else bad "well-framed non-cert AOP bypassed the A2 leaf-only gate"; fi
+if CF_AOP_CA_PEM="$AOP_JUNK" origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts a well-framed non-cert body"; else ok "origin_ca_aop_deployed rejects a well-framed non-cert body"; fi
+AOP_KEYMINE="$(cat "${WORK}/cert-trailing.pem")"
+rc=0
+err="$(CF_AOP_CA_PEM="$AOP_KEYMINE" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env 2>&1)" || rc=$?
+if [ "$rc" -ne 0 ]; then ok "certDER||keyDER AOP does not bypass the A2 leaf-only gate (rc=$rc)"; else bad "certDER||keyDER AOP bypassed the A2 leaf-only gate"; fi
+if CF_AOP_CA_PEM="$AOP_KEYMINE" origin_ca_aop_deployed; then bad "origin_ca_aop_deployed accepts a certDER||keyDER body"; else ok "origin_ca_aop_deployed rejects a certDER||keyDER body"; fi
 CF_AOP_CA_PEM="$AOP_DUMMY"
 if origin_ca_aop_deployed; then ok "origin_ca_aop_deployed accepts a PEM bundle"; else bad "origin_ca_aop_deployed rejects a PEM bundle"; fi
 CF_AOP_CA_PEM="$AOP_DUMMY" ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env
@@ -779,6 +814,11 @@ if grep -qF 'origin_ca_edge_pull() {' "$PROVISION" && grep -qF 'origin_ca_edge_p
 else
   bad "010 A2 edge pull missing or never called (a broken chain could still exit 0)"
 fi
+if grep -qF 'origin_ca_edge_prove() {' "$PROVISION" && grep -qE '^[[:space:]]*origin_ca_edge_prove[[:space:]]*$' "$PROVISION"; then
+  ok "010 defines origin_ca_edge_prove and the main flow calls it"
+else
+  bad "010 origin_ca_edge_prove missing or never called from the main flow"
+fi
 if grep -qF 'origin_ca_chain_blocks "${ORIGIN_CA_CRT}"' "$PROVISION"; then
   ok "010 select-pair gate checks the on-box chain depth"
 else
@@ -803,6 +843,8 @@ printf '%s' "$idx" >"$idx_file"
 case_name="$(printf '%s' "$seq" | cut -d, -f"$idx")"
 [ -n "$case_name" ] || case_name="$(printf '%s' "$seq" | cut -d, -f1)"
 out=""; hdr=""
+pop='TEST1-P1'
+via='1.1 test.cloudfront.net (CloudFront)'
 args=("$@")
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
@@ -817,6 +859,7 @@ case "$case_name" in
   hit)        code=200; cache=Hit;                     cfid=test-cf-id-123; body='tang (via Caddy)' ;;
   refreschit) code=200; cache=RefreshHit;              cfid=test-cf-id-123; body='tang (via Caddy)' ;;
   nocfid)     code=200; cache=Miss;                    cfid="";              body='tang (via Caddy)' ;;
+  nocftuple)  code=200; cache=Miss;                    cfid=test-cf-id-123; body='tang (via Caddy)'; pop=""; via="" ;;
   http502)    code=502; cache='Error from cloudfront'; cfid=test-cf-id-123; body='error' ;;
   rc6)        exit 6 ;;
   nomarker)   code=200; cache=Miss;                    cfid=test-cf-id-123; body='not the marker' ;;
@@ -824,6 +867,8 @@ esac
 if [ -n "$hdr" ]; then
   printf 'HTTP/2 %s\r\nx-cache: %s\r\n' "$code" "$cache" >"$hdr"
   [ -n "$cfid" ] && printf 'x-amz-cf-id: %s\r\n' "$cfid" >>"$hdr"
+  [ -n "$pop" ] && printf 'x-amz-cf-pop: %s\r\n' "$pop" >>"$hdr"
+  [ -n "$via" ] && printf 'via: %s\r\n' "$via" >>"$hdr"
   printf '\r\n' >>"$hdr"
 fi
 [ -n "$out" ] && printf '%s' "$body" >"$out"
@@ -853,6 +898,34 @@ edge_case "edge pull 502,502,miss" "http502,http502,miss" "0"
 edge_case "edge pull rc6x3" "rc6,rc6,rc6" "1"
 case "$EDGE_REASON" in *"does not resolve yet"*) ok "rc6 reason names the resolution failure" ;; *) bad "rc6 reason lacks 'does not resolve yet': $EDGE_REASON" ;; esac
 edge_case "edge pull 200 without the marker" "nomarker" "1"
+edge_case "edge pull 200 without the CloudFront tuple" "nocftuple" "1"
+case "$EDGE_REASON" in *"x-amz-cf-id/x-amz-cf-pop/via tuple"*) ok "missing-tuple reason names the CloudFront header tuple" ;; *) bad "missing-tuple reason lacks the tuple marker: $EDGE_REASON" ;; esac
+
+# origin_ca_edge_prove: the main-flow wiring (scoping + classification).
+# Runs the REAL extracted function in a subshell (die exits the subshell) so
+# the no-pair no-op and each classified die are behavioral, not source pins.
+edge_prove_case() { # $1 label, $2 ORIGIN_TLS, $3 stub sequence, $4 expected rc, $5 output fragment, $6 stub invoked (yes|no)
+  local rc=0 out
+  rm -f "${WORK}/stub.idx"
+  out="$(ORIGIN_TLS="$2" STUB_SEQ="$3" STUB_IDX_FILE="${WORK}/stub.idx" PATH="${STUB_DIR}:${PATH}" ORIGIN_CA_EDGE_PULL_RETRY_SLEEP=0 origin_ca_edge_prove 2>&1)" || rc=$?
+  is "$1: rc" "$4" "$rc"
+  case "$out" in
+    *"$5"*) ok "$1: output carries '$5'" ;;
+    *) bad "$1: output lacks '$5': $out" ;;
+  esac
+  if [ "$6" = "yes" ]; then
+    [ -f "${WORK}/stub.idx" ] && ok "$1: curl was invoked" || bad "$1: curl was not invoked"
+  else
+    [ ! -f "${WORK}/stub.idx" ] && ok "$1: curl was NOT invoked" || bad "$1: curl was invoked without an origin pair"
+  fi
+}
+edge_prove_case "prove: pull success" "1" "miss" "0" "origin contacted this run" "yes"
+edge_prove_case "prove: cache Hit dies" "1" "hit,hit,hit" "1" "served from CloudFront's cache" "yes"
+edge_prove_case "prove: missing cf-id dies" "1" "nocfid" "1" "x-amz-cf-id" "yes"
+edge_prove_case "prove: missing CF tuple dies" "1" "nocftuple" "1" "header tuple" "yes"
+edge_prove_case "prove: unresolvable dies" "1" "rc6,rc6,rc6" "1" "does not resolve yet" "yes"
+edge_prove_case "prove: 502 dies" "1" "http502,http502,http502" "1" "through CloudFront failed" "yes"
+edge_prove_case "prove: no origin pair is a no-op" "0" "miss" "0" "A2 edge not proven" "no"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
