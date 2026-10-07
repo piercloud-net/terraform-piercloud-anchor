@@ -83,6 +83,8 @@ has "${PROVISION_SH}" 'cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_KEY}" "${CA
 has "${PROVISION_SH}" 'cmp -s "/proc/${caddy_pid}/root/etc/caddy/aop-ca.pem" "${CADDY_AOP_CA}"' "Caddy guard compares the mounted AOP CA view"
 has "${PROVISION_SH}" '[ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ "${ORIGIN_TLS}" = "1" ]' "PEM guard is scoped to a selected origin pair"
 has "${PROVISION_SH}" '[ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ -n "${AOP_TLS}" ]' "AOP guard is scoped to a deployed AOP bundle"
+has "${PROVISION_SH}" 'CADDY_MOUNT_STALE_REASON="origin-ca cert"' "stale-reason names the diverging PEM"
+has "${PROVISION_SH}" 'stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-image/mount-set}' "recreate log carries the stale reason"
 
 # ---- unconditional reload/restart (red-team re-verify F4) ------------------
 # The guard proves the MOUNT, not what the running process loaded; the reload
