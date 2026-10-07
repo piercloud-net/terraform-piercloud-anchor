@@ -120,19 +120,23 @@
 #                            Values are single-quote escaped into the piped
 #                            env prefix below — never argv, never logged.
 #                            Docs: docs/recording-witness.md.
-#   ORIGIN_CA_CERT_PEM      operator-planted per-anchor Cloudflare Origin CA
-#                            certificate (repo VARIABLE, cert-only public
-#                            material — NO key material ever travels; the key
-#                            is generated on the box by scripts/010). Empty =
-#                            nothing to install this run (the box keeps its
-#                            current pair); the CSR comes back as the run
-#                            artifact for operator-side signing.
+#   ORIGIN_CA_CERT_PEM      operator-planted per-anchor public certificate
+#                            chain, leaf first (repo VARIABLE, cert-only
+#                            public material — the chain is required, CloudFront
+#                            502s without the intermediate; NO key material ever
+#                            travels; the key is generated on the box by
+#                            scripts/010). Empty = nothing to install this run
+#                            (the box keeps its current pair); the CSR comes
+#                            back as the run artifact for operator-side signing.
 #   CF_AOP_CA_PEM            optional zone-level AOP client-auth bundle (repo
 #                            secret, masked at birth in the workflow like the
 #                            root password). Deployed cert material for
 #                            Caddy's :443 — NOT a standing API token (the box
-#                            presents, never rewrites the zone). Empty = edge
-#                            auth stays firewall-allowlist + Host binding.
+#                            presents, never rewrites the zone). Empty (the A2
+#                            post-cutover state) = edge auth is the firewall
+#                            allowlist + the X-Piercloud-Origin gate; AOP is
+#                            retired for the :443 origin leg (pre-A2
+#                            Cloudflare-edge rollback only).
 #                            Tang is unaffected either way.
 #   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
 #    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)
@@ -887,7 +891,7 @@ cmd_provision() {
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
-  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")' RECORDING_WITNESS_ENDPOINT='$(q "${RECORDING_WITNESS_ENDPOINT:-}")' RECORDING_WITNESS_BUCKET='$(q "${RECORDING_WITNESS_BUCKET:-}")' RECORDING_WITNESS_AUDIT_PREFIX='$(q "${RECORDING_WITNESS_AUDIT_PREFIX:-}")' RECORDING_WITNESS_RECORDINGS_PREFIX='$(q "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}")' RECORDING_WITNESS_KEY_ID='$(q "${RECORDING_WITNESS_KEY_ID:-}")' RECORDING_WITNESS_KEY='$(q "${RECORDING_WITNESS_KEY:-}")' RECORDING_WITNESS_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_SIGNATURE='$(q "${RECORDING_WITNESS_QUIET_SIGNATURE:-}")' RECORDING_WITNESS_COLD_START_SECONDS='$(q "${RECORDING_WITNESS_COLD_START_SECONDS:-}")' RECORDING_WITNESS_SWEEP_SECONDS='$(q "${RECORDING_WITNESS_SWEEP_SECONDS:-}")';";
+  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")' CLOUDFRONT_ORIGIN_SECRET='$(q "${CLOUDFRONT_ORIGIN_SECRET:-}")' MAIN_BOX_IPV4='$(q "${MAIN_BOX_IPV4:-}")' RECORDING_WITNESS_ENDPOINT='$(q "${RECORDING_WITNESS_ENDPOINT:-}")' RECORDING_WITNESS_BUCKET='$(q "${RECORDING_WITNESS_BUCKET:-}")' RECORDING_WITNESS_AUDIT_PREFIX='$(q "${RECORDING_WITNESS_AUDIT_PREFIX:-}")' RECORDING_WITNESS_RECORDINGS_PREFIX='$(q "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}")' RECORDING_WITNESS_KEY_ID='$(q "${RECORDING_WITNESS_KEY_ID:-}")' RECORDING_WITNESS_KEY='$(q "${RECORDING_WITNESS_KEY:-}")' RECORDING_WITNESS_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_SIGNATURE='$(q "${RECORDING_WITNESS_QUIET_SIGNATURE:-}")' RECORDING_WITNESS_COLD_START_SECONDS='$(q "${RECORDING_WITNESS_COLD_START_SECONDS:-}")' RECORDING_WITNESS_SWEEP_SECONDS='$(q "${RECORDING_WITNESS_SWEEP_SECONDS:-}")';";
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi

@@ -13,17 +13,22 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 ## Invariant 2 — the anchor is a key-holder, never an access-path
 
 > The anchor holds **no credential that reaches the user's main box** — no
-> SSH keys, no Teleport tokens, no API tokens, no agent sockets. Its only
+> SSH keys, no Teleport tokens, no API tokens, no agent sockets. Its
 > cross-box interactions are answering clevis's TCP/80 challenges from the
-> main-box IP, plus serving the dashboard and ACME challenges to the
-> Cloudflare edge ranges on TCP/80+443 (narrow firewall rules; no SSH inbound
+> main-box IP, serving the dashboard and ACME challenges to the
+> platform edge ranges on TCP/80 (Cloudflare today; ACME) and the CloudFront
+> origin-facing ranges + main box on TCP/443 (the dashboard leg; Caddy
+> additionally requires the X-Piercloud-Origin secret header from every
+> `:443` peer except the main box and loopback `127.0.0.1/32`/`::1/128`
+> (the on-box probes) — call D), plus probing the tenant's public endpoints
+> for availability (narrow firewall rules; no SSH inbound
 > from the main box either). Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
 > per-event via SCP password-reset + re-dispatch; netcup console/rescue as
 > last resort). No standing SSH keys exist anywhere. *You administer the anchor;
 > the anchor administers nothing.*
 
-**Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80, edge only on :443), and inspection of the module surface.
+**Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate requiring the secret header from every peer except the main box and loopback), and inspection of the module surface.
 
 ## S1 — every netcup use human-approved per run
 

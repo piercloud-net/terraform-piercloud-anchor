@@ -26,7 +26,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist; also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
 | `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, anchor IP selection, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, per-anchor origin-ca, recording-witness) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (token refresh, anchor IP selection, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, anchor DNS, edge origin-auth, config-file mounts, per-anchor origin-ca, recording-witness) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|origin-ca|recording-witness)/)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|edge-origin-auth|origin-ca|recording-witness)/|.*\.tf$)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -72,10 +72,10 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] Run log assertions all pass: firewall policy created/attached; A1 window opened then closed (swept pre + post); tang thumbprint printed; Caddy + Gatus deployed; DNS upsert + verify-after-write; device-grant teardown revoked; the long-lived A1 SSH carries keepalives (`ServerAliveInterval=30`/`ServerAliveCountMax=6`) so a silent witness acceptance cannot drop the session (issue #162).
 - [ ] `dig +short anchor-01-<tenant>.piercloud.net` returns the anchor IPv4 (DNS-only record — clevis must reach tang directly, no edge in front).
 - [ ] `curl -s -o /dev/null -w '%{http_code}' http://anchor-01-<tenant>.piercloud.net/adv` prints `200` from the main box, and times out from an unlisted address (the firewall actually gates tang).
-- [ ] `curl -s -o /dev/null -w '%{http_code}' https://status-<tenant>.piercloud.net/` prints `200`, and the statuses API returns data.
-- [ ] Per-anchor Origin CA (issue #123): the run log shows the on-box key + CSR present-or-generated (never any key material), the `origin-ca-csr-<tenant>` artifact is uploaded (also on a failed run — the CSR is captured before the original status is returned), the cert-only `ORIGIN_CA_CERT_PEM` variable (when set) validates fail-closed and installs; no retired shared-pair secret prefix appears in the run env or logs; the CSR artifact carries no netcup account identifiers.
+- [ ] `curl -s -o /dev/null -w '%{http_code}' https://<tenant>.status.piercloud.net/` prints `200`, and the statuses API returns data (through the platform status edge).
+- [ ] Per-anchor cert (issue #123; A2: a public single-SAN cert for the nested status host — interim: operator-obtained and pasted into the `ORIGIN_CA_CERT_PEM` variable as a leaf-first chain; the platform-broker ACME DNS-01 path is the M1 follow-up — Cloudflare Origin CA is dead for the CloudFront leg): the run log shows the on-box key + CSR present-or-generated (never any key material), the `origin-ca-csr-<tenant>` artifact is uploaded (also on a failed run — the CSR is captured before the original status is returned), the cert-only `ORIGIN_CA_CERT_PEM` variable (when set) validates fail-closed and installs; no retired shared-pair secret prefix appears in the run env or logs; the CSR artifact carries no netcup account identifiers.
 - [ ] No key material in state/plan (CI key-material grep + the provisioning script's own assertion); the thumbprint is saved in the password manager.
-- [ ] Firewall shape: main box + Cloudflare edge only, `:80` tang + ACME, `:443` edge only, egress ACCEPT-all, no SSH left open.
+- [ ] Firewall shape: main box + the platform edge only, `:80` tang + ACME (main box + Cloudflare edge ranges), `:443` the CloudFront origin-facing prefixes + main-box `/32` (A2; no main-box IPv6 rule — the Caddy bypass is v4-only), egress ACCEPT-all, no SSH left open.
 
 ### Retention cap / `mode=check` assert (workflow + docs)
 
@@ -87,34 +87,46 @@ Live proof means running the real flow against a real anchor and capturing the a
 
 ### Dashboard / edge
 
-- [ ] `https://status-<tenant>.piercloud.net/` is `200` over TLS; the certificate chain is valid well beyond the window (`external-watch.yml` asserts HTTP 200, live statuses data, and ≥14 days of cert validity).
-- [ ] Visitor→edge leg: Cloudflare Universal SSL covers the ONE flat label — no Advanced Certificate Manager / Total TLS needed (if a two-label hostname is ever needed, ACM returns; issue #107).
-- [ ] Edge→origin leg: Full (Strict) holds and the per-anchor Origin CA cert verifies; the on-box pair is validated against the on-box key + status host before selection, and the served `:443` leaf must match the installed pair AND cover the status host (`-checkhost`, asserted in the run's non-AOP probe — under AOP the proof is the Caddyfile reference + hash marker after reload + edge 200, since a cert-less `s_client` cannot retrieve the served cert there); the cert carries exactly the one SAN `status-<tenant>.piercloud.net`. Caddy auto-TLS is never relied on for proxied hosts (HTTP-01 catch-22, issue #88).
+- [ ] (Edge live 2026-10-07: the distribution + platform records exist; the anchor-side cutover (nested-SAN cert + origin auth) is the remaining step — until it lands, `external-watch.yml` probes the flat `status-<tenant>` name by default.) `https://<tenant>.status.piercloud.net/` is `200` over TLS; the certificate chain is valid well beyond the window (`external-watch.yml` asserts HTTP 200, live statuses data, and ≥14 days of cert validity; its default flips to the nested name with the platform records via `STATUS_PROBE_URL`).
+- [ ] Visitor→edge leg (A2: CloudFront — live 2026-10-07; anchor-side cutover pending): ONE platform wildcard `*.status.piercloud.net` + ONE ACM wildcard covers the whole fleet — no per-tenant status record, no per-tenant edge cert. (Interim CF path: the flat `status-<tenant>` name rides free Universal SSL; after the cutover the flat record may still resolve until the B move, but the name no longer serves — tombstoned, no redirect.)
+- [ ] Edge→origin leg (A2: CloudFront — live 2026-10-07; anchor-side cutover pending): the anchor presents a **public single-SAN cert** for `<tenant>.status.piercloud.net` (CloudFront trusts Mozilla-store CAs only — Cloudflare Origin CA is dead for this leg); the on-box pair is validated against the on-box key + status host before selection, and the served `:443` leaf must match the installed pair AND cover the status host (`-checkhost`, asserted in the run's non-AOP probe); the cert carries exactly the one SAN `<tenant>.status.piercloud.net`. Caddy auto-TLS is never relied on for proxied hosts (HTTP-01 catch-22, issue #88). **Cutover prerequisite:** the first post-rename dispatch must carry the nested-SAN cert in the same run — the on-box pair is validated against `STATUS_HOST` before selection, so an old flat-SAN pair fails the run closed before the Caddyfile renders (the old flat name keeps serving until then).
+- [ ] CloudFront origin auth (A2 call D — edge buildout; anchor side implemented — `tests/edge-origin-auth/` (render text) + `tests/bind-e2e` (adapted route order + served peer/header matrix) — live proof pending the anchor-side cutover): the `:443` allowlist carries the 81 published CloudFront origin-facing prefixes + the main-box `/32`; Caddy enforces the `X-Piercloud-Origin` secret header with the main-box `/32` and loopback (`127.0.0.1/32`, `::1/128`) exempt (the on-box probes use loopback); a request without the header from a non-main-box peer is aborted, and the gate sits inside the dashboard catch-all handle (a site-level gate is dead code — `abort` adapts after `handle`). The range list is a synced, moving target (re-sync + re-apply on AWS publishes).
 - [ ] Transition state: while the legacy shared wildcard pair still serves, the one-way `.origin-ca-active` marker is absent; once the per-anchor pair has served, the marker exists and the legacy pair is never selected again (no silent resurrection).
 - [ ] Edge ceremony: Cache Rule bypass on `/.well-known/acme-challenge/*`; no WAF / Bot-Fight block on it.
-- [ ] AOP, when `CF_AOP_CA_PEM` is set: cert-less origin pull is rejected at the handshake and the edge pull serves `200` — the run asserts both halves.
+- [ ] AOP, when `CF_AOP_CA_PEM` is set (interim Cloudflare-edge path only; **retired at the CloudFront cutover — delete `CF_AOP_CA_PEM` before the cutover dispatch and disable the CF zone setting after it**, or the run's edge pull fails because Cloudflare is no longer admitted on `:443`): cert-less origin pull is rejected at the handshake and the edge pull serves `200` — the run asserts both halves.
 - [ ] Tang unaffected throughout: `http://anchor-01-<tenant>.piercloud.net/adv` still answers `200`.
 
 ### DNS / migration
 
 - [ ] Anchor record: `dig +short anchor-01-<tenant>.piercloud.net` returns the anchor IPv4 (proxied `false`, TTL 300).
-- [ ] Dashboard record: `dig +short status-<tenant>.piercloud.net` returns Cloudflare anycast addresses (more than one A record) — the origin IP must not leak.
-- [ ] The run log's verify-after-write step matches name + address + proxied flag; a verify miss fails the run fail-closed.
+- [ ] Dashboard record: the platform `*.status.piercloud.net` wildcard resolves to the CloudFront distribution (live 2026-10-07) — there is NO per-tenant status record and the origin IP must not leak. (Interim: `dig +short status-<tenant>.piercloud.net` returns Cloudflare anycast addresses.)
+- [ ] The run log's verify-after-write step matches name + address (+ proxied flag on Cloudflare / ttl + enabled on Gcore) for the ANCHOR record under the active `NET_DNS_PROVIDER`; a verify miss fails the run fail-closed; the writer never touches a status name.
 - [ ] Main-box move: `mode=update-ip` ADD-before-move — the new IP is added and the old kept until the main box boots through the new one, then removed; re-check with `dig` and a clevis boot.
 - [ ] Record cutover: after the flip, the DNS-name-based Gatus monitors keep their history and the dashboard still resolves through the edge.
 
 ### Authenticated Origin Pulls (AOP)
 
+**Pre-A2 Cloudflare-edge path only** — A2 retires AOP for the `:443` origin leg (CloudFront has no AOP); do NOT re-enable it after the cutover. The items below apply only while the edge is still the Cloudflare path (pre-cutover rollback).
+
 - [ ] CF side first: zone-level AOP enabled with our own leaf cert uploaded; THEN `CF_AOP_CA_PEM` set and the anchor re-dispatched.
 - [ ] Run assertions: cert-less origin pull rejected; edge pull serves `200`.
 - [ ] Rollback order (only when rolling back): unset `CF_AOP_CA_PEM` + re-dispatch FIRST, disable the CF setting second (the reverse order black-holes every edge pull).
-- [ ] Rebuild caveat: a rebuild dispatched while `CF_AOP_CA_PEM` is still planted fails before DNS converges — recover by deleting the secret, converging DNS, then re-enabling AOP.
+- [ ] Rebuild caveat: a rebuild dispatched while `CF_AOP_CA_PEM` is still planted fails before DNS converges — recover by deleting the secret, converging DNS, then re-dispatching. A2: do NOT re-enable AOP (retired for the `:443` origin leg — CloudFront has no AOP); pre-A2 rollback to the Cloudflare edge only: re-enable per dr.md (`102 --aop`).
 
-### Naming (`anchor-01-<tenant>`, `status-<tenant>`)
+### Naming (`anchor-01-<tenant>`, `<tenant>.status`)
 
 - [ ] `tofu plan`/outputs show `anchor_hostname = anchor-01-<tenant>.piercloud.net`; `tests/naming-scheme/` is green.
-- [ ] Live: SCP server name, firewall policy name, and the DNS record all carry the canonical `anchor-01-<tenant>` form.
-- [ ] Dashboard host is the ONE flat label `status-<tenant>.piercloud.net` (Universal SSL coverage; two labels would require ACM — issue #107).
+- [ ] Live: SCP server name, firewall policy name, and the DNS record all carry the canonical `anchor-01-<tenant>` form (the anchor name stays on `.net` — clevis binds it).
+- [ ] Dashboard host is the NESTED `<tenant>.status.piercloud.net` under the platform status namespace (wildcard + CloudFront edge; the flat `status-<tenant>` form is tombstoned).
+
+### A2 — nested status host + provider-switched writer
+
+- [ ] `NET_DNS_PROVIDER=cloudflare` (default) `mode=apply` dispatch from the reviewed branch ×2: the anchor A-record upsert + verify-after-write passes; no status record is written; Gatus renders the `dashboard TLS (via edge)` row against `<tenant>.status.piercloud.net`.
+- [ ] `NET_DNS_PROVIDER=gcore` against the canary zone (`NET_DNS_ZONE=pc-canary.com`): write → GET → verify → delete recorded in the PR (the pre-B proof), plus one literal `*.status` rrset POST and the CAA triple check.
+- [ ] Dashboard `200` on the nested name through the CloudFront edge (live 2026-10-07; anchor-side cutover pending) + the platform wildcard/CAA records present; the first post-rename dispatch carries the nested-SAN cert in the same run (DR cutover prerequisite — an old flat-SAN pair fails the run closed before the Caddyfile renders, docs/dr.md §Leg 2); Gatus green.
+- [ ] `tests/anchor-dns/` green (the harness drives the real writer; red paths: verify-mismatch, Gcore GET non-200, missing token per provider).
+- [ ] `tests/edge-origin-auth/` green (render span extracted; fail-closed secret/main-box, gate content, 010 ↔ `cloudfront_ranges.tf` sync tooth, firewall + pipeline wiring).
+- [ ] `tests/bind-e2e` gate section green (test-scoped AND production-shape adapted route order with a production-prefix presence tooth + the served peer/header matrix: main box/loopback pass, admitted-without/wrong-header abort, admitted + forged viewer-IP header abort, outside peers abort).
 
 ### Recording witness (optional component — `scripts/010-provision.sh`, `provision.yml`)
 

@@ -39,9 +39,14 @@ CADDY_ORIGIN_CRT="/etc/caddy/origin.crt"
 CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
 CADDY_AOP_CA="/etc/caddy/aop-ca.pem"
 CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
-# Cloudflare edge ranges for trusted_proxies (public constants — keep in
-# sync with local.cf_edge_cidrs in main.tf; stale ranges read as edge 403s).
-CF_EDGE_CIDRS="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+# CloudFront origin-facing ranges for the :443 origin leg (call D).
+# Public constants — live ip-ranges.json 2026-10-06 (46 IPv4 + 35 IPv6).
+# Keep in sync with local.cloudfront_origin_facing_cidrs in
+# cloudfront_ranges.tf — tests/edge-origin-auth asserts the two lists are
+# identical. CloudFront is not Cloudflare AOP: the :443 leg is gated by
+# these ranges (firewall) plus the X-Piercloud-Origin secret header
+# (Caddy); neither control alone is auth.
+CLOUDFRONT_ORIGIN_CIDRS="130.176.88.0/21 54.239.134.0/23 52.82.134.0/23 130.176.86.0/23 130.176.140.0/22 130.176.0.0/18 54.239.204.0/22 130.176.160.0/19 70.132.0.0/18 15.158.0.0/16 130.176.136.0/23 54.239.170.0/23 130.176.96.0/19 54.182.184.0/22 204.246.166.0/24 130.176.64.0/21 54.182.172.0/22 205.251.218.0/24 130.176.144.0/20 54.182.176.0/21 130.176.78.0/23 54.182.248.0/22 64.252.128.0/18 54.182.154.0/23 64.252.64.0/18 54.182.144.0/21 54.182.224.0/21 130.176.128.0/21 52.46.0.0/18 3.172.64.0/18 52.82.128.0/23 18.68.0.0/16 54.182.156.0/22 54.182.160.0/21 54.182.240.0/21 130.176.192.0/19 130.176.76.0/24 54.239.208.0/21 54.182.188.0/23 24.110.128.0/17 3.172.0.0/18 130.176.80.0/22 54.182.128.0/20 130.176.72.0/22 13.124.199.0/24 3.29.57.0/26 2600:9000:1000::/36 2600:9000:5200::/40 2600:9000:6000::/36 2406:da11:438:2300::/56 2406:da1e:705:1600::/56 2406:da1c:8d8c:4600::/56 2406:da14:17bd:2f00::/56 2406:da12:4b:c200::/56 2406:da16:c01:c200::/56 2406:da1a:6df:6c00::/56 2406:da1b:e7c:ad00::/56 2406:da18:9fa:1b00::/56 2406:da1c:787:2b00::/56 2406:da19:e19:4a00::/56 2406:da1f:396:9100::/56 2406:da10:847f:a100::/56 2406:da12:8b2e:9c00::/56 2406:da14:80bb:ea00::/56 2600:1f11:e79:a800::/56 2600:1f1a:4568:b500::/56 2a05:d014:1362:b000::/56 2a05:d019:80b:e300::/56 2a05:d016:9ed:de00::/56 2a05:d01a:8a9:be00::/56 2a05:d011:531:1800::/56 2a05:d018:1a3a:2d00::/56 2a05:d01c:343:c300::/56 2a05:d012:581:b400::/56 2a05:d025:e59:fb00::/56 2600:1f17:4356:f100::/56 2600:1f1e:a7:2300::/56 2600:1f18:7530:7200::/56 2600:1f16:1923:3000::/56 2600:1f1c:da:600::/56 2600:1f13:417:4d00::/56"
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
@@ -56,7 +61,9 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # (dispatched runs receive STATUS_HOST as the dashboard FQDN via 020's
 # ENV_PREFIX; ANCHOR_HOSTNAME stays the zone-less SCP hostname);
 # tests/naming-scheme/run-test.sh diffs the block against the lib — edit the
-# lib and copy the block, never fork it.
+# lib and copy the block, never fork it. A2 2026-09-30: the dashboard is the
+# NESTED `<tenant>.status.piercloud.net` (platform status namespace,
+# CloudFront-covered); the anchor name stays flat on `.net`.
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
@@ -84,8 +91,8 @@ derive_anchor_hostname() { # $1 = sanitized tenant -> anchor-<NN>-<tenant> (NN=0
   printf 'anchor-01-%s\n' "$1"
 }
 
-derive_status_host() { # $1 = sanitized tenant -> status-<tenant> (dashboard singleton, one label)
-  printf 'status-%s\n' "$1"
+derive_status_host() { # $1 = sanitized tenant -> <tenant>.status (dashboard under the platform status namespace)
+  printf '%s.status\n' "$1"
 }
 # --- END NAMING ---
 caddy_status_names() { # STATUS_HOST/ANCHOR_HOSTNAME from dispatch env, else derived from TENANT_USER
@@ -126,10 +133,11 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
   printf '%s\n' "	servers {"
-  printf '%s\n' "		# Real client IP behind the orange cloud. CF-Connecting-IP only —"
-  printf '%s\n' "		# never X-Forwarded-For (spoofable through the edge)."
-  printf '%s\n' "		trusted_proxies static ${CF_EDGE_CIDRS}"
-  printf '%s\n' "		client_ip_headers CF-Connecting-IP"
+  printf '%s\n' "		# Real client IP behind the CloudFront edge. CloudFront-Viewer-Address"
+  printf '%s\n' "		# only — never X-Forwarded-For (spoofable through the edge); the"
+  printf '%s\n' "		# origin-request policy forwards that header to the origin."
+  printf '%s\n' "		trusted_proxies static ${CLOUDFRONT_ORIGIN_CIDRS}"
+  printf '%s\n' "		client_ip_headers CloudFront-Viewer-Address"
   printf '%s\n' "	}"
   printf '%s\n' "}"
   printf '%s\n' ""
@@ -154,8 +162,8 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "		# list-modules on the v2.11.4 binary; it lives in a third-party xcaddy"
   printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
   printf '%s\n' "		# Flood protection"
-  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
-  printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
+  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus the"
+  printf '%s\n' "		# CloudFront origin gate on :443 when the edge is live (docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
   printf '%s\n' "	}"
   printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
@@ -172,6 +180,23 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	}"
   printf '%s\n' "}"
   if [ -n "${STATUS_HOST:-}" ] && [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
+    # CloudFront origin auth is mandatory for the :443 dashboard block (call
+    # D): fail closed rather than render an unauthenticated origin. The
+    # secret is interpolated into a CEL matcher, so restrict its charset.
+    [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
+    case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
+    [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
+    # Bare single-line IPv4, octets 0-255, no leading zeros, no stray
+    # whitespace: variables.tf validates the same address for the firewall
+    # variable via cidrhost, and Caddy's netip rejects leading zeros — reject
+    # both here rather than fail later at `caddy validate` (a trailing
+    # newline splits the rendered CEL matcher). A console hand-run sets this
+    # secret without terraform, so the two peers must not drift.
+    case "${MAIN_BOX_IPV4}" in *[!0-9.]*) die "MAIN_BOX_IPV4 must be digits and dots only (no whitespace or newlines)." ;; esac
+    printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 || NR > 1 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i ~ /^0[0-9]/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255, no leading zeros)."
+    [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
+    cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
+    cf_cel="${cf_cel%,}"
     printf '%s\n' ""
     printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
     printf '%s\n' "https://${STATUS_HOST} {"
@@ -183,10 +208,26 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "		abort"
     printf '%s\n' "	}"
     printf '%s\n' "	handle {"
+    printf '%s\n' "		# CloudFront origin gate (call D): CloudFront is not AOP. Only"
+    printf '%s\n' "		# CloudFront origin-facing peers (or the main box / loopback) may"
+    printf '%s\n' "		# reach the dashboard, and CloudFront peers must carry the secret"
+    printf '%s\n' "		# header it injects (it overwrites client-supplied values). The"
+    printf '%s\n' "		# firewall admits the same peer set; this is the in-Caddy second"
+    printf '%s\n' "		# factor. INSIDE the catch-all handle on purpose: Caddy 2.11.4"
+    printf '%s\n' "		# adapts \`abort\` AFTER \`handle\`, so a site-level gate would sit"
+    printf '%s\n' "		# behind this handle and never run (tests/bind-e2e pins the"
+    printf '%s\n' "		# adapted route order; tests/edge-origin-auth pins the text)."
+    printf '%s\n' "		# Loopback (127.0.0.1/32 and ::1/128) is exempt: the on-box"
+    printf '%s\n' "		# probes below reach the dashboard via --resolve …:127.0.0.1,"
+    printf '%s\n' "		# and only local processes can source from loopback."
+    printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32'))\`"
+    printf '%s\n' "		abort @not_edge_peer"
+    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
+    printf '%s\n' "		abort @unauthorized"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (the"
-    printf '%s\n' "		# rate_limit directive itself is queued: issue #56)."
+    printf '%s\n' "		# allowlist plus the CloudFront origin gate above (the rate_limit"
+    printf '%s\n' "		# directive itself is queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
     printf '%s\n' "}"
@@ -331,13 +372,18 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 }
 
 # --- origin-ca:start --- (tests/origin-ca extracts this span; keep markers)
-# Per-anchor Cloudflare Origin CA material (issue #123): the private key is
+# Per-anchor cert material (issue #123; A2 2026-09-30): the private key is
 # generated ON this box and never leaves it; the CSR is public material
-# published in the run artifact for operator-side signing; the signed cert
-# returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and is
-# validated fail-closed before Caddy may serve it. Paths are overridable so
-# the harness can run this span off-box (same pattern as the bind-e2e
-# render span).
+# published in the run artifact for operator/broker-side signing; the signed
+# cert returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and
+# is validated fail-closed before Caddy may serve it. A2: the dashboard sits
+# behind CloudFront, which trusts Mozilla-store CAs only — so the cert is a
+# PUBLIC single-SAN cert for the nested `<tenant>.status.piercloud.net`
+# viewer host (broker-issued via ACME DNS-01; Cloudflare Origin CA is dead
+# for this leg). The span/variable names stay `origin-ca` for continuity;
+# the single-SAN selfcheck below is the fail-closed gate either way. Paths
+# are overridable so the harness can run this span off-box (same pattern as
+# the bind-e2e render span).
 ORIGIN_CA_DIR="${ORIGIN_CA_DIR:-/etc/caddy}"
 ORIGIN_CA_KEY="${ORIGIN_CA_KEY:-${ORIGIN_CA_DIR}/origin-ca.key}"
 ORIGIN_CA_CSR="${ORIGIN_CA_CSR:-${ORIGIN_CA_DIR}/origin-ca.csr}"
@@ -446,17 +492,25 @@ origin_ca_generate() { # ensure key+CSR; the key is never regenerated while a ce
   log "per-anchor Origin CA CSR ready (publish it for signing; the key stays on this box)"
 }
 
-origin_ca_cert_pem_ok() { # $1 = PEM text -> exactly one bounded certificate, no leading/trailing junk
-  local pem="$1" bytes begins ends junk
+origin_ca_cert_pem_ok() { # $1 = PEM text -> a bounded leaf-first certificate chain, no framing junk
+  local pem="$1" bytes begins ends
   begins="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
   ends="$(printf '%s\n' "$pem" | grep -c -- '-----END CERTIFICATE-----' || true)"
-  # Multi-cert blobs must be rejected: only the first block would be
-  # validated/hashed while the whole blob got installed.
-  [ "$begins" = "1" ] && [ "$ends" = "1" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----BEGIN CERTIFICATE-----/{exit} {print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----END CERTIFICATE-----/{f=1; next} f{print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
+  # A chain is REQUIRED for the A2 CloudFront origin leg: CloudFront drops the
+  # TCP connection (502, X-Cache: Error from cloudfront) when the intermediate
+  # is missing. Accept 1..8 blocks — the validator below checks the FIRST
+  # block as the leaf, so a chain pasted in the wrong order fails its SAN
+  # check; framing junk and oversized material still fail closed. Bounded at
+  # 16 KiB: a 4-block LE chain is ~5 KiB.
+  [ "$begins" = "$ends" ] || return 1
+  [ "${begins:-0}" -ge 1 ] && [ "${begins:-0}" -le 8 ] || return 1
+  printf '%s\n' "$pem" | awk '
+    /-----BEGIN CERTIFICATE-----/ { if (inblk) bad = 1; inblk = 1; seen = 1; next }
+    /-----END CERTIFICATE-----/   { if (!inblk) bad = 1; inblk = 0; next }
+    { if (!seen) { if ($0 !~ /^[[:space:]]*$/) before = 1 }
+      else if (!inblk) { if ($0 !~ /^[[:space:]]*$/) after = 1 } }
+    END { exit (bad || before || after) }
+  ' || return 1
   bytes="$(printf '%s' "$pem" | wc -c | tr -d ' ')"
   [ "${bytes:-0}" -gt 0 ] && [ "${bytes:-0}" -le 16384 ]
 }
@@ -843,9 +897,11 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "      - \"[RESPONSE_TIME] < 500\"  # Caddy p95>500ms alert, per-probe form (docs: https://gatus.io/docs)"
   printf '%s' "$ENDPOINTS_YAML"
   if [ -n "${STATUS_HOST:-}" ]; then
-    printf '%s\n' "  # Dashboard through the orange cloud: proves edge -> origin TLS and"
-    printf '%s\n' "  # warns while the cert is still fresh (stale-cert failure is"
-    printf '%s\n' "  # dashboard-only — tang answers plain HTTP on its own port)."
+    printf '%s\n' "  # Dashboard through the platform status edge (CloudFront — live"
+    printf '%s\n' "  # 2026-10-07; the anchor-side cutover is the remaining step — the"
+    printf '%s\n' "  # platform status wildcard routes this name): proves edge ->"
+    printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
+    printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
     printf '%s\n' "    url: https://${STATUS_HOST}"
     printf '%s\n' "    interval: 300s"
@@ -862,13 +918,19 @@ TMP_CFG="${GATUS_CONFIG}.new"
   fi
 } >"$TMP_CFG"
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
-  log "Gatus config unchanged — no restart"
+  log "Gatus config unchanged (identical re-render)"
   rm -f "$TMP_CFG"
-  GATUS_RESTART=0
 else
-  mv "$TMP_CFG" "${GATUS_CONFIG}"
-  log "Gatus config installed (rendered from dispatch env)"
-  GATUS_RESTART=1
+  # IN-PLACE install: the gatus container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode and the container keeps
+  # reading the OLD config forever (same class as the Caddyfile below;
+  # observed live 2026-10-07). Truncate+rewrite keeps the inode but is not
+  # atomic; the post-write cmp catches a short/failed write at run time (a
+  # power loss mid-write is repaired only by the next dispatch).
+  cat "$TMP_CFG" >"${GATUS_CONFIG}"
+  cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (out of space?) — refusing to restart Gatus on a partial config"
+  rm -f "$TMP_CFG"
+  log "Gatus config installed in place (rendered from dispatch env)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -908,13 +970,26 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
+# Stale-mount guard: the container bind-mounts the config FILE, and a file
+# bind mount pins the inode — a container created before an `mv` install
+# keeps reading the OLD bytes forever (docker restart does not rebind
+# mounts; live 2026-10-07). Compare the container's view through its root
+# to the rendered path; divergence = recreate once. In-place installs keep
+# this guard quiet on every later run.
+GATUS_MOUNT_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
+  gatus_pid="$(docker inspect --format '{{.State.Pid}}' gatus 2>/dev/null || true)"
+  if [ -n "${gatus_pid}" ] && ! cmp -s "/proc/${gatus_pid}/root/config/config.yaml" "${GATUS_CONFIG}"; then
+    GATUS_MOUNT_STALE=1
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
-    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor; then
+    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ]; then
       log "Gatus already running on ${GATUS_IMAGE}"
     else
-      log "Gatus container predates the hostanchor mapping (dual probes need it) - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
+      log "Gatus container predates the hostanchor mapping or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
       docker rm -f gatus >/dev/null
     fi
   else
@@ -932,10 +1007,14 @@ if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
     --mount type=volume,source=gatus-data,target=/data \
     "${GATUS_IMAGE}" >/dev/null
 fi
-if [ "${GATUS_RESTART:-0}" = "1" ]; then
-  docker restart gatus >/dev/null
-  log "Gatus restarted on new config"
-fi
+# Always restart: the stale-mount guard compares the MOUNT's bytes, not what
+# the running Gatus loaded — an aborted restart (SSH drop, SIGKILL) would
+# otherwise stay invisible, and the next dispatch (identical render, fresh
+# mount) would report green while the monitor serves the old config. A
+# restart is cheap (a ~1s monitor blip) and the sqlite history lives in a
+# named volume.
+docker restart gatus >/dev/null
+log "Gatus restarted"
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
 # run log (the tenant has no shell — this output IS their dashboard check).
 # Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
@@ -966,10 +1045,11 @@ fi
 #    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert,
 #    cert-only PUBLIC material installed from the repo VARIABLE; key material
 #    never travels — the key is generated on this box in section (c1)),
-#    CF_AOP_CA_PEM (optional zone-level Authenticated Origin Pulls bundle for
-#    our own cert; absent = edge auth stays firewall-allowlist + Host binding
-#    until the operator finishes the AOP ceremony in docs/dr.md +
-#    re-dispatches).
+#    CF_AOP_CA_PEM (legacy zone-level Authenticated Origin Pulls bundle for
+#    the pre-A2 Cloudflare edge; A2 retires AOP for the :443 origin leg —
+#    CloudFront has no AOP — so the expected post-cutover state is UNSET:
+#    edge auth = firewall allowlist + the X-Piercloud-Origin gate below.
+#    Pre-A2 Cloudflare-edge rollback only: set it per docs/dr.md).
 # ---------------------------------------------------------------------------
 log "Rendering dispatch-managed Caddyfile (${CADDY_CONFIG})"
 mkdir -p "$(dirname "${CADDY_CONFIG}")" "${CADDY_CHALLENGE_DIR}"
@@ -985,16 +1065,18 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine).
+# AOP bundle (public cert material — world-readable is fine; a key-bearing
+# bundle is refused below rather than written 644).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"BEGIN CERTIFICATE"*) ;; *) die "CF_AOP_CA_PEM does not look like a PEM certificate bundle";; esac
+  case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
   log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + Host binding until the operator finishes the AOP ceremony (docs/dr.md) + re-dispatches"
+  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. Pre-A2 Cloudflare-edge rollback only: set CF_AOP_CA_PEM per docs/dr.md)"
 fi
 CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
 if [ "${ORIGIN_TLS}" = "1" ]; then
@@ -1012,9 +1094,17 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
+# Pre-create root-only BEFORE the render: the :443 render carries the
+# X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
+# rejection may leave it readable beyond root. The mode assumes the pinned
+# container runs as root — a Renovate bump to a non-root USER would make the
+# bind-mounted file unreadable on recreate; verify on every bump.
+install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
-CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
+  # A no-op render still re-asserts 0600: a pre-0600 file must not survive
+  # just because the bytes match.
+  chmod 600 "${CADDY_CONFIG}"
   log "Caddyfile unchanged"
   rm -f "$TMP_CADDY"
 else
@@ -1030,10 +1120,22 @@ else
     CADDY_VAL_ARGS="${CADDY_VAL_ARGS} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
   fi
   # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
-  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"
-  mv "$TMP_CADDY" "${CADDY_CONFIG}"
-  log "Caddyfile installed (rendered from dispatch env)"
-  CADDY_RESTART=1
+  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
+  # IN-PLACE install: the caddy container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode, so the container keeps
+  # reading the OLD bytes and `caddy reload` reports "config is unchanged"
+  # (observed live 2026-10-07: the A2 cutover render never reached the
+  # running Caddy and the :80 Host probe aborted). Truncate+rewrite keeps
+  # the inode (mode is re-asserted 0600 first so a first install cannot
+  # expose the secret-bearing render even transiently) but is not atomic;
+  # the post-write cmp catches a short/failed write at run time (a power
+  # loss mid-write is repaired only by the next dispatch).
+  [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
+  chmod 600 "${CADDY_CONFIG}"
+  cat "$TMP_CADDY" >"${CADDY_CONFIG}"
+  cmp -s "$TMP_CADDY" "${CADDY_CONFIG}" || die "in-place Caddyfile write did not land byte-identical (out of space?) — refusing to reload Caddy on a partial config; the running process keeps the old config"
+  rm -f "$TMP_CADDY"
+  log "Caddyfile installed in place (rendered from dispatch env)"
 fi
 # ---------------------------------------------------------------------------
 # e2) Run Caddy (container recreated when the pinned tag changed — so a
@@ -1053,12 +1155,24 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
 fi
 [ -n "${AOP_TLS}" ] && CADDY_WANT_MOUNTS="${CADDY_WANT_MOUNTS} aop"
 CADDY_HAVE_MOUNTS="$(cat /etc/caddy/.deployed-mounts 2>/dev/null || true)"
+# Stale-mount guard (same rationale as the Gatus block above): the container
+# bind-mounts the Caddyfile FILE; a container created before an `mv` install
+# keeps reading the OLD bytes and the reload silently no-ops ("config is
+# unchanged"). Compare the container's view through its root to the rendered
+# path; divergence = recreate once. In-place installs keep this quiet.
+CADDY_MOUNT_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
+  caddy_pid="$(docker inspect --format '{{.State.Pid}}' caddy 2>/dev/null || true)"
+  if [ -n "${caddy_pid}" ] && ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"; then
+    CADDY_MOUNT_STALE=1
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   CADDY_RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' caddy) # ci-allowlist: code — docker inspect field name, not a live reference.
-  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ]; then
+  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
     log "Caddy already running on ${CADDY_IMAGE}"
   else
-    log "Caddy image or deployed-PEM set changed - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
+    log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f caddy >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "caddy"; then
@@ -1095,18 +1209,21 @@ if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
     die "Caddy exited on boot with the new config — tang stays up on loopback but the :80 proxy is down; reversibility: docs/dr.md"
   fi
 fi
-if [ "${CADDY_RESTART:-0}" = "1" ] || [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-  # Mounts already converged above (recreate path); reload = zero-downtime.
-  # ORIGIN_CERT_CHANGED covers the in-place cert swap: the bind-mounted FILE
-  # kept its inode (in-place write), so only a reload makes Caddy re-read it.
-  docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-  log "Caddy reloaded on new config"
-  if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-    # Recorded ONLY after the successful reload (a failed run must re-reload
-    # on the next dispatch, never claim the cert is live).
-    origin_ca_write_hash "${ORIGIN_CA_CRT}"
-    log "deployed origin-ca cert hash recorded after the successful reload"
-  fi
+# Always reload: the stale-mount guard compares the MOUNT's bytes, not the
+# loaded config — an aborted reload (SSH drop, SIGKILL between the in-place
+# write and this line) would otherwise stay invisible, and the next dispatch
+# (identical render, equal mount bytes) would report green while the running Caddy
+# serves the old config (a rotated X-Piercloud-Origin secret or a changed
+# MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
+# covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
+# (in-place write), so only a reload makes Caddy re-read it.
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+log "Caddy reloaded on new config"
+if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
+  # Recorded ONLY after the successful reload (a failed run must re-reload
+  # on the next dispatch, never claim the cert is live).
+  origin_ca_write_hash "${ORIGIN_CA_CRT}"
+  log "deployed origin-ca cert hash recorded after the successful reload"
 fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
@@ -1239,7 +1356,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
     case "${dash_code}" in
       301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the proxied edge record is upserted by the DNS stage after close)" ;;
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the DNS stage writes only the anchor record; the dashboard name is covered by the platform status wildcard at the edge (live 2026-10-07))" ;;
       *)
         docker logs caddy 2>&1 | tail -20 || true
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
@@ -1297,9 +1414,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The proxied edge record is upserted by the DNS stage AFTER this job, so on a first-time/DR dispatch this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once DNS converges re-enable AOP (docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (live 2026-10-07) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (pre-A2 rollback to the Cloudflare edge only: re-enable per docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the proxied record may still point at the old box (edge 521/522) — the DNS stage converges only AFTER this job, see docs/dr.md"
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. Pre-A2 Cloudflare-edge rollback only: rotate the leaf with 102 --aop --force-aop --apply, then re-dispatch. If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -1325,10 +1442,10 @@ if [ -n "${STATUS_HOST:-}" ]; then
   elif [ "${ORIGIN_TLS}" != "1" ]; then
     # No origin pair selected (absent, or the one-way marker suppressed the
     # legacy fallback): auto-TLS cannot reliably issue for a name whose public
-    # record is only upserted by the DNS stage after this job. Origin TLS is
-    # proven there (verify-after-write + orange-cloud) and by the edge, so
-    # this is loud, not fatal; with a pair selected it stays fail-closed.
-    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the proxied edge record is upserted after close (docs/dr.md)"
+    # edge path (the platform status wildcard) is not in place yet. Origin TLS
+    # is proven by the edge once the platform records exist, so this is loud,
+    # not fatal; with a pair selected it stays fail-closed.
+    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the platform status wildcard may not be in place yet (docs/dr.md)"
   else
     docker logs caddy 2>&1 | tail -20 || true
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
@@ -4550,4 +4667,4 @@ case "$(recording_witness_state)" in
     ;;
 esac
 
-log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."
+log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-<alias>.status.piercloud.net} (visitor TLS at the edge; the origin leg on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

@@ -19,5 +19,5 @@ The domain split: `scripts/` = on-box payloads (run via dispatch SSH or pasted b
 | Script | Runs on | Purpose |
 |---|---|---|
 | `.github/scripts/020-provision-anchor.sh` | the Actions runner | A1 hardened /32 window lifecycle (`sweep-pre`/`open`/`provision`/`close`/`sweep-post`) + plain-ssh provisioning handoff; `--rotate` passthrough, `passwd -l root` last |
-| `.github/scripts/030-anchor-dns.sh` | the Actions runner | Cloudflare A-record upsert + verify-after-write for `anchor-01-<tenant>.piercloud.net`; fail-closed without the org token |
+| `.github/scripts/030-anchor-dns.sh` | the Actions runner | Provider-switched (`NET_DNS_PROVIDER=cloudflare|gcore`, A2) anchor A-record upsert + verify-after-write for `anchor-01-<tenant>.piercloud.net`; the per-tenant dashboard record is gone (platform `*.status` wildcard); fail-closed without the active provider's org token |
 | `.github/scripts/040-retention-cap.sh` | the Actions runner | `mode=check` retention-cap assertion: fails loudly when any workflow's `retention-days` leaves the public-repo 1–90 band (H1: artifacts are a convenience copy, never the durable record) |

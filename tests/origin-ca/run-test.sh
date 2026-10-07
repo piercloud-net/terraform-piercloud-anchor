@@ -16,7 +16,9 @@
 #       and a crafted DN that only imitates the extension strings (review N3);
 #   (f) install validation: a test-CA-signed cert for the exact SAN + key is
 #       accepted; wrong SAN, wrong public key, expired, not-yet-valid, non-PEM,
-#       oversized and multi-cert/junk-framed material are rejected fail-closed;
+#       oversized, over-long and junk-framed material are rejected fail-closed;
+#       a bounded leaf-first chain (leaf + issuer) is accepted and installed
+#       as-is — CloudFront 502s when the intermediate is missing;
 #   (g) the install is an IN-PLACE write: the destination inode survives
 #       (the Caddy container bind-mounts the file — a rename would leave
 #       Caddy reading the old inode forever);
@@ -110,8 +112,8 @@ for fn in origin_ca_generate origin_ca_cert_hash origin_ca_csr_selfcheck origin_
   declare -f "$fn" >/dev/null || { printf 'FAIL extraction did not yield %s\n' "$fn"; exit 1; }
 done
 
-STATUS_HOST="status-citest.piercloud.net"
-OTHER_HOST="status-other.piercloud.net"
+STATUS_HOST="citest.status.piercloud.net"
+OTHER_HOST="other.status.piercloud.net"
 
 # ---- (a) generation ------------------------------------------------------
 origin_ca_generate
@@ -290,6 +292,12 @@ expect_cert_fail "validation rejects a wrong SAN" "${WORK}/cert-wrongsan.pem" "d
 expect_cert_fail "validation rejects a foreign public key" "${WORK}/cert-foreignkey.pem" "does not match"
 expect_cert_fail "validation rejects an expired cert" "${WORK}/cert-expired.pem" "expired"
 expect_cert_fail "validation rejects a not-yet-valid cert" "${WORK}/cert-notyet.pem" "not yet valid"
+cat "${WORK}/cert-valid.pem" "${CA_DIR}/ca.pem" >"${WORK}/cert-chain.pem"
+origin_ca_validate_cert "${WORK}/cert-chain.pem" "${ORIGIN_CA_KEY}" "$STATUS_HOST" \
+  && ok "validation accepts a leaf-first chain (first block is the leaf)" \
+  || bad "validation rejected a leaf-first chain"
+cat "${WORK}/cert-wrongsan.pem" "${CA_DIR}/ca.pem" >"${WORK}/cert-chain-wrong.pem"
+expect_cert_fail "validation rejects a chain whose first block is not the status cert" "${WORK}/cert-chain-wrong.pem" "differs from"
 if origin_ca_cert_pem_ok $'not a pem at all\n'; then bad "bounded-PEM shape accepts non-PEM junk"; else ok "bounded-PEM shape rejects non-PEM junk"; fi
 if origin_ca_cert_pem_ok "$(printf -- '-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----' "$(head -c 17000 /dev/zero | tr '\0' 'A')")"; then
   bad "bounded-PEM shape accepts oversized material"
@@ -297,10 +305,21 @@ else
   ok "bounded-PEM shape rejects oversized material"
 fi
 valid_pem="$(cat "${WORK}/cert-valid.pem")"
-if origin_ca_cert_pem_ok "$(printf '%s\n%s\n' "$valid_pem" "$valid_pem")"; then
-  bad "bounded-PEM shape accepts a multi-cert blob"
+ca_pem="$(cat "${CA_DIR}/ca.pem")"
+if origin_ca_cert_pem_ok "$(printf '%s\n%s\n' "$valid_pem" "$ca_pem")"; then
+  ok "bounded-PEM shape accepts a leaf-first chain (leaf + issuer)"
 else
-  ok "bounded-PEM shape rejects a multi-cert blob (no first-block-only validation)"
+  bad "bounded-PEM shape rejected a leaf-first chain (the CloudFront origin leg needs the intermediate)"
+fi
+if origin_ca_cert_pem_ok "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$valid_pem" "$valid_pem" "$valid_pem" "$valid_pem" "$valid_pem" "$valid_pem" "$valid_pem" "$valid_pem" "$valid_pem")"; then
+  bad "bounded-PEM shape accepts an over-long chain (9 blocks)"
+else
+  ok "bounded-PEM shape rejects an over-long chain (9 blocks)"
+fi
+if origin_ca_cert_pem_ok "$(printf '%s\n%s\n' "$valid_pem" '-----BEGIN CERTIFICATE-----')"; then
+  bad "bounded-PEM shape accepts unbalanced block framing"
+else
+  ok "bounded-PEM shape rejects unbalanced block framing"
 fi
 if origin_ca_cert_pem_ok "$(printf 'leading junk line\n%s\n' "$valid_pem")"; then
   bad "bounded-PEM shape accepts leading junk"
@@ -324,6 +343,15 @@ ORIGIN_CA_CERT_PEM="$valid_pem" origin_ca_install_from_env
 is "install keeps the destination inode" "$crt_inode_before" "$(inode_of "${ORIGIN_CA_CRT}")"
 is "install writes the validated cert content" "$(origin_ca_cert_hash "${WORK}/cert-valid.pem")" "$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
 is "installed cert mode is 0644" "644" "$(mode_of "${ORIGIN_CA_CRT}")"
+
+# The chain install: the whole leaf-first chain lands in the served file
+# (Caddy serves the file as-is — the intermediate is what CloudFront needs),
+# while the served-hash marker stays the leaf fingerprint (first block).
+chain_pem="$(printf '%s\n%s\n' "$(cat "${WORK}/cert-valid.pem")" "$(cat "${CA_DIR}/ca.pem")")"
+ORIGIN_CA_CERT_PEM="$chain_pem" origin_ca_install_from_env
+is "chain install keeps the destination inode" "$crt_inode_before" "$(inode_of "${ORIGIN_CA_CRT}")"
+is "chain install writes both blocks" "2" "$(grep -c -- '-----BEGIN CERTIFICATE-----' "${ORIGIN_CA_CRT}")"
+is "chain install hash stays the leaf fingerprint" "$(origin_ca_cert_hash "${WORK}/cert-valid.pem")" "$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
 
 # A FAILED install leaves the served file untouched (same inode + content).
 crt_hash_before_fail="$(origin_ca_cert_hash "${ORIGIN_CA_CRT}")"
