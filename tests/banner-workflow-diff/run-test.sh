@@ -68,9 +68,11 @@
 #       no-fetch-or-pull with no git alias and no fetch/pull assignment, and
 #       the banner job's single fetch-depth: 0; ci.yml gates AND runs this
 #       harness. The override check is a function the harness probes
-#       behaviourally (14 override payloads), pins to exactly one definition
-#       line, and verifies its effective body and its derived input against
-#       the call site; each close-leg fixture must be accepted by a
+#       behaviourally (16 override payloads incl. real-path source/dot forms),
+#       pins the regex and the function to exactly one definition line each,
+#       and verifies its effective body and its derived input (against both
+#       the derivation-time copy and a call-site recomputation); each
+#       close-leg fixture must be accepted by a
 #       close-leg-removed gate copy (the close leg is load-bearing), the full
 #       close-leg alternative is pinned, and the load-bearing branch's
 #       rc/count test is pinned. Residual: single-quote
@@ -79,12 +81,13 @@
 #       by the override pins), deep variable indirection (`cmd=git; $cmd
 #       fetch`, `git${IFS}fetch`) and an escaped JSON module key
 #       (`"\u006dodule"`) are out of a textual pin's reach, the override
-#       pin's keyword alternative is COUNT-agnostic (a benign `read -r x` /
-#       `export FOO=bar` in the banner step reads as an override form;
-#       fail-closed, latent); the effective-body/input checks run at the
+#       pin's keyword/arithmetic/dot-source alternatives are COUNT-agnostic
+#       (a benign `read -r x`, `export FOO=bar`, `x=$((1+1))` or `. ./lib.sh`
+#       in the banner step reads as an override form; fail-closed, latent);
+#       the effective-body/input checks run at the
 #       call site, but a deliberate rewrite of the canonical/pin lines or an
 #       insertion inside the compound condition can still evade a textual
-#       tripwire, and the exact 226-check floor is count-only (a same-count
+#       tripwire, and the exact 233-check floor is count-only (a same-count
 #       in-place gutting of an unpinned check is invisible) — the pin is a
 #       regression tripwire, the review is the backstop.
 set -euo pipefail
@@ -780,16 +783,22 @@ done
 # close-leg spelling the rewrite misses reddens (fail-closed).
 closelegless="$WORK/banner-workflow-diff.closelegless.sh"
 sed -E 's/\\\*\+\/\[\[:space:\]\]\*module/NEVERMATCH_closeleg/g' "$SCRIPT" > "$closelegless"
-if [ "$(grep -oF 'NEVERMATCH_closeleg' "$closelegless" | wc -l | tr -d ' ')" = "1" ]; then
-  ok "close-leg mutant: the shipped close leg was rewritten exactly once (occurrence count)"
+if [ "$(grep -cF "printf '/*c*/module\"m\" {" "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the attached-label fixture payload is pinned"
+else
+  bad "the attached-label fixture payload was rewritten"
+fi
+if [ "$(grep -oF 'NEVERMATCH_closeleg' "$closelegless" | wc -l | tr -d ' ')" = "1" ] && [ "$(grep -cE '^if git grep -qE .*NEVERMATCH_closeleg' "$closelegless")" = "1" ]; then
+  ok "close-leg mutant: the shipped close leg was rewritten exactly once on the executed gate line"
 else
   bad "close-leg mutant: the shipped close-leg spelling drifted — red, fix the mutant"
 fi
 # The full close-leg alternative must be intact: the sed prefix alone can be
 # satisfied by a narrowed leg (e.g. `module[[:space:]]`) that still refuses the
 # space/tab fixtures while missing an attached label (functional r5i LOW).
-if [ "$(grep -cF '\*+/[[:space:]]*module([^[:alnum:]_]|$)' "$SCRIPT")" = "1" ]; then
-  ok "the shipped close leg keeps the full token-boundary alternative"
+gate_line="$(grep -E '^if git grep -qE' "$SCRIPT")"
+if [ -n "$gate_line" ] && [ "$(grep -c . <<<"$gate_line")" = "1" ] && grep -qF '\*+/[[:space:]]*module([^[:alnum:]_]|$)' <<<"$gate_line"; then
+  ok "the shipped close leg keeps the full token-boundary alternative on the executed gate line"
 else
   bad "the shipped close-leg alternative is missing, narrowed, or duplicated"
 fi
@@ -817,6 +826,16 @@ if [ "$(grep -cE '^  if \[ "\$rc" -eq 0 \] && \[ "\$count" = "1" \]; then$' "$RE
   ok "the close-leg load-bearing check evaluates rc/count exactly once"
 else
   bad "the close-leg load-bearing check was gutted or duplicated"
+fi
+if [ "$(grep -cE '^    ok "\$variant: close leg is load-bearing \(accepted without it\)"$' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the close-leg load-bearing ok branch is pinned"
+else
+  bad "the close-leg load-bearing ok branch was gutted or duplicated"
+fi
+if [ "$(grep -cE '^    bad "\$variant: refused without the close leg — caught by another leg \(rc=\$rc\)"$' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the close-leg load-bearing bad branch is pinned"
+else
+  bad "the close-leg load-bearing bad branch was gutted or duplicated"
 fi
 git_c checkout -q modprose
 rc=0
@@ -892,7 +911,7 @@ override_re="\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|types
 # from the pinned definition text, the harness must carry exactly one
 # `banner_override_check()` definition line (a dead duplicate cannot supply
 # the text while a weakened body runs), and the effective body plus the
-# derived `banner_active` (against the snapshot taken at derivation) are
+# derived `banner_active` (against the derivation-time copy) are
 # compared at the call site — so a live redefinition (any spelling), a
 # probe-aware shadow, a first-call sentinel, an inline-literal rewrite, a
 # renamed variable, `grep -c` in the check's own message, or an in-place
@@ -908,7 +927,17 @@ if [ "$(grep -cE '^banner_override_check\(\)' "$REPO_ROOT/tests/banner-workflow-
 else
   bad "the override check has a shadowed/duplicate definition line"
 fi
-if [ "$(declare -f banner_override_check)" != "$override_fn_canonical" ] || [ "$banner_active" != "$banner_active_snapshot" ]; then
+if [ "$(grep -cE '^override_re="' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the override regex is defined exactly once"
+else
+  bad "the override regex has a shadowed/duplicate definition line"
+fi
+if [ "$(grep -cE '^banner_active="\$\(join_continuations <<<"\$banner_step" \| strip_comments\)"; banner_active_snapshot="\$banner_active"$' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the banner_active derivation and derivation-time copy are pinned"
+else
+  bad "the banner_active derivation was rewritten"
+fi
+if [ "$(command builtin declare -f banner_override_check)" != "$override_fn_canonical" ] || [ "$banner_active" != "$banner_active_snapshot" ] || [ "$banner_active" != "$(join_continuations <<<"$banner_step" | strip_comments)" ]; then
   bad "the override check body or its banner-step input was tampered with (redefinition/reassignment)"
 elif banner_override_check; then
   bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"
@@ -924,7 +953,7 @@ fi
 # read the EFFECTIVE function body, so a dead decoy cannot keep a weakened
 # call site green.
 override_probe_saved="$banner_active"
-for probe in '((COUNT=0))' 'export COUNT=0' 'read COUNT' 'declare COUNT' 'let COUNT' 'unset COUNT' 'readonly COUNT' 'typeset COUNT' 'readarray COUNT' 'mapfile COUNT' 'eval COUNT=0' 'source file' 'printf -v COUNT 0' '. file'; do
+for probe in '((COUNT=0))' 'export COUNT=0' 'read COUNT' 'declare COUNT' 'let COUNT' 'unset COUNT' 'readonly COUNT' 'typeset COUNT' 'readarray COUNT' 'mapfile COUNT' 'eval COUNT=0' 'source file' 'printf -v COUNT 0' '. file' 'source /tmp/evil.sh' '. /etc/profile'; do
   banner_active="$probe"
   if banner_override_check; then ok "the override check fires on: $probe"; else bad "the override check misses: $probe"; fi
 done
@@ -969,7 +998,7 @@ if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml
 # silently reporting one fewer ok (the disclosed multi-line-rewrite residual
 # removes the real call and drops exactly one executed check). Update together
 # with the harness.
-CHECK_FLOOR=226
+CHECK_FLOOR=233
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
