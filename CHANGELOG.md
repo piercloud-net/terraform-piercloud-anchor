@@ -63,6 +63,7 @@ All notable changes to this project will be documented in this file.
 - *(witness)* Harden the vector-generator provenance guard + \Z-anchor the replica TS_RE (closes #155)
 - *(witness)* Bound the delta session listing at the heartbeat stem (closes #161)
 - *(010)* Force the Caddy reload — a chain-only cert change is never re-read (closes #174)
+- *(010)* Enforce the ORIGIN_CA_CERT_PEM chain + prove the A2 edge (closes #172)
 
 ### 💼 Other
 
