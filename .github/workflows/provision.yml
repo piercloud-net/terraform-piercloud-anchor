@@ -23,6 +23,14 @@
 
 name: provision
 
+# Run name is the control plane's only discovery surface: the dispatch API
+# returns 204 with no run id and the run object exposes no `inputs`, so the
+# pc-control dispatcher matches the run it created by `display_title` against
+# the `dispatch_intent` it sent (`<alias> <action> <intent8>`). The fallback
+# keeps manual runs nameable — GitHub substitutes event-specific text for an
+# empty run-name, so an explicit `(manual)` form is required.
+run-name: ${{ inputs.dispatch_intent != '' && inputs.dispatch_intent || format('{0} (manual)', inputs.mode) }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -32,6 +40,11 @@ on:
         default: apply
         type: choice
         options: [apply, check, update-ip, destroy]
+      dispatch_intent:
+        description: "Control-plane intent string, echoed in run-name (operator/pc-control use; leave empty for manual runs)."
+        required: false
+        default: ""
+        type: string
       ack_main_unbound:
         description: "Destroy gate: confirm the main box is already unbound (required for mode=destroy)."
         required: false
