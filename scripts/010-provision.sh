@@ -909,18 +909,19 @@ TMP_CFG="${GATUS_CONFIG}.new"
   fi
 } >"$TMP_CFG"
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
-  log "Gatus config unchanged — no restart"
+  log "Gatus config unchanged (identical re-render)"
   rm -f "$TMP_CFG"
-  GATUS_RESTART=0
 else
   # IN-PLACE install: the gatus container bind-mounts this FILE, and a file
   # bind mount pins the inode — `mv` swaps the inode and the container keeps
   # reading the OLD config forever (same class as the Caddyfile below;
-  # observed live 2026-10-07).
+  # observed live 2026-10-07). Truncate+rewrite keeps the inode but is not
+  # atomic; the post-write cmp catches a short/failed write at run time (a
+  # power loss mid-write is self-healed by the next dispatch).
   cat "$TMP_CFG" >"${GATUS_CONFIG}"
+  cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (disk full?) — refusing to restart Gatus on a partial config"
   rm -f "$TMP_CFG"
   log "Gatus config installed in place (rendered from dispatch env)"
-  GATUS_RESTART=1
 fi
 
 # ---------------------------------------------------------------------------
@@ -997,10 +998,13 @@ if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
     --mount type=volume,source=gatus-data,target=/data \
     "${GATUS_IMAGE}" >/dev/null
 fi
-if [ "${GATUS_RESTART:-0}" = "1" ]; then
-  docker restart gatus >/dev/null
-  log "Gatus restarted on new config"
-fi
+# Always restart: the stale-mount guard compares the MOUNT's bytes, not what
+# the running Gatus loaded — an aborted restart (SSH drop, SIGKILL) would
+# otherwise stay invisible, and the next dispatch (identical render, fresh
+# mount) would report green while the monitor serves the old config. A
+# restart is cheap and the sqlite history lives in a named volume.
+docker restart gatus >/dev/null
+log "Gatus restarted"
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
 # run log (the tenant has no shell — this output IS their dashboard check).
 # Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
@@ -1031,10 +1035,11 @@ fi
 #    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert,
 #    cert-only PUBLIC material installed from the repo VARIABLE; key material
 #    never travels — the key is generated on this box in section (c1)),
-#    CF_AOP_CA_PEM (optional zone-level Authenticated Origin Pulls bundle for
-#    our own cert; absent = edge auth stays firewall-allowlist + Host binding
-#    until the operator finishes the AOP ceremony in docs/dr.md +
-#    re-dispatches).
+#    CF_AOP_CA_PEM (legacy zone-level Authenticated Origin Pulls bundle for
+#    the pre-A2 Cloudflare edge; A2 retires AOP for the :443 origin leg —
+#    CloudFront has no AOP — so the expected post-cutover state is UNSET:
+#    edge auth = firewall allowlist + the X-Piercloud-Origin gate below.
+#    Pre-A2 Cloudflare-edge rollback only: set it per docs/dr.md).
 # ---------------------------------------------------------------------------
 log "Rendering dispatch-managed Caddyfile (${CADDY_CONFIG})"
 mkdir -p "$(dirname "${CADDY_CONFIG}")" "${CADDY_CHALLENGE_DIR}"
@@ -1061,7 +1066,7 @@ if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   AOP_TLS="yes"
   log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + Host binding until the operator finishes the AOP ceremony (docs/dr.md) + re-dispatches"
+  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. Pre-A2 Cloudflare-edge rollback only: set CF_AOP_CA_PEM per docs/dr.md)"
 fi
 CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
 if [ "${ORIGIN_TLS}" = "1" ]; then
@@ -1086,7 +1091,6 @@ TMP_CADDY="${CADDY_CONFIG}.new"
 # bind-mounted file unreadable on recreate; verify on every bump.
 install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
-CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
   # A no-op render still re-asserts 0600: a pre-0600 file must not survive
   # just because the bytes match.
@@ -1112,14 +1116,16 @@ else
   # reading the OLD bytes and `caddy reload` reports "config is unchanged"
   # (observed live 2026-10-07: the A2 cutover render never reached the
   # running Caddy and the :80 Host probe aborted). Truncate+rewrite keeps
-  # the inode; mode is re-asserted 0600 first so a first install cannot
-  # expose the secret-bearing render even transiently.
+  # the inode (mode is re-asserted 0600 first so a first install cannot
+  # expose the secret-bearing render even transiently) but is not atomic;
+  # the post-write cmp catches a short/failed write at run time (a power
+  # loss mid-write is self-healed by the next dispatch).
   [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
   chmod 600 "${CADDY_CONFIG}"
   cat "$TMP_CADDY" >"${CADDY_CONFIG}"
+  cmp -s "$TMP_CADDY" "${CADDY_CONFIG}" || die "in-place Caddyfile write did not land byte-identical (disk full?) — refusing to reload Caddy on a partial config; the running process keeps the old config"
   rm -f "$TMP_CADDY"
   log "Caddyfile installed in place (rendered from dispatch env)"
-  CADDY_RESTART=1
 fi
 # ---------------------------------------------------------------------------
 # e2) Run Caddy (container recreated when the pinned tag changed — so a
@@ -1193,18 +1199,21 @@ if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
     die "Caddy exited on boot with the new config — tang stays up on loopback but the :80 proxy is down; reversibility: docs/dr.md"
   fi
 fi
-if [ "${CADDY_RESTART:-0}" = "1" ] || [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-  # Mounts already converged above (recreate path); reload = zero-downtime.
-  # ORIGIN_CERT_CHANGED covers the in-place cert swap: the bind-mounted FILE
-  # kept its inode (in-place write), so only a reload makes Caddy re-read it.
-  docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-  log "Caddy reloaded on new config"
-  if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-    # Recorded ONLY after the successful reload (a failed run must re-reload
-    # on the next dispatch, never claim the cert is live).
-    origin_ca_write_hash "${ORIGIN_CA_CRT}"
-    log "deployed origin-ca cert hash recorded after the successful reload"
-  fi
+# Always reload: the stale-mount guard compares the MOUNT's bytes, not the
+# loaded config — an aborted reload (SSH drop, SIGKILL between the in-place
+# write and this line) would otherwise stay invisible, and the next dispatch
+# (identical render, fresh mount) would report green while the running Caddy
+# serves the old config (a rotated X-Piercloud-Origin secret or a changed
+# MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
+# covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
+# (in-place write), so only a reload makes Caddy re-read it.
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+log "Caddy reloaded on new config"
+if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
+  # Recorded ONLY after the successful reload (a failed run must re-reload
+  # on the next dispatch, never claim the cert is live).
+  origin_ca_write_hash "${ORIGIN_CA_CRT}"
+  log "deployed origin-ca cert hash recorded after the successful reload"
 fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
@@ -1397,7 +1406,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
       if [ "${edge_rc}" -eq 6 ]; then
         die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is covered by the platform status wildcard (edge buildout) and the DNS stage writes only the anchor record, so on a first-time/DR dispatch before the platform records exist this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (pre-A2 rollback to the Cloudflare edge only: re-enable per docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
+      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (pre-A2 Cloudflare-edge rollback only: rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the dashboard's edge record (the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — the DNS stage writes only the anchor record, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
