@@ -919,7 +919,7 @@ else
   # atomic; the post-write cmp catches a short/failed write at run time (a
   # power loss mid-write is self-healed by the next dispatch).
   cat "$TMP_CFG" >"${GATUS_CONFIG}"
-  cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (disk full?) — refusing to restart Gatus on a partial config"
+  cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (out of space?) — refusing to restart Gatus on a partial config"
   rm -f "$TMP_CFG"
   log "Gatus config installed in place (rendered from dispatch env)"
 fi
@@ -1123,7 +1123,7 @@ else
   [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
   chmod 600 "${CADDY_CONFIG}"
   cat "$TMP_CADDY" >"${CADDY_CONFIG}"
-  cmp -s "$TMP_CADDY" "${CADDY_CONFIG}" || die "in-place Caddyfile write did not land byte-identical (disk full?) — refusing to reload Caddy on a partial config; the running process keeps the old config"
+  cmp -s "$TMP_CADDY" "${CADDY_CONFIG}" || die "in-place Caddyfile write did not land byte-identical (out of space?) — refusing to reload Caddy on a partial config; the running process keeps the old config"
   rm -f "$TMP_CADDY"
   log "Caddyfile installed in place (rendered from dispatch env)"
 fi
