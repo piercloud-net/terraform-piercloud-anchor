@@ -68,9 +68,12 @@
 #       no-fetch-or-pull with no git alias and no fetch/pull assignment, and
 #       the banner job's single fetch-depth: 0; ci.yml gates AND runs this
 #       harness. The override check is a function the harness probes
-#       behaviourally (14 override payloads) with exact definition/call pins,
-#       and each close-leg fixture must be accepted by a close-leg-removed
-#       gate copy (the close leg is load-bearing). Residual: single-quote
+#       behaviourally (14 override payloads), pins to exactly one definition
+#       line, and verifies its effective body and its derived input against
+#       the call site; each close-leg fixture must be accepted by a
+#       close-leg-removed gate copy (the close leg is load-bearing), the full
+#       close-leg alternative is pinned, and the load-bearing branch's
+#       rc/count test is pinned. Residual: single-quote
 #       splicing is not executable as a bare assignment (a syntax error /
 #       `COUNT=0: command not found`; the executable keyword forms are caught
 #       by the override pins), deep variable indirection (`cmd=git; $cmd
@@ -78,11 +81,12 @@
 #       (`"\u006dodule"`) are out of a textual pin's reach, the override
 #       pin's keyword alternative is COUNT-agnostic (a benign `read -r x` /
 #       `export FOO=bar` in the banner step reads as an override form;
-#       fail-closed, latent), and a deliberate multi-line rewrite that
-#       removes the real call, plants dead copies of the pinned lines and
-#       compensates the exact 219-check floor with a dummy ok can still evade
-#       a textual tripwire — the pin is a regression tripwire, the review is
-#       the backstop.
+#       fail-closed, latent); the effective-body/input checks run at the
+#       call site, but a deliberate rewrite of the canonical/pin lines or an
+#       insertion inside the compound condition can still evade a textual
+#       tripwire, and the exact 226-check floor is count-only (a same-count
+#       in-place gutting of an unpinned check is invisible) — the pin is a
+#       regression tripwire, the review is the backstop.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -389,6 +393,14 @@ printf '# module\n' > modules/m/main.tf
 git_c add -A
 git_c commit -qm "comment close attached to the module token (no gap)"
 git_c push -q origin modulecloseattached
+
+git_c checkout -qb modulecloseattachedlabel main
+mkdir -p modules/m
+printf '/*c*/module"m" {\n  source = "./modules/m"\n}\n' > main.tf
+printf '# module\n' > modules/m/main.tf
+git_c add -A
+git_c commit -qm "comment close attached to an attached-label module token (no gap)"
+git_c push -q origin modulecloseattachedlabel
 
 git_c checkout -qb moduleclosetab main
 mkdir -p modules/m
@@ -747,7 +759,7 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
-for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose; do
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached modulecloseattachedlabel moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose; do
   git_c checkout -q "$variant"
   rc=0
   out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
@@ -768,12 +780,20 @@ done
 # close-leg spelling the rewrite misses reddens (fail-closed).
 closelegless="$WORK/banner-workflow-diff.closelegless.sh"
 sed -E 's/\\\*\+\/\[\[:space:\]\]\*module/NEVERMATCH_closeleg/g' "$SCRIPT" > "$closelegless"
-if [ "$(grep -cF 'NEVERMATCH_closeleg' "$closelegless")" = "1" ]; then
-  ok "close-leg mutant: the shipped close leg was rewritten exactly once"
+if [ "$(grep -oF 'NEVERMATCH_closeleg' "$closelegless" | wc -l | tr -d ' ')" = "1" ]; then
+  ok "close-leg mutant: the shipped close leg was rewritten exactly once (occurrence count)"
 else
   bad "close-leg mutant: the shipped close-leg spelling drifted — red, fix the mutant"
 fi
-for variant in moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached moduleclosetab modulebomcomment; do
+# The full close-leg alternative must be intact: the sed prefix alone can be
+# satisfied by a narrowed leg (e.g. `module[[:space:]]`) that still refuses the
+# space/tab fixtures while missing an attached label (functional r5i LOW).
+if [ "$(grep -cF '\*+/[[:space:]]*module([^[:alnum:]_]|$)' "$SCRIPT")" = "1" ]; then
+  ok "the shipped close leg keeps the full token-boundary alternative"
+else
+  bad "the shipped close-leg alternative is missing, narrowed, or duplicated"
+fi
+for variant in moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached modulecloseattachedlabel moduleclosetab modulebomcomment; do
   git_c checkout -q "$variant"
   if ! git_c ls-files --error-unmatch main.tf >/dev/null 2>&1; then
     bad "$variant: main.tf is missing (fixture shape changed)"
@@ -790,6 +810,14 @@ for variant in moduleleadcomment moduleleadcommentnl moduleclosecomment modulest
     bad "$variant: refused without the close leg — caught by another leg (rc=$rc)"
   fi
 done
+# The load-bearing branch's rc/count test must exist exactly once: a
+# same-count in-place gutting (`ok` unconditional) would otherwise stay green
+# (red-team r5i LOW).
+if [ "$(grep -cE '^  if \[ "\$rc" -eq 0 \] && \[ "\$count" = "1" \]; then$' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the close-leg load-bearing check evaluates rc/count exactly once"
+else
+  bad "the close-leg load-bearing check was gutted or duplicated"
+fi
 git_c checkout -q modprose
 rc=0
 count="$(bash "$SCRIPT" main)" || rc=$?
@@ -851,7 +879,7 @@ no_fetch_scan() {
 # satisfying (red-team r2/r3 MEDIUM).
 banner_job="$(awk '/^  visibility-banner:/{f=1; next} f && /^  [a-zA-Z0-9_-]+:$/{f=0} f' "$PROV")"
 banner_step="$(awk '/- name: Approval card/{f=1} /- name: Record head SHA/{f=0} f' "$PROV")"
-banner_active="$(join_continuations <<<"$banner_step" | strip_comments)"
+banner_active="$(join_continuations <<<"$banner_step" | strip_comments)"; banner_active_snapshot="$banner_active"
 if [ -n "$banner_job" ] && [ -n "$banner_step" ]; then ok "the banner job and step were located for the scoped pins"; else bad "the banner job/step was not located (pin scope lost)"; fi
 call_line='COUNT="$(bash .github/scripts/banner-workflow-diff.sh "$BASE_REF")"'
 if [ "$(grep -cF "$call_line" <<<"$banner_active")" = "1" ]; then ok "the banner step calls the diff script (exact active call line)"; else bad "the banner step call line is missing, duplicated, or only commented"; fi
@@ -859,22 +887,35 @@ if [ "$(grep -oF 'COUNT=' <<<"$banner_active" | grep -c .)" = "1" ]; then ok "CO
 if [ "$(grep -cE 'COUNT[[:space:]]*[+*/%^-]?=' <<<"$banner_active")" = "1" ]; then ok "COUNT is assigned exactly once (space/compound-tolerant spelling)"; else bad "the banner step carries a COUNT assignment beyond the single call line"; fi
 override_re="\(\(|(^|[^[:alnum:]_])(export|read|declare|let|unset|readonly|typeset|readarray|mapfile|eval|source)([[:space:]]|$)|(^|[^[:alnum:]_])printf[[:space:]]+[\\]?[\"']?-v|^[[:space:]]*\.[[:space:]]"
 # The banner step must carry no COUNT override form. The check is a function
-# so the pins can probe the EXECUTED check behaviourally: a dead textual decoy
-# cannot satisfy a behaviour probe, an inline-literal rewrite fails the
-# payload set, and the exact definition/call pins catch a `[[ =~ ]]` rewrite,
-# a renamed variable, or `grep -c` in the check's own message (red-team r5f/
-# r5g/r5h LOW, functional r5h LOW, trust r5h LOW). Reach limit (disclosed):
-# a deliberate multi-line rewrite that removes the call and plants a dead copy
-# of both pinned lines can still evade a textual tripwire — the review is the
-# backstop.
+# so the pins can probe the EXECUTED check behaviourally and verify its
+# EFFECTIVE body and input: the canonical body is recomputed in a subshell
+# from the pinned definition text, the harness must carry exactly one
+# `banner_override_check()` definition line (a dead duplicate cannot supply
+# the text while a weakened body runs), and the effective body plus the
+# derived `banner_active` (against the snapshot taken at derivation) are
+# compared at the call site — so a live redefinition (any spelling), a
+# probe-aware shadow, a first-call sentinel, an inline-literal rewrite, a
+# renamed variable, `grep -c` in the check's own message, or an in-place
+# reassignment of the input all redden (red-team r5f/r5g/r5h/r5i LOW,
+# functional r5h/r5i LOW, trust r5h/r5i LOW). Reach limit (disclosed): a
+# deliberate rewrite of the pin/canonical lines, or an insertion inside the
+# compound condition itself, is out of a textual tripwire's reach — the
+# review is the backstop.
 banner_override_check() { grep -qE "$override_re" <<<"$banner_active"; }
-if banner_override_check; then bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"; else ok "no COUNT override form in the banner step"; fi
-if [ "$(grep -cE '^banner_override_check\(\) \{ grep -qE "\$override_re" <<<"\$banner_active"; \}$' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
-  ok "the shipped override check is defined exactly once and consumes override_re"
+override_fn_canonical="$(bash -c 'banner_override_check() { grep -qE "$override_re" <<<"$banner_active"; }; declare -f banner_override_check')"
+if [ "$(grep -cE '^banner_override_check\(\)' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+  ok "the override check has exactly one definition line"
 else
-  bad "the shipped override check definition is missing, duplicated, or rewritten"
+  bad "the override check has a shadowed/duplicate definition line"
 fi
-if [ "$(grep -cE '^if banner_override_check; then bad "the banner step carries a COUNT override form' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
+if [ "$(declare -f banner_override_check)" != "$override_fn_canonical" ] || [ "$banner_active" != "$banner_active_snapshot" ]; then
+  bad "the override check body or its banner-step input was tampered with (redefinition/reassignment)"
+elif banner_override_check; then
+  bad "the banner step carries a COUNT override form (arithmetic/export/read/declare/let/unset/readonly/typeset/readarray/mapfile/eval/source/printf -v)"
+else
+  ok "no COUNT override form in the banner step"
+fi
+if [ "$(grep -cE '^elif banner_override_check; then$' "$REPO_ROOT/tests/banner-workflow-diff/run-test.sh")" = "1" ]; then
   ok "the real banner step runs the shared override check exactly once"
 else
   bad "the real banner step does not run the shared override check (or a decoy call exists)"
@@ -928,7 +969,7 @@ if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml
 # silently reporting one fewer ok (the disclosed multi-line-rewrite residual
 # removes the real call and drops exactly one executed check). Update together
 # with the harness.
-CHECK_FLOOR=219
+CHECK_FLOOR=226
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
