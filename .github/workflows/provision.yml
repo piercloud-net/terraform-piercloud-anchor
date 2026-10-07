@@ -1318,6 +1318,11 @@ jobs:
       # exfiltrate a token the workflow never injects. The script fails
       # closed naming the org secret when the active token is absent.
       NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}
+      # Dashboard CNAME target (CloudFront distribution hostname) — repo
+      # variable, non-secret. Absent = the writer fails closed: without the
+      # explicit record the dashboard name is wildcard-only and goes dark at
+      # every ACME challenge (the challenge node makes it an ENT on Gcore).
+      STATUS_EDGE_DOMAIN: ${{ vars.STATUS_EDGE_DOMAIN }}
       CLOUDFLARE_DNS_TOKEN: ${{ vars.NET_DNS_PROVIDER != 'gcore' && secrets.CLOUDFLARE_DNS_TOKEN || '' }}
       GCORE_DNS_TOKEN: ${{ vars.NET_DNS_PROVIDER == 'gcore' && secrets.GCORE_DNS_TOKEN || '' }}
     steps:
