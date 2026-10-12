@@ -154,6 +154,17 @@ alerting="$(sed -n '/^alerting:/,/^endpoints:/p' "$CFG")"
 has "token adds the bridge Authorization header" "$alerting" 'Authorization: "Bearer tk_testtoken"'
 has "token adds the native provider token" "$alerting" "token: tk_testtoken"
 
+# ---- (b3) token hygiene: backslash / double quote fail closed (F1/F2) ----
+fixture_env
+export NTFY_TOPIC=pc-test-topic NTFY_TOKEN='tk"bad'
+if render token_quote; then bad "double-quote NTFY_TOKEN fails closed"; else ok "double-quote NTFY_TOKEN fails closed"; fi
+has "quote token names the guard" "$(cat "$WORK/token_quote/stderr.log")" "bad NTFY_TOKEN"
+
+fixture_env
+export NTFY_TOPIC=pc-test-topic NTFY_TOKEN='tk\bad'
+if render token_backslash; then bad "backslash NTFY_TOKEN fails closed"; else ok "backslash NTFY_TOKEN fails closed"; fi
+has "backslash token names the guard" "$(cat "$WORK/token_backslash/stderr.log")" "bad NTFY_TOKEN"
+
 # ---- (c) no push topic ----------------------------------------------------
 fixture_env
 if render no_topic; then ok "no-topic shape renders"; else bad "no-topic shape renders"; fi
@@ -190,6 +201,11 @@ if render collide_main; then bad "main= pair fails closed with a tenant"; else o
 has "main collision names the built-in" "$(cat "$WORK/collide_main/stderr.log")" "collides with a built-in endpoint"
 
 fixture_env
+export GATUS_ENDPOINTS="Platform=https://example.org/health"
+if render collide_platform_case; then bad "case-variant platform= pair fails closed"; else ok "case-variant platform= pair fails closed"; fi
+has "case-variant collision names the built-in" "$(cat "$WORK/collide_platform_case/stderr.log")" "collides with a built-in endpoint"
+
+fixture_env
 unset TENANT_USER
 export GATUS_ENDPOINTS="main=https://example.org/health"
 if render main_pair_no_tenant; then ok "main= pair accepted when the built-in did not render"; else bad "main= pair accepted when the built-in did not render"; fi
@@ -222,6 +238,20 @@ awk '!done && /alert_intent main/ { sub(/alert_intent main/, "alert_intent moved
 SPAN="${WORK}/span-moved.src"
 if render moved_assertion; then bad "render assertion catches a ledger name without its stanza"; else ok "render assertion catches a ledger name without its stanza"; fi
 has "moved-row failure names the unalerted endpoint" "$(cat "$WORK/moved_assertion/stderr.log")" "'moved-row' is missing its alerts stanza"
+
+# (g3) the platform alert block removed together with its intent: the C4
+# totals AND the per-name ledger still match (a synchronized drop), so only
+# the operator-shape assertion catches it — the security-lens F4 class.
+fixture_env
+export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator
+awk '
+  /if \[ "\$PLATFORM_ALERTS" -eq 1 \]/ { skip = 1 }
+  skip { if ($0 == "fi") { skip = 0 }; next }
+  { print }
+' "${WORK}/span.src" >"${WORK}/span-noplatform.src"
+SPAN="${WORK}/span-noplatform.src"
+if render teeth_operator_assertion; then bad "operator assertion catches a dropped platform block"; else ok "operator assertion catches a dropped platform block"; fi
+has "operator assertion names the platform stanza" "$(cat "$WORK/teeth_operator_assertion/stderr.log")" "must render the platform alert stanza"
 SPAN="${WORK}/span.src"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -1157,7 +1157,8 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
     url="$(printf '%s' "$pair" | cut -d= -f2- | tr -d '[:space:]')"
     case "$name" in ''|*[!a-zA-Z0-9_-]*) die "bad GATUS_ENDPOINTS pair (want name=url, name chars [a-zA-Z0-9_-]): $pair";; esac
     case "$url" in http://*|https://*) ;; *) die "bad GATUS_ENDPOINTS pair (v1 supports http(s) URLs only): $pair";; esac
-    case " ${BUILTIN_NAMES} " in *" ${name} "*) die "GATUS_ENDPOINTS pair name '${name}' collides with a built-in endpoint (${BUILTIN_NAMES// /, }) — pick another name";; esac
+    name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    case " ${BUILTIN_NAMES} " in *" ${name_lc} "*) die "GATUS_ENDPOINTS pair name '${name}' collides with a built-in endpoint (${BUILTIN_NAMES// /, }) — pick another name";; esac
     ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: ${name}
     url: ${url}
     interval: 60s
@@ -1181,6 +1182,12 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
   # Fail fast on YAML injection: topic/token interpolate into config-as-data.
   case "$NTFY_TOPIC" in ''|*[!a-zA-Z0-9_-]*) die "bad NTFY_TOPIC (chars [a-zA-Z0-9_-] only): ${NTFY_TOPIC}";; esac
   case "${NTFY_TOKEN:-}" in *[[:space:]]*|*[![:print:]]*) die "bad NTFY_TOKEN (no whitespace/control characters)";; esac
+  # Security-lens F1/F2: the token is interpolated into a YAML double-quoted
+  # scalar (the bridge Authorization header). A backslash escape survives the
+  # render (Gatus then fails the alert at runtime — green run, undelivered
+  # alert) and a double quote breaks the YAML (Gatus panics). No valid ntfy
+  # token carries either byte, so reject both here, fail closed.
+  case "${NTFY_TOKEN:-}" in *\\*|*\"*) die "bad NTFY_TOKEN (no backslash or double quote — it is interpolated into the YAML Authorization header)";; esac
   ALERTING_YAML="  ntfy:
     url: https://ntfy.sh
     topic: ${NTFY_TOPIC}"
@@ -1293,6 +1300,14 @@ while IFS= read -r _alert_ep; do
 done <<EOF
 ${ALERTS_EXPECTED_NAMES}
 EOF
+# Operator-shape assertion (security-lens F4): with a push channel, an
+# operator anchor must carry the platform alert stanza — a platform block
+# removed together with its intent would otherwise render monitor-only
+# silently (the C4 ledger cannot see a synchronized drop).
+if [ -n "${NTFY_TOPIC:-}" ] && [ "$PLATFORM_ALERTS" -eq 1 ]; then
+  grep -qx 'platform' <<<"$ALERTS_EXPECTED_NAMES" \
+    || die "Gatus render assertion failed: ANCHOR_ROLE=operator with a push channel must render the platform alert stanza — refusing to install"
+fi
 # Silent-downgrade check (issue #134, call C7): the run log names the
 # endpoints that will alert — `platform` missing means the role/topic is
 # not active (names only; never the topic).
