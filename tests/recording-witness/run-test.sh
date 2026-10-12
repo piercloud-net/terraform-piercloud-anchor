@@ -9751,7 +9751,7 @@ if grep -q 'tests/recording-witness/run-test.sh' "${ROOT}/.github/workflows/ci.y
 else
   bad "ci.yml does not run the recording-witness harness"
 fi
-if grep -q 'origin-ca|recording-witness)/' "${ROOT}/.github/workflows/ci.yml"; then
+if grep -q 'origin-ca|recording-witness|broker-report)/' "${ROOT}/.github/workflows/ci.yml"; then
   ok "ci.yml path gate includes tests/recording-witness/"
 else
   bad "ci.yml path gate missing tests/recording-witness/"
