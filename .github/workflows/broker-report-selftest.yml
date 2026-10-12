@@ -1,0 +1,64 @@
+# broker-report-selftest.yml — dispatch-only canary for the pc-control broker
+# report path (M1 broker leg (b) b2; pc-control #123).
+#
+# It proves the OIDC trust chain end to end (token mint -> broker verify ->
+# registry write) without touching netcup: the job selects the caller-provided
+# environment (so the token's `sub` matches a real registry-bound
+# environment), mints a token with the broker audience and POSTs a
+# documentation-range IPv4 for the given anchor_ref. Use it to verify a broker
+# deploy/rotation, or as the live-proof driver for the pc-control b2 slice.
+#
+# Security: the broker allowlists this workflow ONLY during a proof window
+# (see the pc-control broker role defaults) — a permanent allowlist entry
+# would let an anchor-repo writer report an IP without the managed-tenant
+# preflight that provision.yml enforces. The environment input is safe to
+# expose because the broker's registry check requires the environment to
+# exist with a matching repository binding; an auto-created environment
+# fails closed at the registry.
+name: broker-report-selftest
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment whose OIDC sub to use (must be registry-bound, e.g. a proof environment)."
+        required: true
+        type: string
+      anchor_ref:
+        description: "Anchor lane reference to report for (must exist in that environment's tenant)."
+        required: true
+        default: "broker-selftest"
+        type: string
+      ipv4:
+        description: "IPv4 to report (default: TEST-NET-1 documentation range)."
+        required: false
+        default: "192.0.2.10"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: "Report the anchor IPv4 to the broker"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        with:
+          persist-credentials: false
+
+      - name: Report the anchor IPv4
+        env:
+          BROKER_URL: https://broker.piercloud.net
+          ANCHOR_REF: ${{ inputs.anchor_ref }}
+          ANCHOR_IPV4: ${{ inputs.ipv4 }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/lib/broker-report.sh
+          report_anchor_ip "$ANCHOR_REF" "$ANCHOR_IPV4"

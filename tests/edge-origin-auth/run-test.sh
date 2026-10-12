@@ -197,7 +197,7 @@ has "${PROV}" '::add-mask::${{ secrets.MAIN_BOX_IPV4 }}' "provision.yml masks th
 has "${ANCHOR_020}" "CLOUDFRONT_ORIGIN_SECRET='\$(q \"\${CLOUDFRONT_ORIGIN_SECRET:-}\")'" "020 exports CLOUDFRONT_ORIGIN_SECRET"
 has "${ANCHOR_020}" "MAIN_BOX_IPV4='\$(q \"\${MAIN_BOX_IPV4:-}\")'" "020 exports MAIN_BOX_IPV4"
 has "${CI}" 'tests/edge-origin-auth/run-test.sh' "ci.yml runs this harness"
-has "${CI}" 'edge-origin-auth|origin-ca|recording-witness)/' "ci.yml path gate includes edge-origin-auth (witness pin intact)"
+has "${CI}" 'edge-origin-auth|origin-ca|recording-witness|broker-report)/' "ci.yml path gate includes edge-origin-auth (witness pin intact)"
 # The extraction is anchored on the unit-tests gate's own prefix (not the
 # first `elif grep -qE` in the file) so reordering jobs cannot silently move
 # the case onto another gate (functional/red-team #170 LOW).
