@@ -1,6 +1,6 @@
 # Repo conventions (for contributors and coding agents)
 
-This file holds the engineering conventions of this repo. The two hard invariants live in [invariants.md](invariants.md); the scripts rules live in [scripts/README.md](../scripts/README.md). The user-facing entry point is the [README](../README.md).
+This file holds the engineering conventions of this repo. The hard invariants live in [invariants.md](invariants.md); the scripts rules live in [scripts/README.md](../scripts/README.md). The user-facing entry point is the [README](../README.md).
 
 ## Shape
 

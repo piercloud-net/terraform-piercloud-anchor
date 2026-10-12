@@ -643,7 +643,7 @@ jobs:
             # cloudfront_ranges.tf sync tooth and the firewall-wiring
             # assertions live in tests/edge-origin-auth, so a ranges
             # refresh or rule edit must not skip them.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|edge-origin-auth|origin-ca|recording-witness)/|.*\.tf$)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|managed-inputs|edge-origin-auth|origin-ca|recording-witness)/|.*\.tf$)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -662,6 +662,7 @@ jobs:
           bash tests/scp-token-refresh/run-test.sh
           bash tests/banner-workflow-diff/run-test.sh
           bash tests/anchor-ip-selection/run-test.sh
+          bash tests/managed-inputs/run-test.sh
           bash tests/sweep-pre-classify/run-test.sh
           bash tests/sweep-post-shapes/run-test.sh
           bash tests/naming-scheme/run-test.sh

@@ -599,7 +599,7 @@ iface_fw_put() { # $1 = mac, $2 = user-policy id JSON array -> PUT merged save b
   fi
 }
 
-attach_policy() { # $1 = policy id (idempotent merge under the global mutex)
+attach_policy() { # $1 = policy id (idempotent merge under the account lane)
   local id="$1" mac current_ids merged
   all_digits "$id" || die "attach_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   mac="$(resolve_mac)"
@@ -653,15 +653,22 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 # orphan BEFORE any mutation -> retire EVERY non-own tmp (aged >2h or
 # leaked-fresh) -> drop this run's own leftovers (open recreates the window).
 #
-# SINGLE-WRITER-PER-ACCOUNT ASSUMPTION (why retiring a FRESH non-own tmp is
-# safe here): provision.yml pins concurrency.group=piercloud-netcup-policy, a
-# STATIC literal that serializes every run of THIS workflow for EVERY tenant,
-# so at pre-sweep no other run of this repo can hold a tmp. It does NOT
-# serialize another repo sharing the same netcup account — one account must
-# have exactly ONE writer (this repo's workflow); two writers on one account
-# are out of contract. The tradeoff is deliberate: an attached leaked tmp
-# keeps admitting a stale runner /32 to :22 for as long as it lives (GitHub
-# recycles runner IPs), so the fresh leak is retired now rather than at 2h.
+# SINGLE-WRITER-PER-ACCOUNT CONTRACT (why retiring a FRESH non-own tmp is
+# safe here): provision.yml pins concurrency.group to the account lane —
+# `anchor-<anchor_ref>` when the dispatcher passes the opaque registry
+# account reference, the static `piercloud-netcup-policy` when it does not —
+# so at pre-sweep no other run of THIS workflow for the SAME ACCOUNT can hold
+# a tmp. The anchor↔account relation is 1:1 (docs/invariants.md invariant 3):
+# one account has exactly ONE anchor and ONE writer (this workflow); two
+# writers on one account are out of contract, and another repo sharing the
+# account is out of contract too. All runs that mutate a managed account must
+# carry the same anchor_ref — the platform dispatcher sets it, and a manual
+# run on a managed account passes it explicitly (a managed `tenant` dispatch
+# without it fails closed at the preflight step in the ungated banner job).
+# The tradeoff is deliberate:
+# an attached leaked tmp keeps admitting a stale runner /32 to :22 for as long
+# as it lives (GitHub recycles runner IPs), so the fresh leak is retired now
+# rather than at 2h.
 # ---------------------------------------------------------------------------
 cmd_sweep_pre() {
   require_token
@@ -672,12 +679,13 @@ cmd_sweep_pre() {
   log "pre-sweep: $count tmp polic(ies) on server $SERVER_ID"
   # Pass 1 — classify ONLY, mutate nothing yet: OWN leftovers (a retry is
   # normal; duplicates are possible through async races), NON-OWN (aged >2h
-  # = dead run, or fresh = leaked by a dead run: provision.yml's workflow-wide
-  # concurrency.group serializes every run OF THIS REPO, so a non-own tmp can
-  # never belong to a live run here; another repo on the same account is out
-  # of contract), ORPHAN (no valid created_at — ambiguous, operator must
-  # look). The fail-closed verdict is decided before any retirement (review
-  # MINOR-1: never sweep half the list and then bail).
+  # = dead run, or fresh = leaked by a dead run: provision.yml's account lane
+  # serializes every run of this workflow for the same anchor_ref, so a
+  # non-own tmp for this account can never belong to a live run here; another
+  # repo on the same account is out of contract), ORPHAN (no valid created_at
+  # — ambiguous, operator must look). The fail-closed verdict is decided
+  # before any retirement (review MINOR-1: never sweep half the list and then
+  # bail).
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r '.name')"

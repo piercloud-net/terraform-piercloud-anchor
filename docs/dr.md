@@ -29,6 +29,8 @@ Related: [usage.md](usage.md) (end-to-end flow) · [invariants.md](invariants.md
 
 **Operator anchors:** the `platform` row alerts (tenant pages stay monitor-only). The role is the `ANCHOR_ROLE` repo variable — `operator` alerts, unset/`tenant` is monitor-only, anything else fails the run closed. After setting it (with a real `NTFY_TOPIC`), re-dispatch `mode=apply` and check the run log's `Gatus alert stanzas:` line names `platform`: an unset role silently downgrades the row to monitor-only. A run that clears the variable for a tenant-shape proof must restore it and re-dispatch to confirm the operator shape.
 
+**Managed dispatches (account lane):** every run that mutates a managed netcup account must carry that account's `anchor_ref` (the opaque registry reference for the anchor's account) so all runs on the account serialize — the workflow's concurrency lane becomes `anchor-<ref>`; an empty value falls back to the repo-wide static lane and can overlap a managed run on the same account (a ref-less `apply`/`update-ip`/`destroy` emits a loud warning). A managed dispatch also selects its tenant environment via the `tenant` input; the environment must carry the `MANAGED_TENANT` marker equal to its name (set by the platform env lifecycle), or the run fails closed before the device card.
+
 ## Boot-failure decision tree (main box asks for a passphrase)
 
 Your main box dropped to a passphrase prompt instead of unlocking via the anchor. Four causes, in order:
