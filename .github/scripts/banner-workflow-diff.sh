@@ -80,6 +80,12 @@ unset GIT_LITERAL_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_GLOB_PATHSPECS GIT_ICASE_PA
 # verify HIGH). Drop them all, resolve the binary once to an absolute path (a
 # relative/PATH-shim resolution refuses), and route every call through the
 # resolved path so a later PATH change cannot swap it.
+# Reach limit (disclosed): an environment that defines arbitrary exported
+# functions can shadow `unset`/`exec`/`command` themselves (the drops become
+# no-ops), and `BASH_ENV`/`GITHUB_ENV`/`GITHUB_PATH` can inject code or PATH
+# entries before/around this script; the drops below and the workflow-side
+# pins are regression tripwires, not a sandbox — the reviewer reads the
+# workflow diff (red-team verify MEDIUM).
 unset -f git command grep printf echo 2>/dev/null || true
 git_bin="$(command -v git || true)"
 case "$git_bin" in

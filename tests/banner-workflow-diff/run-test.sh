@@ -77,8 +77,14 @@
 #       drops imported functions (`git`/`command`/`grep`/`printf`/`echo`),
 #       resolves `git` once to an absolute path and
 #       routes every call through it, and the workflow must carry no
-#       `PATH`/`BASH_FUNC_` surface at any level (a workflow-level `env:`
-#       reaches every job) (red-team verify HIGH);
+#       `PATH`/`BASH_ENV`/`GITHUB_PATH`/`BASH_FUNC_` surface at any level (a
+#       workflow-level `env:`
+#       reaches every job) (red-team verify HIGH). Reach limit (disclosed): an
+#       environment that defines arbitrary exported functions can shadow
+#       `unset`/`exec`/`command` themselves, and `BASH_ENV`/`GITHUB_ENV`/
+#       `GITHUB_PATH` can inject code or PATH entries built at runtime — the
+#       drops and these pins are regression tripwires, not a sandbox; the
+#       reviewer reads the workflow diff (red-team verify MEDIUM);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
 #       form (arithmetic/export/read/declare/let/unset/readonly/typeset/
@@ -1272,10 +1278,20 @@ rc=0
 count="$(env "$git_func_probe" bash "$SCRIPT" main)" || rc=$?
 is "an exported git function cannot forge the count" "2" "$count"
 is "an exported git function: rc" "0" "$rc"
-if grep -qE '(^|[[:space:]])PATH[[:space:]]*[:=]' <<<"$prov_active" || grep -qF 'BASH_FUNC_' <<<"$prov_active"; then
-  bad "the workflow carries a PATH assignment or an exported shell function (a git/grep shim could forge the verdict)"
+if grep -qE '(^|[[:space:]])(PATH|BASH_ENV)[[:space:]]*[:=]' <<<"$prov_active" || grep -qE '(^|[^[:alnum:]_])GITHUB_PATH([^[:alnum:]_]|$)' <<<"$prov_active" || grep -qF 'BASH_FUNC_' <<<"$prov_active"; then
+  bad "the workflow carries a PATH/BASH_ENV assignment, a GITHUB_PATH write or an exported shell function (a git/grep shim could forge the verdict)"
 else
-  ok "the workflow carries no PATH assignment or exported shell function"
+  ok "the workflow carries no PATH/BASH_ENV/GITHUB_PATH/exported-function surface"
+fi
+if printf 'BASH_ENV: /tmp/evil.sh\n' | grep -qE '(^|[[:space:]])(PATH|BASH_ENV)[[:space:]]*[:=]'; then
+  ok "the workflow-env refusal matches a BASH_ENV key"
+else
+  bad "the workflow-env refusal misses a BASH_ENV key"
+fi
+if printf '          echo /tmp/shim >> "$GITHUB_PATH"\n' | grep -qE '(^|[^[:alnum:]_])GITHUB_PATH([^[:alnum:]_]|$)'; then
+  ok "the workflow-env refusal matches a GITHUB_PATH write"
+else
+  bad "the workflow-env refusal misses a GITHUB_PATH write"
 fi
 rc=0
 count="$(env 'BASH_FUNC_grep%%=() { echo 0; }' bash "$SCRIPT" main)" || rc=$?
@@ -1333,7 +1349,7 @@ if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml
 # silently reporting one fewer ok (the disclosed multi-line-rewrite residual
 # removes the real call and drops exactly one executed check). Update together
 # with the harness.
-CHECK_FLOOR=298
+CHECK_FLOOR=300
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
