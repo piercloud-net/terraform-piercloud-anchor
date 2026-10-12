@@ -1499,3 +1499,5 @@ jobs:
       # contents:read and cannot push — the committed copy arrives via a
       # reviewable PR from a separate App identity (mechanism resolves before
       # the thumbprint chain is called done; stubbed in M1).
+
+# proof-card scratch: workflow-path change for the #90 CHANGED gate
