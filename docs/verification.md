@@ -26,7 +26,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist; also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
 | `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (banner workflow diff, token refresh, anchor IP selection, managed-input preflight/binding, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, anchor DNS, edge origin-auth, config file mounts, per-anchor origin-ca, Gatus render, recording-witness) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (banner workflow diff, token refresh, anchor IP selection, managed-input preflight/binding, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, anchor DNS, edge origin-auth, config file mounts, per-anchor origin-ca, Gatus render, recording-witness, broker report) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|edge-origin-auth|origin-ca|recording-witness)/|.*\.tf$)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -84,6 +84,14 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] **Fail-closed (shape)**: a dispatch with `tenant=<env>` and an empty `anchor_ref` stops at the preflight step in the **ungated banner job** — before the environment protection gate on `device-flow` (so an opted-in reviewer is never paused for a run that cannot proceed) and before the device card. A ref-less `apply`/`update-ip`/`destroy` warns loudly instead (the disclosed residual).
 - [ ] **Fail-closed (binding)**: a `tenant=<env>` dispatch whose environment does not carry `MANAGED_TENANT=<env>` (auto-created or partial env) stops at the device-flow binding check before any netcup use.
 - [ ] **Environment selection is real**: a `tenant=<env>` dispatch from a ref the environment's deployment branch policy excludes is refused *because the environment was selected* (an empty-`tenant` run would have started) — record the refusal message.
+
+### Broker report / anchor IPv4 (`broker-report.sh`, `provision.yml`)
+
+- [ ] CI green; `tests/broker-report/run-test.sh` exercises the real lib against a stubbed curl (audience-tagged OIDC request, the broker POST, token-never-in-argv, input validation, every refusal path) and pins the workflow wiring.
+- [ ] **Managed report**: a managed dispatch (`tenant=<env>`, `anchor_ref=<ref>`) from the reviewed SHA reaches the report step and the run log shows `anchor IP reported to the broker (anchor_ref=<ref>)`; the registry read-back (`psql`: `anchor.anchor_ipv4` / `anchor_ipv4_run_id` / `anchor_ipv4_reported_at`) matches the resolve log's IPv4 and this run's id; an `anchor.ipv4_reported` audit row exists and the chain verifies.
+- [ ] **Fail-closed**: a report against an unknown/ambiguous anchor_ref, a non-registry environment, or a foreign repository answers non-200 and the run fails at the report step (before the A1 window) — reproduce one locally with the selftest workflow or a bad ref.
+- [ ] **Selftest canary**: dispatch `broker-report-selftest.yml` with the proof environment + a seeded anchor ref (the broker allowlists the selftest workflow only during the proof window) and record the run URL + registry read-back.
+- [ ] **Unmanaged runs unaffected**: a manual/template run (empty `tenant`) skips the step (no report, no OIDC token request).
 
 ### Retention cap / `mode=check` assert (workflow + docs)
 
