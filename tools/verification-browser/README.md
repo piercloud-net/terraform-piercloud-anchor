@@ -19,8 +19,9 @@ CfT uses its own macOS keychain item (`Chromium Safe Storage`), separate from pe
 
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
-| `BROWSER_HOME` | `$HOME/.piercloud/test-browser` | all | Base directory for the profile, CfT copy, and log |
-| `CFT_DIR` | `$BROWSER_HOME/cft` | `build-app.sh` | CfT download/unzip directory |
+| `BROWSER_HOME` | `$HOME/.piercloud/test-browser` | all | Base directory for the profile and log |
+| `CFT_DIR` | `$HOME/.cft` | `build-app.sh` | Shared CfT base — one install for all projects; the app bundle is an APFS COW clone of it |
+| `CFT_SKIP_FETCH` | `0` | `build-app.sh` | `1` = rebuild from the existing `CFT_DIR` without downloading (requires the binary there) |
 | `APP_DIR` | `$HOME/Applications` | `build-app.sh`, `launch.sh` | Where the branded app bundle lives |
 | `APP_NAME` | `CfT PierCloud` | `build-app.sh`, `launch.sh` | Bundle/display name |
 | `BUNDLE_ID` | `com.google.chrome.for.testing.piercloud` | `build-app.sh` | Bundle identifier |
@@ -30,9 +31,16 @@ CfT uses its own macOS keychain item (`Chromium Safe Storage`), separate from pe
 
 Every script echoes the values it resolved. Moving `PROFILE` (with the browser stopped) preserves the sign-ins.
 
+### Shared base CfT
+
+One base install lives at `~/.cft/` (the default `CFT_DIR`); each project's app bundle is an APFS copy-on-write clone of it (≈0 extra disk) and each project keeps its own profile — only the browser data is independent:
+
+- `build-app.sh` fetches the latest stable CfT into the base when the version changed, then rebuilds this project's branded app from it.
+- `CFT_SKIP_FETCH=1 ./build-app.sh` rebuilds from the existing base without downloading (used when another project already updated it).
+
 ## One-time setup (macOS)
 
-1. `./build-app.sh` — resolves the latest stable CfT for your architecture, downloads/unzips it under `CFT_DIR` when the version changed, clones it (`cp -Rc`, copy-on-write) to `$APP_DIR/$APP_NAME.app`, brands the Info.plist with `APP_NAME`/`BUNDLE_ID`, and re-signs ad-hoc. Re-run after CfT updates or to refresh the brand.
+1. `./build-app.sh` — resolves the latest stable CfT for your architecture, downloads/unzips it into the shared base (`CFT_DIR`, default `~/.cft`) when the version changed, clones it (`cp -Rc`, copy-on-write) to `$APP_DIR/$APP_NAME.app`, brands the Info.plist with `APP_NAME`/`BUNDLE_ID`, and re-signs ad-hoc. Re-run after CfT updates or to refresh the brand; `CFT_SKIP_FETCH=1 ./build-app.sh` rebuilds from the existing base without downloading.
 2. `./launch.sh` — starts the browser on CDP `:$CDP_PORT` (idempotent: a no-op when CDP already answers) and activates the window.
 3. In that window, sign in to netcup SCP. macOS prompts once for `Chromium Safe Storage` — choose **Always Allow** (login keychain password required). Deny → logins do not persist; re-running `build-app.sh` changes the signature and the prompt returns.
 

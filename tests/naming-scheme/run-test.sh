@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/naming-scheme/run-test.sh — naming derivation + drift + legacy-shape guard.
 #
-# Guards issue #105 (flat tenant-suffix names: anchor-01-<tenant>):
+# Guards issue #105 (flat tenant-suffix names: anchor-01-<tenant>) and the A2
+# 2026-09-30 nested dashboard (`<tenant>.status.piercloud.net`):
 #   (a) scripts/lib/naming.sh derivations + the D2 fail-closed username policy;
 #   (b) the console-fallback copy embedded in scripts/010-provision.sh between
 #       the BEGIN/END NAMING markers must stay byte-identical to the lib;
@@ -33,12 +34,21 @@ is()  { # $1 label, $2 expected, $3 actual
 # ---- (a) canonical derivations -------------------------------------------
 is "sanitize pier" "pier" "$(sanitize_tenant pier)"
 is "anchor host for pier" "anchor-01-pier" "$(derive_anchor_hostname "$(sanitize_tenant pier)")"
-is "status host for pier" "status-pier" "$(derive_status_host "$(sanitize_tenant pier)")"
-is "status FQDN for pier" "status-pier.piercloud.net" "$(derive_status_host "$(sanitize_tenant pier)").piercloud.net"
+is "status host for pier" "pier.status" "$(derive_status_host "$(sanitize_tenant pier)")"
+is "status FQDN for pier" "pier.status.piercloud.net" "$(derive_status_host "$(sanitize_tenant pier)").piercloud.net"
+# A2: the anchor name STAYS flat on `.net` (clevis binds it; the DNS stage
+# writes it) — the nested form applies to the dashboard only.
 is "anchor FQDN for pier" "anchor-01-pier.piercloud.net" "$(derive_anchor_hostname "$(sanitize_tenant pier)").piercloud.net"
 # The tenants the CI proofs rely on stay derivable unchanged.
-is "status host for citest" "status-citest" "$(derive_status_host "$(sanitize_tenant citest)")"
+is "status host for citest" "citest.status" "$(derive_status_host "$(sanitize_tenant citest)")"
 is "anchor host for prodprobe" "anchor-01-prodprobe" "$(derive_anchor_hostname "$(sanitize_tenant prodprobe)")"
+# Nested-shape guard: the dashboard is `<tenant>.status` (two labels under the
+# apex, the platform status namespace) — a flat `status-<tenant>` regression
+# must fail here, not at the edge.
+case "$(derive_status_host "$(sanitize_tenant pier)")" in
+  *.status) ok "status host carries the nested .status namespace" ;;
+  *) bad "status host is not nested: $(derive_status_host "$(sanitize_tenant pier)")" ;;
+esac
 # The old sanitizer semantics survive (non-destructive: strip/normalize).
 is "sanitize .pier" "pier" "$(sanitize_tenant .pier)"
 is "sanitize pier--carlo" "pier-carlo" "$(sanitize_tenant pier--carlo)"

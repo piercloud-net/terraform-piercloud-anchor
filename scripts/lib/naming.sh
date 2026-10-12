@@ -8,9 +8,14 @@
 # INSIDE its CADDY RENDER span). tests/naming-scheme/run-test.sh diffs the
 # embedded block against this file. Edit HERE and copy the block; never fork it.
 #
-# Scheme (2026-09-11 naming ADR): every platform name is `<site>-<tenant>`,
-# one label deep — anchor: anchor-01-<tenant>.piercloud.net (NN=01; -02+ is a
-# future multi-anchor case), dashboard: status-<tenant>.piercloud.net.
+# Scheme (2026-09-26 hybrid naming ADR + A2 2026-09-30): public surfaces are
+# flat `<site>-<tenant>` one label deep; the anchor stays
+# anchor-01-<tenant>.piercloud.net (NN=01; -02+ is a future multi-anchor
+# case), the dashboard is NESTED under the platform status namespace:
+# <tenant>.status.piercloud.net (written as an explicit CNAME to the
+# CloudFront edge — STATUS_EDGE_DOMAIN; the `_acme-challenge.<tenant>.status`
+# node is an ENT that blocks wildcard synthesis on RFC 4592-strict providers,
+# so the explicit record is the durable form; also the anchor's cert SAN).
 #
 # validate_tenant_username is deliberately strict and fails closed on the
 # LOWERCASED RAW value: the sanitizer maps `.pier`, `pier-`, `pier--carlo`
@@ -45,7 +50,7 @@ derive_anchor_hostname() { # $1 = sanitized tenant -> anchor-<NN>-<tenant> (NN=0
   printf 'anchor-01-%s\n' "$1"
 }
 
-derive_status_host() { # $1 = sanitized tenant -> status-<tenant> (dashboard singleton, one label)
-  printf 'status-%s\n' "$1"
+derive_status_host() { # $1 = sanitized tenant -> <tenant>.status (dashboard under the platform status namespace)
+  printf '%s.status\n' "$1"
 }
 # --- END NAMING ---

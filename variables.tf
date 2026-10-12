@@ -31,7 +31,7 @@ variable "server_name" {
 }
 
 variable "allow_main_box_ipv4" {
-  description = "IPv4 address of your main box; tang (TCP/80) accepts challenges from this address only."
+  description = "IPv4 address of your main box; tang (TCP/80) accepts challenges from this address only, and the Caddy :443 origin gate exempts it from the X-Piercloud-Origin secret header (the dashboard bypass)."
   type        = string
 
   validation {

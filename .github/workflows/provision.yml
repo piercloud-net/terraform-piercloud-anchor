@@ -13,12 +13,27 @@
 # (ephemeral values carry the per-run netcup token; the token never lands in
 # state). The module bump itself lands in M3.
 #
-# DNS stage (anchor-dns job + .github/scripts/030-anchor-dns.sh): Cloudflare
+# DNS stage (anchor-dns job + .github/scripts/030-anchor-dns.sh): anchor
 # A-record upsert + verify-after-write runs after A1 close (needs
 # device-flow) and before thumbprint issuance (thumbprint needs anchor-dns)
 # — a DNS failure fails the run before any thumbprint goes out, always.
+# A2: the writer is provider-switched (`NET_DNS_PROVIDER` repo variable,
+# cloudflare|gcore) so the `.net` zone move flips it without a code change;
+# it upserts BOTH the anchor A and the explicit per-tenant dashboard CNAME
+# `<tenant>.status` (the ACME challenge node is an ENT — wildcard-only goes
+# dark at every renewal on an RFC 4592-strict provider; see
+# 030-anchor-dns.sh). `STATUS_EDGE_DOMAIN` (CloudFront) is required and the
+# job fails closed without it.
 
 name: provision
+
+# Run name is the control plane's only discovery surface: the dispatch API
+# returns 204 with no run id and the run object exposes no `inputs`, so the
+# pc-control dispatcher matches the run it created by `display_title` against
+# the `dispatch_intent` it sent (`<alias> <action> <intent8>`). The fallback
+# keeps manual runs nameable — GitHub substitutes event-specific text for an
+# empty run-name, so an explicit `(manual)` form is required.
+run-name: ${{ inputs.dispatch_intent != '' && inputs.dispatch_intent || format('{0} (manual)', inputs.mode) }}
 
 on:
   workflow_dispatch:
@@ -29,6 +44,11 @@ on:
         default: apply
         type: choice
         options: [apply, check, update-ip, destroy]
+      dispatch_intent:
+        description: "Control-plane intent string, echoed in run-name (operator/pc-control use; leave empty for manual runs)."
+        required: false
+        default: ""
+        type: string
       ack_main_unbound:
         description: "Destroy gate: confirm the main box is already unbound (required for mode=destroy)."
         required: false
@@ -964,13 +984,44 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           # Operator-plane dashboard-TLS material (set at template time — the
           # tenant pastes nothing, bootstrap stays 1 secret): the per-anchor
-          # Origin CA certificate arrives via the cert-only repo VARIABLE
+          # Origin CA certificate chain (leaf-first) arrives via the cert-only
+          # repo VARIABLE
           # (public material — never key material; the key is generated on
-          # the box); CF_AOP_CA_PEM stays the optional zone-AOP client-auth
-          # bundle (repo secret). Deployed material for Caddy's :443, NOT a
-          # standing API token.
+          # the box); CF_AOP_CA_PEM stays the legacy zone-AOP client-auth
+          # bundle (repo secret; A2 retires it — expected unset post-cutover).
+          # Deployed material for Caddy's :443, NOT a standing API token.
           ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
+          # CloudFront origin auth (call D): the secret header CloudFront
+          # injects into the origin request — Caddy enforces it on :443 (the
+          # firewall admits only the CloudFront origin-facing ranges + the
+          # main box). MAIN_BOX_IPV4 is the Caddy main-box bypass address
+          # (already a secret for the firewall). Both are required for the
+          # :443 render (fail-closed).
+          CLOUDFRONT_ORIGIN_SECRET: ${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}
+          MAIN_BOX_IPV4: ${{ secrets.MAIN_BOX_IPV4 }}
+          # Optional recording-completeness witness (docs/recording-witness.md):
+          # KEY is a B2 listFiles application key — the
+          # witness lists metadata and never reads object content. All six
+          # set = the witness installs; empty = the component stays dormant
+          # (tenant anchors are unaffected; a previous install is removed).
+          RECORDING_WITNESS_ENDPOINT: ${{ secrets.RECORDING_WITNESS_ENDPOINT }}
+          RECORDING_WITNESS_BUCKET: ${{ secrets.RECORDING_WITNESS_BUCKET }}
+          RECORDING_WITNESS_AUDIT_PREFIX: ${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX }}
+          RECORDING_WITNESS_RECORDINGS_PREFIX: ${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}
+          RECORDING_WITNESS_KEY_ID: ${{ secrets.RECORDING_WITNESS_KEY_ID }}
+          RECORDING_WITNESS_KEY: ${{ secrets.RECORDING_WITNESS_KEY }}
+          # Optional notification cadence (public repo VARIABLES, not secrets;
+          # empty = the witness defaults): renotify default 1800s,
+          # quiet_renotify default 86400s. quiet_signature pins the current
+          # finding set (stable identities, no ages) to the quiet cadence; the
+          # run-once acceptance prints the value to pin. Any finding-set
+          # change pushes immediately and leaves the pin behind.
+          RECORDING_WITNESS_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_RENOTIFY_SECONDS }}
+          RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS }}
+          RECORDING_WITNESS_QUIET_SIGNATURE: ${{ vars.RECORDING_WITNESS_QUIET_SIGNATURE }}
+          RECORDING_WITNESS_COLD_START_SECONDS: ${{ vars.RECORDING_WITNESS_COLD_START_SECONDS }}
+          RECORDING_WITNESS_SWEEP_SECONDS: ${{ vars.RECORDING_WITNESS_SWEEP_SECONDS }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail
@@ -985,6 +1036,24 @@ jobs:
           # ORIGIN_CA_CERT_PEM is public cert-only material (repo variable) —
           # deliberately NOT masked.
           if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
+          # CloudFront origin secret: masked at first receipt before any use
+          # (repo secrets are auto-masked; the explicit mask covers every
+          # expansion path). The main-box address is masked too (it already
+          # is for the terraform var path).
+          if [ -n "${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}" ]; then echo "::add-mask::${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}"; fi
+          if [ -n "${{ secrets.MAIN_BOX_IPV4 }}" ]; then echo "::add-mask::${{ secrets.MAIN_BOX_IPV4 }}"; fi
+          # Recording-witness values: masked at first receipt before any use
+          # (repo secrets are auto-masked; the explicit masks cover every
+          # expansion path). Never echoed, never logged, never in argv.
+          for witness_value in \
+            "${{ secrets.RECORDING_WITNESS_ENDPOINT }}" \
+            "${{ secrets.RECORDING_WITNESS_BUCKET }}" \
+            "${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX }}" \
+            "${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}" \
+            "${{ secrets.RECORDING_WITNESS_KEY_ID }}" \
+            "${{ secrets.RECORDING_WITNESS_KEY }}"; do
+            if [ -n "$witness_value" ]; then echo "::add-mask::$witness_value"; fi
+          done
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
           # the one-run credential (pasted secret, or the caller-set value
           # minted by bootstrap-password) arrives masked and is never
@@ -1004,7 +1073,7 @@ jobs:
           path: origin-ca.csr
           # 90 = the public-repo cap. Public material (a CSR carries no key):
           # the hand-off for operator-side signing; the signed cert returns
-          # via the cert-only ORIGIN_CA_CERT_PEM variable.
+          # via the cert-only ORIGIN_CA_CERT_PEM variable (leaf-first chain).
           retention-days: 90
           if-no-files-found: warn
 
@@ -1241,7 +1310,7 @@ jobs:
           exit 0
 
   anchor-dns:
-    name: "Anchor DNS upsert + verify (Cloudflare, fail-closed)"
+    name: "Anchor DNS upsert + verify (NET_DNS_PROVIDER, fail-closed)"
     runs-on: ubuntu-latest
     needs: [device-flow]
     if: inputs.mode == 'apply'
@@ -1255,23 +1324,37 @@ jobs:
       # have selected among the resolved server's own addresses (the
       # producer, resolve_anchor_ipv4, fails closed on any mismatch).
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
-      CLOUDFLARE_DNS_TOKEN: ${{ secrets.CLOUDFLARE_DNS_TOKEN }}
+      # A2 provider switch (cloudflare default | gcore post-B). Exactly one
+      # DNS token is injected, selected by the repo variable (anything but
+      # 'gcore' -> cloudflare; the script fails closed on an unknown
+      # provider). This keeps the account-wide Gcore token out of the runner
+      # env unless the gcore path is active — a malicious script edit cannot
+      # exfiltrate a token the workflow never injects. The script fails
+      # closed naming the org secret when the active token is absent.
+      NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}
+      # Dashboard CNAME target (CloudFront distribution hostname) — repo
+      # variable, non-secret. Absent = the writer fails closed: without the
+      # explicit record the dashboard name is wildcard-only and goes dark at
+      # every ACME challenge (the challenge node makes it an ENT on Gcore).
+      STATUS_EDGE_DOMAIN: ${{ vars.STATUS_EDGE_DOMAIN }}
+      CLOUDFLARE_DNS_TOKEN: ${{ vars.NET_DNS_PROVIDER != 'gcore' && secrets.CLOUDFLARE_DNS_TOKEN || '' }}
+      GCORE_DNS_TOKEN: ${{ vars.NET_DNS_PROVIDER == 'gcore' && secrets.GCORE_DNS_TOKEN || '' }}
     steps:
       - name: Checkout (no credentials persisted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
         with:
           persist-credentials: false
-      - name: Upsert anchor A record + verify-after-write
+      - name: Upsert anchor A + dashboard CNAME + verify-after-write
         run: |
           set -euo pipefail
           # Load-bearing order: this job needs device-flow (A1 close +
           # sweep are steps inside it), and the thumbprint job needs THIS
           # job — DNS failure fails the run before any thumbprint goes
           # out, so we never bind-by-name against a record we didn't just
-          # verify. Absent CLOUDFLARE_DNS_TOKEN on mode=apply = explicit
-          # error from the script (C-A fail-closed: set the org secret,
+          # verify. Absent provider token on mode=apply = explicit error
+          # from the script naming the org secret (C-A fail-closed: set it,
           # then re-dispatch). mode=check never runs this job and never
-          # requires the token. Same static global mutex covers this job
+          # requires a token. Same static global mutex covers this job
           # (workflow-level concurrency); no new actions (curl + jq only).
           bash .github/scripts/030-anchor-dns.sh
 

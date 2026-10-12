@@ -4,7 +4,8 @@
 #
 # WHERE THIS RUNS: ON the anchor box itself, as root, normally via the A1
 # dispatch (the runner SSHes in under a per-run device-flow approval and pipes
-# this script over stdin with GATUS_*/NTFY_* env prefixed). Fallback: paste it
+# this script over stdin with GATUS_*/NTFY_*/RECORDING_WITNESS_* env prefixed).
+# Fallback: paste it
 # into the netcup SCP remote console by hand — env unset means a self-check-only
 # monitor. Either way the tang keypair is generated ON THIS BOX and never leaves.
 #
@@ -15,7 +16,8 @@
 # never sends key material anywhere; it only prints a public thumbprint.
 # Per-anchor Cloudflare Origin CA material (issue #123) follows the same rule:
 # the key is generated ON THIS BOX and never leaves; the CSR is public; the
-# signed cert arrives via ORIGIN_CA_CERT_PEM (cert-only material).
+# signed cert arrives via ORIGIN_CA_CERT_PEM (cert-only material; the
+# leaf-first chain is required and enforced for the A2 CloudFront leg).
 #
 set -euo pipefail
 
@@ -38,9 +40,14 @@ CADDY_ORIGIN_CRT="/etc/caddy/origin.crt"
 CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
 CADDY_AOP_CA="/etc/caddy/aop-ca.pem"
 CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
-# Cloudflare edge ranges for trusted_proxies (public constants — keep in
-# sync with local.cf_edge_cidrs in main.tf; stale ranges read as edge 403s).
-CF_EDGE_CIDRS="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+# CloudFront origin-facing ranges for the :443 origin leg (call D).
+# Public constants — live ip-ranges.json 2026-10-06 (46 IPv4 + 35 IPv6).
+# Keep in sync with local.cloudfront_origin_facing_cidrs in
+# cloudfront_ranges.tf — tests/edge-origin-auth asserts the two lists are
+# identical. CloudFront is not Cloudflare AOP: the :443 leg is gated by
+# these ranges (firewall) plus the X-Piercloud-Origin secret header
+# (Caddy); neither control alone is auth.
+CLOUDFRONT_ORIGIN_CIDRS="130.176.88.0/21 54.239.134.0/23 52.82.134.0/23 130.176.86.0/23 130.176.140.0/22 130.176.0.0/18 54.239.204.0/22 130.176.160.0/19 70.132.0.0/18 15.158.0.0/16 130.176.136.0/23 54.239.170.0/23 130.176.96.0/19 54.182.184.0/22 204.246.166.0/24 130.176.64.0/21 54.182.172.0/22 205.251.218.0/24 130.176.144.0/20 54.182.176.0/21 130.176.78.0/23 54.182.248.0/22 64.252.128.0/18 54.182.154.0/23 64.252.64.0/18 54.182.144.0/21 54.182.224.0/21 130.176.128.0/21 52.46.0.0/18 3.172.64.0/18 52.82.128.0/23 18.68.0.0/16 54.182.156.0/22 54.182.160.0/21 54.182.240.0/21 130.176.192.0/19 130.176.76.0/24 54.239.208.0/21 54.182.188.0/23 24.110.128.0/17 3.172.0.0/18 130.176.80.0/22 54.182.128.0/20 130.176.72.0/22 13.124.199.0/24 3.29.57.0/26 2600:9000:1000::/36 2600:9000:5200::/40 2600:9000:6000::/36 2406:da11:438:2300::/56 2406:da1e:705:1600::/56 2406:da1c:8d8c:4600::/56 2406:da14:17bd:2f00::/56 2406:da12:4b:c200::/56 2406:da16:c01:c200::/56 2406:da1a:6df:6c00::/56 2406:da1b:e7c:ad00::/56 2406:da18:9fa:1b00::/56 2406:da1c:787:2b00::/56 2406:da19:e19:4a00::/56 2406:da1f:396:9100::/56 2406:da10:847f:a100::/56 2406:da12:8b2e:9c00::/56 2406:da14:80bb:ea00::/56 2600:1f11:e79:a800::/56 2600:1f1a:4568:b500::/56 2a05:d014:1362:b000::/56 2a05:d019:80b:e300::/56 2a05:d016:9ed:de00::/56 2a05:d01a:8a9:be00::/56 2a05:d011:531:1800::/56 2a05:d018:1a3a:2d00::/56 2a05:d01c:343:c300::/56 2a05:d012:581:b400::/56 2a05:d025:e59:fb00::/56 2600:1f17:4356:f100::/56 2600:1f1e:a7:2300::/56 2600:1f18:7530:7200::/56 2600:1f16:1923:3000::/56 2600:1f1c:da:600::/56 2600:1f13:417:4d00::/56"
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
@@ -55,7 +62,9 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # (dispatched runs receive STATUS_HOST as the dashboard FQDN via 020's
 # ENV_PREFIX; ANCHOR_HOSTNAME stays the zone-less SCP hostname);
 # tests/naming-scheme/run-test.sh diffs the block against the lib — edit the
-# lib and copy the block, never fork it.
+# lib and copy the block, never fork it. A2 2026-09-30: the dashboard is the
+# NESTED `<tenant>.status.piercloud.net` (platform status namespace,
+# CloudFront-covered); the anchor name stays flat on `.net`.
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
@@ -83,8 +92,8 @@ derive_anchor_hostname() { # $1 = sanitized tenant -> anchor-<NN>-<tenant> (NN=0
   printf 'anchor-01-%s\n' "$1"
 }
 
-derive_status_host() { # $1 = sanitized tenant -> status-<tenant> (dashboard singleton, one label)
-  printf 'status-%s\n' "$1"
+derive_status_host() { # $1 = sanitized tenant -> <tenant>.status (dashboard under the platform status namespace)
+  printf '%s.status\n' "$1"
 }
 # --- END NAMING ---
 caddy_status_names() { # STATUS_HOST/ANCHOR_HOSTNAME from dispatch env, else derived from TENANT_USER
@@ -125,10 +134,11 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
   printf '%s\n' "	servers {"
-  printf '%s\n' "		# Real client IP behind the orange cloud. CF-Connecting-IP only —"
-  printf '%s\n' "		# never X-Forwarded-For (spoofable through the edge)."
-  printf '%s\n' "		trusted_proxies static ${CF_EDGE_CIDRS}"
-  printf '%s\n' "		client_ip_headers CF-Connecting-IP"
+  printf '%s\n' "		# Real client IP behind the CloudFront edge. CloudFront-Viewer-Address"
+  printf '%s\n' "		# only — never X-Forwarded-For (spoofable through the edge); the"
+  printf '%s\n' "		# origin-request policy forwards that header to the origin."
+  printf '%s\n' "		trusted_proxies static ${CLOUDFRONT_ORIGIN_CIDRS}"
+  printf '%s\n' "		client_ip_headers CloudFront-Viewer-Address"
   printf '%s\n' "	}"
   printf '%s\n' "}"
   printf '%s\n' ""
@@ -153,8 +163,8 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "		# list-modules on the v2.11.4 binary; it lives in a third-party xcaddy"
   printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
   printf '%s\n' "		# Flood protection"
-  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
-  printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
+  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus the"
+  printf '%s\n' "		# CloudFront origin gate on :443 when the edge is live (docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
   printf '%s\n' "	}"
   printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
@@ -171,6 +181,23 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	}"
   printf '%s\n' "}"
   if [ -n "${STATUS_HOST:-}" ] && [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
+    # CloudFront origin auth is mandatory for the :443 dashboard block (call
+    # D): fail closed rather than render an unauthenticated origin. The
+    # secret is interpolated into a CEL matcher, so restrict its charset.
+    [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
+    case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
+    [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
+    # Bare single-line IPv4, octets 0-255, no leading zeros, no stray
+    # whitespace: variables.tf validates the same address for the firewall
+    # variable via cidrhost, and Caddy's netip rejects leading zeros — reject
+    # both here rather than fail later at `caddy validate` (a trailing
+    # newline splits the rendered CEL matcher). A console hand-run sets this
+    # secret without terraform, so the two peers must not drift.
+    case "${MAIN_BOX_IPV4}" in *[!0-9.]*) die "MAIN_BOX_IPV4 must be digits and dots only (no whitespace or newlines)." ;; esac
+    printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 || NR > 1 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i ~ /^0[0-9]/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255, no leading zeros)."
+    [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
+    cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
+    cf_cel="${cf_cel%,}"
     printf '%s\n' ""
     printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
     printf '%s\n' "https://${STATUS_HOST} {"
@@ -182,10 +209,26 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "		abort"
     printf '%s\n' "	}"
     printf '%s\n' "	handle {"
+    printf '%s\n' "		# CloudFront origin gate (call D): CloudFront is not AOP. Only"
+    printf '%s\n' "		# CloudFront origin-facing peers (or the main box / loopback) may"
+    printf '%s\n' "		# reach the dashboard, and CloudFront peers must carry the secret"
+    printf '%s\n' "		# header it injects (it overwrites client-supplied values). The"
+    printf '%s\n' "		# firewall admits the same peer set; this is the in-Caddy second"
+    printf '%s\n' "		# factor. INSIDE the catch-all handle on purpose: Caddy 2.11.4"
+    printf '%s\n' "		# adapts \`abort\` AFTER \`handle\`, so a site-level gate would sit"
+    printf '%s\n' "		# behind this handle and never run (tests/bind-e2e pins the"
+    printf '%s\n' "		# adapted route order; tests/edge-origin-auth pins the text)."
+    printf '%s\n' "		# Loopback (127.0.0.1/32 and ::1/128) is exempt: the on-box"
+    printf '%s\n' "		# probes below reach the dashboard via --resolve …:127.0.0.1,"
+    printf '%s\n' "		# and only local processes can source from loopback."
+    printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32'))\`"
+    printf '%s\n' "		abort @not_edge_peer"
+    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
+    printf '%s\n' "		abort @unauthorized"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (the"
-    printf '%s\n' "		# rate_limit directive itself is queued: issue #56)."
+    printf '%s\n' "		# allowlist plus the CloudFront origin gate above (the rate_limit"
+    printf '%s\n' "		# directive itself is queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
     printf '%s\n' "}"
@@ -330,13 +373,18 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 }
 
 # --- origin-ca:start --- (tests/origin-ca extracts this span; keep markers)
-# Per-anchor Cloudflare Origin CA material (issue #123): the private key is
+# Per-anchor cert material (issue #123; A2 2026-09-30): the private key is
 # generated ON this box and never leaves it; the CSR is public material
-# published in the run artifact for operator-side signing; the signed cert
-# returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and is
-# validated fail-closed before Caddy may serve it. Paths are overridable so
-# the harness can run this span off-box (same pattern as the bind-e2e
-# render span).
+# published in the run artifact for operator/broker-side signing; the signed
+# cert returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and
+# is validated fail-closed (leaf + linked chain) before Caddy may serve it. A2: the dashboard sits
+# behind CloudFront, which trusts Mozilla-store CAs only — so the cert is a
+# PUBLIC single-SAN cert for the nested `<tenant>.status.piercloud.net`
+# viewer host (broker-issued via ACME DNS-01; Cloudflare Origin CA is dead
+# for this leg). The span/variable names stay `origin-ca` for continuity;
+# the single-SAN selfcheck below is the fail-closed gate either way. Paths
+# are overridable so the harness can run this span off-box (same pattern as
+# the bind-e2e render span).
 ORIGIN_CA_DIR="${ORIGIN_CA_DIR:-/etc/caddy}"
 ORIGIN_CA_KEY="${ORIGIN_CA_KEY:-${ORIGIN_CA_DIR}/origin-ca.key}"
 ORIGIN_CA_CSR="${ORIGIN_CA_CSR:-${ORIGIN_CA_DIR}/origin-ca.csr}"
@@ -445,26 +493,130 @@ origin_ca_generate() { # ensure key+CSR; the key is never regenerated while a ce
   log "per-anchor Origin CA CSR ready (publish it for signing; the key stays on this box)"
 }
 
-origin_ca_cert_pem_ok() { # $1 = PEM text -> exactly one bounded certificate, no leading/trailing junk
-  local pem="$1" bytes begins ends junk
-  begins="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
-  ends="$(printf '%s\n' "$pem" | grep -c -- '-----END CERTIFICATE-----' || true)"
-  # Multi-cert blobs must be rejected: only the first block would be
-  # validated/hashed while the whole blob got installed.
-  [ "$begins" = "1" ] && [ "$ends" = "1" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----BEGIN CERTIFICATE-----/{exit} {print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----END CERTIFICATE-----/{f=1; next} f{print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
+origin_ca_cert_pem_ok() { # $1 = PEM text -> a bounded leaf-first certificate chain, no framing junk
+  local pem="$1" bytes begins ends
+  # Line-anchored markers: an unanchored grep counts the single line
+  # `-----BEGIN CERTIFICATE----------END CERTIFICATE-----` as two blocks
+  # while a PEM parser sees one — the shape gate must count what the parser
+  # counts. The body is constrained to base64/whitespace because Go/Caddy
+  # strip PEM headers while OpenSSL refuses a header-bearing block: an
+  # unconstrained body is a parser differential that must never install.
+  begins="$(printf '%s\n' "$pem" | grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" || true)"
+  ends="$(printf '%s\n' "$pem" | grep -cE -- "^-----END CERTIFICATE-----[[:space:]]*$" || true)"
+  # A chain is REQUIRED for the A2 CloudFront origin leg (enforced in
+  # origin_ca_install_from_env: CloudFront drops the TCP connection — 502,
+  # X-Cache: Error from cloudfront — when the intermediate is missing).
+  # Shape accepts 1..8 blocks: the validator checks the FIRST block as the
+  # leaf, every block must parse, and each hop's signature is verified in
+  # origin_ca_validate_cert. Bounded at 16 KiB: a 4-block LE chain is ~5 KiB.
+  [ "$begins" = "$ends" ] || return 1
+  [ "${begins:-0}" -ge 1 ] && [ "${begins:-0}" -le 8 ] || return 1
+  printf '%s\n' "$pem" | awk '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { if (inblk) bad = 1; inblk = 1; seen = 1; next }
+    /^-----END CERTIFICATE-----[[:space:]]*$/   { if (!inblk) bad = 1; inblk = 0; next }
+    { if (!seen) { if ($0 !~ /^[[:space:]]*$/) before = 1 }
+      else if (!inblk) { if ($0 !~ /^[[:space:]]*$/) after = 1 }
+      else if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^[A-Za-z0-9+\/=[:space:]]+$/) bad = 1 }
+    END { if (inblk) bad = 1; exit (bad || before || after) }
+  ' || return 1
   bytes="$(printf '%s' "$pem" | wc -c | tr -d ' ')"
   [ "${bytes:-0}" -gt 0 ] && [ "${bytes:-0}" -le 16384 ]
 }
 
+origin_ca_chain_blocks() { # $1 = PEM file -> count of real certificate blocks (line-anchored)
+  grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" "$1" 2>/dev/null || true
+}
+
+origin_ca_block_der_exact() { # $1 = PEM file -> the FIRST block's body decodes to exactly the parsed DER (no trailing bytes)
+  local f="$1" raw der
+  # `openssl x509 -in` ignores bytes after the certificate DER, so a body of
+  # certDER||keyDER parses fine — and Go's non-leaf loader does not parse
+  # chain blocks either, so the trailing bytes would install and be served.
+  # The body must decode to exactly the DER OpenSSL re-encodes.
+  raw="$(awk '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { inblk = 1; next }
+    inblk && /^-----END CERTIFICATE-----[[:space:]]*$/ { exit }
+    inblk { print }
+  ' "$f" 2>/dev/null | tr -d '[:space:]' | base64 -d 2>/dev/null | wc -c | tr -d ' ' || true)"
+  der="$(openssl x509 -in "$f" -outform DER 2>/dev/null | wc -c | tr -d ' ' || true)"
+  [ "${raw:-0}" -gt 0 ] && [ "${der:-0}" -gt 0 ] && [ "$raw" = "$der" ]
+}
+
+origin_ca_blocks_parse() { # $1 = PEM file, $2 = optional split dir (kept when given) -> every block parses as exactly one X.509 cert (no trailing DER)
+  local f="$1" dir="${2:-}" created=0 n i cur
+  [ -s "$f" ] || return 1
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -ge 1 ] || return 1
+  if [ -z "$dir" ]; then
+    dir="$(mktemp -d)" || return 1
+    created=1
+  fi
+  # Split on the (already line-anchored) markers. Every block must parse as an
+  # X.509 certificate: a PEM header line that OpenSSL would skip, a
+  # private-key body re-labelled as CERTIFICATE, or bytes after the DER fails
+  # here (OpenSSL ignores trailing bytes; Go's non-leaf loader does not parse
+  # chain blocks either).
+  awk -v dir="$dir" '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { n++; file = sprintf("%s/block-%02d.pem", dir, n) }
+    n > 0 { print > file }
+  ' "$f" || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+  i=1
+  while [ "$i" -le "$n" ]; do
+    cur="$(printf '%s/block-%02d.pem' "$dir" "$i")"
+    openssl x509 -in "$cur" -noout >/dev/null 2>&1 || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+    origin_ca_block_der_exact "$cur" || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+    i=$((i + 1))
+  done
+  [ "$created" = 1 ] && rm -rf "$dir"
+  return 0
+}
+
+origin_ca_chain_ordered() { # $1 = PEM file -> every block parses; each hop verifies against the next block
+  local f="$1" dir n i cur next cur_fp next_fp
+  [ -s "$f" ] || return 1
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -ge 1 ] || return 1
+  dir="$(mktemp -d)" || return 1
+  origin_ca_blocks_parse "$f" "$dir" || { rm -rf "$dir"; return 1; }
+  # Adjacent-only signature linkage, NO self-signed-tail requirement: the
+  # live LE bundle ends with a cross-signed ISRG Root X2 whose issuer is not
+  # in the file. `-partial_chain` lets the next block act as the trust anchor
+  # for the current one: OpenSSL resolves the anchor by issuer name and then
+  # verifies the signature (same-name/different-key CAs are rejected). A
+  # duplicated block is a degenerate trusted anchor — a cert that IS the
+  # CAfile is accepted for itself — so each hop also requires a CA:TRUE
+  # issuer and a fingerprint that differs from the current block.
+  i=1
+  while [ "$i" -lt "$n" ]; do
+    cur="$(printf '%s/block-%02d.pem' "$dir" "$i")"
+    next="$(printf '%s/block-%02d.pem' "$dir" "$((i + 1))")"
+    openssl x509 -in "$next" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:TRUE' \
+      || { rm -rf "$dir"; return 1; }
+    cur_fp="$(openssl x509 -in "$cur" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+    next_fp="$(openssl x509 -in "$next" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+    [ -n "$cur_fp" ] && [ "$cur_fp" != "$next_fp" ] \
+      || { rm -rf "$dir"; return 1; }
+    # -no-CApath/-no-CAstore keep the explicit -CAfile authoritative: without
+    # them the default system store is also loaded, and a hop could "verify"
+    # against a system root instead of the next block.
+    openssl verify -partial_chain -no-CApath -no-CAstore -CAfile "$next" "$cur" >/dev/null 2>&1 \
+      || { rm -rf "$dir"; return 1; }
+    i=$((i + 1))
+  done
+  rm -rf "$dir"
+  return 0
+}
+
 origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on stderr
-  local cert="$1" key="$2" host="$3" sans start start_epoch now_epoch
+  local cert="$1" key="$2" host="$3" sans start start_epoch now_epoch blocks
   [ -s "$cert" ] || { printf 'cert %s missing or empty' "$cert" >&2; return 1; }
   [ -n "$(origin_ca_cert_hash "$cert")" ] \
     || { printf '%s is not a parseable X.509 certificate' "$cert" >&2; return 1; }
+  # A block whose body carries bytes after the certificate DER parses in
+  # OpenSSL (trailing data is ignored) but is not a single well-formed PEM
+  # certificate — key material smuggled this way must never validate/install.
+  origin_ca_block_der_exact "$cert" \
+    || { printf '%s carries trailing bytes after the certificate DER (not a single well-formed PEM certificate)' "$cert" >&2; return 1; }
   openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 \
     || { printf '%s is expired' "$cert" >&2; return 1; }
   start="$(openssl x509 -in "$cert" -noout -startdate 2>/dev/null | cut -d= -f2)"
@@ -475,25 +627,65 @@ origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on
     || { printf '%s is not yet valid (notBefore %s)' "$cert" "$start" >&2; return 1; }
   sans="$(origin_ca_cert_sans "$cert")"
   [ "$(origin_ca_dns_san_count "$sans")" = "1" ] \
-    || { printf '%s carries %s DNS SAN(s), want exactly one (%s)' "$cert" "$(origin_ca_dns_san_count "$sans")" "$host" >&2; return 1; }
+    || { printf '%s carries %s DNS SAN(s), want exactly one (%s) — the first block must be the leaf (a chain pasted issuer-first fails here)' "$cert" "$(origin_ca_dns_san_count "$sans")" "$host" >&2; return 1; }
   [ "$sans" = "$host" ] || { printf 'cert SAN %s differs from %s' "$sans" "$host" >&2; return 1; }
   [ -n "$(origin_ca_key_pub "$key")" ] && [ "$(origin_ca_key_pub "$key")" = "$(origin_ca_cert_pub "$cert")" ] \
     || { printf 'certificate public key does not match %s' "$key" >&2; return 1; }
+  # A multi-block value must be a real chain, not a leaf followed by bytes:
+  # every block parses and each hop's signature verifies against the next
+  # block. A wrong/absent intermediate otherwise installs, serves, passes the
+  # leaf-only probe and leaves CloudFront 502ing — the exact live incident.
+  blocks="$(origin_ca_chain_blocks "$cert")"
+  if [ "${blocks:-0}" -gt 1 ]; then
+    origin_ca_chain_ordered "$cert" \
+      || { printf '%s is not a linked leaf-first chain (every block must be exactly one X.509 certificate — no trailing bytes after the DER — and each certificate must be issued by the next block; issuer blocks must be CA:TRUE and must not duplicate the current block)' "$cert" >&2; return 1; }
+  fi
+  return 0
+}
+
+origin_ca_aop_deployed() { # 0 when a usable AOP bundle is present (marker-bearing garbage must not bypass the A2 gates)
+  local pem="${CF_AOP_CA_PEM:-}" tmp
+  case "$pem" in
+    *"BEGIN CERTIFICATE"*) ;;
+    *) return 1 ;;
+  esac
+  case "$pem" in
+    *"PRIVATE KEY"*) return 1 ;;
+  esac
+  # Bounded PEM shape AND every block parses as exactly one X.509 cert (no
+  # trailing DER): a marker+base64 non-cert body must not read as "deployed"
+  # and skip the A2 chain/depth gates.
+  origin_ca_cert_pem_ok "$pem" || return 1
+  tmp="$(mktemp)" || return 1
+  printf '%s\n' "$pem" >"$tmp"
+  origin_ca_blocks_parse "$tmp" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
   return 0
 }
 
 origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public material), fail-closed
-  local pem="${ORIGIN_CA_CERT_PEM:-}" tmp reason
+  local pem="${ORIGIN_CA_CERT_PEM:-}" tmp reason blocks
   [ -n "$pem" ] || return 0
   ORIGIN_CA_SUPPLIED=1
   [ -n "${STATUS_HOST:-}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but STATUS_HOST is unset — cannot verify the cert SAN; refusing to install"
   [ -s "${ORIGIN_CA_KEY}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but ${ORIGIN_CA_KEY} is missing — restore the key first (the cert must match it)"
+  # Cert-only, like CF_AOP_CA_PEM: this value is a public repo variable and the
+  # file lands in a bind mount — a private key must never travel here.
+  case "$pem" in *"PRIVATE KEY"*) die "ORIGIN_CA_CERT_PEM must be certificate-only (public material; the private key is generated on this box and never travels) — strip the private key";; esac
   origin_ca_cert_pem_ok "$pem" \
-    || die "ORIGIN_CA_CERT_PEM is not a bounded PEM certificate — refusing to install it"
+    || die "ORIGIN_CA_CERT_PEM is not a bounded leaf-first PEM certificate chain — refusing to install it"
   tmp="$(mktemp)"
   printf '%s\n' "$pem" >"$tmp"
+  blocks="$(origin_ca_chain_blocks "$tmp")"
+  if ! origin_ca_aop_deployed; then
+    # A2: the :443 origin leg is CloudFront (AOP retired). CloudFront drops
+    # the TCP connection (502, X-Cache: Error from cloudfront) when the
+    # intermediate is missing — a leaf-only paste must never install here.
+    [ "${blocks:-0}" -ge 2 ] \
+      || { rm -f "$tmp"; die "ORIGIN_CA_CERT_PEM carries a leaf-only certificate (1 block); the A2 CloudFront origin leg REQUIRES the leaf-first chain (leaf + intermediate(s), as issued — e.g. the lego bundle). A leaf-only cert makes CloudFront answer 502 (X-Cache: Error from cloudfront); a pre-A2 Cloudflare-edge rollback is a code-level revert (see docs/dr.md), not a secret/variable change"; }
+  fi
   if ! reason="$(origin_ca_validate_cert "$tmp" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
     rm -f "$tmp"
     die "ORIGIN_CA_CERT_PEM rejected: ${reason} — keeping the currently served pair untouched"
@@ -503,9 +695,11 @@ origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public ma
   cat "$tmp" >"${ORIGIN_CA_CRT}" \
     || { rm -f "$tmp"; die "in-place write to ${ORIGIN_CA_CRT} failed"; }
   rm -f "$tmp"
-  chmod 0644 "${ORIGIN_CA_CRT}"
+  # 0600: the pinned container reads it as root; the served file must never be
+  # a world-readable key sink (a crafted block could otherwise persist key bytes).
+  chmod 0600 "${ORIGIN_CA_CRT}"
   ORIGIN_CA_CERT_PEM=""
-  log "per-anchor Origin CA certificate installed for ${STATUS_HOST} (sha256 $(origin_ca_cert_hash "${ORIGIN_CA_CRT}"))"
+  log "per-anchor Origin CA certificate installed for ${STATUS_HOST} (${blocks} block(s), leaf sha256 $(origin_ca_cert_hash "${ORIGIN_CA_CRT}"))"
 }
 
 origin_ca_write_hash() { # $1 = cert file -> record the deployed cert hash (after a successful reload)
@@ -524,7 +718,7 @@ origin_ca_mark_active() { # one-way: the per-anchor pair has served on :443
 }
 
 origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDATED before it may be selected
-  local reason
+  local reason blocks
   ORIGIN_TLS=0
   ORIGIN_CA_PAIR=0
   ORIGIN_CERT_CHANGED=0
@@ -539,6 +733,11 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
       if ! reason="$(origin_ca_validate_cert "${ORIGIN_CA_CRT}" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
         die "on-box per-anchor Origin CA pair rejected for ${STATUS_HOST}: ${reason} — refusing to select or serve it (fix the cert, or remove origin-ca.{crt,key} to fall back/pending)"
       fi
+      if ! origin_ca_aop_deployed; then
+        blocks="$(origin_ca_chain_blocks "${ORIGIN_CA_CRT}")"
+        [ "${blocks:-0}" -ge 2 ] \
+          || die "on-box per-anchor pair for ${STATUS_HOST} is leaf-only; the A2 CloudFront origin leg REQUIRES the leaf-first chain (CloudFront answers 502 without the intermediate) — set the ORIGIN_CA_CERT_PEM repo variable to the issued chain and re-dispatch"
+      fi
     else
       warn "STATUS_HOST unset — per-anchor pair validation skipped (no :443 vhost is rendered; re-dispatch with TENANT_USER)"
     fi
@@ -551,6 +750,7 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
     if [ "$(cat "${ORIGIN_CA_HASH}" 2>/dev/null || true)" != "${ORIGIN_CA_HASH_WANT}" ]; then
       ORIGIN_CERT_CHANGED=1
     fi
+    log "per-anchor Origin CA pair selected for ${STATUS_HOST} ($(origin_ca_chain_blocks "${ORIGIN_CA_CRT}") block(s), leaf sha256 ${ORIGIN_CA_HASH_WANT})"
   elif [ "${ORIGIN_CA_SUPPLIED}" = "1" ]; then
     die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not present on the box — refusing to select any fallback"
   elif [ -s "${CADDY_ORIGIN_CRT}" ] && [ -s "${CADDY_ORIGIN_KEY}" ]; then
@@ -600,6 +800,129 @@ origin_ca_probe_and_mark() { # $1 = host; asserts the served pair FIRST, then se
   fi
   origin_ca_mark_active
   return 0
+}
+
+origin_ca_edge_pull() { # $1 = host -> 0 when the public edge served the ORIGIN this run (200 + marker, from CloudFront, not a cache Hit)
+  local host="$1" attempt stamp rc code cache cfid pop via via_ok body hdr errf hint attempts why why_class
+  stamp="$(date +%s)-$$"
+  body="$(mktemp)" || return 1
+  hdr="$(mktemp)" || { rm -f "$body"; return 1; }
+  errf="$(mktemp)" || { rm -f "$body" "$hdr"; return 1; }
+  rc=0
+  code=""
+  cache=""
+  cfid=""
+  pop=""
+  via=""
+  via_ok=0
+  attempts=""
+  for attempt in 1 2 3; do
+    rc=0
+    : >"$errf"
+    # Per-run unique buster: a cache policy that keys the query string gets a
+    # fresh key each attempt; one that ignores it does not — hence a Hit is
+    # treated as an unproven pull, never as success.
+    code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' --max-time 20 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "https://${host}/api/v1/endpoints/statuses?pc_chain_probe=${stamp}-${attempt}" 2>"$errf")" || rc=$?
+    cache="$(awk '/^[Xx]-[Cc]ache:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    # CloudFront's response header tuple: x-amz-cf-id (a per-response id),
+    # x-amz-cf-pop (the PoP that served it) and a via naming a
+    # cloudfront.net distribution. These are forgeable by anyone who can
+    # answer for the name with a trusted cert, so the tuple raises the bar
+    # (and a cache Hit is never accepted) without cryptographically pinning
+    # the distribution; the docs carry the honest claim.
+    cfid="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Ii][Dd]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    pop="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Pp][Oo][Pp]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    via="$(awk '/^[Vv]ia:/ { gsub(/\r/, ""); print; exit }' "$hdr" 2>/dev/null || true)"
+    via_ok=0
+    case "$via" in *cloudfront.net*) via_ok=1 ;; esac
+    attempts="${attempts}${attempt}[rc=${rc:-0},http=${code:-000},cache=${cache:-none},cfid=${cfid:-none}] "
+    # A clean pull needs ALL of: HTTP 200, the dashboard marker, an explicit
+    # Miss (an absent x-cache is not a Miss), and CloudFront's header tuple.
+    if [ "$rc" -eq 0 ] && [ "$code" = "200" ] && grep -q 'tang (via Caddy)' "$body" 2>/dev/null \
+       && [ "${cache:-}" = "Miss" ] && [ -n "$cfid" ] && [ -n "$pop" ] && [ "$via_ok" = "1" ]; then
+      rm -f "$body" "$hdr" "$errf"
+      return 0
+    fi
+    case "${cache:-}" in
+      Hit|RefreshHit) printf 'attempt %s was served from cache (x-cache: %s) — the origin was not proven by this response\n' "$attempt" "$cache" >&2 ;;
+    esac
+    if [ "$attempt" -lt 3 ]; then
+      sleep "${ORIGIN_CA_EDGE_PULL_RETRY_SLEEP:-5}"
+    fi
+  done
+  hint="$(tr '\n' ' ' <"$errf" 2>/dev/null | cut -c1-160)"
+  # Name the last attempt's first failed condition AND a stable class token.
+  # The token is emitted by this script as the FIRST field of the final line
+  # (the caller prefix-matches it), so header values echoed later on the line
+  # cannot steer the classification.
+  why_class="generic"
+  why="no clean origin response"
+  if [ "$rc" -eq 6 ]; then
+    why_class="resolve"
+    why="does not resolve yet (curl exit 6)"
+  elif [ "$rc" -ne 0 ]; then
+    why_class="transport"
+    why="curl exit ${rc}"
+  elif [ "$code" != "200" ]; then
+    why_class="http"
+    why="HTTP ${code:-000} through the edge"
+  elif ! grep -q 'tang (via Caddy)' "$body" 2>/dev/null; then
+    why_class="marker"
+    why="HTTP 200 without the dashboard body marker"
+  elif [ "${cache:-}" = "Hit" ] || [ "${cache:-}" = "RefreshHit" ]; then
+    why_class="cache"
+    why="served from cache (x-cache: ${cache}) — the origin was not contacted"
+  elif [ "${cache:-}" != "Miss" ]; then
+    why_class="nocache"
+    why="x-cache: ${cache:-absent} (not a Miss from CloudFront)"
+  elif [ -z "$cfid" ] || [ -z "$pop" ] || [ "$via_ok" != "1" ]; then
+    why_class="tuple"
+    why="HTTP 200 + marker without CloudFront's x-amz-cf-id/x-amz-cf-pop/via tuple"
+  fi
+  rm -f "$body" "$hdr" "$errf"
+  if [ "$rc" -eq 6 ]; then
+    printf '[resolve] https://%s/ does not resolve yet (curl exit 6; attempts: %s)\n' "$host" "${attempts:-none}" >&2
+    return 1
+  fi
+  printf '[%s] no attempt got a clean origin response (%s; curl exit %s, HTTP %s, x-cache: %s, x-amz-cf-id: %s, x-amz-cf-pop: %s, via: %s; attempts: %s; stderr: %s)\n' \
+    "$why_class" "$why" "${rc:-0}" "${code:-000}" "${cache:-unknown}" "${cfid:-missing}" "${pop:-missing}" "${via:-none}" "${attempts:-none}" "${hint:-none}" >&2
+  return 1
+}
+
+origin_ca_edge_prove() { # main-flow A2 proof: the public edge must serve the ORIGIN this run (no-op without a selected pair)
+  local edge_reason edge_last
+  # Scoped to ORIGIN_TLS (not ORIGIN_CA_PAIR): a legacy pair is dead at
+  # CloudFront too, so those runs must fail closed as well. `curl -f` alone
+  # exits 0 on a 3xx and on a cached error page.
+  if [ "${ORIGIN_TLS}" != "1" ]; then
+    log "A2 edge not proven this run — no origin pair selected (auto-TLS or a suppressed legacy pair); the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes"
+    return 0
+  fi
+  edge_reason=""
+  if edge_reason="$(origin_ca_edge_pull "${STATUS_HOST}" 2>&1)"; then
+    log "A2 edge pull through CloudFront serves ${STATUS_HOST} (OK; HTTP 200 + dashboard marker, origin contacted this run)"
+    return 0
+  fi
+  # Prefix-match the stable class token origin_ca_edge_pull emits first on the
+  # final line — never the echoed header values (a crafted via/x-cache value
+  # must not steer the die message).
+  edge_last="$(printf '%s\n' "${edge_reason}" | tail -n 1)"
+  case "${edge_last}" in
+    "[resolve]"*)
+      die "A2 edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME) and covered by the platform status wildcard (live 2026-10-07); on a first-time/DR dispatch before those records exist this probe cannot pass — let the run write them, then re-dispatch (docs/dr.md)" ;;
+    "[cache]"*)
+      die "A2 edge pull was served from CloudFront's cache (x-cache: Hit or RefreshHit) — a cached response cannot prove the origin chain. The probe needs an uncacheable response: set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled), or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[nocache]"*)
+      die "A2 edge pull got no explicit x-cache: Miss from the edge (the header was absent or carried another value) — a response the distribution did not just fetch from the origin cannot prove the origin chain. Set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled) — forwarding query strings alone still allows a Hit — or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[tuple]"*)
+      die "A2 edge pull got a 200 + marker but the response cannot prove it came through the distribution (missing x-amz-cf-id / x-amz-cf-pop / a via naming a cloudfront.net distribution). The tuple is a response-forgery barrier, not cryptographic proof; check that ${STATUS_HOST} resolves to the distribution and re-dispatch. Detail: ${edge_reason}" ;;
+    "[transport]"*)
+      die "A2 edge pull could not complete (the request failed at the transport layer — see Detail for the curl exit) — check the anchor's egress DNS/TLS to the public edge and re-dispatch. Detail: ${edge_reason}" ;;
+    *)
+      die "A2 edge pull through CloudFront failed — the served chain is incomplete or not leaf-first (CloudFront drops the connection with 502), the platform *.status records/distribution are absent, the origin gate (X-Piercloud-Origin) or firewall allowlist does not admit CloudFront, or the dashboard body marker is missing. Local :443 handshakes fine, so this is the edge leg: set ORIGIN_CA_CERT_PEM to the issued leaf-first chain and re-dispatch (docs/dr.md). Detail: ${edge_reason}" ;;
+  esac
 }
 # --- origin-ca:end ---
 
@@ -721,7 +1044,7 @@ assert_no_key_leak() {
   done < <(compgen -G "${TANG_KEYS_DIR}/*.jwk" || true)
   if [ "${leaked}" -eq 1 ]; then
     die "tang key material matched a terraform state/plan file in $(pwd). \
-This violates the module's hard invariant #1 (tang keys never enter tf state). \
+This violates the module's hard invariant 1 (tang keys never enter tf state). \
 Do NOT apply that configuration; investigate before proceeding."
   fi
   log "Key-leak assertion: tang key material NOT present in terraform state files (OK)"
@@ -766,7 +1089,7 @@ ALERTS_EXPECTED=0
 ALERTS_EXPECTED_NAMES=""
 alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
   ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
-  ALERTS_EXPECTED_NAMES="${ALERTS_EXPECTED_NAMES}${1}"$'\n'
+  printf -v ALERTS_EXPECTED_NAMES '%s%s\n' "${ALERTS_EXPECTED_NAMES}" "${1}"
 }
 # Default target: the tenant homepage derives from TENANT_USER — no input
 # needed (pier → https://pier.piercloud.net). Skipped only for hand runs
@@ -926,9 +1249,12 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "      - \"[RESPONSE_TIME] < 500\"  # Caddy p95>500ms alert, per-probe form (docs: https://gatus.io/docs)"
   printf '%s' "$ENDPOINTS_YAML"
   if [ -n "${STATUS_HOST:-}" ]; then
-    printf '%s\n' "  # Dashboard through the orange cloud: proves edge -> origin TLS and"
-    printf '%s\n' "  # warns while the cert is still fresh (stale-cert failure is"
-    printf '%s\n' "  # dashboard-only — tang answers plain HTTP on its own port)."
+    printf '%s\n' "  # Dashboard through the platform status edge (CloudFront — live"
+    printf '%s\n' "  # 2026-10-07; the anchor-side cutover is the remaining step — the"
+    printf '%s\n' "  # explicit per-tenant dashboard CNAME + the platform status"
+    printf '%s\n' "  # wildcard route this name): proves edge ->"
+    printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
+    printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
     printf '%s\n' "    url: https://${STATUS_HOST}"
     printf '%s\n' "    interval: 300s"
@@ -952,7 +1278,7 @@ TMP_CFG="${GATUS_CONFIG}.new"
 # present with equal totals leaves no room for an extra stanza, and a
 # stanza moved to the wrong endpoint keeps the total and still fails
 # (#136 review, finding 2).
-ALERTS_RENDERED="$(grep -c '^    alerts:$' "$TMP_CFG" || true)"
+ALERTS_RENDERED="$(grep -c "^    alerts:$" "$TMP_CFG" || true)"
 [ "$ALERTS_RENDERED" -eq "$ALERTS_EXPECTED" ] \
   || die "Gatus render assertion failed: ${ALERTS_RENDERED} alerts stanza(s) rendered, expected ${ALERTS_EXPECTED} — refusing to install"
 while IFS= read -r _alert_ep; do
@@ -978,13 +1304,19 @@ else
   log "Gatus alert stanzas: 0 (no push channel configured)"
 fi
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
-  log "Gatus config unchanged — no restart"
+  log "Gatus config unchanged (identical re-render)"
   rm -f "$TMP_CFG"
-  GATUS_RESTART=0
 else
-  mv "$TMP_CFG" "${GATUS_CONFIG}"
-  log "Gatus config installed (rendered from dispatch env)"
-  GATUS_RESTART=1
+  # IN-PLACE install: the gatus container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode and the container keeps
+  # reading the OLD config forever (same class as the Caddyfile below;
+  # observed live 2026-10-07). Truncate+rewrite keeps the inode but is not
+  # atomic; the post-write cmp catches a short/failed write at run time (a
+  # power loss mid-write is repaired only by the next dispatch).
+  cat "$TMP_CFG" >"${GATUS_CONFIG}"
+  cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (out of space?) — refusing to restart Gatus on a partial config"
+  rm -f "$TMP_CFG"
+  log "Gatus config installed in place (rendered from dispatch env)"
 fi
 # --- gatus-render:end ---
 
@@ -994,7 +1326,7 @@ fi
 #    STATUS_HOST the Gatus section just resolved; the CSR is public material
 #    published for operator-side signing; a signed cert returns via the
 #    cert-only ORIGIN_CA_CERT_PEM variable and is validated fail-closed
-#    against the on-box key before it is installed in place. The legacy
+#    (leaf + linked chain) against the on-box key before it is installed. The legacy
 #    shared pair (if present) keeps serving until the per-anchor pair does
 #    (see the pair-selection block in the Caddy section).
 # ---------------------------------------------------------------------------
@@ -1025,13 +1357,26 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
+# Stale-mount guard: the container bind-mounts the config FILE, and a file
+# bind mount pins the inode — a container created before an `mv` install
+# keeps reading the OLD bytes forever (docker restart does not rebind
+# mounts; live 2026-10-07). Compare the container's view through its root
+# to the rendered path; divergence = recreate once. In-place installs keep
+# this guard quiet on every later run.
+GATUS_MOUNT_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
+  gatus_pid="$(docker inspect --format '{{.State.Pid}}' gatus 2>/dev/null || true)"
+  if [ -n "${gatus_pid}" ] && ! cmp -s "/proc/${gatus_pid}/root/config/config.yaml" "${GATUS_CONFIG}"; then
+    GATUS_MOUNT_STALE=1
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
-    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor; then
+    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ]; then
       log "Gatus already running on ${GATUS_IMAGE}"
     else
-      log "Gatus container predates the hostanchor mapping (dual probes need it) - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
+      log "Gatus container predates the hostanchor mapping or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
       docker rm -f gatus >/dev/null
     fi
   else
@@ -1049,10 +1394,14 @@ if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
     --mount type=volume,source=gatus-data,target=/data \
     "${GATUS_IMAGE}" >/dev/null
 fi
-if [ "${GATUS_RESTART:-0}" = "1" ]; then
-  docker restart gatus >/dev/null
-  log "Gatus restarted on new config"
-fi
+# Always restart: the stale-mount guard compares the MOUNT's bytes, not what
+# the running Gatus loaded — an aborted restart (SSH drop, SIGKILL) would
+# otherwise stay invisible, and the next dispatch (identical render, fresh
+# mount) would report green while the monitor serves the old config. A
+# restart is cheap (a ~1s monitor blip) and the sqlite history lives in a
+# named volume.
+docker restart gatus >/dev/null
+log "Gatus restarted"
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
 # run log (the tenant has no shell — this output IS their dashboard check).
 # Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
@@ -1080,13 +1429,15 @@ fi
 #    :443 serves the dashboard for the one explicit status hostname below.
 #
 #    Env in (operator-plane — the tenant pastes nothing, so tenant bootstrap
-#    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert,
-#    cert-only PUBLIC material installed from the repo VARIABLE; key material
+#    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert
+#    chain, leaf-first; cert-only PUBLIC material installed from the repo
+#    VARIABLE; key material
 #    never travels — the key is generated on this box in section (c1)),
-#    CF_AOP_CA_PEM (optional zone-level Authenticated Origin Pulls bundle for
-#    our own cert; absent = edge auth stays firewall-allowlist + Host binding
-#    until the operator finishes the AOP ceremony in docs/dr.md +
-#    re-dispatches).
+#    CF_AOP_CA_PEM (legacy zone-level Authenticated Origin Pulls bundle for
+#    the pre-A2 Cloudflare edge; A2 retires AOP for the :443 origin leg —
+#    CloudFront has no AOP — so the expected post-cutover state is UNSET:
+#    edge auth = firewall allowlist + the X-Piercloud-Origin gate below.
+#    Pre-A2 Cloudflare-edge rollback only: set it per docs/dr.md).
 # ---------------------------------------------------------------------------
 log "Rendering dispatch-managed Caddyfile (${CADDY_CONFIG})"
 mkdir -p "$(dirname "${CADDY_CONFIG}")" "${CADDY_CHALLENGE_DIR}"
@@ -1102,16 +1453,18 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine).
+# AOP bundle (public cert material — world-readable is fine; a key-bearing
+# bundle is refused below rather than written 644).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
-  case "${CF_AOP_CA_PEM}" in *"BEGIN CERTIFICATE"*) ;; *) die "CF_AOP_CA_PEM does not look like a PEM certificate bundle";; esac
+  case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
+  origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
   log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + Host binding until the operator finishes the AOP ceremony (docs/dr.md) + re-dispatches"
+  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md; it is not a secret/variable change)"
 fi
 CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
 if [ "${ORIGIN_TLS}" = "1" ]; then
@@ -1129,9 +1482,17 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
+# Pre-create root-only BEFORE the render: the :443 render carries the
+# X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
+# rejection may leave it readable beyond root. The mode assumes the pinned
+# container runs as root — a Renovate bump to a non-root USER would make the
+# bind-mounted file unreadable on recreate; verify on every bump.
+install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
-CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
+  # A no-op render still re-asserts 0600: a pre-0600 file must not survive
+  # just because the bytes match.
+  chmod 600 "${CADDY_CONFIG}"
   log "Caddyfile unchanged"
   rm -f "$TMP_CADDY"
 else
@@ -1147,10 +1508,22 @@ else
     CADDY_VAL_ARGS="${CADDY_VAL_ARGS} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
   fi
   # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
-  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"
-  mv "$TMP_CADDY" "${CADDY_CONFIG}"
-  log "Caddyfile installed (rendered from dispatch env)"
-  CADDY_RESTART=1
+  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
+  # IN-PLACE install: the caddy container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode, so the container keeps
+  # reading the OLD bytes and `caddy reload` reports "config is unchanged"
+  # (observed live 2026-10-07: the A2 cutover render never reached the
+  # running Caddy and the :80 Host probe aborted). Truncate+rewrite keeps
+  # the inode (mode is re-asserted 0600 first so a first install cannot
+  # expose the secret-bearing render even transiently) but is not atomic;
+  # the post-write cmp catches a short/failed write at run time (a power
+  # loss mid-write is repaired only by the next dispatch).
+  [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
+  chmod 600 "${CADDY_CONFIG}"
+  cat "$TMP_CADDY" >"${CADDY_CONFIG}"
+  cmp -s "$TMP_CADDY" "${CADDY_CONFIG}" || die "in-place Caddyfile write did not land byte-identical (out of space?) — refusing to reload Caddy on a partial config; the running process keeps the old config"
+  rm -f "$TMP_CADDY"
+  log "Caddyfile installed in place (rendered from dispatch env)"
 fi
 # ---------------------------------------------------------------------------
 # e2) Run Caddy (container recreated when the pinned tag changed — so a
@@ -1170,12 +1543,47 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
 fi
 [ -n "${AOP_TLS}" ] && CADDY_WANT_MOUNTS="${CADDY_WANT_MOUNTS} aop"
 CADDY_HAVE_MOUNTS="$(cat /etc/caddy/.deployed-mounts 2>/dev/null || true)"
+# Stale-mount guard (same rationale as the Gatus block above): the container
+# bind-mounts the Caddyfile FILE; a container created before an `mv` install
+# keeps reading the OLD bytes and the reload silently no-ops ("config is
+# unchanged"). Compare the container's view through its root to the rendered
+# path; divergence = recreate once. In-place installs keep this quiet.
+CADDY_MOUNT_STALE=0
+CADDY_MOUNT_STALE_REASON=""
+if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
+  caddy_pid="$(docker inspect --format '{{.State.Pid}}' caddy 2>/dev/null || true)"
+  if [ -n "${caddy_pid}" ] && ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"; then
+    CADDY_MOUNT_STALE=1
+    CADDY_MOUNT_STALE_REASON="Caddyfile"
+  fi
+  # The deployed PEMs are bind-mounted FILES too (same class): a container
+  # created before a PEM's inode last changed keeps reading the OLD bytes and
+  # `caddy reload` cannot fix it — live 2026-10-07: the 4-block chain install
+  # landed on the host while the container still served the leaf-only inode
+  # (CloudFront 502 with a green run). Compare the container's view through
+  # its root; divergence = recreate once.
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ "${ORIGIN_TLS}" = "1" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_CRT}" "${CADDY_ORIGIN_CRT}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="origin-ca cert"
+    elif ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_KEY}" "${CADDY_ORIGIN_KEY}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="origin-ca key"
+    fi
+  fi
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ -n "${AOP_TLS}" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/aop-ca.pem" "${CADDY_AOP_CA}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="AOP CA"
+    fi
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   CADDY_RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' caddy) # ci-allowlist: code — docker inspect field name, not a live reference.
-  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ]; then
+  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
     log "Caddy already running on ${CADDY_IMAGE}"
   else
-    log "Caddy image or deployed-PEM set changed - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
+    log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container (stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-image/mount-set})" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f caddy >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "caddy"; then
@@ -1212,18 +1620,34 @@ if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
     die "Caddy exited on boot with the new config — tang stays up on loopback but the :80 proxy is down; reversibility: docs/dr.md"
   fi
 fi
-if [ "${CADDY_RESTART:-0}" = "1" ] || [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-  # Mounts already converged above (recreate path); reload = zero-downtime.
-  # ORIGIN_CERT_CHANGED covers the in-place cert swap: the bind-mounted FILE
-  # kept its inode (in-place write), so only a reload makes Caddy re-read it.
-  docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-  log "Caddy reloaded on new config"
-  if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-    # Recorded ONLY after the successful reload (a failed run must re-reload
-    # on the next dispatch, never claim the cert is live).
-    origin_ca_write_hash "${ORIGIN_CA_CRT}"
-    log "deployed origin-ca cert hash recorded after the successful reload"
-  fi
+# Always reload: the stale-mount guard compares the MOUNT's bytes, not the
+# loaded config — an aborted reload (SSH drop, SIGKILL between the in-place
+# write and this line) would otherwise stay invisible, and the next dispatch
+# (identical render, equal mount bytes) would report green while the running Caddy
+# serves the old config (a rotated X-Piercloud-Origin secret or a changed
+# MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
+# covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
+# (in-place write), so only a reload makes Caddy re-read it.
+#
+# --force is REQUIRED, not cosmetic: the cert FILE is not part of the config
+# JSON, so a chain-only change (same leaf, same Caddyfile) leaves the adapted
+# config byte-identical and Caddy's changeConfig() returns errSameConfig
+# without re-provisioning the TLS app — the bind-mounted PEM is never re-read
+# and the old certificate stays in memory (caddy.go: "if nothing changed, no
+# need to do a whole reload unless the client forces it"; admin.go maps
+# Cache-Control: must-revalidate to forceReload). Live 2026-10-07: the
+# 4-block chain install plus a no-op reload kept serving the leaf-only cert →
+# CloudFront 502 while every loopback probe stayed green. Note the
+# ORIGIN_CERT_CHANGED marker hashes the LEAF only, so it cannot detect a
+# chain-only change; never condition this force on it.
+docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile \
+  || die "caddy reload failed — the running Caddy may still serve the old config (the stale-mount guard only proves the mount bytes); inspect 'docker logs caddy', fix the render, and re-dispatch"
+log "Caddy reloaded on new config"
+if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
+  # Recorded ONLY after the successful reload (a failed run must re-reload
+  # on the next dispatch, never claim the cert is live).
+  origin_ca_write_hash "${ORIGIN_CA_CRT}"
+  log "deployed origin-ca cert hash recorded after the successful reload"
 fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
@@ -1356,7 +1780,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
     case "${dash_code}" in
       301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the proxied edge record is upserted by the DNS stage after close)" ;;
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — this run's anchor-dns job writes both the anchor A and the explicit dashboard CNAME, live 2026-10-07)" ;;
       *)
         docker logs caddy 2>&1 | tail -20 || true
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
@@ -1414,9 +1838,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The proxied edge record is upserted by the DNS stage AFTER this job, so on a first-time/DR dispatch this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once DNS converges re-enable AOP (docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the proxied record may still point at the old box (edge 521/522) — the DNS stage converges only AFTER this job, see docs/dr.md"
+      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -1426,7 +1850,8 @@ if [ -n "${STATUS_HOST:-}" ]; then
       # has SERVED, which is the one-way marker's precondition.
       origin_ca_mark_active
     fi
-    log "edge pull through Cloudflare serves with AOP enforced (OK)"
+    log "edge pull through the public edge serves with AOP enforced (OK)"
+    log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale
@@ -1439,17 +1864,3238 @@ if [ -n "${STATUS_HOST:-}" ]; then
       fi
     fi
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
+    # A2 edge pull: the loopback handshake cannot see a missing/broken chain
+    # (CloudFront drops the connection with 502 before it reaches Caddy), so
+    # the public edge must serve the ORIGIN this run. Fail-closed; the
+    # classification and the no-pair no-op live in origin_ca_edge_prove.
+    origin_ca_edge_prove
   elif [ "${ORIGIN_TLS}" != "1" ]; then
     # No origin pair selected (absent, or the one-way marker suppressed the
     # legacy fallback): auto-TLS cannot reliably issue for a name whose public
-    # record is only upserted by the DNS stage after this job. Origin TLS is
-    # proven there (verify-after-write + orange-cloud) and by the edge, so
-    # this is loud, not fatal; with a pair selected it stays fail-closed.
-    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the proxied edge record is upserted after close (docs/dr.md)"
+    # edge path (the platform status wildcard) is not in place yet. Origin TLS
+    # is proven by the edge once the platform records exist, so this is loud,
+    # not fatal; with a pair selected it stays fail-closed.
+    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the explicit dashboard CNAME / the platform status wildcard may not be in place yet (docs/dr.md)"
+    log "A2 edge not proven this run (no origin pair selected — auto-TLS/pending; the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes)"
   else
     docker logs caddy 2>&1 | tail -20 || true
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
   fi
 fi
 
-log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."
+# --- BEGIN RECORDING WITNESS (tests/recording-witness extracts this span; keep markers) ---
+# Recording-completeness witness — optional component, dormant without env.
+# Renders /usr/local/sbin/pc-recording-witness.sh + its 0600 env file + a
+# 5-minute systemd timer. The witness is STRICTLY list-only (ListObjectsV2 +
+# ListObjectVersions + ListMultipartUploads with a listFiles application key (B2 has no separate version-listing capability)
+# B2 application key: no readFiles, no HEAD, no ListParts) and fail-closed (an
+# un-runnable witness reports
+# `error`; the last baseline is held). Design, key contract and checks:
+# docs/recording-witness.md.
+#
+# Paths are overridable so the committed test harness can render and install
+# into throwaway paths; the dispatch env never exports these names, so on-box
+# runs always get the canonical defaults.
+RECORDING_WITNESS_SBIN="${RECORDING_WITNESS_SBIN:-/usr/local/sbin/pc-recording-witness.sh}"
+RECORDING_WITNESS_ENV_FILE="${RECORDING_WITNESS_ENV_FILE:-/etc/piercloud/recording-witness.env}"
+RECORDING_WITNESS_STATE_DIR="${RECORDING_WITNESS_STATE_DIR:-/var/lib/piercloud/recording-witness}"
+RECORDING_WITNESS_SERVICE="${RECORDING_WITNESS_SERVICE:-/etc/systemd/system/pc-recording-witness.service}"
+RECORDING_WITNESS_TIMER="${RECORDING_WITNESS_TIMER:-/etc/systemd/system/pc-recording-witness.timer}"
+
+recording_witness_config_problem() { # print the first config problem; empty = ok
+  if [ -z "${RECORDING_WITNESS_ENDPOINT:-}" ]; then printf '%s' 'RECORDING_WITNESS_ENDPOINT is empty'; return 0; fi
+  case "${RECORDING_WITNESS_ENDPOINT}" in
+    http://*|https://*) ;;
+    *) printf '%s' 'RECORDING_WITNESS_ENDPOINT must start with http:// or https://'; return 0 ;;
+  esac
+  case "${RECORDING_WITNESS_ENDPOINT}" in *[[:space:]]*) printf '%s' 'RECORDING_WITNESS_ENDPOINT has whitespace'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_BUCKET:-}" ]; then printf '%s' 'RECORDING_WITNESS_BUCKET is empty'; return 0; fi
+  case "${RECORDING_WITNESS_BUCKET}" in *[!a-z0-9.-]*) printf '%s' 'RECORDING_WITNESS_BUCKET must match [a-z0-9.-]'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_AUDIT_PREFIX:-}" ]; then printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX is empty'; return 0; fi
+  case "${RECORDING_WITNESS_AUDIT_PREFIX}" in */) ;; *) printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX must end with /'; return 0;; esac
+  case "${RECORDING_WITNESS_AUDIT_PREFIX}" in *[!A-Za-z0-9._/-]*) printf '%s' 'RECORDING_WITNESS_AUDIT_PREFIX has unsupported characters'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}" ]; then printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX is empty'; return 0; fi
+  case "${RECORDING_WITNESS_RECORDINGS_PREFIX}" in */) ;; *) printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX must end with /'; return 0;; esac
+  case "${RECORDING_WITNESS_RECORDINGS_PREFIX}" in *[!A-Za-z0-9._/-]*) printf '%s' 'RECORDING_WITNESS_RECORDINGS_PREFIX has unsupported characters'; return 0;; esac
+  if [ "${RECORDING_WITNESS_AUDIT_PREFIX}" = "${RECORDING_WITNESS_RECORDINGS_PREFIX}" ]; then printf '%s' 'audit and recordings prefixes must differ'; return 0; fi
+  if [ -z "${RECORDING_WITNESS_KEY_ID:-}" ]; then printf '%s' 'RECORDING_WITNESS_KEY_ID is empty'; return 0; fi
+  case "${RECORDING_WITNESS_KEY_ID}" in *[!A-Za-z0-9_-]*) printf '%s' 'RECORDING_WITNESS_KEY_ID has unsupported characters'; return 0;; esac
+  if [ -z "${RECORDING_WITNESS_KEY:-}" ]; then printf '%s' 'RECORDING_WITNESS_KEY is empty'; return 0; fi
+  case "${RECORDING_WITNESS_KEY}" in *[[:space:]]*|*[![:print:]]*) printf '%s' 'RECORDING_WITNESS_KEY has whitespace or control characters'; return 0;; esac
+  return 0
+}
+
+recording_witness_state() { # off | partial | on
+  local present=0 total=0 name
+  for name in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX RECORDING_WITNESS_RECORDINGS_PREFIX RECORDING_WITNESS_KEY_ID RECORDING_WITNESS_KEY; do
+    total=$((total + 1))
+    if [ -n "${!name:-}" ]; then present=$((present + 1)); fi
+  done
+  if [ "$present" -eq 0 ]; then printf 'off'; return 0; fi
+  if [ "$present" -ne "$total" ]; then printf 'partial'; return 0; fi
+  if [ -n "$(recording_witness_config_problem)" ]; then printf 'partial'; return 0; fi
+  printf 'on'
+}
+
+render_recording_witness() { # print the on-box witness script to stdout
+  cat <<'RECORDING_WITNESS_FILE_EOF'
+#!/usr/bin/env bash
+# pc-recording-witness.sh — list-only recording-completeness witness.
+# RENDERED by terraform-piercloud-anchor scripts/010-provision.sh; DO NOT EDIT.
+# Contract + checks: docs/recording-witness.md (repo).
+#
+# Strictly list-only: reads /etc/piercloud/recording-witness.env (0600) and
+# makes only ListObjectsV2 / ListObjectVersions / ListMultipartUploads calls.
+# Never fetches object
+# content (no GET/HEAD) and never calls ListParts (writeFiles).
+set -euo pipefail
+
+ENV_FILE="${RECORDING_WITNESS_ENV_FILE:-/etc/piercloud/recording-witness.env}"
+if [ ! -r "$ENV_FILE" ]; then
+  printf '[witness] FAIL: witness env file not readable: %s\n' "$ENV_FILE" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090,SC1091  # operator-controlled dispatched env file
+. "$ENV_FILE"
+set +a
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '[witness] FAIL: python3 is not installed\n' >&2
+  exit 2
+fi
+
+exec python3 - <<'RECORDING_WITNESS_PY_EOF'
+"""List-only recording-completeness witness (B2 S3 metadata).
+
+Strictly list-only: ListObjectsV2 + ListObjectVersions + ListMultipartUploads
+with a listFiles application key (object, version and multipart listings). Never reads an object (no
+GET/HEAD) and never calls the writeFiles-gated ListParts. Fail-closed: any
+failure to run reports state
+`error`, exits 2, and never advances the last good baseline (an unreadable or
+oversized state file is preserved as `state.json.corrupt` - or a timestamped
+`.corrupt.<stamp>` sibling when that name is taken - and the repaired record
+reports `baseline: null` - it could not be read and is never fabricated);
+alerts exit 1; green exits 0.
+"""
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+STATE_VERSION = 3
+# The observed/coverage block's own schema version; bumped only when the
+# block layout changes incompatibly (a mismatch is fail-closed repair + sweep).
+CURSOR_VERSION = 1
+# A state record is a few KB; an oversized file is invalid input, never a reason
+# to allocate it. The bounded read keeps a planted huge state.json from raising
+# an uncaught MemoryError before any verdict (round-7 R2).
+STATE_MAX_BYTES = 1 << 20
+# Bounded response reads: a non-2xx body only ever feeds a clipped message,
+# while a 2xx list body is parsed in full. A server that streams without
+# bound must fail the run closed, never allocate it to death. The module
+# constants are patchable for the offline harness.
+MAX_ERROR_BODY = 64 * 1024
+MAX_SUCCESS_BODY = 16 * 1024 * 1024
+# A delta tail is bounded: an overflow abandons the delta and runs an exact
+# sweep, so a post-downtime backlog can never read as a truncated view.
+DELTA_MAX_PAGES = 50
+# The observed view sidecar: the merged key maps live here (not in state.json,
+# whose 1 MiB bound and preserve-and-repair semantics stay untouched). The cap
+# is fail-closed: an oversized or unreadable view takes the repair-sweep path.
+VIEW_VERSION = 1
+VIEW_MAX_BYTES = 64 << 20
+VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
+UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
+# Classification is shape-strict so a malformed session key cannot be re-parsed
+# as a non-session event (or vice versa). The family regexes end `\Z`, not
+# `$`: Python's `$` also matches before a trailing newline (the
+# QUIET_SIGNATURE_RE pitfall below), so a key ending `…json\n`/`…tar\n` would
+# pass the shape predicates (and the classifier's own match) as a real key
+# while sorting above the whole real key space - a cursor-poisoning false
+# green (round-4 RF3.1).
+TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
+# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[-<seq-end>][.<mode>].json.
+# The optional inclusive seq range token (pc-admin #29, D5) rides after the
+# start seq; a single-seq key is the degenerate [seq, seq] (dual shape). The
+# optional mode marker (.shell/.exec) is contract-defined for session.start
+# and session.end only (pc-admin D1); other session events keep the old shape.
+SESSION_KEY_RE = re.compile(
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
+    r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?"
+    r"(?:\.(?P<mode>shell|exec))?\.json\Z"
+)
+# Documented non-session audit event: <ts>-<event-type>.<seq>[-<seq-end>].json
+# (no sid); batched non-session events carry the same optional range token.
+NON_SESSION_KEY_RE = re.compile(
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?\.json\Z"
+)
+HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json\Z")
+UUID_RE = re.compile(UUID_PATTERN)
+RECORDING_KEY_RE = re.compile(r"^(?P<sid>" + UUID_PATTERN + r")\.tar\Z")
+# Cursor grammar guards: a cursor may only ever advance over keys matching the
+# family's own shape (the same regexes the classifier reads). An unshaped key
+# (an acceptance probe, contract drift) still enters the listing/view (audit
+# keys alert as naming-contract/contract-mismatch drift; the recording checks
+# skip unshaped recordings keys), but letting it move a cursor would put the
+# cursor past the real key space and blind the next delta's tail while the run
+# stays green (round-3 forged-cursor / live-probe class). These predicates
+# are layout-specific since #159: `is_audit_session_key` is flat-only and
+# `is_audit_session_dated_key` requires a valid `YYYYMMDD/` day segment; both
+# build on `strip_date_segment`, and the classifier strips the same segment so
+# the cursor movers and the classifier stay in step.
+def strip_date_segment(relative):
+    """Strip exactly one leading ``YYYYMMDD/`` calendar-date segment.
+
+    Returns ``(basename, day)``. ``relative`` is an audit key without its
+    configured prefix. ``day`` is ``None`` for a flat key (no day segment);
+    ``basename`` is the key name the family regexes then match. The segment
+    is stripped only when the eight digits are a real calendar date
+    (``datetime.strptime``): a non-calendar ``[0-9]{8}`` segment (``20260932``,
+    ``00000000``) returns ``(None, segment)``, so callers treat the key as
+    unmatchable drift and never silently strip it into a flat parse. Any
+    other leading segment (a wrong digit count, or a ``session.start``-named
+    segment) is left in place, so the family regexes cannot match it either
+    (a leading `/` makes the basename grammar fail). Never strips more than
+    one segment (#159).
+    """
+    head, sep, rest = relative.partition("/")
+    if not sep:
+        return relative, None
+    if not re.fullmatch(r"[0-9]{8}", head):
+        return relative, None
+    try:
+        datetime.strptime(head, "%Y%m%d")
+    except ValueError:
+        return None, head
+    return rest, head
+
+
+def _audit_session_basename_matches(basename):
+    """True for a basename shaped as a documented session/non-session key."""
+    match = SESSION_KEY_RE.match(basename)
+    if match:
+        # A range on a lifecycle type, a mode marker on a range or a reversed
+        # range is naming/contract drift (D1/D5), never a cursor mover: the
+        # same rule the classifier applies before collection.
+        event_type, _ = canonical_conflict_type(match.group("etype"))
+        return not _audit_range_is_drift(
+            match.group("seq"), match.group("seq_end"), event_type, match.group("mode"))
+    generic = NON_SESSION_KEY_RE.match(basename)
+    if not generic:
+        return False
+    # Mirror the classifier: a NON_SESSION-shaped `session.*` key with no sid
+    # (and its replay-conflict variant) is naming-contract drift, not a
+    # documented non-session event, so it must not move the cursor either.
+    # Only the documented sid-less session events (session.rejected) keep the
+    # non-session shape and stay valid cursor movers.
+    event_type, _ = canonical_conflict_type(generic.group("etype"))
+    if event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS:
+        return False
+    return not _audit_range_is_drift(
+        generic.group("seq"), generic.group("seq_end"), event_type, "")
+
+
+def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
+    """True for a shaped FLAT session/non-session key (no day segment)."""
+    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
+        return False
+    relative = key[len(audit_prefix):]
+    basename, day = strip_date_segment(relative)
+    if basename is None or day is not None:
+        return False
+    return _audit_session_basename_matches(basename)
+
+
+def is_audit_session_dated_key(key, audit_prefix, heartbeat_prefix):
+    """True for a shaped DATED session/non-session key (valid day segment)."""
+    if not key.startswith(audit_prefix) or key >= heartbeat_prefix.rstrip("/"):
+        return False
+    relative = key[len(audit_prefix):]
+    basename, day = strip_date_segment(relative)
+    if basename is None or day is None:
+        return False
+    return _audit_session_basename_matches(basename)
+
+
+def _audit_key_day(audit_prefix, key):
+    """The UTC calendar day of a shaped audit key: day segment or ``<ts>``.
+
+    A flat key carries no day segment, so its day is the leading eight digits
+    of the shaped basename's ``<ts>``; a dated key uses the validated day
+    segment. Returns ``""`` for an unshaped key (a heartbeat, drift, a
+    malformed day). Used for the dated delta's bounded day selection.
+    """
+    relative = key[len(audit_prefix):] if key.startswith(audit_prefix) else key
+    basename, day = strip_date_segment(relative)
+    if basename is None:
+        return ""
+    if day:
+        return day
+    match = SESSION_KEY_RE.match(basename) or NON_SESSION_KEY_RE.match(basename)
+    return match.group("ts")[:8] if match else ""
+
+
+def is_audit_heartbeat_key(key, heartbeat_prefix):
+    """True for a shaped heartbeat key under the heartbeat prefix."""
+    return key.startswith(heartbeat_prefix) and bool(
+        HEARTBEAT_KEY_RE.match(key[len(heartbeat_prefix):]))
+
+
+def is_recording_key(key, recordings_prefix):
+    """True for a shaped `<sid>.tar` recording key."""
+    return key.startswith(recordings_prefix) and bool(
+        RECORDING_KEY_RE.match(key[len(recordings_prefix):]))
+
+
+def key_ts_is_future(now, relative_key, skew_tolerance):
+    """True when a shaped audit key's ``<ts>`` (or day) is future/unparseable.
+
+    A cursor must never advance over a key dated in the future: the key sorts
+    above the whole real key space, so the next delta lists an empty tail while
+    real keys (and a hidden session's gap) sit below it - a false green bounded
+    only by the sweep interval (round-4 RT4.1). The bound is the same
+    clock-skew tolerance the LastModified checks use. A calendar-invalid
+    ``<ts>`` (the shape regex accepts any digits, e.g. ``99999999T999999Z``)
+    parses to nothing and is rejected too - fail closed. An absurd operator
+    tolerance overflows the ``timedelta`` constructor (``>= ~8.64e13`` s) or
+    the ``now + timedelta`` addition (from ~2.5e11 s): the key is rejected (it
+    just never moves a cursor) instead of bricking every run with an
+    ``OverflowError`` (round-5 RT5.4; round-6 red-team NIT). The validated
+    date-partitioned day segment is a second, coarser anchor (#159): a forged
+    ``audit/20991231/<current-ts>.json`` sorts above the real dated space even
+    though its basename ``<ts>`` is current, so the day is future-checked too
+    (tz-aware UTC calendar-date comparison - never a naive-midnight
+    ``strptime`` against an aware ``now``). Recordings keys carry no ``<ts>``
+    and never match a family here.
+    """
+    basename, day = strip_date_segment(relative_key)
+    if basename is None:
+        return False
+    match = (SESSION_KEY_RE.match(basename)
+             or NON_SESSION_KEY_RE.match(basename)
+             or HEARTBEAT_KEY_RE.match(basename))
+    if not match:
+        return False
+    try:
+        moment = datetime.strptime(match.group("ts"), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    try:
+        bound = now + timedelta(seconds=skew_tolerance)
+    except OverflowError:
+        # A tolerance this large is an operator typo, not a bound: reject the
+        # key (fail closed) rather than raising before state/verdict land.
+        return True
+    if moment > bound:
+        return True
+    if day is not None:
+        try:
+            day_date = datetime.strptime(day, "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        if day_date.date() > bound.date():
+            return True
+    return False
+
+
+# Sid-less session.* event types documented by the shipper contract (Teleport
+# v18 emits session.rejected without a session id): they ship on the
+# non-session shape and are not naming drift.
+SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
+# Session lifecycle events stay one object per event (pc-admin D1): a range
+# token on one of these is contract drift, never a batched coverage claim.
+SESSION_MODE_EVENTS = frozenset({"session.start", "session.end"})
+# Replay-conflict variants (pc-admin `disambiguate_audit_key`): when a rebuilt
+# audit file replays an event under a key that already exists with DIFFERENT
+# bytes, the shipper appends `_<sha256[:16]>` to the event type (a session
+# lifecycle variant drops its mode marker) instead of silently skipping the
+# line. The witness is list-only and cannot see bytes, so a variant is the
+# SAME event identity as its base key, re-shipped under a disambiguated name:
+# canonicalize the type and count the (ts, type, seq) identity once per session.
+# Anchoring is hygiene only here: the input is the newline-free etype capture,
+# never a raw key name.
+CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}\Z")
+# The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): a finding
+# signature exactly as emitted in state.json. \A/\Z is a FULL-string match -
+# Python's `$` also matches before a trailing newline, which would accept a
+# pin that can never equal a real signature and silently disable quieting.
+QUIET_SIGNATURE_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+
+def canonical_conflict_type(event_type):
+    """Strip a replay-conflict `_<hash16>` suffix; return (base, is_variant)."""
+    match = CONFLICT_SUFFIX_RE.search(event_type)
+    if not match:
+        return event_type, False
+    return event_type[: match.start()], True
+
+
+def _audit_range_is_drift(seq, seq_end, event_type, mode):
+    """True when a parsed range token violates the batched-key contract.
+
+    Contract (pc-admin #29 D1/D5): a range is defined on batched
+    (non-lifecycle) events only, inclusive with ``seq_end >= seq``, and never
+    carries a mode marker (the mode is contract-defined on the single-object
+    ``session.start``/``session.end`` keys only). A violation is
+    naming/contract drift, judged before the key can claim any coverage.
+    """
+    if seq_end is None:
+        return False
+    if int(seq_end) < int(seq):
+        return True
+    if event_type in SESSION_MODE_EVENTS:
+        return True
+    return bool(mode)
+
+
+def merge_coverage_interval(intervals, start, end):
+    """Merge inclusive ``[start, end]`` into sorted disjoint intervals. Pure.
+
+    Returns ``(merged, overlaps)``: ``merged`` is the coalesced coverage
+    (adjacent intervals coalesce without an overlap) and ``overlaps`` holds
+    the inclusive intersection with coverage already claimed by another
+    identity - the duplicate claims D9 flags. The caller owns the list.
+    """
+    merged = []
+    overlaps = []
+    for low, high in intervals:
+        if high + 1 < start or end + 1 < low:
+            merged.append((low, high))
+            continue
+        if start <= high and end >= low:
+            overlaps.append((max(low, start), min(high, end)))
+        start = min(start, low)
+        end = max(end, high)
+    merged.append((start, end))
+    merged.sort()
+    return merged, overlaps
+
+
+def render_interval_ranges(ranges, limit=20):
+    """Render inclusive ranges boundedly (single values bare, ranges ``a-b``).
+
+    The detail render caps at ``limit`` ranges + an ellipsis; callers fold the
+    full list into the finding identity so a range beyond the cap still moves
+    the signature.
+    """
+    rendered = [
+        str(start) if start == stop else "%d-%d" % (start, stop)
+        for start, stop in ranges[:limit]
+    ]
+    if len(ranges) > limit:
+        rendered.append("...")
+    return ",".join(rendered)
+
+
+class WitnessError(Exception):
+    """Any condition that makes the witness un-runnable (fail-closed)."""
+
+
+class DeltaTooLong(WitnessError):
+    """A bounded delta listing overflowed; the caller falls back to a sweep."""
+
+
+def env(name, default=""):
+    value = os.environ.get(name, "")
+    return value if value else default
+
+
+def env_int(name, default):
+    raw = env(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        raise WitnessError("%s must be an integer, got %r" % (name, raw))
+
+
+def env_window(name, default):
+    """Notification window seconds in [60, 90 days]; out of range warns + default.
+
+    A cadence typo must neither flood (0/negative -> notify on every run) nor
+    silently freeze reminders (absurd values), and must not take the witness
+    down (the detector keeps running with the default cadence).
+    """
+    value = env_int(name, default)
+    if not 60 <= value <= 90 * 86400:
+        log("WARNING: %s=%d is outside [60, 7776000]; using the default %d" % (name, value, default))
+        return default
+    return value
+
+
+def log(message):
+    print("[witness] " + message, flush=True)
+
+
+def clip(text, limit=300):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def identity_digest(identities):
+    """Stable sha256 over a sorted identity list (no ages, no timestamps).
+
+    One canonical digest per finding class keeps the notification signature
+    compact while still covering the whole finding set (every hidden marker
+    key+version, every drift key).
+    """
+    canonical = json.dumps(sorted(identities), separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def finding_signature(state, finding_ids):
+    """Stable digest of the finding set: state + identities, never ages.
+
+    The digest changes when the finding set changes and stays identical when
+    only an age drifts (a `%ds old` / `%ds ago` fragment is displayed, never
+    hashed), so the notification change-trigger pushes on real changes without
+    pushing on every check. `ok` and `error` carry fixed digests of their own.
+    """
+    canonical = state + "\0" + "\n".join(sorted(finding_ids))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def utc_stamp(instant):
+    return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def age_seconds(now, moment, label, skew_tolerance):
+    """Signed age in seconds; a future timestamp beyond tolerance is an error."""
+    age = int((now - moment).total_seconds())
+    if age < -skew_tolerance:
+        raise WitnessError(
+            "%s timestamp %s is %ds in the future (clock skew beyond %ds)"
+            % (label, utc_stamp(moment), -age, skew_tolerance)
+        )
+    return age
+
+
+def parse_timestamp(text):
+    value = (text or "").strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(timezone.utc)
+
+
+def quote(value, keep_slash=False):
+    safe = "-_.~"
+    if keep_slash:
+        safe += "/"
+    return urllib.parse.quote(value, safe=safe)
+
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def sign(key, message):
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+class Config(object):
+    def __init__(self):
+        self.endpoint = env("RECORDING_WITNESS_ENDPOINT").rstrip("/")
+        self.bucket = env("RECORDING_WITNESS_BUCKET")
+        self.audit_prefix = env("RECORDING_WITNESS_AUDIT_PREFIX")
+        self.recordings_prefix = env("RECORDING_WITNESS_RECORDINGS_PREFIX")
+        self.key_id = env("RECORDING_WITNESS_KEY_ID")
+        self.key = env("RECORDING_WITNESS_KEY")
+        self.region = env("RECORDING_WITNESS_REGION")
+        self.state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
+        self.heartbeat_max_age = env_int("RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS", 900)
+        self.session_grace = env_int("RECORDING_WITNESS_SESSION_GRACE_SECONDS", 600)
+        self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
+        self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
+        self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
+        # Bounded listing fan-out; 1 keeps the historical serial behavior and
+        # gives the offline harness a deterministic seam. Out of range falls
+        # back to the default (a cadence/perf knob must not take the witness
+        # down). http.client connections are per-thread, so the pool size is
+        # the whole concurrency model.
+        self.list_workers = env_int("RECORDING_WITNESS_LIST_WORKERS", 6)
+        if not 1 <= self.list_workers <= 32:
+            log("WARNING: RECORDING_WITNESS_LIST_WORKERS=%d is outside [1, 32]; using the default 6" % self.list_workers)
+            self.list_workers = 6
+        # Cold start: a window-bounded seed (seconds of history) whose run
+        # cannot return `ok` until the first full sweep closes it; 0 opts into
+        # the exact-semantics full sweep (slow acceptance, no disclosure).
+        self.cold_start_seconds = env_int("RECORDING_WITNESS_COLD_START_SECONDS", 13 * 3600)
+        if not 0 <= self.cold_start_seconds <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_COLD_START_SECONDS=%d is outside [0, 604800]; using the default 46800" % self.cold_start_seconds)
+            self.cold_start_seconds = 13 * 3600
+        # The full-sweep cadence; the interval IS the delete-marker (hiding)
+        # detection bound for keys older than the delta cursor.
+        self.sweep_seconds = env_int("RECORDING_WITNESS_SWEEP_SECONDS", 6 * 3600)
+        if not 300 <= self.sweep_seconds <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_SWEEP_SECONDS=%d is outside [300, 604800]; using the default 21600" % self.sweep_seconds)
+            self.sweep_seconds = 6 * 3600
+        self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
+        self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
+        self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
+        if self.quiet_signature and not QUIET_SIGNATURE_RE.match(self.quiet_signature):
+            # Same posture as a bad ntfy token: skip the optional behavior
+            # with a bounded warning that never contains the value; the
+            # verdict still lands, so a typo'd pin cannot take the witness
+            # down (it only keeps the default cadence).
+            log("WARNING: quiet signature is malformed (want sha256:<64 lowercase hex>); quieting disabled")
+            self.quiet_signature = ""
+        self.ntfy_topic = env("NTFY_TOPIC")
+        self.ntfy_token = env("NTFY_TOKEN")
+        self.heartbeat_prefix = self.audit_prefix + "heartbeat/"
+        self.validate()
+
+    def validate(self):
+        required = [
+            ("RECORDING_WITNESS_ENDPOINT", self.endpoint),
+            ("RECORDING_WITNESS_BUCKET", self.bucket),
+            ("RECORDING_WITNESS_AUDIT_PREFIX", self.audit_prefix),
+            ("RECORDING_WITNESS_RECORDINGS_PREFIX", self.recordings_prefix),
+            ("RECORDING_WITNESS_KEY_ID", self.key_id),
+            ("RECORDING_WITNESS_KEY", self.key),
+        ]
+        for name, value in required:
+            if not value:
+                raise WitnessError("%s is empty - witness env incomplete" % name)
+        if not self.endpoint.startswith(("http://", "https://")):
+            raise WitnessError("RECORDING_WITNESS_ENDPOINT must be an http(s) URL")
+        if urllib.parse.urlsplit(self.endpoint).path not in ("", "/"):
+            raise WitnessError("RECORDING_WITNESS_ENDPOINT must not carry a path")
+        for name, value in (("AUDIT_PREFIX", self.audit_prefix), ("RECORDINGS_PREFIX", self.recordings_prefix)):
+            if not value.endswith("/"):
+                raise WitnessError("RECORDING_WITNESS_%s must end with /" % name)
+
+    def signing_region(self):
+        if self.region:
+            return self.region
+        match = re.match(r"^https?://s3\.([a-z0-9-]+)\.backblazeb2\.com$", self.endpoint)
+        return match.group(1) if match else "us-east-1"
+
+
+# The per-thread keep-alive pool for signed S3 list GETs. The module-level
+# signed_get() stays the single transport entry point so the harness can
+# patch it; close_connections() is called once per run so a stale cross-run
+# socket never survives a systemd retry.
+_TRANSPORT = threading.local()
+
+
+def _new_connection(config, timeout=30):
+    parts = urllib.parse.urlsplit(config.endpoint)
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+    if parts.scheme == "http":
+        return http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    raise WitnessError("RECORDING_WITNESS_ENDPOINT must be an http(s) URL")
+
+
+def _drop_connection():
+    connection = getattr(_TRANSPORT, "connection", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+    _TRANSPORT.connection = None
+    _TRANSPORT.key = None
+
+
+def _pooled_connection(config, timeout=30):
+    """One keep-alive connection per thread (http.client is not thread-safe)."""
+    key = (config.endpoint, timeout)
+    connection = getattr(_TRANSPORT, "connection", None)
+    if connection is not None and getattr(_TRANSPORT, "key", None) == key:
+        return connection
+    _drop_connection()
+    connection = _new_connection(config, timeout)
+    _TRANSPORT.connection = connection
+    _TRANSPORT.key = key
+    return connection
+
+
+def close_connections():
+    """Drop the calling thread's pooled connection after a run (workers exit)."""
+    _drop_connection()
+
+
+def _read_body(response, limit, truncate):
+    chunks = []
+    total = 0
+    while True:
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            if truncate:
+                # The rest of the body stays unread, so the pooled keep-alive
+                # connection cannot be reused (the next request would fail on
+                # it and burn the one bounded reconnect - an extra Class C
+                # call). Drop it now; the next request opens a fresh socket.
+                _drop_connection()
+                return b"".join(chunks)[:limit]
+            raise WitnessError("S3 response body exceeds %d bytes" % limit)
+    return b"".join(chunks)
+
+
+def signed_get(config, params):
+    """SigV4-signed path-style GET with a per-thread keep-alive connection.
+
+    Fresh SigV4 per request keeps the 15-minute clock-skew contract. A
+    redirect is refused structurally: http.client has no redirect machinery,
+    so a 3xx comes back as an ordinary non-200 status and can never re-send
+    the Authorization header. One bounded reconnect + re-send covers a pooled
+    connection the peer dropped between calls (RemoteDisconnected /
+    BadStatusLine / broken pipe / timeout); HTTP statuses are never retried.
+    Error bodies truncate at MAX_ERROR_BODY; a 2xx body over
+    MAX_SUCCESS_BODY fails the run closed.
+    """
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+    host = urllib.parse.urlsplit(config.endpoint).netloc
+    canonical_uri = "/" + quote(config.bucket, keep_slash=True)
+    pairs = sorted((quote(str(name)), quote(str(value))) for name, value in params.items())
+    canonical_query = "&".join("%s=%s" % (name, value) for name, value in pairs)
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join("%s:%s\n" % (name, headers[name]) for name in sorted(headers))
+    canonical_request = "\n".join(
+        ["GET", canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash]
+    )
+    scope = "%s/%s/s3/aws4_request" % (datestamp, config.signing_region())
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope,
+         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()]
+    )
+    signing_key = sign(("AWS4" + config.key).encode("utf-8"), datestamp)
+    signing_key = sign(signing_key, config.signing_region())
+    signing_key = sign(signing_key, "s3")
+    signing_key = sign(signing_key, "aws4_request")
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
+        config.key_id, scope, signed_headers, signature)
+    request_path = canonical_uri + (("?" + canonical_query) if canonical_query else "")
+    request_headers = dict(headers)
+    request_headers["Authorization"] = authorization
+    last_error = None
+    for _attempt in (0, 1):
+        try:
+            connection = _pooled_connection(config)
+            connection.request("GET", request_path, headers=request_headers)
+            response = connection.getresponse()
+            if 200 <= response.status < 300:
+                body = _read_body(response, MAX_SUCCESS_BODY, False)
+            else:
+                body = _read_body(response, MAX_ERROR_BODY, True)
+            return response.status, body
+        except WitnessError:
+            _drop_connection()
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            # A pooled connection the peer closed between calls, or a
+            # transport failure on an idempotent metadata GET: reconnect once
+            # and re-send the same request; a second failure is fail-closed.
+            _drop_connection()
+            last_error = exc
+    raise WitnessError(
+        "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
+
+
+def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
+    """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
+
+    `start_after` seeds the first page (exclusive, live-verified on B2); it is
+    never combined with a continuation token. `until` is an exclusive upper
+    key bound: any key at/after it is not part of this stream (the session
+    stream passes the heartbeat stem, `audit/heartbeat` - every session key
+    starts with a digit and sorts below it, so the heartbeat family owns the
+    tail and keys sorting after it are sweep-only). The early stop fires on
+    an ordered page whose last key is at/above the bound when the page is
+    complete (`IsTruncated=false`) **or** when the page demonstrably crossed
+    the bound (its first key is below it) - the priced conformant-ordering
+    trade from anchor #161: it bounds the session tail at the heartbeat stem
+    instead of paging through the whole heartbeat subtree. A truncated page
+    entirely at/above the bound keeps paginating (its entries stay skipped),
+    because a nonconformant server could still return an in-bound key on a
+    later page (the round-2 FF2 hole). An unordered page is filtered
+    entry-by-entry and is never an early-stop signal. `max_pages` bounds a
+    delta tail; overflow raises DeltaTooLong so the run can fall back to an
+    exact sweep instead of a truncated view.
+    """
+    objects = {}
+    token = ""
+    for _ in range(max_pages):
+        params = {"list-type": "2", "prefix": prefix}
+        if start_after and not token:
+            params["start-after"] = start_after
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
+            # body served with the wrong status) must never read as an empty
+            # listing: that would turn a listing failure into a false green.
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
+        truncated = False
+        next_token = ""
+        entries = []
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((key, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+            elif name == "Error":
+                # A genuine error document wrapped in a list root at HTTP 200
+                # (nonconformant server) must fail closed, not read as empty.
+                raise WitnessError("ListObjectsV2 %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and next_token:
+            # Contradictory server: a continuation token on a page that says
+            # IsTruncated=false. Follow the token instead of reading the short
+            # page as complete; the token-required guard below still applies.
+            truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = (
+            until is not None
+            and ordered
+            and bool(keys)
+            and keys[-1] >= until
+            and (not truncated or keys[0] < until)
+        )
+        for key, last_modified in entries:
+            if until is not None and key >= until:
+                if crossed:
+                    # The bound is proven exhausted: a complete ordered page
+                    # (no later page exists) or a crossing page (the stream
+                    # entered the out-of-bound tail after in-bound keys - the
+                    # anchor #161 conformant-ordering trade). A truncated page
+                    # entirely at/above the bound proves nothing about later
+                    # pages (a nonconformant server can hide an in-bound key
+                    # behind the bound) and keeps paginating; an unordered
+                    # page is filtered entry-by-entry.
+                    return objects
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+        if not truncated:
+            return objects
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise DeltaTooLong("ListObjectsV2 %s exceeded %d pages" % (prefix, max_pages))
+
+
+def list_objects_delimited(config, prefix, start_after="", until=None, max_pages=1000):
+    """ListObjectsV2 with ``delimiter="/"`` -> ``(contents, common_prefixes)``.
+
+    A separate listing helper so the existing dict-shaped callers (the heartbeat
+    tail, the recordings tail, the seed and the sweep) stay untouched (#159).
+    ``contents`` is ``{key: last_modified}`` exactly like :func:`list_objects`;
+    ``common_prefixes`` is the ordered list of ``<Prefix>`` values under
+    ``CommonPrefixes`` (full prefixes, trailing slash included), deduped.
+    ``until`` is an exclusive upper key bound for ``contents``; the same
+    filter also drops a common prefix at/after the bound (``heartbeat/``),
+    so the caller never lists the heartbeat subtree or a past-bound day.
+    The early-stop semantics are :func:`list_objects`': only an ordered page
+    whose ``Contents`` crossed the bound stops the stream - a prefix-only
+    page (empty ``Contents``) must keep paginating, because a nonconformant
+    server could still return an in-bound key on a later page. ``max_pages``
+    bounds the discovery tail; overflow raises :class:`DeltaTooLong`.
+    """
+    objects = {}
+    prefixes = []
+    seen_prefixes = set()
+    token = ""
+    for _ in range(max_pages):
+        params = {"list-type": "2", "prefix": prefix, "delimiter": "/"}
+        if start_after and not token:
+            params["start-after"] = start_after
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
+        truncated = False
+        next_token = ""
+        entries = []
+        page_prefixes = []
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((key, last_modified))
+            elif name == "CommonPrefixes":
+                for field in child:
+                    if local_name(field.tag) == "Prefix":
+                        page_prefixes.append(field.text or "")
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+            elif name == "Error":
+                raise WitnessError("ListObjectsV2 %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and next_token:
+            truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = (
+            until is not None
+            and ordered
+            and bool(keys)
+            and keys[-1] >= until
+            and (not truncated or keys[0] < until)
+        )
+        for key, last_modified in entries:
+            if until is not None and key >= until:
+                if crossed:
+                    # Same priced conformant-ordering trade as list_objects:
+                    # the bound is proven exhausted. Keep the in-bound
+                    # prefixes seen on this page before returning.
+                    for candidate in page_prefixes:
+                        if until is not None and candidate >= until:
+                            continue
+                        if candidate not in seen_prefixes:
+                            seen_prefixes.add(candidate)
+                            prefixes.append(candidate)
+                    return objects, prefixes
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+        for candidate in page_prefixes:
+            if until is not None and candidate >= until:
+                continue
+            if candidate not in seen_prefixes:
+                seen_prefixes.add(candidate)
+                prefixes.append(candidate)
+        if not truncated:
+            return objects, prefixes
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise DeltaTooLong("ListObjectsV2 %s exceeded %d pages" % (prefix, max_pages))
+
+
+def list_objects_range(config, prefix, after, until, max_pages=1000):
+    """ListObjectsV2 over the half-open key range (after, until].
+
+    `after` seeds the first page; continuation pages follow the token only.
+    Adjacent branches partition the ordered key space exactly: a conformant
+    (ascending) page whose last key is above `until` ends the branch after the
+    in-range entries are kept. A nonconformant unordered page is filtered
+    entry-by-entry and never used as an early-stop signal (the listing-order
+    independence teeth serve fixture-order pages); `until` None keeps the
+    whole fully-open tail.
+    """
+    objects = {}
+    token = ""
+    for _ in range(max_pages):
+        params = {"list-type": "2", "prefix": prefix}
+        if after and not token:
+            params["start-after"] = after
+        if token:
+            params["continuation-token"] = token
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListBucketResult":
+            raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
+        truncated = False
+        next_token = ""
+        entries = []
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Contents":
+                key = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((key, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = child.text or ""
+            elif name == "Error":
+                raise WitnessError("ListObjectsV2 %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and next_token:
+            truncated = True
+        keys = [key for key, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = until is not None and bool(keys) and ordered and keys[-1] > until
+        for key, last_modified in entries:
+            if until is not None and key > until:
+                continue
+            try:
+                objects[key] = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+        if crossed or not truncated:
+            return objects
+        if not next_token:
+            raise WitnessError("ListObjectsV2 %s truncated without a continuation token" % prefix)
+        token = next_token
+    raise DeltaTooLong("ListObjectsV2 %s range exceeded %d pages" % (prefix, max_pages))
+
+
+def list_object_versions(config, prefix):
+    """ListObjectVersions -> [{key, version_id, last_modified}] delete markers.
+
+    Under B2 Object Lock a delete is a HIDE MARKER: the current object
+    disappears from ListObjectsV2 while the locked version survives. The
+    pipeline never deletes, so a delete marker under a watched prefix is
+    tamper evidence by construction. Noncurrent versions from legitimate
+    re-PUTs are not findings, and IsLatest is deliberately ignored: ANY delete
+    marker (not only the latest) means a delete happened. Metadata-only.
+    """
+    markers = []
+    key_marker = ""
+    version_marker = ""
+    for _ in range(1000):
+        params = {"versions": "", "prefix": prefix}
+        if key_marker:
+            params["key-marker"] = key_marker
+        if version_marker:
+            params["version-id-marker"] = version_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListVersionsResult":
+            # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
+            # body served with the wrong status) must never read as "no delete
+            # markers": that would be a false green on the top-severity signal.
+            raise WitnessError("ListObjectVersions %s returned %s (expected ListVersionsResult)" % (prefix, root_name))
+        truncated = False
+        next_key = ""
+        next_version = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name in ("Version", "DeleteMarker"):
+                key = ""
+                version_id = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "VersionId":
+                        version_id = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if name == "DeleteMarker" and key:
+                    try:
+                        moment = parse_timestamp(last_modified)
+                    except ValueError:
+                        raise WitnessError(
+                            "delete marker %s has unparseable LastModified %r" % (key, last_modified))
+                    markers.append({"key": key, "version_id": version_id, "last_modified": moment})
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextVersionIdMarker":
+                next_version = child.text or ""
+            elif name == "Error":
+                # Same fail-closed rule as the object listing: an <Error> child
+                # inside a list root must never read as "no delete markers".
+                raise WitnessError("ListObjectVersions %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and (next_key or next_version):
+            # Contradictory server: Next* markers present while IsTruncated is
+            # false/absent. Follow them; the paired-marker guard below rejects
+            # a half-specified resume.
+            truncated = True
+        if not truncated:
+            return markers
+        if not next_key or not next_version:
+            # Resuming with only the key marker would skip the remaining
+            # versions of that key, hiding markers; require both markers.
+            raise WitnessError("ListObjectVersions %s truncated without a key/version marker" % prefix)
+        key_marker = next_key
+        version_marker = next_version
+    raise WitnessError("ListObjectVersions %s exceeded 1000 pages" % prefix)
+
+
+def list_object_versions_range(config, prefix, after, until, max_pages=1000):
+    """ListObjectVersions over the half-open key range (after, until].
+
+    The first page starts at `key-marker = after` (no key-marker when after is
+    empty); later pages follow the paired NextKeyMarker/NextVersionIdMarker.
+    ListObjectVersions has no end bound, so a conformant (key-ascending) page
+    whose last key is above `until` ends the branch after the in-range entries
+    are kept; a nonconformant unordered page is filtered entry-by-entry and
+    never used as an early-stop signal.
+    """
+    markers = []
+    key_marker = after
+    version_marker = ""
+    for _ in range(max_pages):
+        params = {"versions": "", "prefix": prefix}
+        if key_marker:
+            params["key-marker"] = key_marker
+        if version_marker:
+            params["version-id-marker"] = version_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListVersionsResult":
+            raise WitnessError("ListObjectVersions %s returned %s (expected ListVersionsResult)" % (prefix, root_name))
+        truncated = False
+        next_key = ""
+        next_version = ""
+        entries = []
+        for child in root:
+            name = local_name(child.tag)
+            if name in ("Version", "DeleteMarker"):
+                key = ""
+                version_id = ""
+                last_modified = ""
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        key = field.text or ""
+                    elif field_name == "VersionId":
+                        version_id = field.text or ""
+                    elif field_name == "LastModified":
+                        last_modified = field.text or ""
+                if key:
+                    entries.append((name == "DeleteMarker", key, version_id, last_modified))
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextVersionIdMarker":
+                next_version = child.text or ""
+            elif name == "Error":
+                raise WitnessError("ListObjectVersions %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and (next_key or next_version):
+            truncated = True
+        keys = [key for _, key, _, _ in entries]
+        ordered = all(before <= current for before, current in zip(keys, keys[1:]))
+        crossed = until is not None and bool(keys) and ordered and keys[-1] > until
+        for is_marker, key, version_id, last_modified in entries:
+            if until is not None and key > until:
+                continue
+            if is_marker:
+                try:
+                    moment = parse_timestamp(last_modified)
+                except ValueError:
+                    raise WitnessError(
+                        "delete marker %s has unparseable LastModified %r" % (key, last_modified))
+                markers.append({"key": key, "version_id": version_id, "last_modified": moment})
+        if crossed or not truncated:
+            return markers
+        if not next_key or not next_version:
+            raise WitnessError("ListObjectVersions %s truncated without a key/version marker" % prefix)
+        key_marker = next_key
+        version_marker = next_version
+    raise WitnessError("ListObjectVersions %s range exceeded %d pages" % (prefix, max_pages))
+
+
+def list_uploads(config, prefix):
+    """ListMultipartUploads -> [{key, upload_id, initiated}]. List-only."""
+    uploads = []
+    key_marker = ""
+    upload_marker = ""
+    for _ in range(1000):
+        params = {"uploads": ""}
+        if prefix:
+            params["prefix"] = prefix
+        if key_marker:
+            params["key-marker"] = key_marker
+        if upload_marker:
+            params["upload-id-marker"] = upload_marker
+        status, body = signed_get(config, params)
+        if status != 200:
+            raise WitnessError("ListMultipartUploads %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise WitnessError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
+        root_name = local_name(root.tag)
+        if root_name != "ListMultipartUploadsResult":
+            # Same fail-closed rule as the other two listings: a parseable
+            # non-list document at HTTP 200 must not read as "no uploads".
+            raise WitnessError("ListMultipartUploads %s returned %s (expected ListMultipartUploadsResult)" % (prefix, root_name))
+        truncated = False
+        next_key = ""
+        next_upload = ""
+        for child in root:
+            name = local_name(child.tag)
+            if name == "Upload":
+                entry = {"key": "", "upload_id": "", "initiated": None}
+                for field in child:
+                    field_name = local_name(field.tag)
+                    if field_name == "Key":
+                        entry["key"] = field.text or ""
+                    elif field_name == "UploadId":
+                        entry["upload_id"] = field.text or ""
+                    elif field_name == "Initiated":
+                        entry["initiated"] = parse_timestamp(field.text or "")
+                if entry["key"]:
+                    uploads.append(entry)
+            elif name == "IsTruncated":
+                truncated = (child.text or "").strip().lower() == "true"
+            elif name == "NextKeyMarker":
+                next_key = child.text or ""
+            elif name == "NextUploadIdMarker":
+                next_upload = child.text or ""
+            elif name == "Error":
+                # Same fail-closed rule as the other two listings.
+                raise WitnessError("ListMultipartUploads %s returned an <Error> child (expected list entries)" % prefix)
+        if not truncated and (next_key or next_upload):
+            # Contradictory server: Next* markers present while IsTruncated is
+            # false/absent. Follow them; the paired-marker guard below rejects
+            # a half-specified resume.
+            truncated = True
+        if not truncated:
+            return uploads
+        if not next_key or not next_upload:
+            # Resuming with only the key marker skips the remaining upload ids
+            # of that key (S3 key-marker-only semantics); require both.
+            raise WitnessError("ListMultipartUploads %s truncated without a key/upload marker" % prefix)
+        key_marker = next_key
+        upload_marker = next_upload
+    raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
+
+
+def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candidate_mode):
+    """Resolve duplicate session.start/session.end markers.
+
+    The strictly-newest LastModified wins with its mode. An exact tie is
+    ambiguous (nothing is "newest"): when the declared modes conflict, fail
+    closed to the conservative `shell` marker (a tar is expected), so neither
+    listing order can silently exempt the session; an identical-mode tie
+    keeps the marker as-is.
+    """
+    if current_time is None or candidate_time > current_time:
+        return candidate_time, candidate_mode
+    if candidate_time < current_time:
+        return current_time, current_mode
+    if (candidate_mode == "exec") != (current_mode == "exec"):
+        return current_time, "shell"
+    return current_time, current_mode
+
+
+def _collect_families(config, boundaries=None):
+    """Run the five list families, bounded-parallel when workers > 1.
+
+    On a sweep with persisted `boundaries` and workers > 1, the two audit
+    families split into key-range branches (R = min(workers // 2,
+    len(boundaries)+1)); the three small families stay single-branch. Ranges
+    are strict on the lower bound and inclusive on the upper, so they
+    partition the ordered key space exactly. Every worker returns the same
+    shapes the sequential code produced; a worker failure propagates here and
+    main() turns it into the `error` verdict. Results merge in submission
+    order (never completion order) so the checks stay deterministic.
+    """
+    boundaries = [boundary for boundary in (boundaries or []) if isinstance(boundary, str)]
+    branches = 0
+    if boundaries and config.list_workers > 1:
+        branches = min(max(1, config.list_workers // 2), len(boundaries) + 1)
+        # Only the first `branches - 1` boundaries can be honored: the final
+        # branch must stay unbounded (until=None) or keys above the last kept
+        # boundary would fall outside every range.
+        boundaries = boundaries[:max(0, branches - 1)]
+
+    def range_at(index):
+        return (boundaries[index - 1] if index > 0 else "",
+                boundaries[index] if index < len(boundaries) else None)
+
+    work = []
+    if branches <= 1:
+        work.append(("audit_objects", lambda: list_objects(config, config.audit_prefix)))
+        work.append(("audit_hidden", lambda: list_object_versions(config, config.audit_prefix)))
+    else:
+        for index in range(branches):
+            after, until = range_at(index)
+            work.append(("audit_objects",
+                         lambda a=after, u=until: list_objects_range(config, config.audit_prefix, a, u)))
+            work.append(("audit_hidden",
+                         lambda a=after, u=until: list_object_versions_range(config, config.audit_prefix, a, u)))
+    work.append(("recordings", lambda: list_objects(config, config.recordings_prefix)))
+    work.append(("uploads", lambda: list_uploads(config, config.recordings_prefix)))
+    work.append(("recordings_hidden", lambda: list_object_versions(config, config.recordings_prefix)))
+    if config.list_workers <= 1:
+        results = [fetch() for _, fetch in work]
+    else:
+        with ThreadPoolExecutor(max_workers=config.list_workers) as executor:
+            futures = [executor.submit(fetch) for _, fetch in work]
+            results = [future.result() for future in futures]
+    audit_objects = {}
+    audit_hidden = []
+    recording_objects = None
+    uploads = None
+    recording_hidden = None
+    for (kind, _), result in zip(work, results):
+        if kind == "audit_objects":
+            audit_objects.update(result)
+        elif kind == "audit_hidden":
+            audit_hidden.extend(result)
+        elif kind == "recordings":
+            recording_objects = result
+        elif kind == "uploads":
+            uploads = result
+        else:
+            recording_hidden = result
+    return audit_objects, recording_objects, uploads, audit_hidden, recording_hidden
+
+
+def _cursors_from_listings(config, audit_objects, recording_objects, now):
+    """High-water keys for the dual-layout audit streams + recordings.
+
+    ``audit_session`` is the **flat-layout** high-water key and
+    ``audit_session_dated`` the **dated-layout** one; each is a max over keys
+    of its own layout only (never one max across layouts - a dated key must
+    never become the flat cursor, or the transition-day dated keys below the
+    flat cursor would false-repair into ``mode=sweep``). A legacy state
+    without the dated cursor is valid: the seed or the transition probe
+    populates it.
+
+    A cursor advances only over keys matching the family's own grammar
+    (is_audit_*_key / is_recording_key) whose key ``<ts>`` is not future-dated
+    (key_ts_is_future): an unshaped key - an acceptance probe, contract drift -
+    still enters the view (audit keys alert as naming-contract/contract-mismatch
+    drift; the recording checks skip unshaped recordings keys), but it must
+    never move a cursor past the real key space, or the next delta lists an
+    empty tail while recordings happen (round-3 live-probe false green). A
+    future-dated shaped key sorts above the whole real key space and would pin
+    the cursor the same way (round-4 RT4.1); it stays a listed event, it just
+    never moves a cursor. The
+    session family is additionally bounded above by the heartbeat stem: an
+    exact `audit/heartbeat` object (or any key after it) is not a session
+    key.
+    """
+    heartbeat_keys = [
+        key for key in audit_objects
+        if is_audit_heartbeat_key(key, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
+    session_keys = [
+        key for key in audit_objects
+        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+    dated_session_keys = [
+        key for key in audit_objects
+        if is_audit_session_dated_key(key, config.audit_prefix, config.heartbeat_prefix)
+        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+    recording_keys = [key for key in recording_objects if is_recording_key(key, config.recordings_prefix)]
+    return {
+        "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
+        "audit_session": max(session_keys) if session_keys else "",
+        "audit_session_dated": max(dated_session_keys) if dated_session_keys else "",
+        "recordings": max(recording_keys) if recording_keys else "",
+    }
+
+
+def _sample_boundaries(keys, workers):
+    """Pick the next sweep's audit-key boundaries (<= 31, ~evenly spaced).
+
+    Boundaries come from the previous sweep's already-materialized key list;
+    no extra listing calls. A missing/short list falls back to one unsplit
+    branch, and a deleted boundary key can only empty one range.
+    """
+    ordered = sorted(keys)
+    count = min(31, max(0, min(workers, 8) - 1))
+    if count <= 0 or len(ordered) < 2:
+        return []
+    step = len(ordered) / float(count + 1)
+    chosen = []
+    for index in range(1, count + 1):
+        candidate = ordered[min(len(ordered) - 1, int(index * step))]
+        if candidate not in chosen:
+            chosen.append(candidate)
+    return chosen
+
+
+def _list_cold_start_streams(config, window_start):
+    """Window-bounded audit seed: heartbeat + dual-layout session streams.
+
+    Recordings as a whole (a `<sid>.tar` key carries no timestamp) and uploads
+    are listed in full by the caller. Versions stay sweep-only, so a seed
+    cannot see a pre-window delete marker - disclosed by compact_blind. The
+    session stream starts at the window-start **day prefix**
+    (`audit/<YYYYMMDD>/`), not at an `audit/<marker>` timestamp: dated keys of
+    that day sort below their flat keys (`/` < `T`), and the seed must return
+    both layouts from the window start onward.
+    """
+    marker = window_start.strftime("%Y%m%dT%H%M%SZ")
+    day_prefix = config.audit_prefix + window_start.strftime("%Y%m%d") + "/"
+    heartbeat_objects = list_objects(
+        config, config.heartbeat_prefix, start_after=config.heartbeat_prefix + marker)
+    session_objects = list_objects(
+        config, config.audit_prefix, start_after=day_prefix,
+        until=config.heartbeat_prefix.rstrip("/"))
+    audit_objects = {}
+    audit_objects.update(session_objects)
+    audit_objects.update(heartbeat_objects)
+    return audit_objects, heartbeat_objects
+
+
+def _delta_dated_listings(config, now, discovered_prefixes, flat_cursor, dated_cursor):
+    """Bounded dated-day listing plan for a delta: ``({day: start_after}, drift)``.
+
+    The plan is the dated cursor's own day resumed with the cursor as its
+    exclusive start, plus the discovered day prefixes that are not below the
+    floor (``day >= day(audit_session_dated)``; with an empty dated cursor the
+    floor is the flat cursor's day) and not future (the day segment later
+    than ``(now + tolerance).date()`` is never listed: it cannot move a cursor
+    and would otherwise satisfy the floor on every run). While the dated
+    cursor is still empty and a flat cursor exists, the flat cursor's own day
+    is added as the transition probe - the first dated keys of the switch day
+    sort below the flat cursor, so the forward discovery cannot see them. Days
+    below the floor are never re-listed (the flat tail re-offers every
+    dual-window day on every run, so re-listing would grow the request cost
+    and re-trigger DeltaTooLong on a large day). Deduped by day; each day is
+    listed by the caller with ``audit/<day>T`` as its ``until`` bound (all
+    dated keys of a day sort before its flat keys) and its own page budget.
+
+    The second return value is the list of **drift prefixes**: a non-heartbeat
+    prefix that is not a valid calendar day is a drift signal without listing
+    its keys (plan §1). A drift prefix above the flat cursor is returned for
+    the caller to inject into the view, so the naming-contract/contract-mismatch
+    classifier judges it from the prefix alone; one at/below the flat cursor is
+    dropped here (like a below-floor day) and stays sweep-bounded - disclosed.
+    """
+    try:
+        bound_date = (now + timedelta(seconds=config.clock_skew_tolerance)).date()
+    except OverflowError:
+        # Absurd operator tolerance: fall back to today's UTC date (fail
+        # closed - only today's days can be non-future) instead of setting
+        # ``bound_date = None`` and silently disabling the future-day
+        # exclusion, which would re-list a forged future day every run.
+        bound_date = now.date()
+    cursor_day = _audit_key_day(config.audit_prefix, dated_cursor) if dated_cursor else ""
+    flat_day = _audit_key_day(config.audit_prefix, flat_cursor) if flat_cursor else ""
+    floor_day = cursor_day or flat_day
+    plan = {}
+    drift_prefixes = []
+    if cursor_day:
+        plan[cursor_day] = dated_cursor
+    elif flat_day:
+        plan[flat_day] = config.audit_prefix + flat_day + "/"
+    for prefix in discovered_prefixes:
+        if not prefix.startswith(config.audit_prefix) or prefix.startswith(config.heartbeat_prefix):
+            continue
+        basename, day = strip_date_segment(prefix[len(config.audit_prefix):])
+        if basename is None or not day:
+            # Not a day: a drift signal judged from the prefix alone, never
+            # listed. Above the flat cursor it must alert in delta instead of
+            # a green no-op; at/below the flat cursor (a nonconformant server
+            # can return it) it stays sweep-bounded and is dropped.
+            if flat_cursor and prefix <= flat_cursor:
+                continue
+            drift_prefixes.append(prefix)
+            continue
+        if floor_day and day < floor_day:
+            continue
+        if datetime.strptime(day, "%Y%m%d").date() > bound_date:
+            continue
+        plan.setdefault(day, config.audit_prefix + day + "/")
+    return plan, drift_prefixes
+
+
+def _delta_repair_sweep(config, observed, now):
+    """Full sweep for a delta recovery (page overflow or cursor nonconformance).
+
+    Returns the same shapes as the sweep branch of `run_checks`: a fresh
+    object/upload/hidden view and fresh cursors, so the delta's untrusted
+    state is discarded rather than merged. `now` bounds the fresh cursors:
+    a future-dated key must not re-pin the rebuilt cursor (round-4 RT4.1).
+    """
+    boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+    audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
+    hidden_objects = [
+        marker
+        for marker in audit_hidden + recording_hidden
+        if marker["key"].startswith(config.audit_prefix)
+        or marker["key"].startswith(config.recordings_prefix)
+    ]
+    return audit_objects, recording_objects, uploads, hidden_objects, _cursors_from_listings(config, audit_objects, recording_objects, now)
+
+
+def run_checks(config, now, plan):
+    # NB: `mode` is the per-key session mode inside the check loops below, so
+    # the run mode needs its own name.
+    run_mode = plan.get("mode", "sweep")
+    observed = plan.get("observed") if isinstance(plan.get("observed"), dict) else {}
+    view = plan.get("view") if isinstance(plan.get("view"), dict) else {}
+    window_start = plan.get("window_start")
+    window_text = None
+    view_dirty = False
+    new_audit = {}
+    new_recordings = {}
+    cursors = dict(observed.get("cursors")) if isinstance(observed.get("cursors"), dict) else {}
+    if run_mode == "seed" and window_start is not None:
+        window_text = utc_stamp(window_start)
+        audit_objects, heartbeat_objects = _list_cold_start_streams(config, window_start)
+        if not heartbeat_objects:
+            # A window with no heartbeat at all: either the shipper is dead
+            # (exactly what the sweep is owed for) or the bucket is empty and
+            # an exact sweep is cheap. Never certify a window from nothing.
+            log("WARNING: cold-start window found no heartbeat; falling back to a full sweep")
+            run_mode = "sweep"
+            window_text = None
+    if run_mode == "sweep":
+        # A sweep that starts and then fails must latch, so record that the
+        # sweep was actually attempted (a planned sweep or an internal
+        # seed/delta fallback), not merely that the plan said "sweep".
+        plan["performed_sweep"] = True
+        boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+        audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
+        hidden_objects = [
+            marker
+            for marker in audit_hidden + recording_hidden
+            if marker["key"].startswith(config.audit_prefix)
+            or marker["key"].startswith(config.recordings_prefix)
+        ]
+        view_dirty = True
+        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+    elif run_mode == "seed":
+        recording_objects = list_objects(config, config.recordings_prefix)
+        uploads = list_uploads(config, config.recordings_prefix)
+        hidden_objects = []
+        view_dirty = True
+        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+    else:
+        # Delta: the retained view plus the dual-layout audit tail (the flat
+        # discovery listing + bounded dated-day streams), the heartbeat tail
+        # and the recordings tail. Versions are sweep-only, so the retained
+        # hidden set is carried unchanged and a delete marker on an old key
+        # lands at the sweep bound. A delta listing that overflows its page
+        # bound abandons the delta and runs an exact sweep instead of reading
+        # a truncated view.
+        audit_objects = dict(view.get("audit_objects") or {})
+        recording_objects = dict(view.get("recording_objects") or {})
+        hidden_objects = list(view.get("hidden") or [])
+        uploads = list_uploads(config, config.recordings_prefix)
+        heartbeat_cursor = cursors.get("audit_heartbeat") or ""
+        session_cursor = cursors.get("audit_session") or ""
+        dated_cursor = cursors.get("audit_session_dated") or ""
+        recording_cursor = cursors.get("recordings") or ""
+        heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+        try:
+            new_heartbeat = list_objects(
+                config, config.heartbeat_prefix, start_after=heartbeat_cursor, max_pages=DELTA_MAX_PAGES)
+            # Dated-day discovery rides the flat tail: `delimiter="/"` returns
+            # the flat keys above the flat cursor (normally none once the flat
+            # writer stopped) plus the day prefixes above it, in one page - the
+            # transition day's own prefix sorts below the flat cursor and is
+            # carried by the dated cursor + probe instead.
+            new_session, discovered_prefixes = list_objects_delimited(
+                config, config.audit_prefix, start_after=session_cursor,
+                until=heartbeat_stem, max_pages=DELTA_MAX_PAGES)
+            dated_plan, drift_prefixes = _delta_dated_listings(
+                config, now, discovered_prefixes, session_cursor, dated_cursor)
+            dated_listings = {}
+            for day in sorted(dated_plan):
+                day_prefix = config.audit_prefix + day + "/"
+                day_bound = config.audit_prefix + day + "T"
+                if day_bound > heartbeat_stem:
+                    day_bound = heartbeat_stem
+                dated_listings[day] = (dated_plan[day], list_objects(
+                    config, day_prefix, start_after=dated_plan[day],
+                    until=day_bound, max_pages=DELTA_MAX_PAGES))
+            new_recordings = list_objects(
+                config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
+        except DeltaTooLong as exc:
+            log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
+            plan["performed_sweep"] = True
+            audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+            new_audit = {}
+            new_recordings = {}
+            run_mode = "sweep"
+            window_text = None
+            view_dirty = True
+        else:
+            # A cursor is a high-water key: a conformant listing never returns
+            # a key at or below it (start-after is exclusive). A server that
+            # does is nonconformant and must fail closed, never silently
+            # re-read or skip keys. The documented trace is preserve-and-repair:
+            # discard the delta, rebuild with a full sweep in this run, and
+            # report error (never green) so the rebuilt block serves the next
+            # fast run. Every dated-day listing is paired with **its own**
+            # start_after bound (the dated cursor's day resumes at the cursor;
+            # a new day starts at its prefix).
+            violation = ""
+            for key in new_heartbeat:
+                if heartbeat_cursor and key <= heartbeat_cursor:
+                    violation = "heartbeat delta returned %s at or below its cursor" % clip(key, 120)
+                    break
+            if not violation:
+                for key in new_session:
+                    if session_cursor and key <= session_cursor:
+                        violation = "session delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if not violation:
+                for day in sorted(dated_listings):
+                    start_after, objects = dated_listings[day]
+                    for key in objects:
+                        if key <= start_after:
+                            violation = "dated delta for %s returned %s at or below its listing bound" % (
+                                day, clip(key, 120))
+                            break
+                    if violation:
+                        break
+            if not violation:
+                for key in new_recordings:
+                    if recording_cursor and key <= recording_cursor:
+                        violation = "recordings delta returned %s at or below its cursor" % clip(key, 120)
+                        break
+            if violation:
+                log("WARNING: %s; repairing with a full sweep" % violation)
+                plan["performed_sweep"] = True
+                audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+                new_audit = {}
+                new_recordings = {}
+                run_mode = "sweep"
+                window_text = None
+                view_dirty = True
+                plan["cursor_repair_reason"] = violation
+            else:
+                new_audit.update(new_heartbeat)
+                new_audit.update(new_session)
+                for day in dated_listings:
+                    new_audit.update(dated_listings[day][1])
+                # A non-day prefix above the flat cursor is a drift signal
+                # from the prefix alone (plan §1): never list its keys, but
+                # never stay green either - inject the prefix itself so the
+                # classifier raises naming-contract/contract-mismatch.
+                for prefix in drift_prefixes:
+                    new_audit[prefix] = now
+                audit_objects.update(new_audit)
+                recording_objects.update(new_recordings)
+                # Same grammar + future filter as _cursors_from_listings: an
+                # unshaped key returned by a tail (an acceptance probe,
+                # drift), or a shaped key dated in the future (sorting above
+                # the real key space), must never advance a cursor. Each
+                # cursor advances only over its own layout's keys.
+                heartbeat_new = [
+                    key for key in new_heartbeat
+                    if is_audit_heartbeat_key(key, config.heartbeat_prefix)
+                    and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
+                session_new = [
+                    key for key in new_session
+                    if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
+                    and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+                dated_new = []
+                for day in dated_listings:
+                    for key in dated_listings[day][1]:
+                        if is_audit_session_dated_key(key, config.audit_prefix, config.heartbeat_prefix) \
+                                and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance):
+                            dated_new.append(key)
+                recording_new = [
+                    key for key in new_recordings
+                    if is_recording_key(key, config.recordings_prefix)]
+                if heartbeat_new:
+                    cursors["audit_heartbeat"] = max(heartbeat_new)
+                if session_new:
+                    cursors["audit_session"] = max(session_new)
+                if dated_new:
+                    cursors["audit_session_dated"] = max(dated_new)
+                if recording_new:
+                    cursors["recordings"] = max(recording_new)
+                view_dirty = bool(new_audit or new_recordings)
+    # Overlapping watched prefixes report one marker twice (same key + version
+    # id in both listings); count each hidden version once.
+    hidden_by_version = {}
+    for marker in hidden_objects:
+        hidden_by_version[(marker["key"], marker["version_id"])] = marker
+    hidden_objects = list(hidden_by_version.values())
+    alerts = []
+    # Stable finding identities for the notification signature. Only stable
+    # identities enter (never an age: the displayed `%ds` fragments drift on
+    # every run and would otherwise trigger a push on every check).
+    finding_ids = []
+    # Enforce the clock-skew contract at collection time: every S3 timestamp
+    # the checks can read (object LastModified, delete-marker LastModified,
+    # multipart Initiated) is
+    # validated once here, so "any S3 timestamp more than 5 min in the future
+    # -> error" holds for every key - including exec sessions that are later
+    # exempt from the gap clock and completed tars whose session.end is
+    # present, which never reach a per-session age check otherwise.
+    if run_mode == "delta":
+        # Every NEW timestamp is validated at collection; the retained view
+        # was validated when each key first entered it, so a delta does not
+        # re-parse the whole retained map.
+        for key, last_modified in new_audit.items():
+            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+        for key, last_modified in new_recordings.items():
+            age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    else:
+        for key, last_modified in audit_objects.items():
+            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+        for key, last_modified in recording_objects.items():
+            age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    for upload in uploads:
+        age_seconds(now, upload["initiated"], "upload %s initiated" % upload["key"], config.clock_skew_tolerance)
+    for marker in hidden_objects:
+        age_seconds(
+            now, marker["last_modified"], "delete marker %s" % marker["key"], config.clock_skew_tolerance)
+
+    if hidden_objects:
+        # Hiding is top-severity tamper evidence: list it first and keep the
+        # detail bounded (counts per prefix, the two newest sample keys —
+        # listing order is not recency, and the newest hides matter most).
+        hidden_counts = []
+        for label, prefix in (("audit", config.audit_prefix), ("recordings", config.recordings_prefix)):
+            number = sum(1 for marker in hidden_objects if marker["key"].startswith(prefix))
+            if number:
+                hidden_counts.append("%s=%d" % (label, number))
+        newest = sorted(hidden_objects, key=lambda marker: marker["last_modified"], reverse=True)
+        hidden_keys = ", ".join(clip(marker["key"], 120) for marker in newest[:2])
+        alerts.append(
+            "hidden-object: %d hidden object(s) (delete marker) — hiding detected "
+            "(the pipeline never deletes; an account-admin delete-capable key hid object(s)) "
+            "[%s; keys: %s]" % (len(hidden_objects), " ".join(hidden_counts), hidden_keys)
+        )
+        finding_ids.append(
+            "hidden-object:"
+            + identity_digest(
+                "%s\0%s" % (marker["key"], marker["version_id"]) for marker in hidden_objects
+            )
+        )
+
+    heartbeat_times = []
+    unrecognized = []
+    for key, last_modified in audit_objects.items():
+        if not key.startswith(config.heartbeat_prefix):
+            continue
+        if HEARTBEAT_KEY_RE.match(key[len(config.heartbeat_prefix):]):
+            heartbeat_times.append(last_modified)
+        else:
+            unrecognized.append(key)
+
+    heartbeat_age = None
+    if not heartbeat_times:
+        alerts.append("heartbeat-missing: no objects under %s" % config.heartbeat_prefix)
+        finding_ids.append("heartbeat-missing")
+    else:
+        heartbeat_age = age_seconds(
+            now, max(heartbeat_times), "newest heartbeat", config.clock_skew_tolerance)
+        if heartbeat_age > config.heartbeat_max_age:
+            alerts.append(
+                "heartbeat-stale: newest heartbeat is %ds old (limit %ds)"
+                % (heartbeat_age, config.heartbeat_max_age)
+            )
+            finding_ids.append("heartbeat-stale")
+
+    sessions = {}
+    contract_bad_keys = []
+    for key, last_modified in audit_objects.items():
+        if key.startswith(config.heartbeat_prefix):
+            continue
+        relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
+        # One optional valid `YYYYMMDD/` day segment: both layouts classify
+        # through the same basename grammar. A malformed day segment
+        # (non-calendar 8 digits) is refused by the helper, and a segment of
+        # any other shape (wrong digit count, a `session.*`-named segment)
+        # stays unstripped, so neither can impersonate a valid dated/flat
+        # key; the drift paths below judge such a key like any other unshaped
+        # one.
+        basename, _day = strip_date_segment(relative)
+        match = SESSION_KEY_RE.match(basename) if basename is not None else None
+        if match:
+            event_type, is_variant = canonical_conflict_type(match.group("etype"))
+            sid = match.group("sid").lower()
+            mode = match.group("mode")
+            seq_text = match.group("seq")
+            seq_end_text = match.group("seq_end")
+            seq = int(seq_text)
+            seq_end = int(seq_end_text) if seq_end_text is not None else seq
+            if _audit_range_is_drift(seq_text, seq_end_text, event_type, mode):
+                # A range on a lifecycle type, a mode marker on a range or a
+                # reversed range is naming/contract drift (D1/D5), judged
+                # before collection: the malformed key never creates session
+                # state and never enters the interval coverage math.
+                contract_bad_keys.append(relative)
+                continue
+            state = sessions.setdefault(
+                sid, {"intervals": [], "duplicates": [], "start": None, "end": None,
+                      "start_mode": None, "end_mode": None, "identities": set()})
+            # A base key and its replay-conflict variant share one identity
+            # (ts, canonical type, start, end): count the interval once so a
+            # legitimate variant cannot read as a `sequence-duplicate`, while
+            # a genuine duplicate from a different timestamp still does. The
+            # identity is for sequence counting ONLY - it must not skip
+            # lifecycle resolution: a same-ts `.exec`/`.shell` marker pair
+            # also shares the identity (the mode is not part of it), so
+            # forcing the second key to skip would let whichever key the
+            # listing returns first win regardless of LastModified (a
+            # stale/equal-LM `.exec` silently exempting a shell session).
+            # Only a key whose type `canonical_conflict_type` actually flags
+            # as a replay-conflict variant skips resolution; every canonical
+            # key reaches `resolve_lifecycle_marker` and the newest marker (or
+            # the conservative conflicting tie) wins in either listing order.
+            identity = (match.group("ts"), event_type, seq, seq_end)
+            if identity not in state["identities"]:
+                state["identities"].add(identity)
+                merged, overlaps = merge_coverage_interval(state["intervals"], seq, seq_end)
+                state["intervals"] = merged
+                state["duplicates"].extend(overlaps)
+            if is_variant:
+                # Variants drop the mode marker by contract and must not
+                # re-resolve the lifecycle marker: the base key (which the
+                # producer only variants because it exists) is authoritative.
+                # A mode marker on a variant is naming drift exactly like a
+                # mode marker on any non-lifecycle base shape.
+                if mode:
+                    contract_bad_keys.append(relative)
+                continue
+            # Duplicate starts and ends resolve by the newest LastModified,
+            # exactly like each other: a re-PUT / replayed marker must not win
+            # just because its key sorts first, or a stale `.exec` start could
+            # silently exempt a session whose newest marker says shell. An
+            # exact tie with conflicting declared modes fails closed to the
+            # conservative `shell` (see resolve_lifecycle_marker).
+            if event_type == "session.start":
+                state["start"], state["start_mode"] = resolve_lifecycle_marker(
+                    state["start"], state["start_mode"], last_modified, mode)
+            elif event_type == "session.end":
+                state["end"], state["end_mode"] = resolve_lifecycle_marker(
+                    state["end"], state["end_mode"], last_modified, mode)
+            elif mode:
+                # The mode marker is contract-defined on start/end only; a
+                # marker anywhere else is naming drift.
+                contract_bad_keys.append(relative)
+            continue
+        generic = NON_SESSION_KEY_RE.match(basename) if basename is not None else None
+        if generic:
+            # A replay-conflict variant (`session.rejected_<hash16>`) is the
+            # same documented event as its base type, never naming drift.
+            event_type, _ = canonical_conflict_type(generic.group("etype"))
+            if _audit_range_is_drift(
+                    generic.group("seq"), generic.group("seq_end"), event_type, ""):
+                # A reversed range (or a range on a lifecycle type) on the
+                # sid-less shape is contract drift (D1/D5), never a documented
+                # event: fail closed before the classification.
+                contract_bad_keys.append(relative)
+                continue
+            if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
+                continue  # documented non-session (or known sid-less session) event
+        # Drift is judged by shape (a UUID-shaped sid or a session.* event
+        # type), not by one literal substring: a rename that drops
+        # "-session." but keeps the sid still fails closed.
+        if basename is None or UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
+            contract_bad_keys.append(relative)
+        else:
+            unrecognized.append(key)
+
+    if contract_bad_keys:
+        alerts.append(
+            "naming-contract: %d audit key(s) look like session events but do not match the shipper naming contract"
+            % len(contract_bad_keys)
+        )
+        finding_ids.append("naming-contract:" + identity_digest(contract_bad_keys))
+    if unrecognized:
+        alerts.append(
+            "contract-mismatch: %d audit object(s) match no documented shipper key shape"
+            % len(unrecognized)
+        )
+        finding_ids.append("contract-mismatch:" + identity_digest(unrecognized))
+
+    # Completed recordings and in-progress uploads keyed by lowercased sid:
+    # sessions are grouped case-insensitively, so an uppercase-sid tar or
+    # upload must satisfy the gap check for the lowercased session id instead
+    # of false-alerting (round-6 F5). The newest LastModified wins a case
+    # collision for the tar clock.
+    recordings_by_sid = {}
+    for key, last_modified in recording_objects.items():
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        current = recordings_by_sid.get(sid)
+        if current is None or last_modified > current:
+            recordings_by_sid[sid] = last_modified
+    upload_sids = set()
+    for upload in uploads:
+        key = upload["key"]
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if match:
+            upload_sids.add(match.group("sid").lower())
+    for sid in sorted(sessions):
+        state = sessions[sid]
+        if state["start"] is None:
+            # Stream closure: session events with no session.start can never
+            # be gap-checked, so they must alert on their own.
+            alerts.append(
+                "session-start-missing: session %s has %d audit event(s) but no session.start"
+                % (sid, len(state["identities"]))
+            )
+            finding_ids.append("session-start-missing:events:" + sid)
+            continue
+        # session.end is authoritative for the exec/shell split: live Teleport
+        # v18 emits `interactive` on the end event only (the start key reads
+        # `.shell` for exec sessions too). With no end yet, the start marker
+        # governs; a missing/legacy marker is shell (conservative: a tar is
+        # expected).
+        if state["end"] is not None:
+            session_mode = "exec" if state["end_mode"] == "exec" else "shell"
+        else:
+            session_mode = "exec" if state["start_mode"] == "exec" else "shell"
+        if session_mode == "exec":
+            continue  # non-interactive exec sessions ship no recording (documented)
+        age = age_seconds(now, state["start"], "session.start", config.clock_skew_tolerance)
+        recording_key = config.recordings_prefix + sid + ".tar"
+        completed_at = recordings_by_sid.get(sid)
+        if completed_at is not None:
+            # The tar satisfies the gap check by itself, so a completed
+            # recording whose session.end never shipped would stay green
+            # forever; anchor the end grace on the tar's own LastModified
+            # (the completer-lag window: > shipper backoff, 15 min default).
+            if state["end"] is None:
+                completed_age = age_seconds(
+                    now, completed_at, "recording %s" % recording_key, config.clock_skew_tolerance)
+                if completed_age > config.completer_lag:
+                    alerts.append(
+                        "session-end-missing: %s completed %ds ago but session %s has no session.end (grace %ds)"
+                        % (recording_key, completed_age, sid, config.completer_lag)
+                    )
+                    finding_ids.append("session-end-missing:" + sid)
+            continue
+        if sid in upload_sids:
+            continue
+        if age <= config.session_grace:
+            continue
+        if state["end"] is None:
+            # No end yet: live v18 marks only the end event, so a `.shell`
+            # start cannot be told apart from an in-flight exec session
+            # (which ships no tar and clears this alert when its `.exec` end
+            # lands). Alert anyway - conservative, never silenced - with
+            # wording that names the ambiguity so triage does not read it as
+            # a confirmed loss. An interactive session whose recording never
+            # started has the same shape and is exactly what must not be
+            # suppressed, which is why a longer bound is not used here (it
+            # would only delay both the false positive and the real gap).
+            alerts.append(
+                "recording-gap: shell session %s started %ds ago with no %s object and no in-progress upload "
+                "(no session.end yet - an in-flight exec session also reads `.shell` until its end ships; "
+                "may clear when the end or tar lands)"
+                % (sid, age, recording_key)
+            )
+            finding_ids.append("recording-gap:pending:" + sid)
+        else:
+            alerts.append(
+                "recording-gap: %s session %s started %ds ago with no %s object and no in-progress upload"
+                % (session_mode, sid, age, recording_key)
+            )
+            finding_ids.append("recording-gap:%s:%s" % (session_mode, sid))
+
+    # Orphan completed recordings: a tar whose sid has no audit events at all
+    # is the extreme tail of stream closure (no start -> no gap clock at all).
+    # The session loop above cannot see it because it only visits observed
+    # sessions, so it is checked here against the same completer-lag grace.
+    for key, completed in recording_objects.items():
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        if sid in sessions:
+            continue
+        completed_age = age_seconds(
+            now, completed, "recording %s" % key, config.clock_skew_tolerance)
+        if completed_age > config.completer_lag:
+            alerts.append(
+                "session-start-missing: %s completed %ds ago but session %s has no audit events at all "
+                "(no session.start; grace %ds)" % (key, completed_age, sid, config.completer_lag)
+            )
+            finding_ids.append("session-start-missing:orphan-tar:" + sid)
+
+    for sid in sorted(sessions):
+        intervals = sessions[sid]["intervals"]
+        duplicates = sessions[sid]["duplicates"]
+        if duplicates:
+            # Overlap detection (D9): merged coverage flags any interval claim
+            # that intersects coverage already declared by another identity -
+            # the same seq under a different ts/type, or the rebuild-overlap
+            # residual. Duplicate coverage is never a drop.
+            alerts.append(
+                "sequence-duplicate: session %s repeats <seq> %s"
+                % (sid, render_interval_ranges(duplicates))
+            )
+            # Identity from ALL overlaps: the detail render caps at 20 ranges
+            # + ellipsis, and hashing the capped render would let an overlap
+            # beyond range 20 ride a quiet pin unchanged.
+            finding_ids.append(
+                "sequence-duplicate:%s:%s"
+                % (sid, identity_digest("%d-%d" % (start, stop) for start, stop in duplicates))
+            )
+        # Origin and gap are INDEPENDENT of the overlap: a concurrent hole (or
+        # an out-of-range first seq) must still be named, not swallowed by a
+        # duplicate finding's former short-circuit (round-1 red-team FIX-3).
+        if intervals[0][0] > 1:
+            alerts.append(
+                "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
+                % (sid, intervals[0][0])
+            )
+            finding_ids.append("sequence-origin:%s:%d" % (sid, intervals[0][0]))
+        # A hole BETWEEN merged intervals only (D9): a declared range covers
+        # its whole span, so an event missing *inside* one is invisible
+        # list-only - the disclosed loss. Judged even when duplicates exist
+        # (the overlap never suppresses the hole). Render bounded from the
+        # observed intervals (never range(low, high+1), which crafted seq
+        # values could hang).
+        missing_ranges = [
+            (high + 1, low - 1)
+            for (_, high), (low, _) in zip(intervals, intervals[1:])
+            if low > high + 1
+        ]
+        if missing_ranges:
+            alerts.append(
+                "sequence-gap: session %s missing <seq> %s"
+                % (sid, render_interval_ranges(missing_ranges))
+            )
+            # Identity from ALL missing ranges: the detail render caps at 20
+            # ranges + ellipsis, and hashing the capped render would let a gap
+            # appearing beyond range 20 ride a quiet pin unchanged.
+            finding_ids.append(
+                "sequence-gap:%s:%s"
+                % (sid, identity_digest("%d-%d" % (start, stop) for start, stop in missing_ranges))
+            )
+
+    for upload in uploads:
+        key = upload["key"]
+        if not key.startswith(config.recordings_prefix):
+            continue
+        match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        if not match:
+            continue
+        sid = match.group("sid").lower()
+        initiated_age = age_seconds(
+            now, upload["initiated"], "upload %s initiated" % key, config.clock_skew_tolerance)
+        ended = sessions.get(sid, {}).get("end")
+        if ended is not None:
+            ended_age = age_seconds(now, ended, "session.end for %s" % sid, config.clock_skew_tolerance)
+            if ended_age > config.completer_lag:
+                alerts.append(
+                    "completer-lag: %s still in progress %ds after session.end (started at %s)"
+                    % (key, ended_age, utc_stamp(upload["initiated"]))
+                )
+                finding_ids.append("completer-lag:" + sid)
+        elif initiated_age > config.open_upload_max_age:
+            # Distinct from completer-lag (session.end seen) and from the
+            # bare-old-multipart rule: an upload with no session.end has no
+            # end-anchored clock, so it gets its own age bound.
+            alerts.append(
+                "open-upload-stale: %s has been open %ds with no session.end (bound %ds)"
+                % (key, initiated_age, config.open_upload_max_age)
+            )
+            finding_ids.append("open-upload-stale:" + sid)
+
+    compact_blind = run_mode == "seed" or (
+        run_mode == "delta" and bool((observed.get("coverage") or {}).get("compact_blind")))
+    if compact_blind:
+        # The seed (or a pre-first-sweep delta on a seeded view) cannot
+        # certify history before its window and skips the sweep-only versions
+        # listing: it can never read as green. The disclosure rides the alert
+        # detail and the finding id, so the signature changes until the first
+        # sweep and notification behaves.
+        window_text = window_text or (observed.get("coverage") or {}).get("window_start")
+        alerts.append(
+            "cold-start: seeded baseline from %s; a full sweep is pending and the "
+            "window-bounded view cannot certify history before the window" % (window_text or "unknown"))
+        finding_ids.append("cold-start")
+    if run_mode == "sweep":
+        boundaries_out = _sample_boundaries(audit_objects, config.list_workers)
+    else:
+        boundaries_out = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+    payload = {
+        "mode": run_mode,
+        "window_start": window_text,
+        "cursors": cursors,
+        "boundaries": boundaries_out,
+        "dirty": view_dirty,
+        "audit_objects": audit_objects if view_dirty else None,
+        "recording_objects": recording_objects if view_dirty else None,
+        "hidden": hidden_objects,
+    }
+    if alerts:
+        return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
+    detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
+        len(sessions), len(uploads), len(audit_objects), len(recording_objects),
+        ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
+    return "ok", detail, finding_signature("ok", []), payload
+
+
+def corrupt_state_destination(path, now):
+    """Pick a never-overwriting destination for an unreadable state file.
+
+    `<state>.corrupt` when free; when that name is already taken (an earlier
+    preservation, or a planted entry such as a directory) a timestamped
+    `<state>.corrupt.<UTCstamp>` name is used, so earlier forensics are never
+    overwritten (round-7 R3).
+    """
+    base = path + ".corrupt"
+    if not os.path.lexists(base):
+        return base
+    stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = "%s.%s" % (base, stamp)
+    suffix = 0
+    while os.path.lexists(candidate):
+        suffix += 1
+        candidate = "%s.%s-%d" % (base, stamp, suffix)
+    return candidate
+
+
+def read_state(path):
+    try:
+        # Read raw BYTES: the cap below is a byte bound (a worst-case
+        # 4-byte-per-char UTF-8 file must not slip past a character count).
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read(STATE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError) as exc:
+        raise WitnessError("state file unreadable: %s" % exc)
+    if len(raw_bytes) > STATE_MAX_BYTES:
+        # An oversized state is invalid input, not a reason to read it whole
+        # (round-7 R2: the unbounded read raised an uncaught MemoryError).
+        raise WitnessError("state file exceeds %d bytes" % STATE_MAX_BYTES)
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WitnessError("state file is not valid UTF-8: %s" % exc)
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        # RecursionError: a pathologically nested JSON document must take the
+        # invalid-state path (preserve + repair), never abort before the
+        # verdict with no files (round-6 F4).
+        raise WitnessError("state file unreadable: %s" % exc)
+    if not isinstance(data, dict):
+        raise WitnessError("state file is not a JSON object")
+    return data
+
+
+def _open_state_file(path, mode):
+    """Open a state/verdict file without following or reusing a planted entry.
+
+    A symlink at `state.json.tmp` or `verdict.log` used to redirect the write
+    (truncate + chmod) at whatever it pointed to, before the tmp was renamed
+    into place (round-6 F3). O_NOFOLLOW refuses a symlink at the final
+    component and O_EXCL refuses to reuse an existing tmp; a stale regular tmp
+    is unlinked first (unlinking a name never touches what it points at).
+    """
+    if mode == "w":
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise OSError("cannot clear stale %s: %s" % (path, clip(exc, 120)))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8")
+
+
+def write_state(path, record):
+    tmp = path + ".tmp"
+    with _open_state_file(tmp, "w") as handle:
+        json.dump(record, handle, indent=1, sort_keys=True)
+        handle.write("\n")
+        os.fchmod(handle.fileno(), 0o600)
+    os.replace(tmp, path)
+
+
+def append_verdict(path, state, detail):
+    try:
+        if os.path.getsize(path) >= VERDICT_LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+    except FileNotFoundError:
+        pass
+    with _open_state_file(path, "a") as handle:
+        handle.write("%s %s %s\n" % (utc_stamp(datetime.now(timezone.utc)), state, detail))
+
+
+def ntfy_token_problem(token):
+    """Why a publish token cannot be an HTTP header value (empty string = ok).
+
+    Header values are latin-1 bytes: a control character (especially CR/LF)
+    makes http.client.putheader raise ValueError and a non-ASCII token raises
+    UnicodeEncodeError. Both used to escape notify()'s transport except-clause,
+    aborting the run before state/verdict with no files (and the ValueError
+    text echoed the token bytes into the traceback). Validate first so a bad
+    token becomes a skipped push, never a crash. The length cap also keeps a
+    pathological token from building a giant header (round-6 F1).
+    """
+    if len(token) > 4096:
+        return "token is longer than 4096 characters"
+    for char in token:
+        if not ("!" <= char <= "~"):
+            return "token is not printable ASCII without spaces"
+    return ""
+
+
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect (ntfy POST and signed S3 list GETs).
+
+    urllib's default redirect handler copies the request headers onto the
+    redirect target, so a 301/302/303 to another host or scheme re-sent the
+    `Authorization` header cross-origin: `Bearer <publish token>` for the ntfy
+    POST (round-6 F2, mirror of pc-admin's R3 fix) and the SigV4
+    `AWS4-HMAC-SHA256 Credential=...` header for the witness S3 client
+    (round-7 R1). Neither call needs a redirect hop, so a 3xx becomes a failed
+    call (logged, retried) with nothing sent to the redirect target.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "refusing redirect to %r" % (newurl,), headers, fp
+        )
+
+
+# One redirect-refusing opener serves the ntfy push (the S3 list client now
+# uses http.client, which has no redirect machinery at all). The module-level
+# _NTFY_OPENER name is patchable for the offline harness.
+_REDIRECT_REFUSING_OPENER = urllib.request.build_opener(RefuseRedirects())
+_NTFY_OPENER = _REDIRECT_REFUSING_OPENER
+
+
+def open_ntfy(request, timeout=15):
+    """Open the ntfy POST through the redirect-refusing opener."""
+    return _NTFY_OPENER.open(request, timeout=timeout)
+
+
+def notify(config, state, detail):
+    """Push the verdict through ntfy when a topic is configured. Best-effort."""
+    if not config.ntfy_topic:
+        return False
+    token = config.ntfy_token
+    problem = ntfy_token_problem(token) if token else ""
+    if problem:
+        # The reason names the class of problem only - never the token bytes;
+        # a bad token must fail the push, not the run (round-6 F1).
+        log("WARNING: ntfy push skipped: %s" % problem)
+        return False
+    headers = {
+        "Title": "recording witness: %s" % state,
+        "Tags": "white_check_mark" if state == "ok" else "warning",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        request = urllib.request.Request(
+            "https://ntfy.sh/" + urllib.parse.quote(config.ntfy_topic, safe=""),
+            data=clip(detail, 800).encode("utf-8"),
+            method="POST",
+        )
+        for name, value in headers.items():
+            request.add_header(name, value)
+        with open_ntfy(request, timeout=15):
+            return True
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # HTTPException covers BadStatusLine / IncompleteRead (not OSError
+        # subclasses); URLError covers the refused-redirect HTTPError. A
+        # transport failure must be logged and retried, never abort the run
+        # before state/verdict.
+        log("WARNING: ntfy push failed: %s" % clip(exc, 200))
+        return False
+    except (ValueError, UnicodeError) as exc:
+        # A late header-validation failure can embed the header value (the
+        # token); log the exception class only, never its message, and keep
+        # the push non-fatal (round-6 F1).
+        log("WARNING: ntfy push failed: %s" % type(exc).__name__)
+        return False
+
+
+def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
+                  state_since_run=0, last_notify_run=0, signature="", last_signature="",
+                  quiet_signature="", quiet_renotify=86400):
+    """Notification bookkeeping.
+
+    Non-green states push on transition and whenever the finding signature
+    changed (a new hidden marker, drift key or session alert is new
+    information no matter how recently the previous push landed). An
+    unchanged non-green state re-notifies every `renotify` window - or every
+    `quiet_renotify` window while an `alert` state's signature equals the
+    operator's quiet pin, so a pinned known finding set reminds daily instead
+    of every 30 minutes, and any signature change leaves the pin behind
+    automatically. The quiet pin applies to `alert` finding sets only: the
+    fixed `error`/`ok` signatures are never quieted, so a new failure cause
+    always keeps the default cadence.
+
+    Green pushes on the non-green -> ok recovery; a recovery push that failed
+    is retried while the current ok state began after the last successful
+    notify (state_since_run > last_notify_run), so a green state never
+    re-pushes once its recovery has landed. The retry boundary is the per-run
+    identity, not the second-resolution epoch: a recovery transition in the
+    same second as the last non-green push still retries, and a landing in
+    that same second still stops (run ids are unique per run).
+    """
+    if state == "ok":
+        if previous_state not in (None, "ok"):
+            return True
+        if previous_state == "ok":
+            return int(state_since_run) > int(last_notify_run)
+        return False  # a first-ever green run has nothing to recover from
+    if state != previous_state:
+        return True
+    last_epoch = int(last_epoch)
+    if last_epoch > now_epoch:
+        # A stored last-push epoch in the future (the anchor clock stepped
+        # ahead, then was corrected) would otherwise suppress renotify until
+        # wall clock catches up; an impossible value is not a reason to stay
+        # silent.
+        return True
+    if signature and signature != last_signature:
+        # The finding set itself changed: push regardless of the window.
+        return True
+    window = renotify
+    if state == "alert" and quiet_signature and signature == quiet_signature:
+        window = quiet_renotify
+    return now_epoch - last_epoch >= int(window)
+
+
+def observed_problem(observed, record_run_seq, config=None, now=None):
+    """Fail-closed validation of the observed/coverage block ('' = valid).
+
+    Any violation (wrong cursor version, bad types, a missing coverage record,
+    a cursor outside its prefix) must take the preserve + repair + sweep path:
+    a delta read from an untrusted cursor is never green.
+    """
+    if not isinstance(observed, dict):
+        return "observed block is not a JSON object"
+    if observed.get("cursor_version") != CURSOR_VERSION:
+        return "observed cursor version is not %d" % CURSOR_VERSION
+    for name in ("generation", "written_run_seq", "last_sweep_ok_epoch",
+                 "last_sweep_ok_run_seq", "sweep_due_epoch"):
+        value = observed.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "observed.%s is invalid: %r" % (name, value)
+    if not isinstance(observed.get("sweep_failed"), bool):
+        return "observed.sweep_failed is invalid: %r" % (observed.get("sweep_failed"),)
+    coverage = observed.get("coverage")
+    if not isinstance(coverage, dict):
+        return "observed.coverage is not a JSON object"
+    if coverage.get("mode") not in ("sweep", "seed", "delta"):
+        return "observed.coverage.mode is invalid: %r" % (coverage.get("mode"),)
+    if not isinstance(coverage.get("compact_blind"), bool):
+        return "observed.coverage.compact_blind is invalid: %r" % (coverage.get("compact_blind"),)
+    window = coverage.get("window_start")
+    if window is not None and not isinstance(window, str):
+        return "observed.coverage.window_start is invalid: %r" % (window,)
+    cursors = observed.get("cursors")
+    if not isinstance(cursors, dict):
+        return "observed.cursors is not a JSON object"
+    prefixes = {
+        "audit_heartbeat": config.heartbeat_prefix if config is not None else "audit/heartbeat/",
+        "audit_session": config.audit_prefix if config is not None else "audit/",
+        "audit_session_dated": config.audit_prefix if config is not None else "audit/",
+        "recordings": config.recordings_prefix if config is not None else "recordings/",
+    }
+    for name, prefix in prefixes.items():
+        value = cursors.get(name)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return "observed.cursors.%s is invalid: %r" % (name, value)
+    session_cursor = cursors.get("audit_session")
+    if isinstance(session_cursor, str) and session_cursor >= prefixes["audit_heartbeat"].rstrip("/"):
+        # The two audit streams partition the ordered key space at the
+        # heartbeat stem (every real session key starts with a digit and
+        # sorts below it): a session cursor at/after the stem - the exact
+        # `audit/heartbeat` stem, `audit/i`, or a heartbeat key - would make
+        # the session delta list an empty tail while real session keys sit
+        # below it (a forged-state false green). Fail closed into repair +
+        # sweep.
+        return "observed.cursors.audit_session is at/after the heartbeat prefix boundary: %r" % session_cursor
+    # A cursor must also match its family's key grammar (layout-specific:
+    # `audit_session` is flat-only, `audit_session_dated` requires a valid
+    # day segment, #159). A forged value below the stem but above the real
+    # key space (`audit/9`, `audit/g`, an acceptance probe, an undated
+    # `audit/20260925/<key>` in the flat slot) passes the prefix check and
+    # would list an empty tail while real keys sit below it (false green), so
+    # it fails closed into the repair + sweep path. An absent dated cursor is
+    # valid legacy state (a pre-#159 block or a flat-only bucket) and skips
+    # every check.
+    for name in ("audit_heartbeat", "audit_session", "audit_session_dated", "recordings"):
+        value = cursors.get(name)
+        if value is None or value == "":
+            continue
+        if name == "audit_heartbeat":
+            shaped = is_audit_heartbeat_key(value, prefixes["audit_heartbeat"])
+        elif name == "recordings":
+            shaped = is_recording_key(value, prefixes["recordings"])
+        elif name == "audit_session_dated":
+            shaped = is_audit_session_dated_key(
+                value, prefixes["audit_session_dated"], prefixes["audit_heartbeat"])
+        else:
+            shaped = is_audit_session_key(
+                value, prefixes["audit_session"], prefixes["audit_heartbeat"])
+        if not shaped:
+            return "observed.cursors.%s does not match the witness key grammar: %r" % (name, value)
+        if now is not None and name != "recordings":
+            # A persisted cursor dated in the future sorts above the real key
+            # space and would list an empty tail while runs stay green
+            # (round-4 RT4.1): fail closed into repair + sweep. Recordings
+            # keys carry no <ts>.
+            tolerance = config.clock_skew_tolerance if config is not None else 0
+            if key_ts_is_future(now, value[len(prefixes[name]):], tolerance):
+                return "observed.cursors.%s is future-dated: %r" % (name, value)
+    boundaries = observed.get("sweep_boundaries")
+    if not isinstance(boundaries, list) or len(boundaries) > 32:
+        return "observed.sweep_boundaries is invalid"
+    if not all(isinstance(entry, str) for entry in boundaries):
+        return "observed.sweep_boundaries carries a non-string entry"
+    if isinstance(record_run_seq, int) and not isinstance(record_run_seq, bool):
+        # A block carried through failed runs keeps its last written identity;
+        # it may lag the record but must never be ahead of it (a foreign
+        # block copied from a newer state).
+        if observed.get("written_run_seq", 0) > record_run_seq:
+            return "observed.written_run_seq %r is ahead of run_seq %r" % (
+                observed.get("written_run_seq"), record_run_seq)
+    return ""
+
+
+def build_observed(previous_observed, payload, now_epoch, run_seq, config):
+    """Build the fresh observed/coverage block written with this run's record.
+
+    A full sweep closes every disclosure: last_sweep_ok_* move, compact_blind
+    clears, the sweep latch releases, and the next sweep is due one interval
+    out. A seed keeps the view blind and defers the first sweep. A delta that
+    did not change the view carries its identity (the sidecar generation and
+    written_run_seq must stay in lockstep with this block).
+    """
+    legacy = previous_observed if isinstance(previous_observed, dict) else {}
+    mode = payload.get("mode", "sweep")
+    dirty = bool(payload.get("dirty"))
+    generation = int(legacy.get("generation", 0) or 0)
+    if dirty:
+        generation += 1
+    legacy_coverage = legacy.get("coverage") if isinstance(legacy.get("coverage"), dict) else {}
+    observed = {
+        "cursor_version": CURSOR_VERSION,
+        "generation": generation or 1,
+        "written_run_seq": run_seq if dirty else int(legacy.get("written_run_seq", 0) or 0),
+        "last_sweep_ok_epoch": int(legacy.get("last_sweep_ok_epoch", 0) or 0),
+        "last_sweep_ok_run_seq": int(legacy.get("last_sweep_ok_run_seq", 0) or 0),
+        "sweep_due_epoch": int(legacy.get("sweep_due_epoch", 0) or 0),
+        "sweep_failed": bool(legacy.get("sweep_failed", False)),
+        "coverage": {
+            "mode": mode,
+            "window_start": payload.get("window_start") or legacy_coverage.get("window_start"),
+            "compact_blind": mode == "seed" or (
+                mode == "delta" and bool(legacy_coverage.get("compact_blind"))),
+        },
+        "cursors": payload.get("cursors") or legacy.get("cursors") or {},
+        "sweep_boundaries": payload.get("boundaries") or [],
+    }
+    if mode == "sweep":
+        observed["last_sweep_ok_epoch"] = now_epoch
+        observed["last_sweep_ok_run_seq"] = run_seq
+        observed["sweep_due_epoch"] = now_epoch + config.sweep_seconds
+        observed["sweep_failed"] = False
+    elif mode == "seed":
+        # Defer the first sweep so the acceptance and the post-start immediate
+        # timer fire do not chain straight into a full sweep.
+        observed["sweep_due_epoch"] = now_epoch + min(config.sweep_seconds, 900)
+    else:
+        observed["sweep_due_epoch"] = int(legacy.get("sweep_due_epoch", 0) or 0) or (now_epoch + config.sweep_seconds)
+    return observed
+
+
+def read_view(path):
+    """Read + parse the observed-view sidecar (timestamp strings -> datetimes)."""
+    try:
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read(VIEW_MAX_BYTES + 1)
+    except FileNotFoundError:
+        raise WitnessError("observed view is missing")
+    except (OSError, ValueError, RecursionError) as exc:
+        raise WitnessError("observed view unreadable: %s" % exc)
+    if len(raw_bytes) > VIEW_MAX_BYTES:
+        raise WitnessError("observed view exceeds %d bytes" % VIEW_MAX_BYTES)
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WitnessError("observed view is not valid UTF-8: %s" % exc)
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise WitnessError("observed view unreadable: %s" % exc)
+    if not isinstance(data, dict):
+        raise WitnessError("observed view is not a JSON object")
+    if not isinstance(data.get("audit_objects"), dict) or not isinstance(data.get("recording_objects"), dict):
+        raise WitnessError("observed view maps are not JSON objects")
+    if not isinstance(data.get("hidden"), list):
+        raise WitnessError("observed view hidden set is not a JSON array")
+    try:
+        data["audit_objects"] = {
+            key: parse_timestamp(value) for key, value in data["audit_objects"].items()}
+        data["recording_objects"] = {
+            key: parse_timestamp(value) for key, value in data["recording_objects"].items()}
+        data["hidden"] = [
+            {"key": entry["key"], "version_id": entry["version_id"],
+             "last_modified": parse_timestamp(entry["last_modified"])}
+            for entry in data["hidden"]
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WitnessError("observed view entry invalid: %s" % exc)
+    return data
+
+
+def view_problem(view, observed):
+    """The sidecar must belong to exactly this observed block ('' = valid)."""
+    if not isinstance(view, dict):
+        return "view is not a JSON object"
+    if view.get("view_version") != VIEW_VERSION:
+        return "view schema version is not %d" % VIEW_VERSION
+    for name in ("generation", "written_run_seq"):
+        value = view.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "view.%s is invalid: %r" % (name, value)
+    if view.get("generation") != observed.get("generation"):
+        return "view.generation %r does not match observed.generation %r" % (
+            view.get("generation"), observed.get("generation"))
+    if view.get("written_run_seq") != observed.get("written_run_seq"):
+        return "view.written_run_seq %r does not match observed.written_run_seq %r" % (
+            view.get("written_run_seq"), observed.get("written_run_seq"))
+    return ""
+
+
+def write_view(path, data):
+    tmp = path + ".tmp"
+    with _open_state_file(tmp, "w") as handle:
+        json.dump(data, handle, sort_keys=True)
+        handle.write("\n")
+        os.fchmod(handle.fileno(), 0o600)
+    os.replace(tmp, path)
+
+
+def view_record(observed_out, payload):
+    """Serialize the merged view for the sidecar (exact timestamp round-trip)."""
+    def stamp(moment):
+        return moment.astimezone(timezone.utc).isoformat()  # ci-allowlist: datetime.isoformat() is a stdlib call, not an SCP image reference.
+    return {
+        "view_version": VIEW_VERSION,
+        "generation": observed_out["generation"],
+        "written_run_seq": observed_out["written_run_seq"],
+        "audit_objects": {
+            key: stamp(moment) for key, moment in (payload.get("audit_objects") or {}).items()},
+        "recording_objects": {
+            key: stamp(moment) for key, moment in (payload.get("recording_objects") or {}).items()},
+        "hidden": [
+            {"key": marker["key"], "version_id": marker["version_id"],
+             "last_modified": stamp(marker["last_modified"])}
+            for marker in (payload.get("hidden") or [])
+        ],
+    }
+
+
+def main():
+    now = datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    config = None
+    signature = finding_signature("error", [])
+    state = "error"
+    detail = "error: witness did not run"
+    payload = None
+    coverage = None
+
+    # The state dir comes first: the observed/coverage block decides whether
+    # this run is a cold-start seed, a full sweep or a delta, so the previous
+    # record must be read before any listing.
+    state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
+    state_path = os.path.join(state_dir, "state.json")
+    view_path = os.path.join(state_dir, "view.json")
+    verdict_path = os.path.join(state_dir, "verdict.log")
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        log("FAIL: cannot create state directory: %s" % clip(exc, 200))
+        log("%s: %s" % (state, detail))
+        return 2
+
+    previous = {}
+    state_bad_reason = ""
+    try:
+        previous = read_state(state_path)
+    except WitnessError as exc:
+        state_bad_reason = str(exc)
+        previous = {}
+        # Keep the unreadable record for forensics instead of overwriting it
+        # outright; the repaired record cannot carry a baseline it could not
+        # read.
+        corrupt_path = None
+        try:
+            corrupt_path = corrupt_state_destination(state_path, now)
+            os.replace(state_path, corrupt_path)
+            log("WARNING: unreadable state file preserved as %s" % corrupt_path)
+        except OSError as exc:
+            # An unwritable state dir disables the preservation; say so
+            # instead of silently dropping forensics (round-6 F8). A name
+            # collision is not a failure: the destination is unique (R3).
+            log("WARNING: cannot preserve unreadable state as %s: %s"
+                % (corrupt_path or (state_path + ".corrupt"), clip(exc, 200)))
+
+    baseline = previous.get("baseline") if isinstance(previous.get("baseline"), dict) else None
+    # Defensive numeric parsing: a type-valid state.json with a corrupted
+    # counter (e.g. "run_seq": "not-a-number") must never crash the run
+    # before the verdict/push. A bad value is treated like any other invalid
+    # state: error verdict + repair, while the readable baseline is held.
+    numerics = {}
+    for name in ("last_notify_epoch", "last_notify_run", "run_seq", "state_since_run", "state_since_epoch"):
+        value = previous.get(name)
+        if value is None:
+            numerics[name] = 0
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            state_bad_reason = state_bad_reason or "state field %s is invalid: %r" % (name, value)
+            numerics[name] = 0
+        else:
+            numerics[name] = value
+
+    run_seq = numerics["run_seq"] + 1
+
+    try:
+        config = Config()
+    except Exception as exc:
+        config = None
+        state = "error"
+        detail = "error: %s: %s" % (type(exc).__name__, exc)
+        signature = finding_signature("error", [])
+
+    # The observed/coverage block decides the run mode. A version-3 record
+    # must carry a valid block: any violation is a fail-closed repair + sweep
+    # (never a delta, never green). A legacy record or no file at all is a
+    # cold start, not a corruption.
+    previous_observed = previous.get("observed") if isinstance(previous.get("observed"), dict) else None
+    observed_reason = ""
+    cold_start_reason = ""
+    if previous and previous.get("version") == STATE_VERSION:
+        if previous_observed is None:
+            # A missing block after a non-error verdict means the cursor/view
+            # was lost or tampered with: fail-closed repair + sweep. After an
+            # error verdict the block may simply never have been built (the
+            # failing run could not list), so this is a cold start, not
+            # corruption - the run must re-seed instead of dereferencing the
+            # missing block (a failed cold start otherwise wedges every later
+            # run with AttributeError before state/verdict are written).
+            if previous.get("state") != "error":
+                observed_reason = "observed block is missing from a version-%d record" % STATE_VERSION
+            else:
+                cold_start_reason = ("observed block is missing after an error verdict; "
+                                     "cold-starting instead of dereferencing it")
+        else:
+            observed_reason = observed_problem(previous_observed, previous.get("run_seq"), config, now)
+    elif previous:
+        # A pre-v3 record carries no observed block by construction (the
+        # schema predates cursors). This is the live-box migration trace:
+        # fail-closed repair + full sweep rebuilds the block, never a silent
+        # seed and never a delta.
+        observed_reason = ("state record version %r predates cursor version %d; "
+                           "rebuilding the observed block with a full sweep"
+                           % (previous.get("version"), STATE_VERSION))
+    if observed_reason:
+        log("WARNING: invalid observed state discarded for a repair sweep: %s" % clip(observed_reason, 200))
+    if cold_start_reason:
+        log("WARNING: %s" % clip(cold_start_reason, 200))
+    forced_reason = state_bad_reason or observed_reason
+    if forced_reason:
+        # Nothing read from the stale view survives the repair: this run
+        # rebuilds the block from a full sweep and never reports green.
+        previous_observed = None
+
+    plan = {"mode": "sweep"}
+    if config is not None and not forced_reason:
+        # `previous_observed` is None here only for a first run, a v3 error
+        # record with no block, or a foreign-version record (which took the
+        # repair path above): all three are cold starts.
+        cold_start = previous_observed is None
+        if cold_start:
+            if config.cold_start_seconds > 0:
+                plan = {"mode": "seed", "window_start": now - timedelta(seconds=config.cold_start_seconds)}
+            else:
+                # The full-sweep escape hatch: exact semantics on first run.
+                plan = {"mode": "sweep"}
+        else:
+            observed = previous_observed
+            sweep_due = bool(observed.get("sweep_failed")) or now_epoch >= int(observed.get("sweep_due_epoch") or 0)
+            if sweep_due:
+                plan = {"mode": "sweep", "observed": observed}
+            else:
+                try:
+                    view = read_view(view_path)
+                    view_reason = view_problem(view, observed)
+                    if view_reason:
+                        raise WitnessError(view_reason)
+                except WitnessError as exc:
+                    log("WARNING: observed view unusable (%s); falling back to a repair sweep" % clip(exc, 200))
+                    observed_reason = "observed view is invalid: %s" % exc
+                    forced_reason = observed_reason
+                    previous_observed = None
+                    plan = {"mode": "sweep"}
+                else:
+                    plan = {"mode": "delta", "observed": observed, "view": view}
+
+    if config is not None:
+        try:
+            state, detail, signature, payload = run_checks(config, now, plan)
+        except Exception as exc:  # fail-closed by design: any failure => error
+            state = "error"
+            detail = "error: %s: %s" % (type(exc).__name__, exc)
+            signature = finding_signature("error", [])
+            payload = None
+        finally:
+            # Drop this thread's pooled S3 connection: the process is one run,
+            # so a stale cross-run socket must not survive a systemd retry.
+            close_connections()
+    detail = clip(detail, 1000)
+
+    if payload is not None and plan.get("cursor_repair_reason"):
+        # A nonconformant delta was repaired with a full sweep in this run:
+        # the delta is untrusted, so the verdict is error (never green) and
+        # the rebuilt block is marked repaired. See docs/recording-witness.md
+        # (preserve-and-repair).
+        observed_reason = "delta cursor nonconformance: %s" % plan["cursor_repair_reason"]
+        if state != "error":
+            state = "error"
+            detail = clip("error: %s" % observed_reason, 1000)
+        signature = finding_signature("error", [])
+
+    if forced_reason:
+        if state != "error":
+            state = "error"
+            detail = clip("error: %s" % forced_reason, 1000)
+        else:
+            detail = clip("%s (state record also invalid: %s)" % (detail, forced_reason), 1000)
+        # An invalid record is not a trustworthy previous state: the error
+        # verdict must push instead of comparing against it.
+        signature = finding_signature("error", [])
+        previous = {}
+
+    renotify = config.renotify if config is not None else 1800
+    quiet_renotify = config.quiet_renotify if config is not None else 86400
+    quiet_signature = config.quiet_signature if config is not None else ""
+    last_notify_epoch = numerics["last_notify_epoch"]
+    last_notify_run = numerics["last_notify_run"]
+    last_notify_signature = previous.get("last_notify_signature")
+    if not isinstance(last_notify_signature, str):
+        # Notification bookkeeping only: a non-string value errs toward
+        # notifying (the change-trigger is never suppressed by a corrupted
+        # value), so it does not force the error/repair path.
+        last_notify_signature = ""
+    # Per-run identity: a monotonic counter written into state.json, never a
+    # second-resolution timestamp, so a genuine same-second run still advances
+    # it while a run that failed to persist state still repeats it.
+    state_since_run = numerics["state_since_run"]
+    state_since_epoch = numerics["state_since_epoch"]
+    previous_state = previous.get("state")
+    # Arm the transition marker only when a PERSISTED previous state changed:
+    # a first-ever run (previous_state None) must not arm it, or the next
+    # green run looks like an un-landed recovery and pushes a spurious ok.
+    if previous_state is not None and previous_state != state:
+        state_since_run = run_seq
+        state_since_epoch = now_epoch
+    if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify,
+                     state_since_run, last_notify_run, signature, last_notify_signature,
+                     quiet_signature, quiet_renotify):
+        if config is not None and notify(config, state, detail):
+            last_notify_epoch = now_epoch
+            last_notify_run = run_seq
+            last_notify_signature = signature
+    observed_out = previous_observed
+    view_to_write = None
+    if payload is not None:
+        observed_out = build_observed(previous_observed, payload, now_epoch, run_seq, config)
+        if payload.get("dirty"):
+            view_to_write = view_record(observed_out, payload)
+    elif observed_out is not None:
+        # The checks could not run: the previous view is unchanged. A sweep
+        # that actually ran (planned or an internal delta/seed fallback) and
+        # failed latches (every later run forces a sweep until one succeeds);
+        # a failed delta just carries the block, still in lockstep with the
+        # sidecar's generation and written_run_seq. A config error (no
+        # run_checks at all) never latches.
+        observed_out = dict(observed_out)
+        if plan.get("performed_sweep"):
+            observed_out["sweep_failed"] = True
+    record = {
+        "version": STATE_VERSION,
+        "state": state,
+        "detail": detail,
+        "updated_at": utc_stamp(now),
+        "run_seq": run_seq,
+        "state_since_run": state_since_run,
+        "state_since_epoch": state_since_epoch,
+        "last_notify_run": last_notify_run,
+        "last_notify_epoch": last_notify_epoch,
+        "signature": signature,
+        "last_notify_signature": last_notify_signature,
+    }
+    if observed_out is not None:
+        record["observed"] = observed_out
+    if state_bad_reason or observed_reason:
+        # Explicit repair evidence: an unreadable/invalid record (or an
+        # invalid observed block) has no trustworthy view, so the observed
+        # block above was rebuilt from scratch and the run is never green.
+        # The run-once acceptance cannot tell a repair from a stale record by
+        # `run_seq` alone, so mark the repair here and name the systemd
+        # invocation that wrote it below; the acceptance only counts a repair
+        # written by the invocation that just ran.
+        record["repaired"] = True
+    invocation = env("INVOCATION_ID", "")
+    if invocation:
+        # systemd's per-runtime-cycle ID (unique 32-hex, the same value
+        # `systemctl show -p InvocationID` reports). A failed state write
+        # leaves the previous record - and its previous invocation - in
+        # place, so this is what lets the acceptance tell "this invocation
+        # repaired the record" from "this invocation never persisted state".
+        record["invocation"] = invocation
+    if state == "error":
+        # Held when it could be read: an un-runnable run never advances the
+        # last good baseline. An unreadable state file has no readable
+        # baseline (the file is kept as state.json.corrupt); the repaired
+        # record says null rather than fabricating one.
+        record["baseline"] = baseline
+    else:
+        record["baseline"] = {"state": state, "detail": detail, "updated_at": utc_stamp(now)}
+    view_written = True
+    if view_to_write is not None:
+        try:
+            write_view(view_path, view_to_write)
+        except OSError as exc:
+            view_written = False
+            log("WARNING: cannot write observed view: %s" % clip(exc, 200))
+    if view_written:
+        try:
+            write_state(state_path, record)
+        except OSError as exc:
+            log("WARNING: cannot write state file: %s" % clip(exc, 200))
+    try:
+        append_verdict(verdict_path, state, detail)
+    except OSError as exc:
+        log("WARNING: cannot append verdict log: %s" % clip(exc, 200))
+    log("%s: %s" % (state, detail))
+    return {"ok": 0, "alert": 1, "error": 2}[state]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+RECORDING_WITNESS_PY_EOF
+RECORDING_WITNESS_FILE_EOF
+}
+
+render_recording_witness_service() { # print the systemd service unit to stdout
+  cat <<RECORDING_WITNESS_UNIT_EOF
+[Unit]
+Description=pc-admin recording-completeness witness (list-only B2 metadata)
+Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/recording-witness.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${RECORDING_WITNESS_SBIN}
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=${RECORDING_WITNESS_STATE_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RECORDING_WITNESS_UNIT_EOF
+}
+
+render_recording_witness_timer() { # print the systemd timer unit to stdout
+  cat <<'RECORDING_WITNESS_TIMER_EOF'
+[Unit]
+Description=Run the pc-admin recording-completeness witness every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+RECORDING_WITNESS_TIMER_EOF
+}
+
+recording_witness_install() { # render + install the component (idempotent)
+  local tmp
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "Installing python3 (witness runtime)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq python3-minimal >/dev/null
+  fi
+  mkdir -p "$(dirname "$RECORDING_WITNESS_SBIN")" "$(dirname "$RECORDING_WITNESS_ENV_FILE")" "$RECORDING_WITNESS_STATE_DIR" \
+    "$(dirname "$RECORDING_WITNESS_SERVICE")" "$(dirname "$RECORDING_WITNESS_TIMER")"
+  chmod 700 "$RECORDING_WITNESS_STATE_DIR"
+  tmp="$(mktemp)"
+  render_recording_witness >"$tmp"
+  bash -n "$tmp" || die "rendered witness script failed bash -n - refusing to install"
+  chmod 0755 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$RECORDING_WITNESS_SBIN"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
+    printf '%s\n' "# DO NOT EDIT BY HAND - re-rendered on every provision run. Holds the"
+    printf '%s\n' "# list-only witness key: mode 0600, root-only, never printed to logs."
+    printf 'RECORDING_WITNESS_ENDPOINT=%q\n' "$RECORDING_WITNESS_ENDPOINT"
+    printf 'RECORDING_WITNESS_BUCKET=%q\n' "$RECORDING_WITNESS_BUCKET"
+    printf 'RECORDING_WITNESS_AUDIT_PREFIX=%q\n' "$RECORDING_WITNESS_AUDIT_PREFIX"
+    printf 'RECORDING_WITNESS_RECORDINGS_PREFIX=%q\n' "$RECORDING_WITNESS_RECORDINGS_PREFIX"
+    printf 'RECORDING_WITNESS_KEY_ID=%q\n' "$RECORDING_WITNESS_KEY_ID"
+    printf 'RECORDING_WITNESS_KEY=%q\n' "$RECORDING_WITNESS_KEY"
+    printf 'RECORDING_WITNESS_STATE_DIR=%q\n' "$RECORDING_WITNESS_STATE_DIR"
+    if [ -n "${RECORDING_WITNESS_REGION:-}" ]; then printf 'RECORDING_WITNESS_REGION=%q\n' "$RECORDING_WITNESS_REGION"; fi
+    if [ -n "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_RENOTIFY_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_QUIET_SIGNATURE:-}" ]; then printf 'RECORDING_WITNESS_QUIET_SIGNATURE=%q\n' "$RECORDING_WITNESS_QUIET_SIGNATURE"; fi
+    if [ -n "${RECORDING_WITNESS_COLD_START_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_COLD_START_SECONDS=%q\n' "$RECORDING_WITNESS_COLD_START_SECONDS"; fi
+    if [ -n "${RECORDING_WITNESS_SWEEP_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_SWEEP_SECONDS=%q\n' "$RECORDING_WITNESS_SWEEP_SECONDS"; fi
+    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$RECORDING_WITNESS_ENV_FILE"
+  render_recording_witness_service >"$RECORDING_WITNESS_SERVICE.tmp.$$"
+  chmod 0644 "$RECORDING_WITNESS_SERVICE.tmp.$$"
+  mv "$RECORDING_WITNESS_SERVICE.tmp.$$" "$RECORDING_WITNESS_SERVICE"
+  render_recording_witness_timer >"$RECORDING_WITNESS_TIMER.tmp.$$"
+  chmod 0644 "$RECORDING_WITNESS_TIMER.tmp.$$"
+  mv "$RECORDING_WITNESS_TIMER.tmp.$$" "$RECORDING_WITNESS_TIMER"
+  systemctl daemon-reload
+  # Enable WITHOUT --now: the acceptance below stops the timer, runs one
+  # synchronous seed/sweep, and restarts the timer on every exit path, so no
+  # timer fire can land between the drain and the acceptance run.
+  systemctl enable pc-recording-witness.timer >/dev/null
+  log "recording witness installed (5 min timer; env file 0600, key never printed)"
+}
+
+recording_witness_redact() { # redact session ids / recording keys from a verdict line
+  python3 - "$1" <<'RECORDING_WITNESS_REDACT_PY'
+import hashlib
+import re
+import sys
+
+
+def _scrub(match):
+    token = match.group(0)
+    return "<redacted:%s:%d>" % (hashlib.sha256(token.encode("utf-8")).hexdigest()[:12], len(token))
+
+
+sys.stdout.write(re.sub(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    _scrub,
+    sys.argv[1],
+))
+RECORDING_WITNESS_REDACT_PY
+}
+
+recording_witness_service_drained() { # no witness invocation in flight right now?
+  local active
+  active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
+  case "${active}" in
+    ""|inactive|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recording_witness_wait_idle() { # bounded wait for a timer-triggered invocation to finish
+  # 3600s, not 100s: a witness run re-lists both watched prefixes in full
+  # (objects + versions + multipart), so its duration grows with the bucket
+  # (~48k audit objects on 2026-09-30; historical install->verdict phases at
+  # ~3.5k keys took 80-182s and no on-box measurement exists at the current
+  # size) and the old 100s bound failed a healthy in-flight run closed on
+  # every dispatch (runs 36658506403/36662210599/36662866976). The bound is a
+  # cap above every plausible run, not added latency: a drain normally returns
+  # as soon as the in-flight run ends. Issue #153 cuts the per-run listing
+  # cost (delta listings + slower full sweeps) and can shrink the bound again.
+  # The drain sleep is `/usr/bin/env sleep 1`, not a bare `sleep 1` and not
+  # `command sleep 1`: `/usr/bin/env` is called by absolute path, so function
+  # and alias lookup cannot shadow `env` itself, and it execs the real sleep
+  # binary, so a definition named after the sleep utility — or after
+  # `command`/`builtin`/`env`, the names an earlier `command sleep 1` fix left
+  # shadowable — whatever its body spelling — `{ … }`, `( : )`, `(( 0 ))`,
+  # `if …; then …; fi`, … — cannot turn the loop into a busy poll and
+  # collapse the 3600s bound. r9 red-team HIGH: a crafted compound-bodied
+  # `sleep` definition before this span ran the harness 535/0 while all 3600
+  # calls no-opped and the bound collapsed to ~2s; `command sleep 1` closed
+  # that spelling chase but `command` is not a special builtin, so a crafted
+  # `command () { :; }` collapsed it identically (0.000s) and `builtin`
+  # shadows the same way. PATH lookup of `sleep` is preserved (`/usr/bin/env`
+  # resolves it through PATH), so the harness's fake-sleep seam still counts
+  # and interleaves the calls; a PATH-prepended shadow binary is refused by
+  # the harness teeth (r13: no `PATH` assignment/export/unset, no
+  # command-position `builtin`/`enable`/`trap`/`hash`, no `$'` quoting in
+  # code), which are a regression detector for the pinned source, not a
+  # sandbox; definition-shaped text for sleep/command/builtin/env is refused
+  # too, defense-in-depth.
+  local attempt active
+  for ((attempt = 0; attempt < 3600; attempt++)); do
+    if recording_witness_service_drained; then
+      return 0
+    fi
+    /usr/bin/env sleep 1
+  done
+  active="$(systemctl show pc-recording-witness.service -p ActiveState --value 2>/dev/null || true)"
+  die "witness unit did not drain within 3600s (ActiveState=${active:-unknown}) — an invocation is in flight and cannot be attributed to this run-once (issue #143); refusing to continue with a possibly merged run"
+}
+
+recording_witness_timer_stop() { # stop the timer so no fire can merge with the acceptance
+  systemctl stop pc-recording-witness.timer >/dev/null 2>&1 || true
+}
+
+recording_witness_timer_start() { # restart the timer on every exit path
+  systemctl start pc-recording-witness.timer >/dev/null 2>&1 || true
+}
+
+recording_witness_accept() { # timer-stopped synchronous acceptance (one run, always restarted)
+  local rc=0
+  # The EXIT trap restarts the timer on EVERY path (success, alert, die):
+  # monitoring is never silently left stopped by a failed acceptance.
+  trap 'recording_witness_timer_start' EXIT
+  recording_witness_timer_stop
+  recording_witness_run_once || rc=$?
+  recording_witness_timer_start
+  trap - EXIT
+  return "$rc"
+}
+
+recording_witness_run_once() { # run one check now and surface the verdict
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced signature
+  # Issue #143: on a long-up box the timer's OnBootSec=2min has already
+  # elapsed, so the timer fires the service as soon as it is enabled (fresh
+  # install) and a reinstall can find a timer-triggered invocation already
+  # in flight. Reading the unit while that invocation runs lets this
+  # function's `systemctl start` merge with its job: the merged start
+  # returns the in-flight run's result while InvocationID stays put, and the
+  # fail-closed gate below then refuses a perfectly valid verdict. Drain
+  # first (bounded) so the captured baseline is stable; the bounded retry
+  # after the start covers a fire that still lands between the drain and the
+  # start. If the unit will not drain, fail closed rather than guess.
+  recording_witness_wait_idle
+  # Anchor freshness to THIS invocation, not to wall-clock recency: a run
+  # that genuinely took longer than the old +/-300 s window must not be
+  # rejected, and a wedged `systemctl start` that never executed ExecStart
+  # (or a failed state write) must not let the previous verdict read as
+  # current. InvocationID changes on every real systemd invocation (skipped
+  # only if the property is unavailable); state.json's per-run identity
+  # (run_seq) must also advance so a run that could not persist state.json
+  # never counts, while two runs in the same wall-clock second still count
+  # (updated_at is second-resolution and may legitimately repeat). The one
+  # exception is an explicit repair written by THIS invocation (`repaired`,
+  # a matching `invocation`, and the `error` verdict a repair always
+  # carries): only an unreadable `run_seq` restarts the counter at 1 (a
+  # valid `run_seq` with another invalid field is kept and still advances),
+  # and that `error` verdict still fails the acceptance closed below.
+  before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  before_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
+  exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+  after_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  # Belt-and-braces for the residual race: if the start still landed on an
+  # in-flight invocation (InvocationID unchanged), a merged `systemctl start`
+  # has only returned once the shared job finished, so the unit is (or will
+  # shortly be) idle again. Retry exactly once and re-anchor the run_seq
+  # baseline to the merged run's write, so the verdict read below belongs to
+  # the retry invocation this run actually started. If InvocationID still
+  # does not advance, the unchanged check below dies exactly as before —
+  # this never accepts a stale state.
+  if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
+    log "witness start did not advance InvocationID (${after_invocation}) — the unit may have merged with an in-flight timer-triggered invocation; retrying once on the now-idle unit (issue #143)"
+    recording_witness_wait_idle
+    before_run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+    rc=0
+    systemctl start pc-recording-witness.service >/dev/null 2>&1 || rc=$?
+    exec_status="$(systemctl show pc-recording-witness.service -p ExecMainStatus --value 2>/dev/null || true)"
+    after_invocation="$(systemctl show pc-recording-witness.service -p InvocationID --value 2>/dev/null || true)"
+  fi
+  # Type=oneshot: the witness alert (exit 1) also makes `systemctl start`
+  # non-zero. A witness run is exactly rc=0+ExecMainStatus=0 (ok),
+  # rc=1+ExecMainStatus=1 (alert) or rc=1+ExecMainStatus=2 (error); anything
+  # else (unset status, exec error 203, a failed start that never executed the
+  # main process) is not a verdict.
+  case "${rc}:${exec_status}" in
+    0:0|1:1|1:2) ;;
+    *) die "witness produced no trustworthy verdict (systemctl rc=${rc} ExecMainStatus=${exec_status:-unset}) — the unit demonstrably did not run; refusing to read a possibly stale state.json" ;;
+  esac
+  state="$(jq -r '.state // "unknown"' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  detail="$(jq -r '.detail // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null | cut -c1-300 || true)"
+  updated_at="$(jq -r '.updated_at // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  run_seq="$(jq -r '.run_seq // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  repaired="$(jq -r '.repaired // false' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  state_invocation="$(jq -r '.invocation // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  if [ -n "${after_invocation}" ] && [ "${after_invocation}" = "${before_invocation}" ]; then
+    die "witness unit did not start a new invocation (InvocationID ${after_invocation} unchanged, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale state.json"
+  fi
+  state_advanced=yes
+  if [ -z "${run_seq}" ] || [ "${run_seq}" = "${before_run_seq}" ]; then
+    state_advanced=no
+    if [ -n "${run_seq}" ] && [ "${repaired}" = "true" ] && [ "${state}" = "error" ] && [ -n "${state_invocation}" ] && [ "${state_invocation}" = "${after_invocation}" ]; then
+      state_advanced=yes
+      log "witness state was repaired by this invocation (run_seq reset to ${run_seq}); reading the explicit repair verdict"
+    fi
+  fi
+  if [ "${state_advanced}" != "yes" ]; then
+    die "witness state did not advance (run_seq=${run_seq:-none}, before=${before_run_seq:-none}, updated_at=${updated_at:-none}, systemctl rc=${rc} ExecMainStatus=${exec_status}) — refusing to read a possibly stale verdict"
+  fi
+  # A `repaired` record is only trustworthy as the `error` verdict the shipped
+  # writer always forces. Enforce that AFTER advancement is granted, not only
+  # in the collision branch above: when the prior run_seq does not render as
+  # the same non-empty string (unreadable state -> ""; a missing run_seq;
+  # "01"; 1.0; -1; true) or is simply advanced (5 -> 6), the outer check
+  # passes. The invocation field is only evidence for the collision-branch
+  # exception (run_seq did not move); a fresh run_seq already authenticates
+  # the record as THIS run's write, so every repaired non-error record dies
+  # here however it names its invocation.
+  if [ "${repaired}" = "true" ] && [ "${state}" != "error" ]; then
+    die "witness state carries repaired=true but state=${state} (a repaired record must be error) — no trustworthy verdict; refusing to finish blind"
+  fi
+  detail="$(recording_witness_redact "${detail}")"
+  signature="$(jq -r '.signature // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  case "${state}:${exec_status}" in
+    ok:0) log "witness verdict: OK - ${detail}" ;;
+    alert:1) warn "witness verdict: ALERT - ${detail} (the witness works; the recording pipeline has an open alert)" ;;
+    error:2) die "witness verdict: ERROR - ${detail} (an un-runnable witness fails the run closed; fix the config and re-dispatch)" ;;
+    *) die "witness produced no trustworthy verdict (state=${state:-missing} ExecMainStatus=${exec_status} rc=${rc}) - refusing to finish blind" ;;
+  esac
+  if [ -n "${signature}" ]; then
+    # Safe to log: a sha256 over finding identities, never raw keys. The
+    # operator copies it into the RECORDING_WITNESS_QUIET_SIGNATURE variable
+    # to keep the daily quiet re-notify while this exact finding set persists.
+    log "witness finding signature: ${signature}"
+  fi
+  coverage_mode="$(jq -r '.observed.coverage.mode // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  if [ -n "${coverage_mode}" ]; then
+    # A seed run discloses that the verdict is window-bounded until the first
+    # sweep; a sweep run closes the disclosure; a delta run is a fast refresh.
+    log "witness coverage: mode=${coverage_mode}"
+  fi
+}
+
+recording_witness_disable() { # remove a previously installed component
+  if [ ! -e "$RECORDING_WITNESS_SERVICE" ] && [ ! -e "$RECORDING_WITNESS_TIMER" ] && [ ! -e "$RECORDING_WITNESS_SBIN" ] && [ ! -e "$RECORDING_WITNESS_ENV_FILE" ]; then
+    return 0
+  fi
+  log "recording witness disabled (no RECORDING_WITNESS_* env) - removing the timer and rendered artifacts"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now pc-recording-witness.timer >/dev/null 2>&1 || true
+    systemctl stop pc-recording-witness.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$RECORDING_WITNESS_SERVICE" "$RECORDING_WITNESS_TIMER" "$RECORDING_WITNESS_SBIN" "$RECORDING_WITNESS_ENV_FILE"
+  log "witness state + verdict log kept at ${RECORDING_WITNESS_STATE_DIR} (evidence; remove by hand to reset)"
+}
+# --- END RECORDING WITNESS ---
+
+# ---------------------------------------------------------------------------
+# g) Recording-completeness witness (list-only; optional)
+#    Renders + enables the 5-minute witness timer when the RECORDING_WITNESS_*
+#    env is fully set. Missing env = the component stays dormant (tenants
+#    unaffected) and a previously installed copy is removed, so a retire never
+#    leaves a stale timer. A partial env is a config error (fail closed).
+#    Env in: RECORDING_WITNESS_ENDPOINT / _BUCKET / _AUDIT_PREFIX /
+#    _RECORDINGS_PREFIX / _KEY_ID / _KEY (list-only), plus the existing
+#    NTFY_TOPIC / NTFY_TOKEN for alert pushes. Docs: docs/recording-witness.md.
+# ---------------------------------------------------------------------------
+case "$(recording_witness_state)" in
+  on)
+    log "Installing the list-only recording-completeness witness (B2 metadata checks)"
+    recording_witness_install
+    recording_witness_accept
+    ;;
+  partial)
+    witness_problem="$(recording_witness_config_problem)"
+    die "recording-witness env is partial: ${witness_problem:-unknown problem}. Set every RECORDING_WITNESS_* repo secret or none at all (docs/recording-witness.md)."
+    ;;
+  off)
+    recording_witness_disable
+    ;;
+esac
+
+log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-<alias>.status.piercloud.net} (visitor TLS at the edge; the origin leg on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

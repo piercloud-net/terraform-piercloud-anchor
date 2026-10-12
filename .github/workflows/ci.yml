@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Maintainer-triggered fallback: run CI on a ref when GitHub's event
+  # delivery is degraded. Fresh check runs land on the ref tip; this does
+  # not re-associate checks with an open PR.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -334,11 +338,12 @@ jobs:
           # and fail on anything else netcup-shaped in the CI-called surface
           # (provision.yml + .github/scripts). Permitted today:
           #   URLs: the SCP REST base, the two A1 egress-IP endpoints, ntfy,
-          #   and the Cloudflare DNS API (anchor A-record upsert + verify).
+          #   the Cloudflare DNS API (anchor A-record upsert + verify), and
+          #   the Gcore DNS API (A2 writer; the `.net` provider switch is B).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com|api\.gcore\.com)(/|$)'
           # Passwordless bootstrap (issue #50) extends the surface with task
           # polling (/tasks) and the approver guard (/users/{id}); the
           # provisioning-only stems above stay intact (sanity check enforces).
@@ -569,8 +574,9 @@ jobs:
           set -euo pipefail
           # issue #123: the zone-wide shared origin pair is retired. No tracked
           # .tf/.sh/.yml may reference its secret prefix — the per-anchor pair
-          # (key generated on the box, cert returned via the cert-only repo
-          # variable) replaced it. Pattern runs from the contract source
+          # (key generated on the box, leaf-first chain returned via the
+          # cert-only repo variable) replaced it. Pattern runs from the
+          # contract source
           # (/tmp/contract-origin.yml — see the fetch step); files scanned stay
           # on HEAD. A line carrying 'ci-allowlist: <reason>' (10+ chars) is
           # the only escape hatch; the pattern's own defining line uses it.
@@ -633,7 +639,11 @@ jobs:
             # large list makes grep's early exit SIGPIPE the writer
             # (pipeline rc 141), which silently turns this match into
             # run=no on exactly the big PRs that need the harnesses.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|origin-ca|gatus-render)/)' <<<"$changed"; then
+            # `.*\.tf$` is part of the gate on purpose: the 010<->
+            # cloudfront_ranges.tf sync tooth and the firewall-wiring
+            # assertions live in tests/edge-origin-auth, so a ranges
+            # refresh or rule edit must not skip them.
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|edge-origin-auth|origin-ca|recording-witness)/|.*\.tf$)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -654,12 +664,16 @@ jobs:
           bash tests/sweep-pre-classify/run-test.sh
           bash tests/sweep-post-shapes/run-test.sh
           bash tests/naming-scheme/run-test.sh
+          bash tests/anchor-dns/run-test.sh
           bash tests/ntfy-token-handrun/run-test.sh
           bash tests/retention-cap/run-test.sh
           bash tests/policy-naming/run-test.sh
           bash tests/public-log-safety/run-test.sh
+          bash tests/edge-origin-auth/run-test.sh
+          bash tests/config-file-mounts/run-test.sh
           bash tests/origin-ca/run-test.sh
           bash tests/gatus-render/run-test.sh
+          bash tests/recording-witness/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |

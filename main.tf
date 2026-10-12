@@ -56,7 +56,7 @@ resource "netcup_scp_user_firewall_policy" "tang" {
 
   user_id     = var.scp_user_id
   name        = local.policy_name
-  description = "Caddy origin (TCP/80+443) from the main box + Cloudflare edge only; egress open. Managed by terraform-piercloud-anchor."
+  description = "Caddy origin (TCP/80+443): :80 main box + Cloudflare edge (orange/ACME); :443 CloudFront origin-facing ranges + main box only; egress open. Managed by terraform-piercloud-anchor."
 
   rules = concat(
     [
@@ -79,8 +79,11 @@ resource "netcup_scp_user_firewall_policy" "tang" {
     ] : [],
     local.extra_ingress_rules,
     # Caddy owns :80 (tang proxy + ACME HTTP-01 arrive via the orange
-    # cloud; the main box still reaches :80 direct for clevis). :443
-    # admits the edge only; :8080/:8081 never leave loopback (on-box
+    # cloud; the main box still reaches :80 direct for clevis). :443 is the
+    # CloudFront origin leg: only the published CLOUDFRONT_ORIGIN_FACING
+    # ranges (local.cloudfront_origin_facing_cidrs) plus the main box are
+    # admitted — Caddy additionally requires the X-Piercloud-Origin secret
+    # header from those peers. :8080/:8081 never leave loopback (on-box
     # bindings, not firewall rules).
     # Live 2026-09-08 (issue #61): the rixlhq/netcup provider models
     # `sources` as an order-significant List, but the SCP API echoes it
@@ -101,7 +104,20 @@ resource "netcup_scp_user_firewall_policy" "tang" {
       }
     ],
     [
-      for cidr in local.cf_edge_cidrs : {
+      {
+        action            = "ACCEPT"
+        direction         = "INGRESS"
+        protocol          = "TCP"
+        destination_ports = "443"
+        sources           = ["${var.allow_main_box_ipv4}/32"]
+      },
+    ],
+    # No main-box IPv6 :443 rule: the Caddy gate exempts the v4
+    # MAIN_BOX_IPV4/32 only (call D), so a v6 peer would be
+    # firewall-admitted and Caddy-aborted — dead and misleading.
+    # allow_main_box_ipv6 stays the :80 tang path (its documented scope).
+    [
+      for cidr in local.cloudfront_origin_facing_cidrs : {
         action            = "ACCEPT"
         direction         = "INGRESS"
         protocol          = "TCP"
