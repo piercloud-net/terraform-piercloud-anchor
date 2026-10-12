@@ -25,7 +25,7 @@
 # Environment:
 #   ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN — set by the
 #     runner when the job carries `id-token: write`.
-#   BROKER_URL — https base URL (default https://broker.piercloud.net).
+#   BROKER_URL — https base URL (default host broker.piercloud.net).
 #
 # The IPv4 shape check is duplicated here on purpose: the value arrives from
 # the resolve step's `$GITHUB_OUTPUT`, and this lib is also called by the
@@ -139,7 +139,7 @@ report_anchor_ip() { # $1 = anchor_ref, $2 = ipv4
   base="${BROKER_URL:-https://broker.piercloud.net}"
   base="${base%/}"
   case "$base" in
-    https://*) ;;
+    https:*//*) ;;
     *)
       echo "::error::broker report: BROKER_URL must be an https URL (got a non-https value) — refusing." >&2
       return 1
