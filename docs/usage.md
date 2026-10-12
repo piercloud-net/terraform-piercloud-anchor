@@ -23,7 +23,7 @@ In the netcup SCP (web UI, TOTP 2FA), order a small VPS — the [VPS pico G11s](
 
 **Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — ignore the password entirely. Keep the email for the printed SSH fingerprints to verify the host key on first contact. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
-Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
+Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — `TENANT_USER`, `NET_DNS_PROVIDER`, `STATUS_EDGE_DOMAIN` — nothing to touch). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
 
 - **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — the ONE required secret (provider credential only; the SCP user id resolves itself from your approval token — override via `SCP_USER_ID` repo secret only if yours differs)
 - nothing else to enter: your username, hostname, anchor IP, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers
@@ -72,7 +72,7 @@ The run opens the hardened A1 self-open /32 SSH window, sets its own one-time ro
 
 The tang thumbprint reaches you via the H1 chain — run artifact (`retention-days: 90` = the public-repo cap, a 90-day convenience copy only; the durable legs — committed break-glass file via reviewable App PR and the platform registry — are pending). Never rely on logs or artifacts alone (repo logs are a separate setting, also capped at 90 days on public repos). `mode=check` asserts every workflow's retention stays within the cap. **Save the thumbprint in your PM NOW** (and finish the [day-1 checklist](dr.md#day-1-off-device-checklist)).
 
-The run also creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net` → anchor IPv4) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://status-<you>.piercloud.net` (TLS terminated on the box by Caddy; nothing to enter).
+The run also creates/verifies the anchor DNS record (`anchor-01-<alias>.piercloud.net` → anchor IPv4) and the dashboard CNAME (`<you>.status.piercloud.net` → the platform status edge) automatically, after A1 close and before any thumbprint goes out. The same run fronts the uptime dashboard at `https://<you>.status.piercloud.net` (served through the platform status edge; visitor TLS ends at the edge, and the edge→origin leg's TLS is terminated on the box by Caddy; nothing to enter). *(Edge live 2026-10-07; the anchor-side cutover (nested-SAN cert + origin auth) is the remaining step — until it lands the flat `status-<you>.piercloud.net` name serves through the orange cloud.)*
 
 ## 5. Bind your main box (clevis) — at its keyboard, not your phone
 
@@ -113,10 +113,10 @@ Planned — enforcement (including the canary-fail proof gate) lands with live M
 
 ## 9. Explore later: push alerts + extra monitors (optional, after the bind)
 
-The anchor already watches your homepage and tang itself, and prints statuses into the run log. When you want taps on the shoulder instead:
+The anchor already watches your homepage, tang itself, and the platform. The platform row is monitor-only on your page — it exists so you can tell "platform problem" from "my problem". The operator anchor watches the same platform and alerts on it. When you want taps on the shoulder instead:
 
 - install the [ntfy app](https://ntfy.sh), subscribe to any random topic name (yours), then set repo secrets `NTFY_TOPIC` (that name) + `NTFY_TOKEN` only if your ntfy server needs auth (empty for ntfy.sh hosted) — re-dispatch `mode=apply` to take effect.
-- extra targets: `GATUS_ENDPOINTS` repo secret, comma-separated `name=url` (`blog=https://blog.example.com`, HTTP(S) only) + re-dispatch.
+- extra targets: `GATUS_ENDPOINTS` repo secret, comma-separated `name=url` (`blog=https://blog.example.com`, HTTP(S) only) + re-dispatch. `main` and `platform` are reserved monitor names — a `GATUS_ENDPOINTS` pair using either fails the run.
 
 ## 10. External watch: always-on, GitHub-side (automatic)
 
@@ -134,5 +134,5 @@ The anchor already watches your homepage and tang itself, and prints statuses in
 - No netcup identifiers in public run output: server id, SCP user id, order name, MAC and the account's server list are masked at first receipt or never printed; policy names carry the public hostname / run id only. This repo is public — anyone with a (free) GitHub account can read every run log, summary and artifact; anonymous visitors see run and artifact metadata.
 - The explicit deny-list (logs/summaries/artifacts/committed files): customer number, SCP user id, server id, order name, MAC, device/access/refresh tokens, root-password paths/values, private keys, account server lists, a resolved server's address inventory beyond its public A-record address, tenant GitHub identities, SSH host keys, tang fingerprints (published only via H1).
 - No sovereignty-downgrade fallback, ever (C-A) — failed check = no apply.
-- The anchor holds no credential that reaches your main box (its only cross-box interaction is answering clevis challenges on TCP/80).
+- The anchor holds no credential that reaches your main box (its cross-box interactions are answering clevis challenges on TCP/80, serving ACME challenges to the Cloudflare edge on TCP/80 and the dashboard to the CloudFront edge on TCP/443 (edge live 2026-10-07; the anchor-side cutover is the remaining step), and probing your public endpoints for availability — no credential reaches the main box either way).
 - Workflows never touch rescue/image/snapshot/iso/disk surfaces (CI allowlist grep from `main`); tang-key management is never offered through automation.

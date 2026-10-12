@@ -64,7 +64,7 @@
 #       the grace (and stays quiet inside it);
 #       mode-marker fixtures are built with the pc-admin shipper key grammar
 #       (shipper_keys.py, pinned to the SHA in PINNED_PC_ADMIN_SHA, currently
-#       cad0p/pc-admin @ 262e98c; the generator's
+#       cad0p/pc-admin @ 1b9946c; the generator's
 #       provenance guard compares content, not `git status` — an
 #       assume-unchanged/skip-worktree worktree edit cannot smuggle unpinned
 #       builder bytes, replacement refs are disabled (`git replace` cannot
@@ -186,6 +186,16 @@
 #       the replica builds the dated layout by default (`--flat` legacy) and
 #       the checked-in vectors replay dated goldens, flat legacy vectors and
 #       the day-segment split (valid/flat/malformed refusals).
+#   (m) seq-range interval continuity (issue #159 phase 2, pc-admin #29):
+#       the key grammar accepts the optional inclusive `<seq>-<seq-end>`
+#       token; ranges merge into coverage intervals (contiguous ranges green,
+#       a hole BETWEEN intervals alerts sequence-gap, overlap alerts
+#       sequence-duplicate, a replay-conflict range variant folds onto the
+#       base interval); a range on a lifecycle type, a mode marker on a range
+#       and a reversed range are naming-contract drift that never moves a
+#       cursor; an 18-digit range parses while a 19-digit end is drift; an
+#       event missing INSIDE a declared range is invisible list-only (the
+#       disclosed loss, pinned green).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -215,7 +225,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=965
+MIN_CHECKS=1010
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -233,6 +243,26 @@ variant_key() { # replay-conflict variant: --variant <body> <event-type> <ts> [s
 dated_key() { # dated `audit/YYYYMMDD/<basename>` (the pinned builder's layout)
   python3 "${HARNESS_DIR}/shipper_keys.py" "$@"
 }
+range_key() { # flat batched range key (pc-admin #29): --range <end> <type> <ts> [sid] [seq]
+  local range_end="$1"
+  shift
+  python3 "${HARNESS_DIR}/shipper_keys.py" --flat --range "${range_end}" "$@"
+}
+dated_range_key() { # dated batched range key
+  local range_end="$1"
+  shift
+  python3 "${HARNESS_DIR}/shipper_keys.py" --range "${range_end}" "$@"
+}
+range_variant_key() { # flat replay-conflict variant of a range key
+  local body="$1" range_end="$2"
+  shift 2
+  python3 "${HARNESS_DIR}/shipper_keys.py" --flat --variant "${body}" --range "${range_end}" "$@"
+}
+dated_range_variant_key() { # dated replay-conflict variant of a range key
+  local body="$1" range_end="$2"
+  shift 2
+  python3 "${HARNESS_DIR}/shipper_keys.py" --variant "${body}" --range "${range_end}" "$@"
+}
 dated_variant_key() { # dated replay-conflict variant
   python3 "${HARNESS_DIR}/shipper_keys.py" --variant "$@"
 }
@@ -243,7 +273,11 @@ audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
-# were generated from the real builder at cad0p/pc-admin @ 262e98c
+# were generated from the real builder at cad0p/pc-admin @ 1b9946c
+# (pc-admin #29: the optional inclusive seq-range token on batched
+# non-lifecycle keys, `build_audit_range_key` + the parser's `seq_end` + the
+# range-preserving `disambiguate_audit_key`); the previous grammar point was
+# cad0p/pc-admin @ 262e98c
 # (scripts/lib/b2_client.py build_audit_key/session_mode/disambiguate_audit_key/
 # split_audit_date_segment + parse_audit_key_full, the full-SHA pin in
 # shipper_keys.py; the pinned point (pc-admin #39 r3) `\Z`-anchored the
@@ -400,6 +434,35 @@ is "replica dated golden session.start variant keeps the day segment" \
 is "replica dated golden user.login variant keeps the day segment" \
   "audit/${DATE}/20260925T100008Z-user.login_${VARIANT_HASH}.000006.json" \
   "$(dated_variant_key "${VARIANT_BODY}" user.login 20260925T100008Z "" 6)"
+# Seq-range grammar (pc-admin #29): the inclusive `<seq>-<seq-end>` token on
+# batched (non-lifecycle) keys, both layouts, with the degenerate `[seq, seq]`
+# and the 18-digit ceiling; the replay-conflict variant preserves the range.
+RANGE_BODY='{"event":"session.data","seq":2,"v":"harness-range"}'
+RANGE_HASH="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])' "${RANGE_BODY}")"
+is "replica golden flat session.data range 2-7" \
+  "audit/20260925T100008Z-session.data.${REPLICA_SID}.000002-000007.json" \
+  "$(range_key 7 session.data 20260925T100008Z "${REPLICA_SID}" 2)"
+is "replica dated golden session.data range 2-7" \
+  "audit/${DATE}/20260925T100008Z-session.data.${REPLICA_SID}.000002-000007.json" \
+  "$(dated_range_key 7 session.data 20260925T100008Z "${REPLICA_SID}" 2)"
+is "replica dated golden user.login range 3-9" \
+  "audit/${DATE}/20260925T100008Z-user.login.000003-000009.json" \
+  "$(dated_range_key 9 user.login 20260925T100008Z "" 3)"
+is "replica golden degenerate range 5-5 (dual shape)" \
+  "audit/20260925T100008Z-session.data.${REPLICA_SID}.000005-000005.json" \
+  "$(range_key 5 session.data 20260925T100008Z "${REPLICA_SID}" 5)"
+is "replica golden seq-0 range 0-4 (build_audit_range_key accepts 0)" \
+  "audit/${DATE}/20260925T100008Z-session.data.${REPLICA_SID}.000000-000004.json" \
+  "$(dated_range_key 4 session.data 20260925T100008Z "${REPLICA_SID}" 0)"
+is "replica golden 18-digit ceiling range 1-10^18-1" \
+  "audit/20260925T100008Z-session.data.${REPLICA_SID}.000001-999999999999999999.json" \
+  "$(range_key 999999999999999999 session.data 20260925T100008Z "${REPLICA_SID}" 1)"
+is "replica golden session.data range variant (range preserved)" \
+  "audit/20260925T100008Z-session.data_${RANGE_HASH}.${REPLICA_SID}.000002-000007.json" \
+  "$(range_variant_key "${RANGE_BODY}" 7 session.data 20260925T100008Z "${REPLICA_SID}" 2)"
+is "replica dated golden user.login range variant (range preserved)" \
+  "audit/${DATE}/20260925T100008Z-user.login_${RANGE_HASH}.000003-000009.json" \
+  "$(dated_range_variant_key "${RANGE_BODY}" 9 user.login 20260925T100008Z "" 3)"
 # The replica must refuse any unexpected shape instead of silently building a
 # key the real shipper cannot emit.
 replica_refuses() { # <label> <expected-refusal-reason> + shipper_keys.py args; non-zero = refused
@@ -485,6 +548,13 @@ replica_refuses "over-long non-exact session.data type without a sid (capped nea
 # same argv would reach the sid-less-session refusal instead.
 replica_refuses "trailing-newline type (real newline, \Z grammar)" "outside the shipper grammar" \
   $'session.data\n' 20260925T100008Z "" 1
+# pc-admin #29 range drifts: reversed, lifecycle, mode-on-range and an end
+# beyond the 18-digit grammar refuse with the real builder's reason.
+replica_refuses "reversed session range (7-2)" "seq_end must be" --flat --range 2 session.data 20260925T100008Z "${REPLICA_SID}" 7
+replica_refuses "reversed non-session range (7-2)" "seq_end must be" --flat --range 2 user.login 20260925T100008Z "" 7
+replica_refuses "range on a lifecycle type" "lifecycle event" --flat --range 2 session.start 20260925T100008Z "${REPLICA_SID}" 1 shell
+replica_refuses "mode marker on a range" "contract-defined on lifecycle" --flat --range 2 session.data 20260925T100008Z "${REPLICA_SID}" 1 shell
+replica_refuses "range end beyond the 18-digit grammar" "seq_end must be" --flat --range 1000000000000000000 user.login 20260925T100008Z "" 1
 
 # Direct-API teeth for the sid type (functional round-10 LOWs): the CLI is
 # string-only, so only a direct call can pass a non-string sid. The real
@@ -570,10 +640,11 @@ with open(matrix_path, "rb") as matrix_file:
 vectors = json.loads(matrix_bytes.decode("utf-8"))
 
 
-def replay(args, body=None, flat=False):
+def replay(args, body=None, flat=False, seq_end=None):
     args = list(args)
     args[3] = int(args[3])
-    key = replica.audit_key(*args, flat=flat)
+    key = replica.audit_key(
+        *args, flat=flat, seq_end=(int(seq_end) if seq_end is not None else None))
     if body is not None:
         # 'kind: "variant"' vectors carry the real builder's
         # 'disambiguate_audit_key' output for this body.
@@ -588,12 +659,12 @@ if vectors.get("pinned_pc_admin_sha") != replica.PINNED_PC_ADMIN_SHA:
 # Matrix size pin: a deleted vector/segment/refusal entry must fail loudly
 # instead of shrinking the matrix silently (red-team round-2 LOW M10). Update
 # this pin together with the matrix.
-if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 15
-        or len(vectors["full_key_refusals"]) != 3
-        or len(vectors["refusals"]) != 17):
+if (len(vectors["vectors"]) != 39 or len(vectors["date_segments"]) != 15
+        or len(vectors["full_key_refusals"]) != 4
+        or len(vectors["refusals"]) != 22):
     raise SystemExit(
         "vector matrix size changed: %d vectors / %d segments / %d full_key_refusals / %d refusals "
-        "(pinned 32/15/3/17) - update this pin together with the matrix"
+        "(pinned 39/15/4/22) - update this pin together with the matrix"
         % (len(vectors["vectors"]), len(vectors["date_segments"]),
            len(vectors["full_key_refusals"]), len(vectors["refusals"])))
 
@@ -603,7 +674,7 @@ if (len(vectors["vectors"]) != 32 or len(vectors["date_segments"]) != 15
 # together with the file. The digest covers the SAME bytes that are replayed
 # (single read above).
 matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
-MATRIX_SHA256 = "710493917516d3c8ad2ebe11f6c1923207000710f2731db1aa2c88e5f859eed5"
+MATRIX_SHA256 = "f6533f04839c8b4f32417fa09d45cc5a22797130b8d8fe15b80b850dc6d98cc8"
 if matrix_sha != MATRIX_SHA256:
     raise SystemExit(
         "vector matrix content changed (sha256 %s != pinned %s) - regenerate via "
@@ -675,7 +746,8 @@ for vector in vectors["vectors"]:
             raise SystemExit(
                 "%s: non-UUID sid %r was rewritten to %r in replica_args"
                 % (vector["name"], event_sid, sid_arg))
-    got = replay(vector["replica_args"], vector.get("body"), flat=(vector.get("layout") == "flat"))
+    got = replay(vector["replica_args"], vector.get("body"),
+                 flat=(vector.get("layout") == "flat"), seq_end=vector.get("seq_end"))
     if got != vector["expected"]:
         raise SystemExit("%s: expected %s got %s" % (vector["name"], vector["expected"], got))
 for segment in vectors["date_segments"]:
@@ -705,7 +777,7 @@ for entry in vectors["full_key_refusals"]:
         raise SystemExit("%s: trailing-newline key was laundered into a variant" % entry["name"])
 for refusal in vectors["refusals"]:
     try:
-        replay(refusal["replica_args"])
+        replay(refusal["replica_args"], seq_end=refusal.get("seq_end"))
     except ValueError:
         continue
     raise SystemExit("refusal accepted: %s" % refusal["name"])
@@ -714,7 +786,7 @@ print("vectors=%d segments=%d full_key_refusals=%d refusals=%d pin=%s source=%s"
     len(vectors["full_key_refusals"]), len(vectors["refusals"]),
     vectors["pinned_pc_admin_sha"], source_sha[:12]))
 PY
-)" && [[ "$matrix_out" == "vectors=32 segments=15 full_key_refusals=3 refusals=17 pin=262e98c546d336607430d139dd1effa2accd0851 source=262e98c546d3" ]]; then
+)" && [[ "$matrix_out" == "vectors=39 segments=15 full_key_refusals=4 refusals=22 pin=1b9946cbbad50c8822fad8f23eed9d8770181496 source=1b9946cbbad5" ]]; then
   ok "replica replays the real-builder golden+boundary vectors (pin-matched, refusals held)"
 else
   bad "shipper replica diverged from the checked-in real-builder vectors or the checker did not run (out: ${matrix_out:-<empty>})"
@@ -6784,6 +6856,332 @@ run_delta "${dl_dnc_dir}"
 is "dated nonconformance (conformant control): the delta stays green" "ok" "${CASE_STATE}"
 is "dated nonconformance (conformant control): the run stays a delta" "delta" \
   "$(state_field observed.coverage.mode)"
+
+# (10) Seq-range interval continuity (phase 2, pc-admin #29): ranges merge
+# into coverage intervals; sequence-origin is the first interval's start,
+# sequence-gap only BETWEEN intervals, sequence-duplicate is overlap
+# detection; range-on-lifecycle, mode-on-range and reversed ranges are
+# naming-contract drift that never moves a cursor (a no-mode lifecycle range
+# pins the lifecycle branch; a duplicate never suppresses a concurrent
+# gap); an event missing *inside* a declared range is invisible list-only
+# (the disclosed loss).
+R29_SID="5f5f5f5f-5f5f-4f5f-8f5f-5f5f5f5f5f5f"
+R29_HB="audit/heartbeat/$(audit_stamp -60).json"
+R29_START="$(dated_key session.start 20260925T150000Z "${R29_SID}" 1 shell)"
+R29_RANGE_A="$(dated_range_key 4 session.data 20260925T150100Z "${R29_SID}" 2)"
+R29_RANGE_B="$(dated_range_key 7 session.data 20260925T150200Z "${R29_SID}" 5)"
+R29_END="$(dated_key session.end 20260925T150300Z "${R29_SID}" 8 shell)"
+r29_dir="${WORK}/state-159p2-contiguous"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_START}","ago":300},
+  {"key":"${R29_RANGE_A}","ago":299},
+  {"key":"${R29_RANGE_B}","ago":298},
+  {"key":"${R29_END}","ago":297},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${r29_dir}"
+is "ranges: contiguous ranges + lifecycle -> ok" "ok" "${CASE_STATE}"
+is "ranges: the cursor advances over the range keys" "${R29_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+R29_GAP_START="$(dated_key session.start 20260925T151000Z "${R29_SID}" 1 shell)"
+R29_GAP_A="$(dated_range_key 4 session.data 20260925T151100Z "${R29_SID}" 2)"
+R29_GAP_B="$(dated_range_key 8 session.data 20260925T151200Z "${R29_SID}" 6)"
+R29_GAP_END="$(dated_key session.end 20260925T151300Z "${R29_SID}" 9 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_GAP_START}","ago":300},
+  {"key":"${R29_GAP_A}","ago":299},
+  {"key":"${R29_GAP_B}","ago":298},
+  {"key":"${R29_GAP_END}","ago":297},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-gap"
+is "ranges: a hole between intervals -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"missing <seq> 5"*) ok "ranges: the gap between intervals names the hole (5), never the covered span" ;; *) bad "ranges: gap-between-intervals detail: ${CASE_DETAIL}" ;; esac
+
+R29_OV_START="$(dated_key session.start 20260925T152000Z "${R29_SID}" 1 shell)"
+R29_OV_A="$(dated_range_key 6 session.data 20260925T152100Z "${R29_SID}" 2)"
+R29_OV_B="$(dated_range_key 8 session.data 20260925T152200Z "${R29_SID}" 5)"
+R29_OV_END="$(dated_key session.end 20260925T152300Z "${R29_SID}" 9 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_OV_START}","ago":300},
+  {"key":"${R29_OV_A}","ago":299},
+  {"key":"${R29_OV_B}","ago":298},
+  {"key":"${R29_OV_END}","ago":297},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-overlap"
+is "ranges: overlapping intervals -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"repeats <seq> 5-6"*) ok "ranges: the duplicate render names the overlap intersection (5-6)" ;; *) bad "ranges: overlap detail: ${CASE_DETAIL}" ;; esac
+
+# A hole concurrent with an overlap must be named too (red-team FIX-3):
+# intervals 2-4 / 4-5 / 9-10 + end 11 repeat <seq> 4 AND miss 6-8; the old
+# duplicate short-circuit kept 6-8 out of the detail and the signature.
+R29_CG_START="$(dated_key session.start 20260925T152500Z "${R29_SID}" 1 shell)"
+R29_CG_A="$(dated_range_key 4 session.data 20260925T152510Z "${R29_SID}" 2)"
+R29_CG_B="$(dated_range_key 5 session.data 20260925T152520Z "${R29_SID}" 4)"
+R29_CG_C="$(dated_range_key 10 session.data 20260925T152530Z "${R29_SID}" 9)"
+R29_CG_END="$(dated_key session.end 20260925T152540Z "${R29_SID}" 11 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_CG_START}","ago":300},
+  {"key":"${R29_CG_A}","ago":299},
+  {"key":"${R29_CG_B}","ago":298},
+  {"key":"${R29_CG_C}","ago":297},
+  {"key":"${R29_CG_END}","ago":296},
+  {"key":"recordings/${R29_SID}.tar","ago":295}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-dup-gap"
+is "ranges: a hole concurrent with an overlap -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"repeats <seq> 4"*) ok "ranges: the concurrent overlap is still named" ;; *) bad "ranges: concurrent overlap detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"missing <seq> 6-8"*) ok "ranges: the concurrent hole is named alongside the overlap" ;; *) bad "ranges: concurrent hole detail: ${CASE_DETAIL}" ;; esac
+
+R29_DS_START="$(key session.start 20260925T153000Z "${R29_SID}" 1 shell)"
+R29_DS_ONE="$(key session.data 20260925T153100Z "${R29_SID}" 2)"
+R29_DS_RANGE="$(range_key 4 session.data 20260925T153200Z "${R29_SID}" 3)"
+R29_DS_TWO="$(key session.data 20260925T153300Z "${R29_SID}" 5)"
+R29_DS_END="$(key session.end 20260925T153400Z "${R29_SID}" 6 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_DS_START}","ago":300},
+  {"key":"${R29_DS_ONE}","ago":299},
+  {"key":"${R29_DS_RANGE}","ago":298},
+  {"key":"${R29_DS_TWO}","ago":297},
+  {"key":"${R29_DS_END}","ago":296},
+  {"key":"recordings/${R29_SID}.tar","ago":295}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-dualshape"
+is "ranges: single-seq + range dual-shape coverage -> ok" "ok" "${CASE_STATE}"
+
+# A degenerate one-event interval (`[N, N]`, contract-legal) must be accepted
+# green by the live witness (red-team/functional N3); the vector matrix pins
+# the replica shape only.
+R29_DG_START="$(dated_key session.start 20260925T153500Z "${R29_SID}" 1 shell)"
+R29_DG_RANGE="$(dated_range_key 2 session.data 20260925T153600Z "${R29_SID}" 2)"
+R29_DG_END="$(dated_key session.end 20260925T153700Z "${R29_SID}" 3 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_DG_START}","ago":300},
+  {"key":"${R29_DG_RANGE}","ago":299},
+  {"key":"${R29_DG_END}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-degenerate-range"
+is "ranges: the degenerate [N, N] range -> ok" "ok" "${CASE_STATE}"
+
+# A range whose START is seq 0 (the real `build_audit_range_key` floor) must
+# be accepted green by the live witness too (delta-2 red-team F1): the
+# replica golden for the seq-0 range pins the built key shape only, so a live
+# regression refusing seq-0 ranges (the red-team `mseq0` mutant in
+# `_audit_range_is_drift`) would otherwise leave the suite green. The span is
+# intentionally NON-degenerate (0-1, start 2, end 3) so the tooth exercises
+# the seq-0 START rather than re-testing the `[N, N]` degeneracy pinned above.
+R29_S0_START="$(dated_key session.start 20260925T153800Z "${R29_SID}" 2 shell)"
+R29_S0_RANGE="$(dated_range_key 1 session.data 20260925T153810Z "${R29_SID}" 0)"
+R29_S0_END="$(dated_key session.end 20260925T153820Z "${R29_SID}" 3 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_S0_START}","ago":300},
+  {"key":"${R29_S0_RANGE}","ago":299},
+  {"key":"${R29_S0_END}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-seq0-range"
+is "ranges: a seq-0 range start (the build_audit_range_key floor) -> ok" "ok" "${CASE_STATE}"
+
+R29_VB_BODY='{"event":"session.data","seq":2,"v":"r29-base"}'
+R29_VB_START="$(dated_key session.start 20260925T154000Z "${R29_SID}" 1 shell)"
+R29_VB_BASE="$(dated_range_key 4 session.data 20260925T154100Z "${R29_SID}" 2)"
+R29_VB_VAR="$(dated_range_variant_key "${R29_VB_BODY}" 4 session.data 20260925T154100Z "${R29_SID}" 2)"
+R29_VB_END="$(dated_key session.end 20260925T154200Z "${R29_SID}" 5 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_VB_START}","ago":300},
+  {"key":"${R29_VB_BASE}","ago":299},
+  {"key":"${R29_VB_VAR}","ago":298},
+  {"key":"${R29_VB_END}","ago":297},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-rangevariant"
+is "ranges: a replay-conflict range variant folds onto the base interval -> ok" "ok" "${CASE_STATE}"
+
+R29_LR_START="$(dated_key session.start 20260925T155000Z "${R29_SID}" 1 shell)"
+R29_LR_DRIFT="audit/20260925/20260925T155100Z-session.end.${R29_SID}.2-3.shell.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_LR_START}","ago":300},
+  {"key":"${R29_LR_DRIFT}","ago":299},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-lifecycle-range"
+is "ranges: a range on a lifecycle type -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: lifecycle range is naming-contract drift" ;; *) bad "ranges: lifecycle-range detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a lifecycle range never moves the cursor" "${R29_LR_START}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+# The `.shell` marker above is refused independently by the mode-on-range
+# rule, so a no-mode lifecycle range is the only shape that pins the
+# lifecycle branch (red-team FIX-1). The crafted key is the NEWEST: a
+# regression that collects it would absorb the 2-4 hole (green) and win the
+# dated cursor.
+R29_LNR_START="$(dated_key session.start 20260925T155400Z "${R29_SID}" 1 shell)"
+R29_LNR_END="$(dated_key session.end 20260925T155600Z "${R29_SID}" 5 shell)"
+R29_LNR_DRIFT="audit/20260925/20260925T155700Z-session.end.${R29_SID}.2-4.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_LNR_START}","ago":300},
+  {"key":"${R29_LNR_END}","ago":299},
+  {"key":"${R29_LNR_DRIFT}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-lifecycle-range-nomode"
+is "ranges: a no-mode lifecycle range -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: a no-mode lifecycle range is naming-contract drift" ;; *) bad "ranges: no-mode lifecycle-range detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"missing <seq> 2-4"*) ok "ranges: a no-mode lifecycle range is never collected (hole 2-4 named)" ;; *) bad "ranges: no-mode lifecycle-range hole detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a no-mode lifecycle range never moves the cursor" "${R29_LNR_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+R29_MR_START="$(dated_key session.start 20260925T155800Z "${R29_SID}" 1 shell)"
+R29_MR_DRIFT="audit/20260925/20260925T155950Z-session.data.${R29_SID}.2-4.shell.json"
+R29_MR_END="$(dated_key session.end 20260925T155900Z "${R29_SID}" 5 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_MR_START}","ago":300},
+  {"key":"${R29_MR_DRIFT}","ago":299},
+  {"key":"${R29_MR_END}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-mode-range"
+is "ranges: a mode marker on a range -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: mode-on-range is naming-contract drift" ;; *) bad "ranges: mode-on-range detail: ${CASE_DETAIL}" ;; esac
+case "${CASE_DETAIL}" in *"missing <seq> 2-4"*) ok "ranges: mode-on-range never enters the interval math (hole 2-4 named)" ;; *) bad "ranges: mode-on-range hole detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a mode-on-range key never moves the cursor" "${R29_MR_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+R29_RR_START="$(dated_key session.start 20260925T161000Z "${R29_SID}" 1 shell)"
+R29_RR_END="$(dated_key session.end 20260925T161050Z "${R29_SID}" 3 shell)"
+R29_RR_DRIFT="audit/20260925/20260925T161100Z-session.data.${R29_SID}.4-2.json"
+R29_RR_OTHER="audit/20260925/20260925T161200Z-user.login.4-2.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_RR_START}","ago":300},
+  {"key":"${R29_RR_END}","ago":299},
+  {"key":"${R29_RR_DRIFT}","ago":298},
+  {"key":"${R29_RR_OTHER}","ago":297},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-reversed"
+is "ranges: a reversed range -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *"naming-contract: 2 audit key(s)"*) ok "ranges: reversed session + non-session ranges are both naming-contract" ;; *) bad "ranges: reversed-range detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a reversed range never moves the cursor" "${R29_RR_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+R29_B19_START="$(dated_key session.start 20260925T162000Z "${R29_SID}" 1 shell)"
+R29_B19_END="$(dated_key session.end 20260925T162050Z "${R29_SID}" 3 shell)"
+R29_B19_DRIFT="audit/20260925/20260925T162100Z-session.data.${R29_SID}.1-9999999999999999999.json"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_B19_START}","ago":300},
+  {"key":"${R29_B19_END}","ago":299},
+  {"key":"${R29_B19_DRIFT}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-19digit"
+is "ranges: a 19-digit range end -> alert" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in *naming-contract*) ok "ranges: a 19-digit range end is naming-contract drift" ;; *) bad "ranges: 19-digit range detail: ${CASE_DETAIL}" ;; esac
+is "ranges: a 19-digit range never moves the cursor" "${R29_B19_END}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+
+R29_B18_START="$(dated_key session.start 20260925T163000Z "${R29_SID}" 1 shell)"
+R29_B18_RANGE="$(dated_range_key 999999999999999999 session.data 20260925T163100Z "${R29_SID}" 2)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_B18_START}","ago":300},
+  {"key":"${R29_B18_RANGE}","ago":299},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-18digit"
+is "ranges: the 18-digit ceiling range parses -> ok" "ok" "${CASE_STATE}"
+
+# The disclosed-loss tooth: the range declares seqs 2-10, so the witness sees
+# full coverage even though seq 4 was never shipped. This is the honest
+# non-detection the docs disclose, not a defect.
+R29_IA_START="$(dated_key session.start 20260925T160000Z "${R29_SID}" 1 shell)"
+R29_IA_RANGE="$(dated_range_key 10 session.data 20260925T160100Z "${R29_SID}" 2)"
+R29_IA_END="$(dated_key session.end 20260925T160200Z "${R29_SID}" 11 shell)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${R29_HB}","ago":60},
+  {"key":"${R29_IA_START}","ago":300},
+  {"key":"${R29_IA_RANGE}","ago":299},
+  {"key":"${R29_IA_END}","ago":298},
+  {"key":"recordings/${R29_SID}.tar","ago":296}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${WORK}/state-159p2-intra-range"
+is "ranges: an event missing inside a declared range is invisible (disclosed loss) -> ok" "ok" "${CASE_STATE}"
+
 
 # ---- (g) the key is never printed ----------------------------------------
 if grep -q 'SENTINEL' "${WORK}/witness.out" "${WORK}/witness.err" "${WORK}/state/verdict.log" "${WORK}/state/state.json" 2>/dev/null; then

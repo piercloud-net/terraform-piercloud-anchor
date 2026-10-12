@@ -16,7 +16,8 @@
 # never sends key material anywhere; it only prints a public thumbprint.
 # Per-anchor Cloudflare Origin CA material (issue #123) follows the same rule:
 # the key is generated ON THIS BOX and never leaves; the CSR is public; the
-# signed cert arrives via ORIGIN_CA_CERT_PEM (cert-only material).
+# signed cert arrives via ORIGIN_CA_CERT_PEM (cert-only material; the
+# leaf-first chain is required and enforced for the A2 CloudFront leg).
 #
 set -euo pipefail
 
@@ -39,9 +40,14 @@ CADDY_ORIGIN_CRT="/etc/caddy/origin.crt"
 CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
 CADDY_AOP_CA="/etc/caddy/aop-ca.pem"
 CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
-# Cloudflare edge ranges for trusted_proxies (public constants — keep in
-# sync with local.cf_edge_cidrs in main.tf; stale ranges read as edge 403s).
-CF_EDGE_CIDRS="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+# CloudFront origin-facing ranges for the :443 origin leg (call D).
+# Public constants — live ip-ranges.json 2026-10-06 (46 IPv4 + 35 IPv6).
+# Keep in sync with local.cloudfront_origin_facing_cidrs in
+# cloudfront_ranges.tf — tests/edge-origin-auth asserts the two lists are
+# identical. CloudFront is not Cloudflare AOP: the :443 leg is gated by
+# these ranges (firewall) plus the X-Piercloud-Origin secret header
+# (Caddy); neither control alone is auth.
+CLOUDFRONT_ORIGIN_CIDRS="130.176.88.0/21 54.239.134.0/23 52.82.134.0/23 130.176.86.0/23 130.176.140.0/22 130.176.0.0/18 54.239.204.0/22 130.176.160.0/19 70.132.0.0/18 15.158.0.0/16 130.176.136.0/23 54.239.170.0/23 130.176.96.0/19 54.182.184.0/22 204.246.166.0/24 130.176.64.0/21 54.182.172.0/22 205.251.218.0/24 130.176.144.0/20 54.182.176.0/21 130.176.78.0/23 54.182.248.0/22 64.252.128.0/18 54.182.154.0/23 64.252.64.0/18 54.182.144.0/21 54.182.224.0/21 130.176.128.0/21 52.46.0.0/18 3.172.64.0/18 52.82.128.0/23 18.68.0.0/16 54.182.156.0/22 54.182.160.0/21 54.182.240.0/21 130.176.192.0/19 130.176.76.0/24 54.239.208.0/21 54.182.188.0/23 24.110.128.0/17 3.172.0.0/18 130.176.80.0/22 54.182.128.0/20 130.176.72.0/22 13.124.199.0/24 3.29.57.0/26 2600:9000:1000::/36 2600:9000:5200::/40 2600:9000:6000::/36 2406:da11:438:2300::/56 2406:da1e:705:1600::/56 2406:da1c:8d8c:4600::/56 2406:da14:17bd:2f00::/56 2406:da12:4b:c200::/56 2406:da16:c01:c200::/56 2406:da1a:6df:6c00::/56 2406:da1b:e7c:ad00::/56 2406:da18:9fa:1b00::/56 2406:da1c:787:2b00::/56 2406:da19:e19:4a00::/56 2406:da1f:396:9100::/56 2406:da10:847f:a100::/56 2406:da12:8b2e:9c00::/56 2406:da14:80bb:ea00::/56 2600:1f11:e79:a800::/56 2600:1f1a:4568:b500::/56 2a05:d014:1362:b000::/56 2a05:d019:80b:e300::/56 2a05:d016:9ed:de00::/56 2a05:d01a:8a9:be00::/56 2a05:d011:531:1800::/56 2a05:d018:1a3a:2d00::/56 2a05:d01c:343:c300::/56 2a05:d012:581:b400::/56 2a05:d025:e59:fb00::/56 2600:1f17:4356:f100::/56 2600:1f1e:a7:2300::/56 2600:1f18:7530:7200::/56 2600:1f16:1923:3000::/56 2600:1f1c:da:600::/56 2600:1f13:417:4d00::/56"
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*"; }
@@ -56,7 +62,9 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # (dispatched runs receive STATUS_HOST as the dashboard FQDN via 020's
 # ENV_PREFIX; ANCHOR_HOSTNAME stays the zone-less SCP hostname);
 # tests/naming-scheme/run-test.sh diffs the block against the lib — edit the
-# lib and copy the block, never fork it.
+# lib and copy the block, never fork it. A2 2026-09-30: the dashboard is the
+# NESTED `<tenant>.status.piercloud.net` (platform status namespace,
+# CloudFront-covered); the anchor name stays flat on `.net`.
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
@@ -69,8 +77,8 @@ validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail
     return 1
   fi
   case "$1" in
-    anchor* | status* | pcu*)
-      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu are platform labels, not tenants.\n' "$1" >&2
+    anchor* | status* | pcu* | platform*)
+      printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
       return 1 ;;
   esac
   return 0
@@ -84,8 +92,8 @@ derive_anchor_hostname() { # $1 = sanitized tenant -> anchor-<NN>-<tenant> (NN=0
   printf 'anchor-01-%s\n' "$1"
 }
 
-derive_status_host() { # $1 = sanitized tenant -> status-<tenant> (dashboard singleton, one label)
-  printf 'status-%s\n' "$1"
+derive_status_host() { # $1 = sanitized tenant -> <tenant>.status (dashboard under the platform status namespace)
+  printf '%s.status\n' "$1"
 }
 # --- END NAMING ---
 caddy_status_names() { # STATUS_HOST/ANCHOR_HOSTNAME from dispatch env, else derived from TENANT_USER
@@ -126,10 +134,11 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
   printf '%s\n' "	servers {"
-  printf '%s\n' "		# Real client IP behind the orange cloud. CF-Connecting-IP only —"
-  printf '%s\n' "		# never X-Forwarded-For (spoofable through the edge)."
-  printf '%s\n' "		trusted_proxies static ${CF_EDGE_CIDRS}"
-  printf '%s\n' "		client_ip_headers CF-Connecting-IP"
+  printf '%s\n' "		# Real client IP behind the CloudFront edge. CloudFront-Viewer-Address"
+  printf '%s\n' "		# only — never X-Forwarded-For (spoofable through the edge); the"
+  printf '%s\n' "		# origin-request policy forwards that header to the origin."
+  printf '%s\n' "		trusted_proxies static ${CLOUDFRONT_ORIGIN_CIDRS}"
+  printf '%s\n' "		client_ip_headers CloudFront-Viewer-Address"
   printf '%s\n' "	}"
   printf '%s\n' "}"
   printf '%s\n' ""
@@ -154,8 +163,8 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "		# list-modules on the v2.11.4 binary; it lives in a third-party xcaddy"
   printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
   printf '%s\n' "		# Flood protection"
-  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus AOP"
-  printf '%s\n' "		# handshake enforcement when the bundle is deployed (see docs/dr.md)."
+  printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus the"
+  printf '%s\n' "		# CloudFront origin gate on :443 when the edge is live (docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
   printf '%s\n' "	}"
   printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
@@ -172,6 +181,23 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	}"
   printf '%s\n' "}"
   if [ -n "${STATUS_HOST:-}" ] && [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
+    # CloudFront origin auth is mandatory for the :443 dashboard block (call
+    # D): fail closed rather than render an unauthenticated origin. The
+    # secret is interpolated into a CEL matcher, so restrict its charset.
+    [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
+    case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
+    [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
+    # Bare single-line IPv4, octets 0-255, no leading zeros, no stray
+    # whitespace: variables.tf validates the same address for the firewall
+    # variable via cidrhost, and Caddy's netip rejects leading zeros — reject
+    # both here rather than fail later at `caddy validate` (a trailing
+    # newline splits the rendered CEL matcher). A console hand-run sets this
+    # secret without terraform, so the two peers must not drift.
+    case "${MAIN_BOX_IPV4}" in *[!0-9.]*) die "MAIN_BOX_IPV4 must be digits and dots only (no whitespace or newlines)." ;; esac
+    printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 || NR > 1 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i ~ /^0[0-9]/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255, no leading zeros)."
+    [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
+    cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
+    cf_cel="${cf_cel%,}"
     printf '%s\n' ""
     printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
     printf '%s\n' "https://${STATUS_HOST} {"
@@ -183,10 +209,26 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "		abort"
     printf '%s\n' "	}"
     printf '%s\n' "	handle {"
+    printf '%s\n' "		# CloudFront origin gate (call D): CloudFront is not AOP. Only"
+    printf '%s\n' "		# CloudFront origin-facing peers (or the main box / loopback) may"
+    printf '%s\n' "		# reach the dashboard, and CloudFront peers must carry the secret"
+    printf '%s\n' "		# header it injects (it overwrites client-supplied values). The"
+    printf '%s\n' "		# firewall admits the same peer set; this is the in-Caddy second"
+    printf '%s\n' "		# factor. INSIDE the catch-all handle on purpose: Caddy 2.11.4"
+    printf '%s\n' "		# adapts \`abort\` AFTER \`handle\`, so a site-level gate would sit"
+    printf '%s\n' "		# behind this handle and never run (tests/bind-e2e pins the"
+    printf '%s\n' "		# adapted route order; tests/edge-origin-auth pins the text)."
+    printf '%s\n' "		# Loopback (127.0.0.1/32 and ::1/128) is exempt: the on-box"
+    printf '%s\n' "		# probes below reach the dashboard via --resolve …:127.0.0.1,"
+    printf '%s\n' "		# and only local processes can source from loopback."
+    printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32'))\`"
+    printf '%s\n' "		abort @not_edge_peer"
+    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
+    printf '%s\n' "		abort @unauthorized"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus AOP handshake enforcement when deployed (the"
-    printf '%s\n' "		# rate_limit directive itself is queued: issue #56)."
+    printf '%s\n' "		# allowlist plus the CloudFront origin gate above (the rate_limit"
+    printf '%s\n' "		# directive itself is queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
     printf '%s\n' "}"
@@ -331,13 +373,18 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 }
 
 # --- origin-ca:start --- (tests/origin-ca extracts this span; keep markers)
-# Per-anchor Cloudflare Origin CA material (issue #123): the private key is
+# Per-anchor cert material (issue #123; A2 2026-09-30): the private key is
 # generated ON this box and never leaves it; the CSR is public material
-# published in the run artifact for operator-side signing; the signed cert
-# returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and is
-# validated fail-closed before Caddy may serve it. Paths are overridable so
-# the harness can run this span off-box (same pattern as the bind-e2e
-# render span).
+# published in the run artifact for operator/broker-side signing; the signed
+# cert returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and
+# is validated fail-closed (leaf + linked chain) before Caddy may serve it. A2: the dashboard sits
+# behind CloudFront, which trusts Mozilla-store CAs only — so the cert is a
+# PUBLIC single-SAN cert for the nested `<tenant>.status.piercloud.net`
+# viewer host (broker-issued via ACME DNS-01; Cloudflare Origin CA is dead
+# for this leg). The span/variable names stay `origin-ca` for continuity;
+# the single-SAN selfcheck below is the fail-closed gate either way. Paths
+# are overridable so the harness can run this span off-box (same pattern as
+# the bind-e2e render span).
 ORIGIN_CA_DIR="${ORIGIN_CA_DIR:-/etc/caddy}"
 ORIGIN_CA_KEY="${ORIGIN_CA_KEY:-${ORIGIN_CA_DIR}/origin-ca.key}"
 ORIGIN_CA_CSR="${ORIGIN_CA_CSR:-${ORIGIN_CA_DIR}/origin-ca.csr}"
@@ -446,26 +493,130 @@ origin_ca_generate() { # ensure key+CSR; the key is never regenerated while a ce
   log "per-anchor Origin CA CSR ready (publish it for signing; the key stays on this box)"
 }
 
-origin_ca_cert_pem_ok() { # $1 = PEM text -> exactly one bounded certificate, no leading/trailing junk
-  local pem="$1" bytes begins ends junk
-  begins="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
-  ends="$(printf '%s\n' "$pem" | grep -c -- '-----END CERTIFICATE-----' || true)"
-  # Multi-cert blobs must be rejected: only the first block would be
-  # validated/hashed while the whole blob got installed.
-  [ "$begins" = "1" ] && [ "$ends" = "1" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----BEGIN CERTIFICATE-----/{exit} {print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
-  junk="$(printf '%s\n' "$pem" | awk '/-----END CERTIFICATE-----/{f=1; next} f{print}' | tr -d '[:space:]')"
-  [ -z "$junk" ] || return 1
+origin_ca_cert_pem_ok() { # $1 = PEM text -> a bounded leaf-first certificate chain, no framing junk
+  local pem="$1" bytes begins ends
+  # Line-anchored markers: an unanchored grep counts the single line
+  # `-----BEGIN CERTIFICATE----------END CERTIFICATE-----` as two blocks
+  # while a PEM parser sees one — the shape gate must count what the parser
+  # counts. The body is constrained to base64/whitespace because Go/Caddy
+  # strip PEM headers while OpenSSL refuses a header-bearing block: an
+  # unconstrained body is a parser differential that must never install.
+  begins="$(printf '%s\n' "$pem" | grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" || true)"
+  ends="$(printf '%s\n' "$pem" | grep -cE -- "^-----END CERTIFICATE-----[[:space:]]*$" || true)"
+  # A chain is REQUIRED for the A2 CloudFront origin leg (enforced in
+  # origin_ca_install_from_env: CloudFront drops the TCP connection — 502,
+  # X-Cache: Error from cloudfront — when the intermediate is missing).
+  # Shape accepts 1..8 blocks: the validator checks the FIRST block as the
+  # leaf, every block must parse, and each hop's signature is verified in
+  # origin_ca_validate_cert. Bounded at 16 KiB: a 4-block LE chain is ~5 KiB.
+  [ "$begins" = "$ends" ] || return 1
+  [ "${begins:-0}" -ge 1 ] && [ "${begins:-0}" -le 8 ] || return 1
+  printf '%s\n' "$pem" | awk '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { if (inblk) bad = 1; inblk = 1; seen = 1; next }
+    /^-----END CERTIFICATE-----[[:space:]]*$/   { if (!inblk) bad = 1; inblk = 0; next }
+    { if (!seen) { if ($0 !~ /^[[:space:]]*$/) before = 1 }
+      else if (!inblk) { if ($0 !~ /^[[:space:]]*$/) after = 1 }
+      else if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^[A-Za-z0-9+\/=[:space:]]+$/) bad = 1 }
+    END { if (inblk) bad = 1; exit (bad || before || after) }
+  ' || return 1
   bytes="$(printf '%s' "$pem" | wc -c | tr -d ' ')"
   [ "${bytes:-0}" -gt 0 ] && [ "${bytes:-0}" -le 16384 ]
 }
 
+origin_ca_chain_blocks() { # $1 = PEM file -> count of real certificate blocks (line-anchored)
+  grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" "$1" 2>/dev/null || true
+}
+
+origin_ca_block_der_exact() { # $1 = PEM file -> the FIRST block's body decodes to exactly the parsed DER (no trailing bytes)
+  local f="$1" raw der
+  # `openssl x509 -in` ignores bytes after the certificate DER, so a body of
+  # certDER||keyDER parses fine — and Go's non-leaf loader does not parse
+  # chain blocks either, so the trailing bytes would install and be served.
+  # The body must decode to exactly the DER OpenSSL re-encodes.
+  raw="$(awk '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { inblk = 1; next }
+    inblk && /^-----END CERTIFICATE-----[[:space:]]*$/ { exit }
+    inblk { print }
+  ' "$f" 2>/dev/null | tr -d '[:space:]' | base64 -d 2>/dev/null | wc -c | tr -d ' ' || true)"
+  der="$(openssl x509 -in "$f" -outform DER 2>/dev/null | wc -c | tr -d ' ' || true)"
+  [ "${raw:-0}" -gt 0 ] && [ "${der:-0}" -gt 0 ] && [ "$raw" = "$der" ]
+}
+
+origin_ca_blocks_parse() { # $1 = PEM file, $2 = optional split dir (kept when given) -> every block parses as exactly one X.509 cert (no trailing DER)
+  local f="$1" dir="${2:-}" created=0 n i cur
+  [ -s "$f" ] || return 1
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -ge 1 ] || return 1
+  if [ -z "$dir" ]; then
+    dir="$(mktemp -d)" || return 1
+    created=1
+  fi
+  # Split on the (already line-anchored) markers. Every block must parse as an
+  # X.509 certificate: a PEM header line that OpenSSL would skip, a
+  # private-key body re-labelled as CERTIFICATE, or bytes after the DER fails
+  # here (OpenSSL ignores trailing bytes; Go's non-leaf loader does not parse
+  # chain blocks either).
+  awk -v dir="$dir" '
+    /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ { n++; file = sprintf("%s/block-%02d.pem", dir, n) }
+    n > 0 { print > file }
+  ' "$f" || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+  i=1
+  while [ "$i" -le "$n" ]; do
+    cur="$(printf '%s/block-%02d.pem' "$dir" "$i")"
+    openssl x509 -in "$cur" -noout >/dev/null 2>&1 || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+    origin_ca_block_der_exact "$cur" || { [ "$created" = 1 ] && rm -rf "$dir"; return 1; }
+    i=$((i + 1))
+  done
+  [ "$created" = 1 ] && rm -rf "$dir"
+  return 0
+}
+
+origin_ca_chain_ordered() { # $1 = PEM file -> every block parses; each hop verifies against the next block
+  local f="$1" dir n i cur next cur_fp next_fp
+  [ -s "$f" ] || return 1
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -ge 1 ] || return 1
+  dir="$(mktemp -d)" || return 1
+  origin_ca_blocks_parse "$f" "$dir" || { rm -rf "$dir"; return 1; }
+  # Adjacent-only signature linkage, NO self-signed-tail requirement: the
+  # live LE bundle ends with a cross-signed ISRG Root X2 whose issuer is not
+  # in the file. `-partial_chain` lets the next block act as the trust anchor
+  # for the current one: OpenSSL resolves the anchor by issuer name and then
+  # verifies the signature (same-name/different-key CAs are rejected). A
+  # duplicated block is a degenerate trusted anchor — a cert that IS the
+  # CAfile is accepted for itself — so each hop also requires a CA:TRUE
+  # issuer and a fingerprint that differs from the current block.
+  i=1
+  while [ "$i" -lt "$n" ]; do
+    cur="$(printf '%s/block-%02d.pem' "$dir" "$i")"
+    next="$(printf '%s/block-%02d.pem' "$dir" "$((i + 1))")"
+    openssl x509 -in "$next" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:TRUE' \
+      || { rm -rf "$dir"; return 1; }
+    cur_fp="$(openssl x509 -in "$cur" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+    next_fp="$(openssl x509 -in "$next" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^.*=//' -e 's/://g' | tr 'A-F' 'a-f')"
+    [ -n "$cur_fp" ] && [ "$cur_fp" != "$next_fp" ] \
+      || { rm -rf "$dir"; return 1; }
+    # -no-CApath/-no-CAstore keep the explicit -CAfile authoritative: without
+    # them the default system store is also loaded, and a hop could "verify"
+    # against a system root instead of the next block.
+    openssl verify -partial_chain -no-CApath -no-CAstore -CAfile "$next" "$cur" >/dev/null 2>&1 \
+      || { rm -rf "$dir"; return 1; }
+    i=$((i + 1))
+  done
+  rm -rf "$dir"
+  return 0
+}
+
 origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on stderr
-  local cert="$1" key="$2" host="$3" sans start start_epoch now_epoch
+  local cert="$1" key="$2" host="$3" sans start start_epoch now_epoch blocks
   [ -s "$cert" ] || { printf 'cert %s missing or empty' "$cert" >&2; return 1; }
   [ -n "$(origin_ca_cert_hash "$cert")" ] \
     || { printf '%s is not a parseable X.509 certificate' "$cert" >&2; return 1; }
+  # A block whose body carries bytes after the certificate DER parses in
+  # OpenSSL (trailing data is ignored) but is not a single well-formed PEM
+  # certificate — key material smuggled this way must never validate/install.
+  origin_ca_block_der_exact "$cert" \
+    || { printf '%s carries trailing bytes after the certificate DER (not a single well-formed PEM certificate)' "$cert" >&2; return 1; }
   openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 \
     || { printf '%s is expired' "$cert" >&2; return 1; }
   start="$(openssl x509 -in "$cert" -noout -startdate 2>/dev/null | cut -d= -f2)"
@@ -476,25 +627,65 @@ origin_ca_validate_cert() { # $1 = cert, $2 = key, $3 = expected host; reason on
     || { printf '%s is not yet valid (notBefore %s)' "$cert" "$start" >&2; return 1; }
   sans="$(origin_ca_cert_sans "$cert")"
   [ "$(origin_ca_dns_san_count "$sans")" = "1" ] \
-    || { printf '%s carries %s DNS SAN(s), want exactly one (%s)' "$cert" "$(origin_ca_dns_san_count "$sans")" "$host" >&2; return 1; }
+    || { printf '%s carries %s DNS SAN(s), want exactly one (%s) — the first block must be the leaf (a chain pasted issuer-first fails here)' "$cert" "$(origin_ca_dns_san_count "$sans")" "$host" >&2; return 1; }
   [ "$sans" = "$host" ] || { printf 'cert SAN %s differs from %s' "$sans" "$host" >&2; return 1; }
   [ -n "$(origin_ca_key_pub "$key")" ] && [ "$(origin_ca_key_pub "$key")" = "$(origin_ca_cert_pub "$cert")" ] \
     || { printf 'certificate public key does not match %s' "$key" >&2; return 1; }
+  # A multi-block value must be a real chain, not a leaf followed by bytes:
+  # every block parses and each hop's signature verifies against the next
+  # block. A wrong/absent intermediate otherwise installs, serves, passes the
+  # leaf-only probe and leaves CloudFront 502ing — the exact live incident.
+  blocks="$(origin_ca_chain_blocks "$cert")"
+  if [ "${blocks:-0}" -gt 1 ]; then
+    origin_ca_chain_ordered "$cert" \
+      || { printf '%s is not a linked leaf-first chain (every block must be exactly one X.509 certificate — no trailing bytes after the DER — and each certificate must be issued by the next block; issuer blocks must be CA:TRUE and must not duplicate the current block)' "$cert" >&2; return 1; }
+  fi
+  return 0
+}
+
+origin_ca_aop_deployed() { # 0 when a usable AOP bundle is present (marker-bearing garbage must not bypass the A2 gates)
+  local pem="${CF_AOP_CA_PEM:-}" tmp
+  case "$pem" in
+    *"BEGIN CERTIFICATE"*) ;;
+    *) return 1 ;;
+  esac
+  case "$pem" in
+    *"PRIVATE KEY"*) return 1 ;;
+  esac
+  # Bounded PEM shape AND every block parses as exactly one X.509 cert (no
+  # trailing DER): a marker+base64 non-cert body must not read as "deployed"
+  # and skip the A2 chain/depth gates.
+  origin_ca_cert_pem_ok "$pem" || return 1
+  tmp="$(mktemp)" || return 1
+  printf '%s\n' "$pem" >"$tmp"
+  origin_ca_blocks_parse "$tmp" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
   return 0
 }
 
 origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public material), fail-closed
-  local pem="${ORIGIN_CA_CERT_PEM:-}" tmp reason
+  local pem="${ORIGIN_CA_CERT_PEM:-}" tmp reason blocks
   [ -n "$pem" ] || return 0
   ORIGIN_CA_SUPPLIED=1
   [ -n "${STATUS_HOST:-}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but STATUS_HOST is unset — cannot verify the cert SAN; refusing to install"
   [ -s "${ORIGIN_CA_KEY}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but ${ORIGIN_CA_KEY} is missing — restore the key first (the cert must match it)"
+  # Cert-only, like CF_AOP_CA_PEM: this value is a public repo variable and the
+  # file lands in a bind mount — a private key must never travel here.
+  case "$pem" in *"PRIVATE KEY"*) die "ORIGIN_CA_CERT_PEM must be certificate-only (public material; the private key is generated on this box and never travels) — strip the private key";; esac
   origin_ca_cert_pem_ok "$pem" \
-    || die "ORIGIN_CA_CERT_PEM is not a bounded PEM certificate — refusing to install it"
+    || die "ORIGIN_CA_CERT_PEM is not a bounded leaf-first PEM certificate chain — refusing to install it"
   tmp="$(mktemp)"
   printf '%s\n' "$pem" >"$tmp"
+  blocks="$(origin_ca_chain_blocks "$tmp")"
+  if ! origin_ca_aop_deployed; then
+    # A2: the :443 origin leg is CloudFront (AOP retired). CloudFront drops
+    # the TCP connection (502, X-Cache: Error from cloudfront) when the
+    # intermediate is missing — a leaf-only paste must never install here.
+    [ "${blocks:-0}" -ge 2 ] \
+      || { rm -f "$tmp"; die "ORIGIN_CA_CERT_PEM carries a leaf-only certificate (1 block); the A2 CloudFront origin leg REQUIRES the leaf-first chain (leaf + intermediate(s), as issued — e.g. the lego bundle). A leaf-only cert makes CloudFront answer 502 (X-Cache: Error from cloudfront); a pre-A2 Cloudflare-edge rollback is a code-level revert (see docs/dr.md), not a secret/variable change"; }
+  fi
   if ! reason="$(origin_ca_validate_cert "$tmp" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
     rm -f "$tmp"
     die "ORIGIN_CA_CERT_PEM rejected: ${reason} — keeping the currently served pair untouched"
@@ -504,9 +695,11 @@ origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public ma
   cat "$tmp" >"${ORIGIN_CA_CRT}" \
     || { rm -f "$tmp"; die "in-place write to ${ORIGIN_CA_CRT} failed"; }
   rm -f "$tmp"
-  chmod 0644 "${ORIGIN_CA_CRT}"
+  # 0600: the pinned container reads it as root; the served file must never be
+  # a world-readable key sink (a crafted block could otherwise persist key bytes).
+  chmod 0600 "${ORIGIN_CA_CRT}"
   ORIGIN_CA_CERT_PEM=""
-  log "per-anchor Origin CA certificate installed for ${STATUS_HOST} (sha256 $(origin_ca_cert_hash "${ORIGIN_CA_CRT}"))"
+  log "per-anchor Origin CA certificate installed for ${STATUS_HOST} (${blocks} block(s), leaf sha256 $(origin_ca_cert_hash "${ORIGIN_CA_CRT}"))"
 }
 
 origin_ca_write_hash() { # $1 = cert file -> record the deployed cert hash (after a successful reload)
@@ -525,7 +718,7 @@ origin_ca_mark_active() { # one-way: the per-anchor pair has served on :443
 }
 
 origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDATED before it may be selected
-  local reason
+  local reason blocks
   ORIGIN_TLS=0
   ORIGIN_CA_PAIR=0
   ORIGIN_CERT_CHANGED=0
@@ -540,6 +733,11 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
       if ! reason="$(origin_ca_validate_cert "${ORIGIN_CA_CRT}" "${ORIGIN_CA_KEY}" "${STATUS_HOST}" 2>&1)"; then
         die "on-box per-anchor Origin CA pair rejected for ${STATUS_HOST}: ${reason} — refusing to select or serve it (fix the cert, or remove origin-ca.{crt,key} to fall back/pending)"
       fi
+      if ! origin_ca_aop_deployed; then
+        blocks="$(origin_ca_chain_blocks "${ORIGIN_CA_CRT}")"
+        [ "${blocks:-0}" -ge 2 ] \
+          || die "on-box per-anchor pair for ${STATUS_HOST} is leaf-only; the A2 CloudFront origin leg REQUIRES the leaf-first chain (CloudFront answers 502 without the intermediate) — set the ORIGIN_CA_CERT_PEM repo variable to the issued chain and re-dispatch"
+      fi
     else
       warn "STATUS_HOST unset — per-anchor pair validation skipped (no :443 vhost is rendered; re-dispatch with TENANT_USER)"
     fi
@@ -552,6 +750,7 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
     if [ "$(cat "${ORIGIN_CA_HASH}" 2>/dev/null || true)" != "${ORIGIN_CA_HASH_WANT}" ]; then
       ORIGIN_CERT_CHANGED=1
     fi
+    log "per-anchor Origin CA pair selected for ${STATUS_HOST} ($(origin_ca_chain_blocks "${ORIGIN_CA_CRT}") block(s), leaf sha256 ${ORIGIN_CA_HASH_WANT})"
   elif [ "${ORIGIN_CA_SUPPLIED}" = "1" ]; then
     die "ORIGIN_CA_CERT_PEM was supplied this run but the per-anchor pair is not present on the box — refusing to select any fallback"
   elif [ -s "${CADDY_ORIGIN_CRT}" ] && [ -s "${CADDY_ORIGIN_KEY}" ]; then
@@ -601,6 +800,129 @@ origin_ca_probe_and_mark() { # $1 = host; asserts the served pair FIRST, then se
   fi
   origin_ca_mark_active
   return 0
+}
+
+origin_ca_edge_pull() { # $1 = host -> 0 when the public edge served the ORIGIN this run (200 + marker, from CloudFront, not a cache Hit)
+  local host="$1" attempt stamp rc code cache cfid pop via via_ok body hdr errf hint attempts why why_class
+  stamp="$(date +%s)-$$"
+  body="$(mktemp)" || return 1
+  hdr="$(mktemp)" || { rm -f "$body"; return 1; }
+  errf="$(mktemp)" || { rm -f "$body" "$hdr"; return 1; }
+  rc=0
+  code=""
+  cache=""
+  cfid=""
+  pop=""
+  via=""
+  via_ok=0
+  attempts=""
+  for attempt in 1 2 3; do
+    rc=0
+    : >"$errf"
+    # Per-run unique buster: a cache policy that keys the query string gets a
+    # fresh key each attempt; one that ignores it does not — hence a Hit is
+    # treated as an unproven pull, never as success.
+    code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' --max-time 20 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "https://${host}/api/v1/endpoints/statuses?pc_chain_probe=${stamp}-${attempt}" 2>"$errf")" || rc=$?
+    cache="$(awk '/^[Xx]-[Cc]ache:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    # CloudFront's response header tuple: x-amz-cf-id (a per-response id),
+    # x-amz-cf-pop (the PoP that served it) and a via naming a
+    # cloudfront.net distribution. These are forgeable by anyone who can
+    # answer for the name with a trusted cert, so the tuple raises the bar
+    # (and a cache Hit is never accepted) without cryptographically pinning
+    # the distribution; the docs carry the honest claim.
+    cfid="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Ii][Dd]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    pop="$(awk '/^[Xx]-[Aa][Mm][Zz]-[Cc][Ff]-[Pp][Oo][Pp]:/ { gsub(/\r/, ""); print $2; exit }' "$hdr" 2>/dev/null || true)"
+    via="$(awk '/^[Vv]ia:/ { gsub(/\r/, ""); print; exit }' "$hdr" 2>/dev/null || true)"
+    via_ok=0
+    case "$via" in *cloudfront.net*) via_ok=1 ;; esac
+    attempts="${attempts}${attempt}[rc=${rc:-0},http=${code:-000},cache=${cache:-none},cfid=${cfid:-none}] "
+    # A clean pull needs ALL of: HTTP 200, the dashboard marker, an explicit
+    # Miss (an absent x-cache is not a Miss), and CloudFront's header tuple.
+    if [ "$rc" -eq 0 ] && [ "$code" = "200" ] && grep -q 'tang (via Caddy)' "$body" 2>/dev/null \
+       && [ "${cache:-}" = "Miss" ] && [ -n "$cfid" ] && [ -n "$pop" ] && [ "$via_ok" = "1" ]; then
+      rm -f "$body" "$hdr" "$errf"
+      return 0
+    fi
+    case "${cache:-}" in
+      Hit|RefreshHit) printf 'attempt %s was served from cache (x-cache: %s) — the origin was not proven by this response\n' "$attempt" "$cache" >&2 ;;
+    esac
+    if [ "$attempt" -lt 3 ]; then
+      sleep "${ORIGIN_CA_EDGE_PULL_RETRY_SLEEP:-5}"
+    fi
+  done
+  hint="$(tr '\n' ' ' <"$errf" 2>/dev/null | cut -c1-160)"
+  # Name the last attempt's first failed condition AND a stable class token.
+  # The token is emitted by this script as the FIRST field of the final line
+  # (the caller prefix-matches it), so header values echoed later on the line
+  # cannot steer the classification.
+  why_class="generic"
+  why="no clean origin response"
+  if [ "$rc" -eq 6 ]; then
+    why_class="resolve"
+    why="does not resolve yet (curl exit 6)"
+  elif [ "$rc" -ne 0 ]; then
+    why_class="transport"
+    why="curl exit ${rc}"
+  elif [ "$code" != "200" ]; then
+    why_class="http"
+    why="HTTP ${code:-000} through the edge"
+  elif ! grep -q 'tang (via Caddy)' "$body" 2>/dev/null; then
+    why_class="marker"
+    why="HTTP 200 without the dashboard body marker"
+  elif [ "${cache:-}" = "Hit" ] || [ "${cache:-}" = "RefreshHit" ]; then
+    why_class="cache"
+    why="served from cache (x-cache: ${cache}) — the origin was not contacted"
+  elif [ "${cache:-}" != "Miss" ]; then
+    why_class="nocache"
+    why="x-cache: ${cache:-absent} (not a Miss from CloudFront)"
+  elif [ -z "$cfid" ] || [ -z "$pop" ] || [ "$via_ok" != "1" ]; then
+    why_class="tuple"
+    why="HTTP 200 + marker without CloudFront's x-amz-cf-id/x-amz-cf-pop/via tuple"
+  fi
+  rm -f "$body" "$hdr" "$errf"
+  if [ "$rc" -eq 6 ]; then
+    printf '[resolve] https://%s/ does not resolve yet (curl exit 6; attempts: %s)\n' "$host" "${attempts:-none}" >&2
+    return 1
+  fi
+  printf '[%s] no attempt got a clean origin response (%s; curl exit %s, HTTP %s, x-cache: %s, x-amz-cf-id: %s, x-amz-cf-pop: %s, via: %s; attempts: %s; stderr: %s)\n' \
+    "$why_class" "$why" "${rc:-0}" "${code:-000}" "${cache:-unknown}" "${cfid:-missing}" "${pop:-missing}" "${via:-none}" "${attempts:-none}" "${hint:-none}" >&2
+  return 1
+}
+
+origin_ca_edge_prove() { # main-flow A2 proof: the public edge must serve the ORIGIN this run (no-op without a selected pair)
+  local edge_reason edge_last
+  # Scoped to ORIGIN_TLS (not ORIGIN_CA_PAIR): a legacy pair is dead at
+  # CloudFront too, so those runs must fail closed as well. `curl -f` alone
+  # exits 0 on a 3xx and on a cached error page.
+  if [ "${ORIGIN_TLS}" != "1" ]; then
+    log "A2 edge not proven this run — no origin pair selected (auto-TLS or a suppressed legacy pair); the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes"
+    return 0
+  fi
+  edge_reason=""
+  if edge_reason="$(origin_ca_edge_pull "${STATUS_HOST}" 2>&1)"; then
+    log "A2 edge pull through CloudFront serves ${STATUS_HOST} (OK; HTTP 200 + dashboard marker, origin contacted this run)"
+    return 0
+  fi
+  # Prefix-match the stable class token origin_ca_edge_pull emits first on the
+  # final line — never the echoed header values (a crafted via/x-cache value
+  # must not steer the die message).
+  edge_last="$(printf '%s\n' "${edge_reason}" | tail -n 1)"
+  case "${edge_last}" in
+    "[resolve]"*)
+      die "A2 edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME) and covered by the platform status wildcard (live 2026-10-07); on a first-time/DR dispatch before those records exist this probe cannot pass — let the run write them, then re-dispatch (docs/dr.md)" ;;
+    "[cache]"*)
+      die "A2 edge pull was served from CloudFront's cache (x-cache: Hit or RefreshHit) — a cached response cannot prove the origin chain. The probe needs an uncacheable response: set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled), or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[nocache]"*)
+      die "A2 edge pull got no explicit x-cache: Miss from the edge (the header was absent or carried another value) — a response the distribution did not just fetch from the origin cannot prove the origin chain. Set the distribution's cache policy for the statuses path to TTL 0 (CachingDisabled) — forwarding query strings alone still allows a Hit — or purge the cache, then re-dispatch. Detail: ${edge_reason}" ;;
+    "[tuple]"*)
+      die "A2 edge pull got a 200 + marker but the response cannot prove it came through the distribution (missing x-amz-cf-id / x-amz-cf-pop / a via naming a cloudfront.net distribution). The tuple is a response-forgery barrier, not cryptographic proof; check that ${STATUS_HOST} resolves to the distribution and re-dispatch. Detail: ${edge_reason}" ;;
+    "[transport]"*)
+      die "A2 edge pull could not complete (the request failed at the transport layer — see Detail for the curl exit) — check the anchor's egress DNS/TLS to the public edge and re-dispatch. Detail: ${edge_reason}" ;;
+    *)
+      die "A2 edge pull through CloudFront failed — the served chain is incomplete or not leaf-first (CloudFront drops the connection with 502), the platform *.status records/distribution are absent, the origin gate (X-Piercloud-Origin) or firewall allowlist does not admit CloudFront, or the dashboard body marker is missing. Local :443 handshakes fine, so this is the edge leg: set ORIGIN_CA_CERT_PEM to the issued leaf-first chain and re-dispatch (docs/dr.md). Detail: ${edge_reason}" ;;
+  esac
 }
 # --- origin-ca:end ---
 
@@ -735,8 +1057,18 @@ assert_no_key_leak
 #    repo secret + re-dispatch). Rendered on EVERY run; hand edits die
 #    (one-time backup below). Env in: GATUS_ENDPOINTS (comma-separated
 #    name=url pairs, http(s) only, v1), NTFY_TOPIC / NTFY_TOKEN (empty =
-#    checks without push + warn).
+#    checks without push + warn), ANCHOR_ROLE (empty/tenant = the platform
+#    row is monitor-only; operator = it alerts).
 # ---------------------------------------------------------------------------
+# --- gatus-render:start ---
+# Operator-role gate (issue #134, call C1): unset/tenant = the platform row
+# is monitor-only; operator = the platform row alerts (with a push topic).
+# Fail closed on anything else — an unknown role must not silently alert.
+case "${ANCHOR_ROLE:-}" in
+  ''|tenant) PLATFORM_ALERTS=0 ;;
+  operator)  PLATFORM_ALERTS=1 ;;
+  *) die "bad ANCHOR_ROLE (want empty/tenant/operator): ${ANCHOR_ROLE}" ;;
+esac
 log "Rendering dispatch-managed Gatus config (${GATUS_CONFIG})"
 mkdir -p "$(dirname "${GATUS_CONFIG}")"
 caddy_status_names
@@ -748,6 +1080,17 @@ fi
 # Tenant endpoints. Bad pairs fail closed: a typo'd monitor you'd trust is
 # worse than none.
 ENDPOINTS_YAML=""
+# Alert-intent ledger (issue #134, call C4): every alert stanza appended
+# below records its endpoint name; the render-time assertion after the
+# config write checks each named endpoint's block carries the stanza and
+# that the total matches — a count-only check would pass a stanza moved
+# to the wrong endpoint (#136 review).
+ALERTS_EXPECTED=0
+ALERTS_EXPECTED_NAMES=""
+alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
+  ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
+  printf -v ALERTS_EXPECTED_NAMES '%s%s\n' "${ALERTS_EXPECTED_NAMES}" "${1}"
+}
 # Default target: the tenant homepage derives from TENANT_USER — no input
 # needed (pier → https://pier.piercloud.net). Skipped only for hand runs
 # without env (console fallback = self-check only, as documented).
@@ -761,10 +1104,48 @@ if [ -n "${TENANT_USER:-}" ]; then
 "
   if [ -n "${NTFY_TOPIC:-}" ]; then
     ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
-      - type: ntfy
+      - type: custom
         failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: \"5\"
+              RESOLVED: \"3\"
 "
+    alert_intent main
   fi
+fi
+# Built-in endpoint names actually rendered this run (issue #134, call C6):
+# a GATUS_ENDPOINTS pair may not shadow one — the render has no dedupe, so a
+# collision would silently render two rows under one name. `platform` is
+# unconditional; `main` exists only when TENANT_USER is set (console
+# fallback runs don't render it, so a `main=` pair is accepted there — the
+# next dispatch fails loud, which is when the duplicate would appear).
+BUILTIN_NAMES="platform"
+[ -n "${TENANT_USER:-}" ] && BUILTIN_NAMES="main ${BUILTIN_NAMES}"
+# Platform row (issue #134, calls C2/C3): the shared host's health as a
+# platform-level fact, built into the render (not a per-anchor secret). The
+# durable name is created S1-era on the control plane; tenant pages show it
+# monitor-only (host-down already reds `main`), the operator anchor alerts.
+ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: platform
+    url: https://platform.piercloud.net/healthz
+    interval: 60s
+    conditions:
+      - \"[STATUS] == 200\"
+"
+if [ "$PLATFORM_ALERTS" -eq 1 ] && [ -n "${NTFY_TOPIC:-}" ]; then
+  ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: \"5\"
+              RESOLVED: \"3\"
+"
+  alert_intent platform
 fi
 if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   set -f
@@ -776,6 +1157,8 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
     url="$(printf '%s' "$pair" | cut -d= -f2- | tr -d '[:space:]')"
     case "$name" in ''|*[!a-zA-Z0-9_-]*) die "bad GATUS_ENDPOINTS pair (want name=url, name chars [a-zA-Z0-9_-]): $pair";; esac
     case "$url" in http://*|https://*) ;; *) die "bad GATUS_ENDPOINTS pair (v1 supports http(s) URLs only): $pair";; esac
+    name_lc="$(printf '%s' "$name" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+    case " ${BUILTIN_NAMES} " in *" ${name_lc} "*) die "GATUS_ENDPOINTS pair name '${name}' collides with a built-in endpoint (${BUILTIN_NAMES// /, }) — pick another name";; esac
     ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: ${name}
     url: ${url}
     interval: 60s
@@ -786,7 +1169,10 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
       ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
       - type: ntfy
         failure-threshold: 3
+        provider-override:
+          priority: 4  # alert class 4 (time-sensitive; never a night emergency)
 "
+      alert_intent "$name"
     fi
   done
   IFS="$OLD_IFS"
@@ -796,6 +1182,12 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
   # Fail fast on YAML injection: topic/token interpolate into config-as-data.
   case "$NTFY_TOPIC" in ''|*[!a-zA-Z0-9_-]*) die "bad NTFY_TOPIC (chars [a-zA-Z0-9_-] only): ${NTFY_TOPIC}";; esac
   case "${NTFY_TOKEN:-}" in *[[:space:]]*|*[![:print:]]*) die "bad NTFY_TOKEN (no whitespace/control characters)";; esac
+  # Security-lens F1/F2: the token is interpolated into a YAML double-quoted
+  # scalar (the bridge Authorization header). A backslash escape survives the
+  # render (Gatus then fails the alert at runtime — green run, undelivered
+  # alert) and a double quote breaks the YAML (Gatus panics). No valid ntfy
+  # token carries either byte, so reject both here, fail closed.
+  case "${NTFY_TOKEN:-}" in *\\*|*\"*) die "bad NTFY_TOKEN (no backslash or double quote — it is interpolated into the YAML Authorization header)";; esac
   ALERTING_YAML="  ntfy:
     url: https://ntfy.sh
     topic: ${NTFY_TOPIC}"
@@ -803,6 +1195,27 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
     ALERTING_YAML="${ALERTING_YAML}
     token: ${NTFY_TOKEN}"
   fi
+  # ntfy-JSON bridge (issue #134, call C9): the native ntfy provider repeats
+  # its single priority on resolve, so class-5 rows (main/platform) publish
+  # through ntfy's JSON API instead — [ALERT_TRIGGERED_OR_RESOLVED] maps to
+  # 5 (triggered) / 3 (resolved), and per-alert provider-override.placeholders
+  # carries the class.
+  ALERTING_YAML="${ALERTING_YAML}
+  custom:
+    url: \"https://ntfy.sh/\"
+    method: POST
+    headers:
+      Content-Type: \"application/json\""
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    ALERTING_YAML="${ALERTING_YAML}
+      Authorization: \"Bearer ${NTFY_TOKEN}\""
+  fi
+  ALERTING_YAML="${ALERTING_YAML}
+    body: '{\"topic\":\"${NTFY_TOPIC}\",\"title\":\"Gatus: [ENDPOINT_NAME]\",\"message\":\"[ENDPOINT_NAME]: [RESULT_CONDITIONS][RESULT_ERRORS]\",\"priority\":[ALERT_TRIGGERED_OR_RESOLVED]}'
+    placeholders:
+      ALERT_TRIGGERED_OR_RESOLVED:
+        TRIGGERED: \"5\"
+        RESOLVED: \"3\""
 else
   ALERTING_YAML="  # No push channel: NTFY_TOPIC unset, so failures are checked
   # but never pushed. Set the NTFY_TOPIC secret + re-dispatch for alerts."
@@ -843,9 +1256,12 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "      - \"[RESPONSE_TIME] < 500\"  # Caddy p95>500ms alert, per-probe form (docs: https://gatus.io/docs)"
   printf '%s' "$ENDPOINTS_YAML"
   if [ -n "${STATUS_HOST:-}" ]; then
-    printf '%s\n' "  # Dashboard through the orange cloud: proves edge -> origin TLS and"
-    printf '%s\n' "  # warns while the cert is still fresh (stale-cert failure is"
-    printf '%s\n' "  # dashboard-only — tang answers plain HTTP on its own port)."
+    printf '%s\n' "  # Dashboard through the platform status edge (CloudFront — live"
+    printf '%s\n' "  # 2026-10-07; the anchor-side cutover is the remaining step — the"
+    printf '%s\n' "  # explicit per-tenant dashboard CNAME + the platform status"
+    printf '%s\n' "  # wildcard route this name): proves edge ->"
+    printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
+    printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
     printf '%s\n' "    url: https://${STATUS_HOST}"
     printf '%s\n' "    interval: 300s"
@@ -858,18 +1274,66 @@ TMP_CFG="${GATUS_CONFIG}.new"
       printf '%s\n' "        failure-threshold: 3"
       printf '%s\n' "        provider-override:"
       printf '%s\n' "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
+      alert_intent "dashboard TLS (via edge)"
     fi
   fi
 } >"$TMP_CFG"
-if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
-  log "Gatus config unchanged — no restart"
-  rm -f "$TMP_CFG"
-  GATUS_RESTART=0
-else
-  mv "$TMP_CFG" "${GATUS_CONFIG}"
-  log "Gatus config installed (rendered from dispatch env)"
-  GATUS_RESTART=1
+# Render-time assertion (issue #134, call C4): the rendered alert stanzas
+# must equal the intent ledger recorded while rendering — the #118 class of
+# gap (condition rendered, stanza forgotten) is otherwise invisible. Total
+# equality plus a per-name presence check is exact: every intended name
+# present with equal totals leaves no room for an extra stanza, and a
+# stanza moved to the wrong endpoint keeps the total and still fails
+# (#136 review, finding 2).
+ALERTS_RENDERED="$(grep -c "^    alerts:$" "$TMP_CFG" || true)"
+[ "$ALERTS_RENDERED" -eq "$ALERTS_EXPECTED" ] \
+  || die "Gatus render assertion failed: ${ALERTS_RENDERED} alerts stanza(s) rendered, expected ${ALERTS_EXPECTED} — refusing to install"
+while IFS= read -r _alert_ep; do
+  [ -n "$_alert_ep" ] || continue
+  awk -v want="  - name: ${_alert_ep}" '
+    $0 == want { inb = 1; next }
+    inb && /^  - name: / { inb = 0 }
+    inb && $0 == "    alerts:" { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$TMP_CFG" \
+    || die "Gatus render assertion failed: '${_alert_ep}' is missing its alerts stanza — refusing to install"
+done <<EOF
+${ALERTS_EXPECTED_NAMES}
+EOF
+# Operator-shape assertion (security-lens F4): with a push channel, an
+# operator anchor must carry the platform alert stanza — a platform block
+# removed together with its intent would otherwise render monitor-only
+# silently (the C4 ledger cannot see a synchronized drop).
+if [ -n "${NTFY_TOPIC:-}" ] && [ "$PLATFORM_ALERTS" -eq 1 ]; then
+  grep -qx 'platform' <<<"$ALERTS_EXPECTED_NAMES" \
+    || die "Gatus render assertion failed: ANCHOR_ROLE=operator with a push channel must render the platform alert stanza — refusing to install"
 fi
+# Silent-downgrade check (issue #134, call C7): the run log names the
+# endpoints that will alert — `platform` missing means the role/topic is
+# not active (names only; never the topic).
+if [ "$ALERTS_EXPECTED" -gt 0 ]; then
+  log "Gatus alert stanzas: ${ALERTS_EXPECTED} — $(printf '%s' "${ALERTS_EXPECTED_NAMES}" | tr '\n' ',' | sed 's/,$//')"
+elif [ -n "${NTFY_TOPIC:-}" ]; then
+  log "Gatus alert stanzas: 0 (push channel configured; no alerting rows in this shape)"
+else
+  log "Gatus alert stanzas: 0 (no push channel configured)"
+fi
+if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
+  log "Gatus config unchanged (identical re-render)"
+  rm -f "$TMP_CFG"
+else
+  # IN-PLACE install: the gatus container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode and the container keeps
+  # reading the OLD config forever (same class as the Caddyfile below;
+  # observed live 2026-10-07). Truncate+rewrite keeps the inode but is not
+  # atomic; the post-write cmp catches a short/failed write at run time (a
+  # power loss mid-write is repaired only by the next dispatch).
+  cat "$TMP_CFG" >"${GATUS_CONFIG}"
+  cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (out of space?) — refusing to restart Gatus on a partial config"
+  rm -f "$TMP_CFG"
+  log "Gatus config installed in place (rendered from dispatch env)"
+fi
+# --- gatus-render:end ---
 
 # ---------------------------------------------------------------------------
 # c1) Per-anchor Origin CA key + CSR + cert install (issue #123, M2)
@@ -877,7 +1341,7 @@ fi
 #    STATUS_HOST the Gatus section just resolved; the CSR is public material
 #    published for operator-side signing; a signed cert returns via the
 #    cert-only ORIGIN_CA_CERT_PEM variable and is validated fail-closed
-#    against the on-box key before it is installed in place. The legacy
+#    (leaf + linked chain) against the on-box key before it is installed. The legacy
 #    shared pair (if present) keeps serving until the per-anchor pair does
 #    (see the pair-selection block in the Caddy section).
 # ---------------------------------------------------------------------------
@@ -908,13 +1372,26 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
+# Stale-mount guard: the container bind-mounts the config FILE, and a file
+# bind mount pins the inode — a container created before an `mv` install
+# keeps reading the OLD bytes forever (docker restart does not rebind
+# mounts; live 2026-10-07). Compare the container's view through its root
+# to the rendered path; divergence = recreate once. In-place installs keep
+# this guard quiet on every later run.
+GATUS_MOUNT_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
+  gatus_pid="$(docker inspect --format '{{.State.Pid}}' gatus 2>/dev/null || true)"
+  if [ -n "${gatus_pid}" ] && ! cmp -s "/proc/${gatus_pid}/root/config/config.yaml" "${GATUS_CONFIG}"; then
+    GATUS_MOUNT_STALE=1
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
-    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor; then
+    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ]; then
       log "Gatus already running on ${GATUS_IMAGE}"
     else
-      log "Gatus container predates the hostanchor mapping (dual probes need it) - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
+      log "Gatus container predates the hostanchor mapping or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
       docker rm -f gatus >/dev/null
     fi
   else
@@ -932,10 +1409,14 @@ if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
     --mount type=volume,source=gatus-data,target=/data \
     "${GATUS_IMAGE}" >/dev/null
 fi
-if [ "${GATUS_RESTART:-0}" = "1" ]; then
-  docker restart gatus >/dev/null
-  log "Gatus restarted on new config"
-fi
+# Always restart: the stale-mount guard compares the MOUNT's bytes, not what
+# the running Gatus loaded — an aborted restart (SSH drop, SIGKILL) would
+# otherwise stay invisible, and the next dispatch (identical render, fresh
+# mount) would report green while the monitor serves the old config. A
+# restart is cheap (a ~1s monitor blip) and the sqlite history lives in a
+# named volume.
+docker restart gatus >/dev/null
+log "Gatus restarted"
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
 # run log (the tenant has no shell — this output IS their dashboard check).
 # Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
@@ -963,13 +1444,15 @@ fi
 #    :443 serves the dashboard for the one explicit status hostname below.
 #
 #    Env in (operator-plane — the tenant pastes nothing, so tenant bootstrap
-#    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert,
-#    cert-only PUBLIC material installed from the repo VARIABLE; key material
+#    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert
+#    chain, leaf-first; cert-only PUBLIC material installed from the repo
+#    VARIABLE; key material
 #    never travels — the key is generated on this box in section (c1)),
-#    CF_AOP_CA_PEM (optional zone-level Authenticated Origin Pulls bundle for
-#    our own cert; absent = edge auth stays firewall-allowlist + Host binding
-#    until the operator finishes the AOP ceremony in docs/dr.md +
-#    re-dispatches).
+#    CF_AOP_CA_PEM (legacy zone-level Authenticated Origin Pulls bundle for
+#    the pre-A2 Cloudflare edge; A2 retires AOP for the :443 origin leg —
+#    CloudFront has no AOP — so the expected post-cutover state is UNSET:
+#    edge auth = firewall allowlist + the X-Piercloud-Origin gate below.
+#    Pre-A2 Cloudflare-edge rollback only: set it per docs/dr.md).
 # ---------------------------------------------------------------------------
 log "Rendering dispatch-managed Caddyfile (${CADDY_CONFIG})"
 mkdir -p "$(dirname "${CADDY_CONFIG}")" "${CADDY_CHALLENGE_DIR}"
@@ -985,16 +1468,18 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine).
+# AOP bundle (public cert material — world-readable is fine; a key-bearing
+# bundle is refused below rather than written 644).
 AOP_TLS=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
-  case "${CF_AOP_CA_PEM}" in *"BEGIN CERTIFICATE"*) ;; *) die "CF_AOP_CA_PEM does not look like a PEM certificate bundle";; esac
+  case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
+  origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
   printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
   log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + Host binding until the operator finishes the AOP ceremony (docs/dr.md) + re-dispatches"
+  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md; it is not a secret/variable change)"
 fi
 CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
 if [ "${ORIGIN_TLS}" = "1" ]; then
@@ -1012,9 +1497,17 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
+# Pre-create root-only BEFORE the render: the :443 render carries the
+# X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
+# rejection may leave it readable beyond root. The mode assumes the pinned
+# container runs as root — a Renovate bump to a non-root USER would make the
+# bind-mounted file unreadable on recreate; verify on every bump.
+install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
-CADDY_RESTART=0
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
+  # A no-op render still re-asserts 0600: a pre-0600 file must not survive
+  # just because the bytes match.
+  chmod 600 "${CADDY_CONFIG}"
   log "Caddyfile unchanged"
   rm -f "$TMP_CADDY"
 else
@@ -1030,10 +1523,22 @@ else
     CADDY_VAL_ARGS="${CADDY_VAL_ARGS} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
   fi
   # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
-  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"
-  mv "$TMP_CADDY" "${CADDY_CONFIG}"
-  log "Caddyfile installed (rendered from dispatch env)"
-  CADDY_RESTART=1
+  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
+  # IN-PLACE install: the caddy container bind-mounts this FILE, and a file
+  # bind mount pins the inode — `mv` swaps the inode, so the container keeps
+  # reading the OLD bytes and `caddy reload` reports "config is unchanged"
+  # (observed live 2026-10-07: the A2 cutover render never reached the
+  # running Caddy and the :80 Host probe aborted). Truncate+rewrite keeps
+  # the inode (mode is re-asserted 0600 first so a first install cannot
+  # expose the secret-bearing render even transiently) but is not atomic;
+  # the post-write cmp catches a short/failed write at run time (a power
+  # loss mid-write is repaired only by the next dispatch).
+  [ -e "${CADDY_CONFIG}" ] || install -m 0600 /dev/null "${CADDY_CONFIG}"
+  chmod 600 "${CADDY_CONFIG}"
+  cat "$TMP_CADDY" >"${CADDY_CONFIG}"
+  cmp -s "$TMP_CADDY" "${CADDY_CONFIG}" || die "in-place Caddyfile write did not land byte-identical (out of space?) — refusing to reload Caddy on a partial config; the running process keeps the old config"
+  rm -f "$TMP_CADDY"
+  log "Caddyfile installed in place (rendered from dispatch env)"
 fi
 # ---------------------------------------------------------------------------
 # e2) Run Caddy (container recreated when the pinned tag changed — so a
@@ -1053,12 +1558,47 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
 fi
 [ -n "${AOP_TLS}" ] && CADDY_WANT_MOUNTS="${CADDY_WANT_MOUNTS} aop"
 CADDY_HAVE_MOUNTS="$(cat /etc/caddy/.deployed-mounts 2>/dev/null || true)"
+# Stale-mount guard (same rationale as the Gatus block above): the container
+# bind-mounts the Caddyfile FILE; a container created before an `mv` install
+# keeps reading the OLD bytes and the reload silently no-ops ("config is
+# unchanged"). Compare the container's view through its root to the rendered
+# path; divergence = recreate once. In-place installs keep this quiet.
+CADDY_MOUNT_STALE=0
+CADDY_MOUNT_STALE_REASON=""
+if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
+  caddy_pid="$(docker inspect --format '{{.State.Pid}}' caddy 2>/dev/null || true)"
+  if [ -n "${caddy_pid}" ] && ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"; then
+    CADDY_MOUNT_STALE=1
+    CADDY_MOUNT_STALE_REASON="Caddyfile"
+  fi
+  # The deployed PEMs are bind-mounted FILES too (same class): a container
+  # created before a PEM's inode last changed keeps reading the OLD bytes and
+  # `caddy reload` cannot fix it — live 2026-10-07: the 4-block chain install
+  # landed on the host while the container still served the leaf-only inode
+  # (CloudFront 502 with a green run). Compare the container's view through
+  # its root; divergence = recreate once.
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ "${ORIGIN_TLS}" = "1" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_CRT}" "${CADDY_ORIGIN_CRT}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="origin-ca cert"
+    elif ! cmp -s "/proc/${caddy_pid}/root${CADDY_ORIGIN_KEY}" "${CADDY_ORIGIN_KEY}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="origin-ca key"
+    fi
+  fi
+  if [ "${CADDY_MOUNT_STALE}" = "0" ] && [ -n "${caddy_pid}" ] && [ -n "${AOP_TLS}" ]; then
+    if ! cmp -s "/proc/${caddy_pid}/root/etc/caddy/aop-ca.pem" "${CADDY_AOP_CA}"; then
+      CADDY_MOUNT_STALE=1
+      CADDY_MOUNT_STALE_REASON="AOP CA"
+    fi
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   CADDY_RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' caddy) # ci-allowlist: code — docker inspect field name, not a live reference.
-  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ]; then
+  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
     log "Caddy already running on ${CADDY_IMAGE}"
   else
-    log "Caddy image or deployed-PEM set changed - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
+    log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container (stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-image/mount-set})" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f caddy >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "caddy"; then
@@ -1095,18 +1635,34 @@ if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
     die "Caddy exited on boot with the new config — tang stays up on loopback but the :80 proxy is down; reversibility: docs/dr.md"
   fi
 fi
-if [ "${CADDY_RESTART:-0}" = "1" ] || [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-  # Mounts already converged above (recreate path); reload = zero-downtime.
-  # ORIGIN_CERT_CHANGED covers the in-place cert swap: the bind-mounted FILE
-  # kept its inode (in-place write), so only a reload makes Caddy re-read it.
-  docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-  log "Caddy reloaded on new config"
-  if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
-    # Recorded ONLY after the successful reload (a failed run must re-reload
-    # on the next dispatch, never claim the cert is live).
-    origin_ca_write_hash "${ORIGIN_CA_CRT}"
-    log "deployed origin-ca cert hash recorded after the successful reload"
-  fi
+# Always reload: the stale-mount guard compares the MOUNT's bytes, not the
+# loaded config — an aborted reload (SSH drop, SIGKILL between the in-place
+# write and this line) would otherwise stay invisible, and the next dispatch
+# (identical render, equal mount bytes) would report green while the running Caddy
+# serves the old config (a rotated X-Piercloud-Origin secret or a changed
+# MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
+# covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
+# (in-place write), so only a reload makes Caddy re-read it.
+#
+# --force is REQUIRED, not cosmetic: the cert FILE is not part of the config
+# JSON, so a chain-only change (same leaf, same Caddyfile) leaves the adapted
+# config byte-identical and Caddy's changeConfig() returns errSameConfig
+# without re-provisioning the TLS app — the bind-mounted PEM is never re-read
+# and the old certificate stays in memory (caddy.go: "if nothing changed, no
+# need to do a whole reload unless the client forces it"; admin.go maps
+# Cache-Control: must-revalidate to forceReload). Live 2026-10-07: the
+# 4-block chain install plus a no-op reload kept serving the leaf-only cert →
+# CloudFront 502 while every loopback probe stayed green. Note the
+# ORIGIN_CERT_CHANGED marker hashes the LEAF only, so it cannot detect a
+# chain-only change; never condition this force on it.
+docker exec caddy caddy reload --force --config /etc/caddy/Caddyfile \
+  || die "caddy reload failed — the running Caddy may still serve the old config (the stale-mount guard only proves the mount bytes); inspect 'docker logs caddy', fix the render, and re-dispatch"
+log "Caddy reloaded on new config"
+if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
+  # Recorded ONLY after the successful reload (a failed run must re-reload
+  # on the next dispatch, never claim the cert is live).
+  origin_ca_write_hash "${ORIGIN_CA_CRT}"
+  log "deployed origin-ca cert hash recorded after the successful reload"
 fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
@@ -1239,7 +1795,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
     case "${dash_code}" in
       301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — the proxied edge record is upserted by the DNS stage after close)" ;;
+        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — this run's anchor-dns job writes both the anchor A and the explicit dashboard CNAME, live 2026-10-07)" ;;
       *)
         docker logs caddy 2>&1 | tail -20 || true
         die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
@@ -1297,9 +1853,9 @@ if [ -n "${STATUS_HOST:-}" ]; then
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The proxied edge record is upserted by the DNS stage AFTER this job, so on a first-time/DR dispatch this probe cannot pass. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once DNS converges re-enable AOP (docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
       fi
-      die "edge pull through Cloudflare failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply (or rotate the leaf with 102 --force-aop, then re-dispatch). If this is a first-time/DR dispatch, the proxied record may still point at the old box (edge 521/522) — the DNS stage converges only AFTER this job, see docs/dr.md"
+      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -1309,7 +1865,8 @@ if [ -n "${STATUS_HOST:-}" ]; then
       # has SERVED, which is the one-way marker's precondition.
       origin_ca_mark_active
     fi
-    log "edge pull through Cloudflare serves with AOP enforced (OK)"
+    log "edge pull through the public edge serves with AOP enforced (OK)"
+    log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale
@@ -1322,13 +1879,19 @@ if [ -n "${STATUS_HOST:-}" ]; then
       fi
     fi
     log "Caddy :443 handshakes for ${STATUS_HOST} (OK; edge trust is zone-side, see docs/dr.md)"
+    # A2 edge pull: the loopback handshake cannot see a missing/broken chain
+    # (CloudFront drops the connection with 502 before it reaches Caddy), so
+    # the public edge must serve the ORIGIN this run. Fail-closed; the
+    # classification and the no-pair no-op live in origin_ca_edge_prove.
+    origin_ca_edge_prove
   elif [ "${ORIGIN_TLS}" != "1" ]; then
     # No origin pair selected (absent, or the one-way marker suppressed the
     # legacy fallback): auto-TLS cannot reliably issue for a name whose public
-    # record is only upserted by the DNS stage after this job. Origin TLS is
-    # proven there (verify-after-write + orange-cloud) and by the edge, so
-    # this is loud, not fatal; with a pair selected it stays fail-closed.
-    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the proxied edge record is upserted after close (docs/dr.md)"
+    # edge path (the platform status wildcard) is not in place yet. Origin TLS
+    # is proven by the edge once the platform records exist, so this is loud,
+    # not fatal; with a pair selected it stays fail-closed.
+    log "WARNING: Caddy :443 has no certificate for ${STATUS_HOST} yet — no origin pair selected this run; the explicit dashboard CNAME / the platform status wildcard may not be in place yet (docs/dr.md)"
+    log "A2 edge not proven this run (no origin pair selected — auto-TLS/pending; the A2 CloudFront leg stays UNPROVEN until a pair is selected and the pull passes)"
   else
     docker logs caddy 2>&1 | tail -20 || true
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
@@ -1430,7 +1993,6 @@ oversized state file is preserved as `state.json.corrupt` - or a timestamped
 reports `baseline: null` - it could not be read and is never fabricated);
 alerts exit 1; green exits 0.
 """
-import collections
 import hashlib
 import hmac
 import http.client
@@ -1480,17 +2042,22 @@ UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 # while sorting above the whole real key space - a cursor-poisoning false
 # green (round-4 RF3.1).
 TS_PATTERN = r"[0-9]{8}T[0-9]{6}Z"
-# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[.<mode>].json. The
+# Session-scoped keys: <ts>-session.<type>.<sid>.<seq>[-<seq-end>][.<mode>].json.
+# The optional inclusive seq range token (pc-admin #29, D5) rides after the
+# start seq; a single-seq key is the degenerate [seq, seq] (dual shape). The
 # optional mode marker (.shell/.exec) is contract-defined for session.start
 # and session.end only (pc-admin D1); other session events keep the old shape.
 SESSION_KEY_RE = re.compile(
     r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>session\.[A-Za-z0-9_]+)\."
     r"(?P<sid>" + UUID_PATTERN + r")\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?"
     r"(?:\.(?P<mode>shell|exec))?\.json\Z"
 )
-# Documented non-session audit event: <ts>-<event-type>.<seq>.json (no sid).
+# Documented non-session audit event: <ts>-<event-type>.<seq>[-<seq-end>].json
+# (no sid); batched non-session events carry the same optional range token.
 NON_SESSION_KEY_RE = re.compile(
-    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})\.json\Z"
+    r"^(?P<ts>" + TS_PATTERN + r")-(?P<etype>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\.(?P<seq>[0-9]{1,18})"
+    r"(?:-(?P<seq_end>[0-9]{1,18}))?\.json\Z"
 )
 HEARTBEAT_KEY_RE = re.compile(r"^(?P<ts>" + TS_PATTERN + r")\.json\Z")
 UUID_RE = re.compile(UUID_PATTERN)
@@ -1535,8 +2102,14 @@ def strip_date_segment(relative):
 
 def _audit_session_basename_matches(basename):
     """True for a basename shaped as a documented session/non-session key."""
-    if SESSION_KEY_RE.match(basename):
-        return True
+    match = SESSION_KEY_RE.match(basename)
+    if match:
+        # A range on a lifecycle type, a mode marker on a range or a reversed
+        # range is naming/contract drift (D1/D5), never a cursor mover: the
+        # same rule the classifier applies before collection.
+        event_type, _ = canonical_conflict_type(match.group("etype"))
+        return not _audit_range_is_drift(
+            match.group("seq"), match.group("seq_end"), event_type, match.group("mode"))
     generic = NON_SESSION_KEY_RE.match(basename)
     if not generic:
         return False
@@ -1546,7 +2119,10 @@ def _audit_session_basename_matches(basename):
     # Only the documented sid-less session events (session.rejected) keep the
     # non-session shape and stay valid cursor movers.
     event_type, _ = canonical_conflict_type(generic.group("etype"))
-    return not (event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS)
+    if event_type.startswith("session.") and event_type not in SID_LESS_SESSION_EVENTS:
+        return False
+    return not _audit_range_is_drift(
+        generic.group("seq"), generic.group("seq_end"), event_type, "")
 
 
 def is_audit_session_key(key, audit_prefix, heartbeat_prefix):
@@ -1656,6 +2232,9 @@ def key_ts_is_future(now, relative_key, skew_tolerance):
 # v18 emits session.rejected without a session id): they ship on the
 # non-session shape and are not naming drift.
 SID_LESS_SESSION_EVENTS = frozenset({"session.rejected"})
+# Session lifecycle events stay one object per event (pc-admin D1): a range
+# token on one of these is contract drift, never a batched coverage claim.
+SESSION_MODE_EVENTS = frozenset({"session.start", "session.end"})
 # Replay-conflict variants (pc-admin `disambiguate_audit_key`): when a rebuilt
 # audit file replays an event under a key that already exists with DIFFERENT
 # bytes, the shipper appends `_<sha256[:16]>` to the event type (a session
@@ -1679,6 +2258,63 @@ def canonical_conflict_type(event_type):
     if not match:
         return event_type, False
     return event_type[: match.start()], True
+
+
+def _audit_range_is_drift(seq, seq_end, event_type, mode):
+    """True when a parsed range token violates the batched-key contract.
+
+    Contract (pc-admin #29 D1/D5): a range is defined on batched
+    (non-lifecycle) events only, inclusive with ``seq_end >= seq``, and never
+    carries a mode marker (the mode is contract-defined on the single-object
+    ``session.start``/``session.end`` keys only). A violation is
+    naming/contract drift, judged before the key can claim any coverage.
+    """
+    if seq_end is None:
+        return False
+    if int(seq_end) < int(seq):
+        return True
+    if event_type in SESSION_MODE_EVENTS:
+        return True
+    return bool(mode)
+
+
+def merge_coverage_interval(intervals, start, end):
+    """Merge inclusive ``[start, end]`` into sorted disjoint intervals. Pure.
+
+    Returns ``(merged, overlaps)``: ``merged`` is the coalesced coverage
+    (adjacent intervals coalesce without an overlap) and ``overlaps`` holds
+    the inclusive intersection with coverage already claimed by another
+    identity - the duplicate claims D9 flags. The caller owns the list.
+    """
+    merged = []
+    overlaps = []
+    for low, high in intervals:
+        if high + 1 < start or end + 1 < low:
+            merged.append((low, high))
+            continue
+        if start <= high and end >= low:
+            overlaps.append((max(low, start), min(high, end)))
+        start = min(start, low)
+        end = max(end, high)
+    merged.append((start, end))
+    merged.sort()
+    return merged, overlaps
+
+
+def render_interval_ranges(ranges, limit=20):
+    """Render inclusive ranges boundedly (single values bare, ranges ``a-b``).
+
+    The detail render caps at ``limit`` ranges + an ellipsis; callers fold the
+    full list into the finding identity so a range beyond the cap still moves
+    the signature.
+    """
+    rendered = [
+        str(start) if start == stop else "%d-%d" % (start, stop)
+        for start, stop in ranges[:limit]
+    ]
+    if len(ranges) > limit:
+        rendered.append("...")
+    return ",".join(rendered)
 
 
 class WitnessError(Exception):
@@ -3053,29 +3689,41 @@ def run_checks(config, now, plan):
         if match:
             event_type, is_variant = canonical_conflict_type(match.group("etype"))
             sid = match.group("sid").lower()
+            mode = match.group("mode")
+            seq_text = match.group("seq")
+            seq_end_text = match.group("seq_end")
+            seq = int(seq_text)
+            seq_end = int(seq_end_text) if seq_end_text is not None else seq
+            if _audit_range_is_drift(seq_text, seq_end_text, event_type, mode):
+                # A range on a lifecycle type, a mode marker on a range or a
+                # reversed range is naming/contract drift (D1/D5), judged
+                # before collection: the malformed key never creates session
+                # state and never enters the interval coverage math.
+                contract_bad_keys.append(relative)
+                continue
             state = sessions.setdefault(
-                sid, {"seqs": [], "start": None, "end": None, "start_mode": None,
-                      "end_mode": None, "identities": set()})
-            seq = int(match.group("seq"))
+                sid, {"intervals": [], "duplicates": [], "start": None, "end": None,
+                      "start_mode": None, "end_mode": None, "identities": set()})
             # A base key and its replay-conflict variant share one identity
-            # (ts, canonical type, seq): count the seq once so a legitimate
-            # variant cannot read as a `sequence-duplicate`, while a genuine
-            # duplicate from a different timestamp still does. The identity is
-            # for sequence counting ONLY - it must not skip lifecycle
-            # resolution: a same-ts `.exec`/`.shell` marker pair also shares
-            # the identity (the mode is not part of it), so forcing the second
-            # key to skip would let whichever key the listing returns first
-            # win regardless of LastModified (a stale/equal-LM `.exec` silently
-            # exempting a shell session). Only a key whose type
-            # `canonical_conflict_type` actually flags as a replay-conflict
-            # variant skips resolution; every canonical key reaches
-            # `resolve_lifecycle_marker` and the newest marker (or the
-            # conservative conflicting tie) wins in either listing order.
-            identity = (match.group("ts"), event_type, seq)
+            # (ts, canonical type, start, end): count the interval once so a
+            # legitimate variant cannot read as a `sequence-duplicate`, while
+            # a genuine duplicate from a different timestamp still does. The
+            # identity is for sequence counting ONLY - it must not skip
+            # lifecycle resolution: a same-ts `.exec`/`.shell` marker pair
+            # also shares the identity (the mode is not part of it), so
+            # forcing the second key to skip would let whichever key the
+            # listing returns first win regardless of LastModified (a
+            # stale/equal-LM `.exec` silently exempting a shell session).
+            # Only a key whose type `canonical_conflict_type` actually flags
+            # as a replay-conflict variant skips resolution; every canonical
+            # key reaches `resolve_lifecycle_marker` and the newest marker (or
+            # the conservative conflicting tie) wins in either listing order.
+            identity = (match.group("ts"), event_type, seq, seq_end)
             if identity not in state["identities"]:
                 state["identities"].add(identity)
-                state["seqs"].append(seq)
-            mode = match.group("mode")
+                merged, overlaps = merge_coverage_interval(state["intervals"], seq, seq_end)
+                state["intervals"] = merged
+                state["duplicates"].extend(overlaps)
             if is_variant:
                 # Variants drop the mode marker by contract and must not
                 # re-resolve the lifecycle marker: the base key (which the
@@ -3107,6 +3755,13 @@ def run_checks(config, now, plan):
             # A replay-conflict variant (`session.rejected_<hash16>`) is the
             # same documented event as its base type, never naming drift.
             event_type, _ = canonical_conflict_type(generic.group("etype"))
+            if _audit_range_is_drift(
+                    generic.group("seq"), generic.group("seq_end"), event_type, ""):
+                # A reversed range (or a range on a lifecycle type) on the
+                # sid-less shape is contract drift (D1/D5), never a documented
+                # event: fail closed before the classification.
+                contract_bad_keys.append(relative)
+                continue
             if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
                 continue  # documented non-session (or known sid-less session) event
         # Drift is judged by shape (a UUID-shaped sid or a session.* event
@@ -3161,7 +3816,7 @@ def run_checks(config, now, plan):
             # be gap-checked, so they must alert on their own.
             alerts.append(
                 "session-start-missing: session %s has %d audit event(s) but no session.start"
-                % (sid, len(state["seqs"]))
+                % (sid, len(state["identities"]))
             )
             finding_ids.append("session-start-missing:events:" + sid)
             continue
@@ -3245,39 +3900,48 @@ def run_checks(config, now, plan):
             finding_ids.append("session-start-missing:orphan-tar:" + sid)
 
     for sid in sorted(sessions):
-        seqs = sessions[sid]["seqs"]
-        counts = collections.Counter(seqs)
-        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
+        intervals = sessions[sid]["intervals"]
+        duplicates = sessions[sid]["duplicates"]
         if duplicates:
-            rendered = ",".join(str(number) for number in duplicates)
+            # Overlap detection (D9): merged coverage flags any interval claim
+            # that intersects coverage already declared by another identity -
+            # the same seq under a different ts/type, or the rebuild-overlap
+            # residual. Duplicate coverage is never a drop.
             alerts.append(
-                "sequence-duplicate: session %s repeats <seq> %s" % (sid, rendered)
+                "sequence-duplicate: session %s repeats <seq> %s"
+                % (sid, render_interval_ranges(duplicates))
             )
-            finding_ids.append("sequence-duplicate:%s:%s" % (sid, rendered))
-            continue
-        unique = sorted(counts)
-        if unique[0] > 1:
+            # Identity from ALL overlaps: the detail render caps at 20 ranges
+            # + ellipsis, and hashing the capped render would let an overlap
+            # beyond range 20 ride a quiet pin unchanged.
+            finding_ids.append(
+                "sequence-duplicate:%s:%s"
+                % (sid, identity_digest("%d-%d" % (start, stop) for start, stop in duplicates))
+            )
+        # Origin and gap are INDEPENDENT of the overlap: a concurrent hole (or
+        # an out-of-range first seq) must still be named, not swallowed by a
+        # duplicate finding's former short-circuit (round-1 red-team FIX-3).
+        if intervals[0][0] > 1:
             alerts.append(
                 "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
-                % (sid, unique[0])
+                % (sid, intervals[0][0])
             )
-            finding_ids.append("sequence-origin:%s:%d" % (sid, unique[0]))
-        if unique[-1] - unique[0] + 1 != len(unique):
-            # Bounded missing-set: render gap ranges from the observed values
-            # (never range(low, high+1), which crafted seq values could hang).
-            missing_ranges = [
-                (before + 1, after - 1)
-                for before, after in zip(unique, unique[1:]) if after > before + 1
-            ]
-            rendered = [
-                str(start) if start == stop else "%d-%d" % (start, stop)
-                for start, stop in missing_ranges[:20]
-            ]
-            if len(missing_ranges) > 20:
-                rendered.append("...")
+            finding_ids.append("sequence-origin:%s:%d" % (sid, intervals[0][0]))
+        # A hole BETWEEN merged intervals only (D9): a declared range covers
+        # its whole span, so an event missing *inside* one is invisible
+        # list-only - the disclosed loss. Judged even when duplicates exist
+        # (the overlap never suppresses the hole). Render bounded from the
+        # observed intervals (never range(low, high+1), which crafted seq
+        # values could hang).
+        missing_ranges = [
+            (high + 1, low - 1)
+            for (_, high), (low, _) in zip(intervals, intervals[1:])
+            if low > high + 1
+        ]
+        if missing_ranges:
             alerts.append(
                 "sequence-gap: session %s missing <seq> %s"
-                % (sid, ",".join(rendered))
+                % (sid, render_interval_ranges(missing_ranges))
             )
             # Identity from ALL missing ranges: the detail render caps at 20
             # ranges + ellipsis, and hashing the capped render would let a gap
@@ -4449,4 +5113,4 @@ case "$(recording_witness_state)" in
     ;;
 esac
 
-log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-status-<alias>.piercloud.net} (TLS on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."
+log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-<alias>.status.piercloud.net} (visitor TLS at the edge; the origin leg on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

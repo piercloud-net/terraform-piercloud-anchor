@@ -12,7 +12,7 @@
 #
 # Deliberately NOT in .github/scripts/: that path is scanned by CI's SCP
 # endpoint allowlist (scope: provision.yml + .github/scripts/*.sh), which
-# would reject the status-* URL and the /api/v1 path as unlisted. New
+# would reject the dashboard URL and the /api/v1 path as unlisted. New
 # workflow files are out of that scope by construction.
 
 name: external-watch
@@ -52,7 +52,11 @@ jobs:
         id: probe
         continue-on-error: true
         env:
-          PROBE_URL: ${{ inputs.probe_url }}
+          # At the A2 cutover (platform `*.status` records live, flat name
+          # tombstoned) set the repo variable STATUS_PROBE_URL to the nested
+          # dashboard URL. Until then it is unset and the shell default below
+          # probes the flat name.
+          PROBE_URL: ${{ inputs.probe_url || vars.STATUS_PROBE_URL }}
           MIN_CERT_DAYS: "14"
           ATTEMPTS: "3"
           RETRY_SLEEP: "10"
@@ -61,6 +65,15 @@ jobs:
           # see the header comment. Env knobs exist so the exact code can be
           # extracted and run locally against good/bad URLs.
           set -uo pipefail
+          # Post-A2 cutover (2026-10-07): the nested
+          # <tenant>.status.piercloud.net is live — the platform
+          # `*.status` wildcard plus the explicit per-tenant dashboard CNAME
+          # (ENT-proof: the ACME challenge node blocks wildcard synthesis on
+          # RFC 4592-strict providers). The flat `status-<tenant>` form is
+          # tombstoned; the default below is that legacy name only as the
+          # last-resort fallback — every provisioned repo sets
+          # STATUS_PROBE_URL to its nested URL (this repo:
+          # https://pier.status.piercloud.net/).
           URL="${PROBE_URL:-https://status-pier.piercloud.net/}"
           base="${URL%/}"
           host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"

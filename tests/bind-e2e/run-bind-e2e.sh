@@ -22,7 +22,12 @@ PROVISION_SH="${REPO_ROOT}/scripts/010-provision.sh"
 CADDY_PORT="${CADDY_PORT:-18080}"
 MOCK_PORT="${MOCK_PORT:-18081}"
 STUB_PORT="${STUB_PORT:-18082}"
-AOP_SNI="status-prodprobe.piercloud.net"
+# Gate-proof ports (call D): a dedicated dashboard render + stub, served
+# before the main .ci serve so no other Caddy holds the admin endpoint.
+GATE_TLS_PORT="${GATE_TLS_PORT:-18443}"
+GATE_HTTP_PORT="${GATE_HTTP_PORT:-18084}"
+GATE_STUB_PORT="${GATE_STUB_PORT:-18085}"
+AOP_SNI="prodprobe.status.piercloud.net"
 TENANT_USER="${TENANT_USER:-citest}"
 CADDY_VERSION="2.11.4"
 CADDY_TGZ="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
@@ -38,6 +43,8 @@ die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   # Best-effort teardown in reverse bring-up order; never masks the failure.
   [ -n "${RT_PID:-}" ] && kill "${RT_PID}" 2>/dev/null || true
+  [ -n "${GATE_PID:-}" ] && kill "${GATE_PID}" 2>/dev/null || true
+  [ -n "${GATE_STUB_PID:-}" ] && kill "${GATE_STUB_PID}" 2>/dev/null || true
   cryptsetup close real-tang 2>/dev/null || true
   [ -n "${CADDY_PID:-}" ] && kill "${CADDY_PID}" 2>/dev/null || true
   [ -n "${AOP_CADDY_PID:-}" ] && kill "${AOP_CADDY_PID}" 2>/dev/null || true
@@ -92,9 +99,9 @@ sed -n "$((b+1)),$((e-1))p" "${PROVISION_SH}" > "${WORK}/render.src"
 source "${WORK}/render.src"
 command -v caddy_status_names >/dev/null || die "extraction did not yield caddy_status_names"
 command -v render_caddyfile >/dev/null || die "extraction did not yield render_caddyfile"
-# Production firewall constant, extracted — never retyped, cannot drift.
-eval "$(grep '^CF_EDGE_CIDRS=' "${PROVISION_SH}")"
-[ -n "${CF_EDGE_CIDRS:-}" ] || die "CF_EDGE_CIDRS extraction failed"
+# Production origin-range constant, extracted — never retyped, cannot drift.
+eval "$(grep '^CLOUDFRONT_ORIGIN_CIDRS=' "${PROVISION_SH}")"
+[ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS extraction failed"
 export TENANT_USER TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
 export CADDY_CHALLENGE_DIR="${WORK}/acme-challenge"
 # Bare :port (like production :80): matches ANY Host with plain HTTP, so the
@@ -106,7 +113,7 @@ export DASH_TLS_STANZA="	# harness: no :443 block (CADDY_SKIP_HTTPS); tang never
 export STATUS_HOST="" STATUS_MATCH=""
 caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.ci"
-[ "${STATUS_HOST}" = "status-citest.piercloud.net" ] || die "sanitize drift: STATUS_HOST=${STATUS_HOST}"
+[ "${STATUS_HOST}" = "citest.status.piercloud.net" ] || die "sanitize drift: STATUS_HOST=${STATUS_HOST}"
 grep -q "reverse_proxy 127.0.0.1:${MOCK_PORT}" "${WORK}/Caddyfile.ci" || die "render does not point /adv|/rec at the mock"
 grep -q "reverse_proxy 127.0.0.1:${STUB_PORT}" "${WORK}/Caddyfile.ci" || die "render does not point the status host at the stub"
 grep -q "host ${STATUS_HOST}" "${WORK}/Caddyfile.ci" || die "render lacks the exact-Host status matcher"
@@ -115,10 +122,14 @@ log "CI Caddyfile rendered (status host: ${STATUS_HOST})"
 # production addressing and validate (never served here).
 ( export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
 export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
 export DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.prodshape" )
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --adapter caddyfile
+grep -q "@unauthorized" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the CloudFront origin gate"
+grep -q "harness-origin-secret" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the origin secret in the gate"
+grep -q "192.0.2.99/32" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the main-box bypass"
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
 
@@ -138,6 +149,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin.key" -out "${WORK}/or
   -days 1 -nodes -subj "/CN=harness-origin" >/dev/null 2>&1 || die "openssl could not mint the harness origin pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # shellcheck disable=SC1090
@@ -156,6 +168,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin-ca.key" -out "${WORK}
   -days 1 -nodes -subj "/CN=harness-origin-ca" >/dev/null 2>&1 || die "openssl could not mint the harness origin-ca pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" ORIGIN_CA_PAIR="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin-ca.crt" CADDY_ORIGIN_KEY="${WORK}/origin-ca.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # The REAL stanza builder (extracted above) must pick up the per-anchor
@@ -173,6 +186,126 @@ if grep -vE '^[[:space:]]*#' "${WORK}/Caddyfile.origin-ca" | grep -q "on_demand"
 fi
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.origin-ca" --adapter caddyfile
 log "Per-anchor origin-ca render validates (real pair + AOP stanza compiled)"
+
+# ---------------------------------------------------------------- 3e. gate
+# CloudFront origin gate (call D) — request-level proof. Caddy 2.11.4 adapts
+# `abort` AFTER `handle`, so a site-level gate would sit behind the dashboard
+# catch-all handle and never execute; the gate lives INSIDE that handle
+# (scripts/010-provision.sh) and this section proves it BOTH ways: the
+# adapted route order (test-scoped AND production-shape), then a served
+# peer/header matrix. Loopback is exempt (the on-box probes connect from
+# it), so the matrix uses MAIN_BOX_IPV4=127.0.0.2 and a test-scoped admitted
+# range 127.0.0.3/32 (production carries the 81 public AWS prefixes; the
+# render reads CLOUDFRONT_ORIGIN_CIDRS). The matrix includes a forged
+# client-IP header from an admitted peer: the gate must match the DIRECT
+# peer (remote_ip), never the trusted-proxy-resolved client, or a
+# viewer-supplied header would be spoofable through the edge.
+log "Gate: adapted route order + served peer/header matrix"
+GATE_HOST="gateprobe.status.piercloud.net:${GATE_TLS_PORT}"
+# The cert SAN must cover the site host or Caddy falls back to ACME (which
+# would hang/fail here): mint it for the exact host.
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/gate.key" -out "${WORK}/gate.crt" \
+  -days 1 -nodes -subj "/CN=${GATE_HOST%:*}" -addext "subjectAltName=DNS:${GATE_HOST%:*}" >/dev/null 2>&1 \
+  || die "openssl could not mint the gate pair"
+( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
+  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_CIDRS="127.0.0.3/32" CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
+  export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.gate" )
+# Serve copy: one global option added so the test binds no privileged :80
+# (Caddy's auto HTTP->HTTPS redirect listener); the dashboard block under
+# test is byte-identical to the render.
+awk 'NR == 1 { print; next } /^\{$/ { print; print "\tauto_https disable_redirects"; next } { print }' \
+  "${WORK}/Caddyfile.gate" > "${WORK}/Caddyfile.gate.serve"
+HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.json" \
+  || die "gate render does not adapt"
+assert_gate_order() { # $1 = adapted config json, $2 = site host
+python3 - "$1" "$2" <<'PY' || die "adapted route order puts the origin gate behind the catch-all handle (dead code)"
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+host = sys.argv[2]
+site = None
+for srv in cfg["apps"]["http"]["servers"].values():
+    for rt in srv.get("routes", []):
+        for m in rt.get("match", []):
+            if host in m.get("host", []):
+                site = rt
+if site is None:
+    print(f"dashboard route for {host} not found")
+    sys.exit(1)
+catchall = None
+for grp in site["handle"][0]["routes"]:
+    h0 = grp["handle"][0]
+    if "match" not in grp and h0.get("handler") == "subroute":
+        catchall = grp
+if catchall is None:
+    print("catch-all handle group not found")
+    sys.exit(1)
+inner = [r["handle"][0] for r in catchall["handle"][0]["routes"]]
+kinds = ["abort" if h.get("handler") == "static_response" and h.get("abort") else h.get("handler") for h in inner]
+if kinds.count("abort") < 2 or "reverse_proxy" not in kinds:
+    print(f"gate handlers missing from the catch-all handle: {kinds}")
+    sys.exit(1)
+if kinds.index("reverse_proxy") < max(i for i, k in enumerate(kinds) if k == "abort"):
+    print(f"gate aborts after the reverse_proxy: {kinds}")
+    sys.exit(1)
+print(f"adapted gate order OK: {kinds}")
+PY
+}
+assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
+# Production-shape render: the real 81-prefix CLOUDFRONT_ORIGIN_CIDRS (the
+# value extracted from 010 above, no test override) must adapt to the same
+# gate order AND actually carry the production prefixes — the served matrix
+# below uses a test-scoped range, and `caddy adapt` is CEL-blind, so the
+# presence tooth below is what keeps a leaked override from passing.
+( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
+  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
+  export CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
+  export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
+  caddy_status_names
+  render_caddyfile > "${WORK}/Caddyfile.gate.prod" )
+HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate.prod" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.prod.json" \
+  || die "production-shape gate render does not adapt"
+assert_gate_order "${WORK}/Caddyfile.gate.prod.json" "${GATE_HOST%:*}"
+grep -q '130.176.88.0/21' "${WORK}/Caddyfile.gate.prod" || die "production-shape gate render does not carry the production ranges"
+if grep -q '127.0.0.3/32' "${WORK}/Caddyfile.gate.prod"; then die "production-shape gate render carries the test range"; fi
+mkdir -p "${WORK}/gate-stub" && printf 'STUBOK' > "${WORK}/gate-stub/index.html"
+python3 -m http.server "${GATE_STUB_PORT}" --bind 127.0.0.1 --directory "${WORK}/gate-stub" >"${WORK}/gate-stub.log" 2>&1 &
+GATE_STUB_PID=$!
+HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.gate.serve" --adapter caddyfile >"${WORK}/caddy-gate.log" 2>&1 &
+GATE_PID=$!
+ok=0
+for i in $(seq 1 30); do
+  if curl -skf --max-time 3 --interface 127.0.0.2 --resolve "${GATE_HOST}:127.0.0.1" "https://${GATE_HOST}/" -o /dev/null; then ok=1; break; fi
+  sleep 1
+done
+[ "${ok}" = "1" ] || { tail -20 "${WORK}/caddy-gate.log"; kill "${GATE_PID}" "${GATE_STUB_PID}" 2>/dev/null || true; die "gate test Caddy did not serve the dashboard"; }
+gate_expect() { # $1 label, $2 source interface, $3 want (ok|abort); rest = extra curl args
+  local label="$1" iface="$2" want="$3"; shift 3
+  local code rc
+  # An abort gives curl a non-zero rc (empty reply / stream error) — capture
+  # it instead of letting `set -e` kill the harness before the assertion.
+  set +e
+  code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --interface "${iface}" --resolve "${GATE_HOST}:127.0.0.1" "$@" "https://${GATE_HOST}/" 2>/dev/null)"
+  rc=$?
+  set -e
+  case "${want}" in
+    ok)    [ "${code}" = "200" ] && log "gate OK: ${label}" || die "gate: ${label} expected 200, got ${code} (curl rc ${rc})" ;;
+    abort) { [ "${code}" != "200" ] || [ "${rc}" -ne 0 ]; } && log "gate OK: ${label} (aborted, http ${code}, curl rc ${rc})" || die "gate: ${label} expected an abort, got 200" ;;
+  esac
+}
+gate_expect "main box, no header passes"          127.0.0.2 ok
+gate_expect "admitted peer, no header aborts"     127.0.0.3 abort
+gate_expect "admitted peer, wrong header aborts"  127.0.0.3 abort -H 'X-Piercloud-Origin: wrong'
+gate_expect "admitted peer, secret passes"        127.0.0.3 ok    -H 'X-Piercloud-Origin: harness-origin-secret'
+gate_expect "outside peer, secret aborts"         127.0.0.4 abort -H 'X-Piercloud-Origin: harness-origin-secret'
+gate_expect "outside peer, no header aborts"      127.0.0.4 abort
+gate_expect "loopback, no header passes"          127.0.0.1 ok
+gate_expect "admitted peer, forged viewer-IP header aborts" 127.0.0.3 abort -H 'CloudFront-Viewer-Address: 127.0.0.1'
+kill "${GATE_PID}" "${GATE_STUB_PID}" 2>/dev/null || true
+wait "${GATE_PID}" 2>/dev/null || true
+log "Gate matrix passed (adapted order + 8 request cases)"
 
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"
@@ -280,7 +413,7 @@ adv_ok "${WORK}/not-an-adv.json" && die "provision /adv assertion accepts a raw 
 log "PASS: provision /adv assertion accepts flattened + general advertisements and rejects raw JWK sets"
 # Regression guard: the prodshape render above runs in a subshell precisely
 # so this still names the CI tenant (a clobbered name aborts here, by design).
-[ "${STATUS_HOST}" = "status-citest.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
+[ "${STATUS_HOST}" = "citest.status.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
 STUB_GOT="$(curl -sf -H "Host: ${STATUS_HOST}" "http://127.0.0.1:${CADDY_PORT}/api/v1/endpoints/statuses")" || die "status-host request failed"
 [ "${STUB_GOT}" = "gatus-stub-ok" ] || die "status-host routing broken (got: ${STUB_GOT})"
 log "PASS: exact-Host dashboard routing reaches the stub"
