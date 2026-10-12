@@ -142,7 +142,7 @@ jobs:
           ANCHOR_REF="${ANCHOR_REF:-}"
           case "$TENANT_INPUT" in
             '') ;;
-            [!a-z0-9]* | *- | *[!a-z0-9_-]*) echo "::error::tenant input must match [a-z0-9][a-z0-9_-]{0,39} (no leading/trailing hyphen or underscore) — refusing."; exit 1 ;;
+            [!a-z0-9]* | *- | *[!a-z0-9_-]*) echo "::error::tenant input must match [a-z0-9][a-z0-9_-]{0,39} (must start alphanumeric; no trailing hyphen) — refusing."; exit 1 ;;
           esac
           [ "${#TENANT_INPUT}" -le 40 ] || { echo "::error::tenant input exceeds 40 characters — refusing."; exit 1; }
           # Lowercase-only: the concurrency lane is evaluated before any step

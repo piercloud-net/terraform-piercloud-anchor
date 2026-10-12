@@ -13,9 +13,10 @@
 #     function of `anchor_ref` only; exactly the two environment-gated jobs
 #     carry the dynamic `environment:` expression (per-job extraction, so a
 #     quoted literal or a decoy binding elsewhere is caught); the preflight
-#     step lives in the UNGATED banner job, has no `if:` and precedes the
-#     device-flow job; the device-flow job depends on the banner job; the
-#     environment binding check uses the MANAGED_TENANT marker.
+#     step lives in the UNGATED job that owns it, is that job's FIRST step,
+#     has no `if:`, and the device-flow job `needs:` that same job
+#     (dependency-checked, not line proximity); the environment binding check
+#     uses the MANAGED_TENANT marker.
 #   - BEHAVIORAL: the REAL preflight and binding step bodies (extracted,
 #     never copies) run under `env -i`; refusals must fail closed and valid
 #     shapes must pass (incl. the ref-less mutating-run warning).
@@ -66,23 +67,36 @@ is "anchor-dns binds the dynamic environment" "anchor-dns|$DYN_ENV" "$(printf '%
 is "tenant input declared" "1" "$(grep -c '^      tenant:$' "$PROV")"
 is "anchor_ref input declared" "1" "$(grep -c '^      anchor_ref:$' "$PROV")"
 
-# Preflight placement: in the ungated banner job, before device-flow, no `if:`.
+# Preflight placement: the preflight must be the FIRST step of the ungated job
+# that owns it, and device-flow must `needs:` that job — a new ungated job
+# owning the preflight between banner and device-flow must not stay green.
 PREFLIGHT_LINE="$(grep -n '^      - name: Managed-input preflight' "$PROV" | head -1 | cut -d: -f1)"
-BANNER_LINE="$(grep -n '^  visibility-banner:' "$PROV" | cut -d: -f1)"
 DEVFLOW_LINE="$(grep -n '^  device-flow:' "$PROV" | cut -d: -f1)"
 [ -n "$PREFLIGHT_LINE" ] && ok "preflight step present" || bad "preflight step missing"
-if [ -n "$PREFLIGHT_LINE" ] && [ -n "$BANNER_LINE" ] && [ -n "$DEVFLOW_LINE" ] \
-   && [ "$PREFLIGHT_LINE" -gt "$BANNER_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$DEVFLOW_LINE" ]; then
-  ok "preflight sits in the ungated banner job, before device-flow"
+# The owning job = nearest 2-space job header at/before the preflight line.
+OWNER_JOB="$(awk -v n="$PREFLIGHT_LINE" 'NR<=n && /^  [A-Za-z0-9_.-]+:$/ { job=$1; sub(/:$/, "", job) } END { print job }' "$PROV")"
+OWNER_HEADER_LINE=""
+[ -n "$OWNER_JOB" ] && OWNER_HEADER_LINE="$(grep -n "^  ${OWNER_JOB}:" "$PROV" | head -1 | cut -d: -f1)"
+FIRST_STEP_LINE=""
+[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(awk -v n="$OWNER_HEADER_LINE" 'NR>n && /^      - name: / { print NR; exit }' "$PROV")"
+is "preflight is the first step of its own job" "$PREFLIGHT_LINE" "$FIRST_STEP_LINE"
+# …and it must still precede the device-flow job in the file (the banner job
+# is scheduled before device-flow).
+if [ -n "$PREFLIGHT_LINE" ] && [ -n "$DEVFLOW_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$DEVFLOW_LINE" ]; then
+  ok "preflight precedes the device-flow job"
 else
-  bad "preflight is not in the banner job before device-flow ($PREFLIGHT_LINE / $BANNER_LINE / $DEVFLOW_LINE)"
+  bad "preflight does not precede device-flow ($PREFLIGHT_LINE / $DEVFLOW_LINE)"
 fi
+# device-flow must `needs:` the owning job (dependency, not line proximity).
+DEVFLOW_NEEDS="$(awk '/^  device-flow:/{f=1; next} f && /^    needs:/{line=$0; sub(/^    needs: */, "", line); print line; exit} f && /^  [A-Za-z0-9_.-]+:$/{exit}' "$PROV")"
+case "$DEVFLOW_NEEDS" in *"$OWNER_JOB"*) ok "device-flow needs the preflight's job ($OWNER_JOB)";; *) bad "device-flow does not need $OWNER_JOB (needs: $DEVFLOW_NEEDS)";; esac
 # Step header (name .. run:) must carry no `if:` — a disabled preflight is a
 # silent bypass.
 awk -v n="$PREFLIGHT_LINE" 'NR>=n && /^      - name:/ && NR>n { exit } NR>=n { print }' "$PROV" > "$WORK/preflight-header.txt"
 is "preflight step has no if: guard" "0" "$(grep -c '^        if:' "$WORK/preflight-header.txt")"
-# device-flow must depend on the banner job so a preflight failure gates it.
-contains "device-flow needs the banner job" "needs: [visibility-banner]" "$(cat "$PROV")"
+# The owning job must be ungated (no `environment:` for it in the per-job extraction).
+OWNER_ENV="$(printf '%s\n' "$ENV_LINES" | grep "^${OWNER_JOB}|" || true)"
+is "preflight's job is ungated" "" "$OWNER_ENV"
 
 # Environment binding check.
 contains "binding check uses MANAGED_TENANT" 'MANAGED_TENANT: ${{ vars.MANAGED_TENANT }}' "$(cat "$PROV")"
@@ -145,6 +159,10 @@ rc="$(RUN_BODY p2b "$PREFLIGHT_BODY" TENANT_INPUT=_foo ANCHOR_REF=ok MODE=check)
 is "p2b leading underscore rc" "1" "$rc"
 rc="$(RUN_BODY p2c "$PREFLIGHT_BODY" TENANT_INPUT=_ ANCHOR_REF=ok MODE=check)"
 is "p2c lone underscore rc" "1" "$rc"
+# Trailing underscore is inside the allowed charset (N3: the message must not
+# claim otherwise).
+rc="$(RUN_BODY p2d "$PREFLIGHT_BODY" TENANT_INPUT=foo_ ANCHOR_REF=ok MODE=check)"
+is "p2d trailing underscore allowed rc" "0" "$rc"
 
 rc="$(RUN_BODY p3 "$PREFLIGHT_BODY" TENANT_INPUT=-foo ANCHOR_REF=ok MODE=check)"
 is "p3 leading hyphen rc" "1" "$rc"

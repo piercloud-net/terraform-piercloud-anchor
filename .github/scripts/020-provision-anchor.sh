@@ -664,7 +664,8 @@ close_policy() { # $1 = policy id: detach-then-delete, ALWAYS in that order
 # account is out of contract too. All runs that mutate a managed account must
 # carry the same anchor_ref — the platform dispatcher sets it, and a manual
 # run on a managed account passes it explicitly (a managed `tenant` dispatch
-# without it fails closed at the resolve step). The tradeoff is deliberate:
+# without it fails closed at the preflight step in the ungated banner job).
+# The tradeoff is deliberate:
 # an attached leaked tmp keeps admitting a stale runner /32 to :22 for as long
 # as it lives (GitHub recycles runner IPs), so the fresh leak is retired now
 # rather than at 2h.
