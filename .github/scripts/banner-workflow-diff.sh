@@ -74,12 +74,13 @@ set -euo pipefail
 # workspace checkout the script was called in, so neutralise them all.
 unset GIT_LITERAL_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_GLOB_PATHSPECS GIT_ICASE_PATHSPECS GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE
 
-# A shell function named `git` (an exported `BASH_FUNC_git%%`) can forge the
-# verdict — a decoy `diff`/`grep` returns a false UNCHANGED (red-team verify
-# HIGH). Drop any imported function, resolve the binary once to an absolute
-# path (a relative/PATH-shim resolution refuses), and route every call through
-# the resolved path so a later PATH change cannot swap it.
-unset -f git 2>/dev/null || true
+# A shell function can shadow ANY command the script relies on (`git`,
+# `command`, `grep`, `printf`, `echo`): an exported `BASH_FUNC_*` decoy forges
+# the verdict — a decoy `diff`/`grep` returns a false UNCHANGED (red-team
+# verify HIGH). Drop them all, resolve the binary once to an absolute path (a
+# relative/PATH-shim resolution refuses), and route every call through the
+# resolved path so a later PATH change cannot swap it.
+unset -f git command grep printf echo 2>/dev/null || true
 git_bin="$(command -v git || true)"
 case "$git_bin" in
   /*) ;;
@@ -160,14 +161,16 @@ fi
 # comment/heredoc/string text or a valid expression (`x = true ? "module" : "y"`,
 # `x = { "module": true }`; the JSON-key leg is unanchored so minified JSON is
 # caught) — any line carrying a JSON string with a `\uNNNN`/`\UNNNNNNNN`
-# escape in KEY position: before a colon, or ending a line after `{`/`,` (the
+# escape in KEY position: before a colon, or ending a line after `{`/`,` or
+# at line start (an indented pretty-printed key) (the
 # escaped-key legs are name-agnostic and not decode-aware, so ANY escaped key
 # refuses — e.g. `{"caf\u00e9":1}` — not just `module`; a value string ending
-# a line after a colon does not refuse; red-team verify MEDIUM/LOW), and a line
+# a line after a colon does not refuse, but a leading-comma value line ending
+# in an escaped string does — fail-closed; red-team verify MEDIUM/LOW), and a line
 # ending in the literal string `"module"` —
 # the review is the backstop (trust r5f/r5g/r5h LOW, red-team r5f/r5h LOW,
 # functional r5g/r5h LOW, red-team seeded MEDIUM).
-if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:|(^|[[:space:]]*[{,][[:space:]]*)"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
+if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:|(^[[:space:]]*|[[:space:]]*[{,][[:space:]]*)"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
    || git grep -qE $'^\xef\xbb\xbf[[:space:]]*module([^[:alnum:]_]|$)' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
   echo "::error::a module block exists in the counted root HCL — its source tree is executed code outside the counted set; add it to the pathspecs and relax this gate deliberately" >&2
   exit 1

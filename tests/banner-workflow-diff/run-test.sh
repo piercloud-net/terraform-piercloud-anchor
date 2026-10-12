@@ -48,8 +48,8 @@
 #       and text before the close, indentation, a BOM prefix, a comment close
 #       directly before the token, JSON split keys and spaced colons,
 #       source-value escapes, and a Unicode-escaped JSON key spelling like
-#       `"\u006dodule"` in KEY position — before a colon or ending a line
-#       after `{`/`,` — name-agnostic and not decode-aware, so ANY escaped key
+#       `"\u006dodule"` in KEY position — before a colon, ending a line
+#       after `{`/`,` or at line start (an indented pretty-printed key) — name-agnostic and not decode-aware, so ANY escaped key
 #       refuses while a JSON string VALUE escape does not; `.tf`/`.tf.json`/`.tofu`/`.tofu.json`
 #       included), while a non-module `source` (attribute, comment or heredoc
 #       text) and the bare word "module" in prose do not refuse (red-team
@@ -62,7 +62,10 @@
 #       heredoc/string text, a comment/heredoc/string or a valid expression
 #       carrying `"module":` (e.g. `x = true ? "module" : "y"`,
 #       `x = { "module": true }`), a JSON string with a `\uNNNN` escape
-#       directly before a colon, a line ending in the literal `"module"`);
+#       in key position (before a colon, ending a line after `{`/`,` or at
+#       line start — any escaped key refuses, not just `module`; a
+#       leading-comma value line ending in an escaped string also refuses,
+#       fail-closed), a line ending in the literal `"module"`);
 #   (s) ambient git environment: `GIT_*_PATHSPECS` must not change the verdict
 #       (`GIT_LITERAL_PATHSPECS` makes the `:(top)`/`:(glob)` magic literal →
 #       every pathspec matches nothing → a false UNCHANGED; the other three
@@ -71,9 +74,11 @@
 #       neutralises the whole family and the pins assert the count is
 #       unaffected (red-team seeded HIGH); an exported `BASH_FUNC_git%%`
 #       function or a PATH shim must not forge the verdict either — the script
-#       drops imported functions, resolves `git` once to an absolute path and
-#       routes every call through it, and the banner job must carry no
-#       `PATH`/`BASH_FUNC_` surface (red-team verify HIGH);
+#       drops imported functions (`git`/`command`/`grep`/`printf`/`echo`),
+#       resolves `git` once to an absolute path and
+#       routes every call through it, and the workflow must carry no
+#       `PATH`/`BASH_FUNC_` surface at any level (a workflow-level `env:`
+#       reaches every job) (red-team verify HIGH);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
 #       form (arithmetic/export/read/declare/let/unset/readonly/typeset/
@@ -90,7 +95,8 @@
 #       output and branching on it with no shell `WORKFLOW_FILES=` assignment
 #       (an env-shadowing decoy) and every non-env mention a read, the
 #       acknowledge gate's `workflows_changed == 'true'` condition and its
-#       `!= "true"` checkbox test pinned, no ANSI-C
+#       `!= "true"` checkbox test pinned on the comment-stripped view (a
+#       commented decoy cannot satisfy them), no ANSI-C
 #       quoting (`$'…'`) in the banner
 #       job (an ANSI-C `$'\x66etch'` executes as `fetch` while a textual pin
 #       sees only `\x66etch`), an
@@ -123,7 +129,7 @@
 #       latent); the effective-body/input checks run at the
 #       call site, but a deliberate rewrite of the canonical/pin lines or an
 #       insertion inside the compound condition can still evade a textual
-#       tripwire, and the exact 291-check floor is count-only (a same-count
+#       tripwire, and the exact 298-check floor is count-only (a same-count
 #       in-place gutting of an unpinned check is invisible) — the pin is a
 #       regression tripwire, the review is the backstop.
 set -euo pipefail
@@ -302,6 +308,14 @@ printf '{}\n' > modules/m/main.tf.json
 git_c add -A
 git_c commit -qm "escaped JSON module key split from its colon"
 git_c push -q origin modulejsonescapenl
+
+git_c checkout -qb modulejsonescapeindent main
+mkdir -p modules/m
+printf '{\n  "\\u006dodule"\n  : {"m":{"source":"./modules/m"}}\n}\n' > main.tf.json
+printf '{}\n' > modules/m/main.tf.json
+git_c add -A
+git_c commit -qm "indented escaped JSON module key"
+git_c push -q origin modulejsonescapeindent
 
 git_c checkout -qb modulejsonvalueeol main
 printf '{\n  "output": {\n    "x": {\n      "value": "caf\\u00e9"\n    }\n  }\n}\n' > main.tf.json
@@ -834,7 +848,7 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
-for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached modulecloseattachedlabel moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose modulejsonescape modulejsonescapemid modulejsonescapenl; do
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached modulecloseattachedlabel moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose modulejsonescape modulejsonescapemid modulejsonescapenl modulejsonescapeindent; do
   git_c checkout -q "$variant"
   rc=0
   out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
@@ -887,7 +901,7 @@ if [ -n "$gate_line" ] && [ "$(grep -c . <<<"$gate_line")" = "1" ]; then
 else
   bad "the executed gate line is missing or multiline"
 fi
-canonical_closeleg_re='^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:|(^|[[:space:]]*[{,][[:space:]]*)"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*$'
+canonical_closeleg_re='^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:|(^[[:space:]]*|[[:space:]]*[{,][[:space:]]*)"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*$'
 gate_re="$(sed -E "s/^.*-qE '([^']*)'.*\$/\1/" <<<"$gate_line")"
 if [ "$gate_re" = "$canonical_closeleg_re" ]; then
   ok "the executed gate line carries the exact canonical close-leg regex argument"
@@ -1225,21 +1239,23 @@ if [ -z "$ntfy_stray" ]; then ok "every WORKFLOW_FILES mention outside the env k
 # The acknowledge gate CONSUMES the verdict output: a rewrite of its condition
 # or of the checkbox test would let a red run proceed unacknowledged
 # (red-team verify MEDIUM).
-if [ "$(grep -cF "if: needs.visibility-banner.outputs.workflows_changed == 'true'" "$PROV")" = "1" ]; then
+if [ "$(grep -cF "if: needs.visibility-banner.outputs.workflows_changed == 'true'" <<<"$prov_active")" = "1" ]; then
   ok "the acknowledge gate is conditioned on the banner's workflows_changed output"
 else
   bad "the acknowledge gate condition was rewritten (a red run could skip the checkbox)"
 fi
-if [ "$(grep -cF 'if [ "${{ inputs.acknowledge_changed_workflows }}" != "true" ]; then' "$PROV")" = "1" ]; then
+if [ "$(grep -cF 'if [ "${{ inputs.acknowledge_changed_workflows }}" != "true" ]; then' <<<"$prov_active")" = "1" ]; then
   ok "the acknowledge gate requires the dispatch input to be true"
 else
   bad "the acknowledge-gate checkbox test was rewritten"
 fi
-# A shell function named `git` (exported `BASH_FUNC_git%%`) or a PATH shim can
-# forge the verdict; the script must drop imported functions and route every
-# call through one resolved absolute binary, and the banner job must carry no
-# PATH/BASH_FUNC surface (red-team verify HIGH).
-git_unset_line='unset -f git 2>/dev/null || true'
+# A shell function named `git` (exported `BASH_FUNC_git%%`) — or one shadowing
+# `command`/`grep`/`printf`/`echo` — or a PATH shim can forge the verdict; the
+# script must drop imported functions and route every call through one
+# resolved absolute binary, and the workflow must carry no PATH/BASH_FUNC
+# surface at any level (a workflow-level `env:` reaches every job; red-team
+# verify HIGH).
+git_unset_line='unset -f git command grep printf echo 2>/dev/null || true'
 git_resolve_line='git_bin="$(command -v git || true)"'
 git_wrapper_line='git() { command "$git_bin" "$@"; }'
 for pinned_git_line in "$git_unset_line" "$git_resolve_line" "$git_wrapper_line"; do
@@ -1256,11 +1272,19 @@ rc=0
 count="$(env "$git_func_probe" bash "$SCRIPT" main)" || rc=$?
 is "an exported git function cannot forge the count" "2" "$count"
 is "an exported git function: rc" "0" "$rc"
-if grep -qE '(^|[[:space:]])PATH[[:space:]]*[:=]' <<<"$banner_job" || grep -qF 'BASH_FUNC_' <<<"$banner_job"; then
-  bad "the banner job carries a PATH assignment or an exported shell function (a git shim could forge the verdict)"
+if grep -qE '(^|[[:space:]])PATH[[:space:]]*[:=]' <<<"$prov_active" || grep -qF 'BASH_FUNC_' <<<"$prov_active"; then
+  bad "the workflow carries a PATH assignment or an exported shell function (a git/grep shim could forge the verdict)"
 else
-  ok "the banner job carries no PATH assignment or exported shell function"
+  ok "the workflow carries no PATH assignment or exported shell function"
 fi
+rc=0
+count="$(env 'BASH_FUNC_grep%%=() { echo 0; }' bash "$SCRIPT" main)" || rc=$?
+is "an exported grep function cannot forge the count" "2" "$count"
+is "an exported grep function: rc" "0" "$rc"
+rc=0
+count="$(env 'BASH_FUNC_command%%=() { echo DECOY; }' bash "$SCRIPT" main)" || rc=$?
+is "an exported command function cannot forge the count" "2" "$count"
+is "an exported command function: rc" "0" "$rc"
 # ANSI-C quoting (`$'\x66etch'`) executes as `fetch` while a textual no-fetch
 # pin sees only `\x66etch` — refuse the construct outright in the banner job
 # (red-team seeded LOW). The rest of the workflow legitimately uses `$'...'`
@@ -1288,7 +1312,7 @@ if printf 'DECOY="$(git\nfetch origin main --depth=1)"\n' | tr '\n' ' ' | grep -
 if grep -qE 'alias\.' <<<"$prov_active"; then bad "provision.yml carries a git alias (a fetch can hide behind one)"; else ok "provision.yml carries no git alias"; fi
 alias_probe='git -c alias.f=fetch f'
 if grep -qE "$no_fetch_re" <<<"$alias_probe" || ! grep -qE 'alias\.' <<<"$alias_probe"; then bad "an alias-spelled fetch would evade the no-fetch pins"; else ok "an alias-spelled fetch is refused by the alias pin"; fi
-splice_re='[[:alnum:]_]"{1,2}[[:alnum:]_]'
+splice_re='[[:alnum:]_]"{1,2}([[:alnum:]_]|=)'
 if grep -qE "$splice_re" <<<"$banner_active"; then bad "the banner step carries a double-quote-spliced identifier (a COUNT override can hide behind one)"; else ok "no double-quote-spliced identifier in the banner step"; fi
 if grep -qE "$splice_re" <<<"$prov_active"; then bad "provision.yml carries a double-quote-spliced identifier (a fetch can hide behind one)"; else ok "no double-quote-spliced identifier in provision.yml"; fi
 assign_re="=[[:space:]]*[\"']?(fetch|pull)([^[:alnum:]_]|$)"
@@ -1309,7 +1333,7 @@ if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml
 # silently reporting one fewer ok (the disclosed multi-line-rewrite residual
 # removes the real call and drops exactly one executed check). Update together
 # with the harness.
-CHECK_FLOOR=291
+CHECK_FLOOR=298
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
