@@ -107,7 +107,8 @@
 #       commented decoy cannot satisfy them), no ANSI-C
 #       quoting (`$'…'`) in the banner
 #       job (an ANSI-C `$'\x66etch'` executes as `fetch` while a textual pin
-#       sees only `\x66etch`), an
+#       sees only `\x66etch`), no `continue-on-error` anywhere (a swallowed
+#       refusal would skip the acknowledge gate), an
 #       option/continuation/quote/newline/backslash-splice-tolerant
 #       no-fetch-or-pull with no git alias and no fetch/pull assignment, and
 #       the banner job's single fetch-depth: 0; ci.yml gates AND runs this
@@ -137,7 +138,7 @@
 #       latent); the effective-body/input checks run at the
 #       call site, but a deliberate rewrite of the canonical/pin lines or an
 #       insertion inside the compound condition can still evade a textual
-#       tripwire, and the exact 305-check floor is count-only (a same-count
+#       tripwire, and the exact 307-check floor is count-only (a same-count
 #       in-place gutting of an unpinned check is invisible) — the pin is a
 #       regression tripwire, the review is the backstop.
 set -euo pipefail
@@ -1319,6 +1320,21 @@ if grep -qF "\$'" <<<"$banner_job"; then
 else
   ok "no ANSI-C quoting in the banner job"
 fi
+# `continue-on-error: true` on the banner or acknowledge-gate step converts a
+# fail-closed refusal into a pass (the runner marks the step Succeeded, the
+# verdict output stays empty, the ack gate is skipped and device-flow mints a
+# code unacknowledged) — refuse it outright in this workflow (red-team verify
+# MEDIUM).
+if grep -qF 'continue-on-error' <<<"$prov_active"; then
+  bad "the workflow carries continue-on-error (a refused banner step would be swallowed and the acknowledge gate skipped)"
+else
+  ok "no continue-on-error in the workflow"
+fi
+if printf '        continue-on-error: true\n' | grep -qF 'continue-on-error'; then
+  ok "the continue-on-error refusal matches the step key"
+else
+  bad "the continue-on-error refusal misses the step key"
+fi
 ansic_probe="git \$'\x66etch' origin main --depth=1"
 if grep -qF "\$'" <<<"$ansic_probe"; then ok "the ANSI-C refusal matches an ANSI-C fetch spelling"; else bad "the ANSI-C refusal misses an ANSI-C fetch spelling"; fi
 no_fetch_re="(^|[^[:alnum:]_])[\"']?git[\"']?([[:space:]]+[^[:space:];&|]+)*[[:space:]]+[\"']?(fetch|pull)[\"']?"
@@ -1358,7 +1374,7 @@ if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml
 # silently reporting one fewer ok (the disclosed multi-line-rewrite residual
 # removes the real call and drops exactly one executed check). Update together
 # with the harness.
-CHECK_FLOOR=305
+CHECK_FLOOR=307
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
