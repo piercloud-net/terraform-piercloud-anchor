@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 - *(witness)* Seq-range interval continuity — phase 2 (closes #159)
 - *(a2)* Nested status host + provider-switched DNS writer + CloudFront origin auth (closes #166)
 - *(provision)* Run-name + dispatch_intent input for control-plane run discovery (closes #176)
+- *(broker)* Report the anchor IPv4 to the pc-control broker (closes #183)
 
 ### 🐛 Bug Fixes
 
@@ -105,6 +106,7 @@ All notable changes to this project will be documented in this file.
 - API-derived anchor IP + multi-IPv4 fail-loud (closes #124)
 - Allow the Gcore DNS API endpoint in the contract allowlist (closes #157)
 - *(132)* Account concurrency lane + managed tenant environment (closes #132)
+- *(allowlist)* Permit the pc-control broker report endpoint (closes #181)
 
 
 ## [Unreleased]
