@@ -77,6 +77,7 @@ All notable changes to this project will be documented in this file.
 - Refresh the shipper-key replica for the pc-admin#19 grammar (sid-less `session.data` → `unknown`) (closes #149)
 - Refresh the shipper-key replica for the pc-admin#20 \Z grammar (trailing-newline type regexes) (closes #151)
 - \Z-anchor the provisioned span key classifiers (closes #152)
+- Built-in platform row + role gate + collision guard + alert bridge (closes #134)
 
 ### 📚 Documentation
 
