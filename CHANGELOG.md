@@ -104,6 +104,7 @@ All notable changes to this project will be documented in this file.
 - External-watch — GitHub-side cron probes the public dashboard (closes #94)
 - API-derived anchor IP + multi-IPv4 fail-loud (closes #124)
 - Allow the Gcore DNS API endpoint in the contract allowlist (closes #157)
+- *(132)* Account concurrency lane + managed tenant environment (closes #132)
 
 
 ## [Unreleased]
