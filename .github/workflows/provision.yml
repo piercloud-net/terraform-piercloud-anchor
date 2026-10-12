@@ -87,16 +87,23 @@ on:
         default: ""
         type: string
 
-# Single-writer-per-account lane (docs/invariants.md §Invariant 3): every run
-# that mutates a netcup account serializes on `anchor-<anchor_ref>` — the
-# opaque registry reference for the anchor's account (anchor↔account is 1:1,
-# so one lane == one writer per account). The `inputs` context is legal in
-# concurrency.group; only `secrets` is forbidden (R6 pipeline §9, gate 6).
-# An empty ref falls back to the static lane — manual and template-created
-# runs are unchanged — but every run that can touch a managed account MUST
-# carry the same ref: the platform dispatcher sets it, and a manual run on a
-# managed account passes it explicitly; a managed (tenant) dispatch without
-# it fails closed at the resolve step.
+# Single-writer-per-account lane (owner ruling 2026-10-12, issue #132;
+# docs/invariants.md §Invariant 3). Every run that mutates a netcup account
+# serializes on `anchor-<anchor_ref>` — the opaque registry reference for the
+# anchor's account (anchor↔account is 1:1, so one lane == one writer per
+# account). The `inputs` context is legal in concurrency.group; only
+# `secrets` is forbidden (verified R6 gate 6; this supersedes the same
+# note's per-tenant `provision-<alias>` recommendation — a group anchor
+# shares one lane, and per-tenant lanes would let two members' runs overlap
+# on one account). An empty ref falls back to the static lane — manual and
+# template-created runs are unchanged — but every run that can touch a
+# managed account MUST carry the same ref: the platform dispatcher sets it,
+# a manual run on a managed account passes it explicitly, a managed (tenant)
+# dispatch without it fails closed at the preflight, and a ref-less mutating
+# run warns loudly. NOTE: the lane is evaluated when the run is created,
+# before any input validation — a bad dispatch carrying a valid ref still
+# occupies that account's lane and can cancel its single pending run; the
+# backend ledger is the queue, never GitHub.
 concurrency:
   group: ${{ inputs.anchor_ref != '' && format('anchor-{0}', inputs.anchor_ref) || 'piercloud-netcup-policy' }}
   cancel-in-progress: false
@@ -113,6 +120,58 @@ jobs:
       head_short: ${{ steps.banner.outputs.head_short }}
       workflows_changed: ${{ steps.banner.outputs.workflows_changed }}
     steps:
+      # Managed-input preflight (issue #132). Lives in the UNGATED banner job
+      # so a malformed dispatch fails BEFORE the runner evaluates the
+      # environment protection gate on `device-flow` — a reviewer tap must
+      # never be consumed by a run that cannot proceed — and before an
+      # unknown `tenant` can be bound to a job. The runner evaluates the
+      # environment name and the concurrency lane when the jobs are
+      # scheduled, so this step can only reject the *shape*; the device-flow
+      # job re-checks the environment binding (the MANAGED_TENANT marker)
+      # once the environment is selected.
+      - name: Managed-input preflight (tenant/anchor_ref — fail closed before any gate)
+        env:
+          TENANT_INPUT: ${{ inputs.tenant }}
+          ANCHOR_REF: ${{ inputs.anchor_ref }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          # Default both for `set -u` (the workflow always passes them;
+          # hand-extracted step bodies may not).
+          TENANT_INPUT="${TENANT_INPUT:-}"
+          ANCHOR_REF="${ANCHOR_REF:-}"
+          case "$TENANT_INPUT" in
+            '') ;;
+            [!a-z0-9]* | *- | *[!a-z0-9_-]*) echo "::error::tenant input must match [a-z0-9][a-z0-9_-]{0,39} (no leading/trailing hyphen or underscore) — refusing."; exit 1 ;;
+          esac
+          [ "${#TENANT_INPUT}" -le 40 ] || { echo "::error::tenant input exceeds 40 characters — refusing."; exit 1; }
+          # Lowercase-only: the concurrency lane is evaluated before any step
+          # runs and GitHub expressions cannot fold case, so an uppercase ref
+          # could occupy a different lane than its lowercase spelling.
+          # Canonical dispatcher refs are lowercase (the registry ref is ours
+          # to define).
+          case "$ANCHOR_REF" in
+            '') ;;
+            *[!a-z0-9._-]*) echo "::error::anchor_ref input must match [a-z0-9._-]{1,64} (lowercase) — refusing."; exit 1 ;;
+          esac
+          [ "${#ANCHOR_REF}" -le 64 ] || { echo "::error::anchor_ref input exceeds 64 characters — refusing."; exit 1; }
+          # A managed dispatch must carry the lane: without it the run would
+          # fall into the static lane while other runs for the same account
+          # use `anchor-<ref>` — two writers on one account (invariant 3).
+          if [ -n "$TENANT_INPUT" ] && [ -z "$ANCHOR_REF" ]; then
+            echo "::error::a managed (tenant) dispatch must carry anchor_ref — the account lane key; refusing (a lane-less run could overlap a live run on the same account)."
+            exit 1
+          fi
+          # A mutating run without the lane key on a managed account is the
+          # disclosed residual (invariant 3): warn loudly, never fail —
+          # template/standalone repos legitimately dispatch without one.
+          if [ -z "$ANCHOR_REF" ]; then
+            case "$MODE" in
+              apply|update-ip|destroy) echo "::warning::no anchor_ref — this run uses the static fallback lane. On a managed netcup account pass the account's anchor_ref so runs on it serialize (one writer per account)." ;;
+            esac
+          fi
+          echo "Managed-input preflight ok."
+
       - name: Checkout (no credentials persisted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
         with:
@@ -247,6 +306,7 @@ jobs:
       thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
       anchor_ipv4: ${{ steps.resolve.outputs.anchor_ipv4 }}
       anchor_hostname: ${{ steps.resolve.outputs.anchor_hostname }}
+      tenant_user: ${{ steps.resolve.outputs.tenant_user }}
     env:
       # Identifiers resolve from REPO-level secrets inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
@@ -270,44 +330,29 @@ jobs:
           # must check it out to call it (full checkout: tofu below needs
           # the module files too).
 
-      - name: Managed-input preflight (tenant/anchor_ref — fail closed before anything runs)
-        # (a′) dispatch hygiene: the runner evaluates the environment name
-        # (`tenant`) and the concurrency lane key (`anchor_ref`) BEFORE any
-        # step can run, so this preflight is the earliest fail-closed check
-        # that a managed dispatch is well-formed — a malformed one never
-        # reaches the device card. The lane key is a concurrency identifier
-        # (never a path or shell value). The environment name cannot be
-        # verified to exist: GitHub auto-creates an unknown name unprotected;
-        # the platform lifecycle (verify-after-write, can_admins_bypass:false)
-        # is the control, and the approver guard still fails closed on a
-        # wrong-account approval.
+      - name: Tenant-environment binding check (environment marker == tenant input)
         env:
           TENANT_INPUT: ${{ inputs.tenant }}
-          ANCHOR_REF: ${{ inputs.anchor_ref }}
+          MANAGED_TENANT: ${{ vars.MANAGED_TENANT }}
         run: |
           set -euo pipefail
-          # Default both for `set -u` (the workflow always passes them;
-          # hand-extracted step bodies may not).
           TENANT_INPUT="${TENANT_INPUT:-}"
-          ANCHOR_REF="${ANCHOR_REF:-}"
-          case "$TENANT_INPUT" in
-            '') ;;
-            -* | *- | *[!a-z0-9_-]*) echo "::error::tenant input must match [a-z0-9][a-z0-9_-]{0,39} (no leading/trailing hyphen) — refusing."; exit 1 ;;
-          esac
-          [ "${#TENANT_INPUT}" -le 40 ] || { echo "::error::tenant input exceeds 40 characters — refusing."; exit 1; }
-          case "$ANCHOR_REF" in
-            '') ;;
-            *[!A-Za-z0-9._-]*) echo "::error::anchor_ref input must match [A-Za-z0-9._-]{1,64} — refusing."; exit 1 ;;
-          esac
-          [ "${#ANCHOR_REF}" -le 64 ] || { echo "::error::anchor_ref input exceeds 64 characters — refusing."; exit 1; }
-          # A managed dispatch must carry the lane: without it the run would
-          # fall into the static lane while other runs for the same account
-          # use `anchor-<ref>` — two writers on one account (invariant 3).
-          if [ -n "$TENANT_INPUT" ] && [ -z "$ANCHOR_REF" ]; then
-            echo "::error::a managed (tenant) dispatch must carry anchor_ref — the account lane key; refusing (a lane-less run could overlap a live run on the same account)."
+          MANAGED_TENANT="${MANAGED_TENANT:-}"
+          # GitHub resolves environment-scoped variables with a repo-level
+          # fallback per key, so an auto-created (typo) or partially
+          # provisioned environment silently mixes repo-level values with a
+          # tenant's. The env lifecycle (pc-lifecycle; verify-after-write,
+          # can_admins_bypass:false) sets MANAGED_TENANT=<environment name>
+          # on every provisioned tenant environment; its absence/mismatch
+          # fails this run closed before the banner gate and the device
+          # card. In-workflow half of the "platform lifecycle is the
+          # control" claim; the lane key itself was already evaluated when
+          # the run was created.
+          if [ -n "$TENANT_INPUT" ] && [ "$MANAGED_TENANT" != "$TENANT_INPUT" ]; then
+            echo "::error::environment '$TENANT_INPUT' does not carry MANAGED_TENANT='$TENANT_INPUT' — refusing (a typo'd/partial environment would silently read repo-level values). Provisioned tenant environments set the marker; see docs/invariants.md invariant 3."
             exit 1
           fi
-          echo "Managed-input preflight ok."
+          echo "Tenant-environment binding ok."
 
       - name: Red-banner acknowledge gate (C-E, no-GitHub path)
         if: needs.visibility-banner.outputs.workflows_changed == 'true'
@@ -611,8 +656,9 @@ jobs:
           # prefixes (anchor/status/pcu) fail closed too. The lib returns
           # zone-less names; STATUS_HOST adds the zone here because the
           # on-box Caddy render consumes it as the dashboard FQDN.
-          # (Managed-dispatch inputs are validated by the preflight step
-          # above, before any netcup use — nothing to re-check here.)
+          # (Managed-dispatch inputs are validated by the preflight step in
+          # the ungated visibility-banner job; the tenant-environment binding
+          # is re-checked at the top of this job. Nothing to re-check here.)
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
           # ANCHOR_ROLE (issue #134): optional operator-plane repo variable.
           # Empty or `tenant` = the platform row is monitor-only; `operator` =
@@ -651,6 +697,13 @@ jobs:
           echo "STATUS_HOST=$STATUS_HOST" >> "$GITHUB_ENV"
           guard_line "anchor_hostname" "$HOSTNAME"
           echo "anchor_hostname=$HOSTNAME" >> "$GITHUB_OUTPUT"
+          # The resolved tenant alias travels as an output: post-gate jobs
+          # (thumbprint, mode markers) must not re-read `vars.TENANT_USER`,
+          # which resolves REPO-level in a job that does not select the
+          # tenant environment (a managed dispatch would mislabel its
+          # artifact with the operator's alias).
+          guard_line "tenant_user" "$TENANT_USER"
+          echo "tenant_user=$TENANT_USER" >> "$GITHUB_OUTPUT"
           echo "Derived hostname $HOSTNAME (dashboard $STATUS_HOST)."
           # SCP user id: NEVER the customer number (live 403 proved they
           # differ). Resolved from the token itself via OIDC userinfo
@@ -688,7 +741,7 @@ jobs:
           guard_line "API_USER" "$API_USER"
           echo "::add-mask::$API_USER"
           if [ "$API_USER" != "$CUSTOMER_NUMBER" ]; then
-            echo "::error::WRONG-ACCOUNT APPROVAL: this run was approved from a different netcup account than the repo expects. STOP — nothing runs. Re-dispatch and approve from the account that owns the anchor."
+            echo "::error::WRONG-ACCOUNT APPROVAL: this run was approved from a different netcup account than the target environment expects (the repo-level value when no tenant environment is selected). STOP — nothing runs. Re-dispatch and approve from the account that owns the anchor."
             exit 1
           fi
           echo "Approver guard ok: the approval came from the tenant's own account."
@@ -1000,8 +1053,8 @@ jobs:
         run: |
           set -euo pipefail
           # Dual-endpoint egress-IP pin (exact match or fail) + idempotent
-          # create on run_id + attach — all under the static global mutex
-          # above (one mutex serializes every tenant's policy mutations).
+          # create on run_id + attach — all under the account lane
+          # (concurrency.group: one writer per netcup account).
           .github/scripts/020-provision-anchor.sh open
 
       - name: Passwordless bootstrap (caller-set one-time root password)
@@ -1429,7 +1482,7 @@ jobs:
           # verify. Absent provider token on mode=apply = explicit error
           # from the script naming the org secret (C-A fail-closed: set it,
           # then re-dispatch). mode=check never runs this job and never
-          # requires a token. Same static global mutex covers this job
+          # requires a token. Same account lane covers this job
           # (workflow-level concurrency); no new actions (curl + jq only).
           bash .github/scripts/030-anchor-dns.sh
 
@@ -1455,7 +1508,7 @@ jobs:
       - name: Mode marker (real steps run in the device-flow job)
         run: |
           set -euo pipefail
-          echo "mode=apply for alias '${{ vars.TENANT_USER }}': tofu plan/apply + A1 window + ssh provision run in the device-flow job (same-runner token handoff)."
+          echo "mode=apply for alias '${{ needs.device-flow.outputs.tenant_user }}': tofu plan/apply + A1 window + ssh provision run in the device-flow job (same-runner token handoff)."
 
   check-hygiene:
     name: "mode=check (drift + hygiene skeleton)"
@@ -1502,7 +1555,7 @@ jobs:
       - name: Skeleton marker (M2 wires the real steps)
         run: |
           set -euo pipefail
-          echo "mode=update-ip skeleton for alias '${{ vars.TENANT_USER }}': add='${{ inputs.add_ipv4 }} ${{ inputs.add_ipv6 }}' remove='${{ inputs.remove_ipv4 }}'. ADD-before-move enforcement lands in M2."
+          echo "mode=update-ip skeleton for alias '${{ needs.device-flow.outputs.tenant_user }}': add='${{ inputs.add_ipv4 }} ${{ inputs.add_ipv6 }}' remove='${{ inputs.remove_ipv4 }}'. ADD-before-move enforcement lands in M2."
 
   destroy-gate:
     name: "mode=destroy (policy + attachment ONLY)"
@@ -1556,13 +1609,13 @@ jobs:
           BIND_SCHEME="http"
           ANCHOR_FQDN="${ANCHOR_HOSTNAME}.piercloud.net"
           printf '%s\n' "$THUMBPRINT" > thumbprint.txt
-          echo "alias=${{ vars.TENANT_USER }} head=${{ github.sha }}" >> thumbprint.txt
+          echo "alias=${{ needs.device-flow.outputs.tenant_user }} head=${{ github.sha }}" >> thumbprint.txt
           echo "bind_url=${BIND_SCHEME}://${ANCHOR_FQDN}" >> thumbprint.txt
           echo "clevis luks bind -d /dev/sda3 tang '{\"url\":\"${BIND_SCHEME}://${ANCHOR_FQDN}\"}'" >> thumbprint.txt
       - name: Upload thumbprint artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
         with:
-          name: thumbprint-${{ vars.TENANT_USER }}
+          name: thumbprint-${{ needs.device-flow.outputs.tenant_user }}
           path: thumbprint.txt
           # 90 = the public-repo cap: a convenience copy, never the durable
           # record (H1 rule: never rely on logs or artifacts alone; the

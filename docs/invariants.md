@@ -33,14 +33,18 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 ## Invariant 3 — one netcup account per anchor; one writer per account
 
 > One netcup account holds **exactly one anchor** — never several anchors per
-> account. Every provisioning run that mutates an account carries the
-> account's opaque reference (`anchor_ref`) and serializes on the
-> `anchor-<ref>` concurrency lane: **one writer per account**. A **family /
-> group anchor** (one anchor shared by several people) is the supported
-> sharing shape and shares that one lane; per-tenant lanes are wrong there —
-> two members' runs on one anchor must not overlap. Registry
-> `netcup_account_ref` uniqueness at anchor create is the platform-side
-> enforcement of the 1:1 relation.
+> account. Runs that mutate a managed account serialize on the account's
+> **lane**, `anchor-<anchor_ref>` (`anchor_ref` = the opaque registry
+> reference for the anchor's account; anchor↔account is 1:1): **one writer
+> per account**. A **family / group anchor** (one anchor shared by several
+> people) is the supported sharing shape and shares that one lane —
+> per-tenant lanes are wrong there, because two members' runs on one anchor
+> must not overlap. A **manual** run that omits `anchor_ref` uses the static
+> fallback lane `piercloud-netcup-policy`; on a managed account that is a
+> *different* lane from `anchor-<ref>`, so it can overlap a live managed run
+> — the operator passes the account's ref (a ref-less mutating run emits a
+> loud `::warning::`; a managed `tenant` dispatch without a ref fails
+> closed).
 
 **Rationale.** The pre-sweep (`020-provision-anchor.sh` `cmd_sweep_pre`)
 retires every foreign `piercloud-tmp-*` firewall policy on the account, and
@@ -50,13 +54,29 @@ window (killing its SSH mid-provision) — and the account token reaches every
 server on the account, not just the anchor (R8 finding F4: one tenant's run
 could enumerate the account and reset root on servers that are not theirs).
 Making the account the single-writer unit keeps the sweep truthful.
-Enforced by: the `anchor-<ref>` concurrency lane in `provision.yml`, the
-managed-dispatch validation (a `tenant` dispatch must carry `anchor_ref`),
-the approver guard (`API_USER == CUSTOMER_NUMBER` — the approval came from
-the account the environment expects), and the registry's
-`netcup_account_ref` uniqueness. The static `piercloud-netcup-policy`
-fallback lane keeps manual and template-created runs on one lane; each such
-account must have exactly one writer.
+
+**Enforced by, today:**
+
+- the `anchor-<ref>` lane in `provision.yml` (static `piercloud-netcup-policy`
+  fallback; the lane is assigned when the run is created, before input
+  validation — a bad dispatch with a valid ref still occupies the lane and
+  can cancel its single pending run, which is why the backend ledger, not
+  GitHub, is the queue);
+- the managed-input preflight (ungated `visibility-banner` job): a `tenant`
+  dispatch without `anchor_ref`, or with a malformed, uppercase or
+  over-long value, fails before the environment gate and the device card;
+- the tenant-environment binding check: `MANAGED_TENANT` (set by the
+  platform env lifecycle on every provisioned tenant environment) must equal
+  the `tenant` input — an auto-created or partially provisioned environment
+  fails closed before any netcup use;
+- the approver guard (`API_USER == CUSTOMER_NUMBER` — the approval came from
+  the account the selected environment expects).
+
+**Not yet in place:** the registry `netcup_account_ref` uniqueness at anchor
+create (R6 registry invariant 6 — designed, platform-side, not live) and a
+runner-side account↔anchor inventory check (R8 M7 workstream) — until then
+the 1:1 relation rests on provisioning discipline, with the lane + preflight
+as the repo-side controls.
 
 ## S1 — every netcup use human-approved per run
 

@@ -599,7 +599,7 @@ iface_fw_put() { # $1 = mac, $2 = user-policy id JSON array -> PUT merged save b
   fi
 }
 
-attach_policy() { # $1 = policy id (idempotent merge under the global mutex)
+attach_policy() { # $1 = policy id (idempotent merge under the account lane)
   local id="$1" mac current_ids merged
   all_digits "$id" || die "attach_policy: policy id is not all-digits — refusing to interpolate it into API paths (injection guard)"
   mac="$(resolve_mac)"
