@@ -46,7 +46,8 @@
 #     comment whose text precedes the close) directly precedes the `module`
 #     token, a BOM-prefixed `module` token, or the `"module"` key (JSON HCL,
 #     incl. a key split from its colon and a Unicode-escaped spelling like
-#     `"\u006dodule"`) — never the bare word in prose (a
+#     `"\u006dodule"`, in key position before a colon or ending a line after
+#     `{`/`,`) — never the bare word in prose (a
 #     description/comment containing "module" must not refuse; functional
 #     r5c/r5c-delta/r5f HIGH/MEDIUM, red-team r5c/r5c-delta/r5f MEDIUM, trust
 #     r5f MEDIUM). Registry-only modules refuse too (fail-closed): extend the
@@ -72,6 +73,19 @@ set -euo pipefail
 # GIT_INDEX_FILE can point the diff at another checkout. The contract is the
 # workspace checkout the script was called in, so neutralise them all.
 unset GIT_LITERAL_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_GLOB_PATHSPECS GIT_ICASE_PATHSPECS GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE
+
+# A shell function named `git` (an exported `BASH_FUNC_git%%`) can forge the
+# verdict — a decoy `diff`/`grep` returns a false UNCHANGED (red-team verify
+# HIGH). Drop any imported function, resolve the binary once to an absolute
+# path (a relative/PATH-shim resolution refuses), and route every call through
+# the resolved path so a later PATH change cannot swap it.
+unset -f git 2>/dev/null || true
+git_bin="$(command -v git || true)"
+case "$git_bin" in
+  /*) ;;
+  *) echo "::error::git does not resolve to an absolute executable — refusing a banner verdict" >&2; exit 1 ;;
+esac
+git() { command "$git_bin" "$@"; }
 
 base_ref="${1:?usage: banner-workflow-diff.sh <base-ref>}"
 remote_ref="refs/remotes/origin/${base_ref}"
@@ -146,12 +160,14 @@ fi
 # comment/heredoc/string text or a valid expression (`x = true ? "module" : "y"`,
 # `x = { "module": true }`; the JSON-key leg is unanchored so minified JSON is
 # caught) — any line carrying a JSON string with a `\uNNNN`/`\UNNNNNNNN`
-# escape followed by a colon (the escaped-key leg is key-scoped but not
-# decode-aware: a value string with an escape directly before a colon would
-# refuse; fail-closed), and a line ending in the literal string `"module"` —
+# escape in KEY position: before a colon, or ending a line after `{`/`,` (the
+# escaped-key legs are name-agnostic and not decode-aware, so ANY escaped key
+# refuses — e.g. `{"caf\u00e9":1}` — not just `module`; a value string ending
+# a line after a colon does not refuse; red-team verify MEDIUM/LOW), and a line
+# ending in the literal string `"module"` —
 # the review is the backstop (trust r5f/r5g/r5h LOW, red-team r5f/r5h LOW,
 # functional r5g/r5h LOW, red-team seeded MEDIUM).
-if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
+if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:|(^|[[:space:]]*[{,][[:space:]]*)"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
    || git grep -qE $'^\xef\xbb\xbf[[:space:]]*module([^[:alnum:]_]|$)' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
   echo "::error::a module block exists in the counted root HCL — its source tree is executed code outside the counted set; add it to the pathspecs and relax this gate deliberately" >&2
   exit 1
