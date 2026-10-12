@@ -198,7 +198,10 @@ has "${ANCHOR_020}" "CLOUDFRONT_ORIGIN_SECRET='\$(q \"\${CLOUDFRONT_ORIGIN_SECRE
 has "${ANCHOR_020}" "MAIN_BOX_IPV4='\$(q \"\${MAIN_BOX_IPV4:-}\")'" "020 exports MAIN_BOX_IPV4"
 has "${CI}" 'tests/edge-origin-auth/run-test.sh' "ci.yml runs this harness"
 has "${CI}" 'edge-origin-auth|origin-ca|recording-witness)/' "ci.yml path gate includes edge-origin-auth (witness pin intact)"
-gate_line_ci="$(grep -m1 'elif grep -qE' "${CI}" || true)"
+# The extraction is anchored on the unit-tests gate's own prefix (not the
+# first `elif grep -qE` in the file) so reordering jobs cannot silently move
+# the case onto another gate (functional/red-team #170 LOW).
+gate_line_ci="$(grep -m1 -F "elif grep -qE '^(\\.github/scripts/" "${CI}" || true)"
 case "${gate_line_ci}" in
   *'.*\.tf$'*) ok "ci.yml unit-tests gate runs on .tf-only changes" ;;
   *) bad "ci.yml unit-tests gate skips .tf-only changes (the sync tooth would not run)" ;;

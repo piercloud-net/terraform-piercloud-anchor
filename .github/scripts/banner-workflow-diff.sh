@@ -45,17 +45,33 @@
 #     comment close (`*/`, incl. a `*` run like `/***/` and a multi-line
 #     comment whose text precedes the close) directly precedes the `module`
 #     token, a BOM-prefixed `module` token, or the `"module"` key (JSON HCL,
-#     incl. a key split from its colon) — never the bare word in prose (a
+#     incl. a key split from its colon and a Unicode-escaped spelling like
+#     `"\u006dodule"`) — never the bare word in prose (a
 #     description/comment containing "module" must not refuse; functional
 #     r5c/r5c-delta/r5f HIGH/MEDIUM, red-team r5c/r5c-delta/r5f MEDIUM, trust
 #     r5f MEDIUM). Registry-only modules refuse too (fail-closed): extend the
 #     pathspecs and relax this gate deliberately.
+#   * Ambient git environment must not change the verdict (red-team seeded
+#     HIGH): `GIT_*_PATHSPECS` makes the `:(top)`/`:(glob)` magic literal, so
+#     every pathspec — and the module gate's `git grep` — matches nothing and
+#     the card renders a false UNCHANGED; `GIT_DIR`/`GIT_WORK_TREE`/
+#     `GIT_OBJECT_DIRECTORY`/`GIT_INDEX_FILE` can point the diff at another
+#     checkout. The contract is the workspace checkout the script was called
+#     in, so all are neutralised below.
 #   * A diff that cannot be computed is a loud error, never a silent
 #     "0 files changed": the card's UNCHANGED verdict is a security signal
 #     and an undeterminable count must fail closed.
 #
 # Prints the changed-file count (one line, digits) to stdout on success.
 set -euo pipefail
+
+# Ambient git environment must not change the verdict (red-team seeded HIGH):
+# GIT_*_PATHSPECS makes the `:(top)`/`:(glob)` magic literal (every pathspec
+# and the module gate's `git grep` match nothing → false UNCHANGED);
+# GIT_DIR/GIT_WORK_TREE/GIT_OBJECT_DIRECTORY/GIT_ALTERNATE_OBJECT_DIRECTORIES/
+# GIT_INDEX_FILE can point the diff at another checkout. The contract is the
+# workspace checkout the script was called in, so neutralise them all.
+unset GIT_LITERAL_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_GLOB_PATHSPECS GIT_ICASE_PATHSPECS GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE
 
 base_ref="${1:?usage: banner-workflow-diff.sh <base-ref>}"
 remote_ref="refs/remotes/origin/${base_ref}"
@@ -116,23 +132,26 @@ fi
 # gate is the block statement itself — a line whose first non-comment token is
 # `module` (native HCL: `module "m" {`, `module/*c*/"m" {`, `module"m" {`, a
 # leading block comment `/*c*/ module "m"`, a BOM prefix) or the `"module"` key
-# (JSON HCL, including a key split from its colon) — never the bare word in
+# (JSON HCL, including a key split from its colon and a Unicode-escaped
+# spelling such as `"\u006dodule"`) — never the bare word in
 # prose (a description/comment containing "module" must not refuse; functional
 # r5c/r5c-delta HIGH/MEDIUM, red-team r5c/r5c-delta MEDIUM). Registry-only
 # modules refuse too (fail-closed): extend the pathspecs with the module tree
 # and relax this gate deliberately.
-# Residual: an escaped JSON KEY (`"\u006dodule"`; a source-VALUE escape like
-# `source = "\u002e/x"` is covered because the block itself is seen) is out of
-# a textual scan's reach; the gate over-refuses (fail-closed) any line whose
+# Residual: a source-VALUE escape like `source = "\u002e/x"` is covered because
+# the block itself is seen; the gate over-refuses (fail-closed) any line whose
 # first token is `module` even when it is not a block (e.g. a `module = 3`
 # local), any line where a `*/` precedes a `module` token (incl. heredoc/string
 # text like `*/ module …`), any line carrying `"module":` outside a JSON key —
 # comment/heredoc/string text or a valid expression (`x = true ? "module" : "y"`,
 # `x = { "module": true }`; the JSON-key leg is unanchored so minified JSON is
-# caught) — and a line ending in the literal string `"module"` — the review is
-# the backstop (trust r5f/r5g/r5h LOW, red-team r5f/r5h LOW, functional r5g/r5h
-# LOW).
-if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
+# caught) — any line carrying a JSON string with a `\uNNNN`/`\UNNNNNNNN`
+# escape followed by a colon (the escaped-key leg is key-scoped but not
+# decode-aware: a value string with an escape directly before a colon would
+# refuse; fail-closed), and a line ending in the literal string `"module"` —
+# the review is the backstop (trust r5f/r5g/r5h LOW, red-team r5f/r5h LOW,
+# functional r5g/r5h LOW, red-team seeded MEDIUM).
+if git grep -qE '^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json' \
    || git grep -qE $'^\xef\xbb\xbf[[:space:]]*module([^[:alnum:]_]|$)' -- ':(top,glob)*.tf' ':(top,glob)*.tf.json' ':(top,glob)*.tofu' ':(top,glob)*.tofu.json'; then
   echo "::error::a module block exists in the counted root HCL — its source tree is executed code outside the counted set; add it to the pathspecs and relax this gate deliberately" >&2
   exit 1

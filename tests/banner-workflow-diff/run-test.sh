@@ -47,23 +47,42 @@
 #       attached label, leading inline/multi-line block comments incl. `*` runs
 #       and text before the close, indentation, a BOM prefix, a comment close
 #       directly before the token, JSON split keys and spaced colons,
-#       source-value escapes covered; `.tf`/`.tf.json`/`.tofu`/`.tofu.json`
+#       source-value escapes, and a Unicode-escaped JSON key spelling like
+#       `"\u006dodule"` — key-scoped, so a JSON string VALUE escape does not
+#       refuse; `.tf`/`.tf.json`/`.tofu`/`.tofu.json`
 #       included), while a non-module `source` (attribute, comment or heredoc
 #       text) and the bare word "module" in prose do not refuse (red-team
 #       r5/r5b/r5c/r5c-delta/r5f MEDIUM, trust r5b/r5c-delta/r5f MEDIUM/LOW,
-#       functional r5b/r5c/r5c-delta/r5f HIGH/MEDIUM/LOW; latent — no module
+#       functional r5b/r5c/r5c-delta/r5f HIGH/MEDIUM/LOW, red-team seeded
+#       MEDIUM; latent — no module
 #       blocks in the counted root HCL today; the example tree has one,
 #       unexecuted; fail-closed over-refusals: a non-block first-token
 #       `module` (e.g. `module = 3`), any `*/`-before-`module` line incl.
 #       heredoc/string text, a comment/heredoc/string or a valid expression
 #       carrying `"module":` (e.g. `x = true ? "module" : "y"`,
-#       `x = { "module": true }`), a line ending in the literal `"module"`);
+#       `x = { "module": true }`), a JSON string with a `\uNNNN` escape
+#       directly before a colon, a line ending in the literal `"module"`);
+#   (s) ambient git environment: `GIT_*_PATHSPECS` must not change the verdict
+#       (`GIT_LITERAL_PATHSPECS` makes the `:(top)`/`:(glob)` magic literal →
+#       every pathspec matches nothing → a false UNCHANGED; the other three
+#       global-magic vars are determinism guards) and a hostile
+#       `GIT_DIR`/`GIT_WORK_TREE` must not redirect the diff; the script
+#       neutralises the whole family and the pins assert the count is
+#       unaffected (red-team seeded HIGH);
 #   (e) wiring: comment- and continuation-proof pins — the exact active call,
 #       exactly one COUNT= token (space/compound-tolerant), no COUNT override
 #       form (arithmetic/export/read/declare/let/unset/readonly/typeset/
 #       readarray/mapfile/eval/source, incl. quoted/escaped `printf -v`),
 #       every non-call COUNT mention is a read, no double-quote-spliced
-#       identifier, exactly one `-eq 0` with no widened/decoy comparison, an
+#       identifier, exactly one `-eq 0` with no widened/decoy comparison and
+#       with `$COUNT` (not a literal) as its left operand, the real count
+#       written to `workflow_files` exactly once, both `workflows_changed`
+#       verdict writes present exactly once and each adjacent to its own
+#       branch (the false write in the `$COUNT -eq 0` arm, the true write in
+#       the `else`), the ntfy step's `WORKFLOW_FILES` consuming the card's
+#       output and branching on it, no ANSI-C quoting (`$'…'`) in the banner
+#       job (an ANSI-C `$'\x66etch'` executes as `fetch` while a textual pin
+#       sees only `\x66etch`), an
 #       option/continuation/quote/newline/backslash-splice-tolerant
 #       no-fetch-or-pull with no git alias and no fetch/pull assignment, and
 #       the banner job's single fetch-depth: 0; ci.yml gates AND runs this
@@ -84,8 +103,7 @@
 #       splicing is not executable as a bare assignment (a syntax error /
 #       `COUNT=0: command not found`; the executable keyword forms are caught
 #       by the override pins), deep variable indirection (`cmd=git; $cmd
-#       fetch`, `git${IFS}fetch`) and an escaped JSON module key
-#       (`"\u006dodule"`) are out of a textual pin's reach, a deliberate
+#       fetch`, `git${IFS}fetch`) is out of a textual pin's reach, a deliberate
 #       rewrite that re-shadows `command`/`builtin`/`declare` after the
 #       witness's `unset -f` (or shadows `unset`) is equally out of reach, the
 #       override pin's keyword/arithmetic/dot-source alternatives are
@@ -94,7 +112,7 @@
 #       latent); the effective-body/input checks run at the
 #       call site, but a deliberate rewrite of the canonical/pin lines or an
 #       insertion inside the compound condition can still evade a textual
-#       tripwire, and the exact 245-check floor is count-only (a same-count
+#       tripwire, and the exact 274-check floor is count-only (a same-count
 #       in-place gutting of an unpinned check is invisible) — the pin is a
 #       regression tripwire, the review is the backstop.
 set -euo pipefail
@@ -243,6 +261,28 @@ printf '{}\n' > modules/m/main.tf.json
 git_c add -A
 git_c commit -qm "JSON local module source"
 git_c push -q origin modulesrcjson
+
+git_c checkout -qb modulejsonescape main
+mkdir -p modules/m
+printf '{"\\u006dodule":{"m":{"source":"./modules/m"}}}\n' > main.tf.json
+printf '{}\n' > modules/m/main.tf.json
+git_c add -A
+git_c commit -qm "escaped JSON module key"
+git_c push -q origin modulejsonescape
+
+git_c checkout -qb modulejsonescapemid main
+mkdir -p modules/m
+printf '{"a":{"b":1},"\\u006dodule":{"m":{"source":"./modules/m"}}}\n' > main.tf.json
+printf '{}\n' > modules/m/main.tf.json
+git_c add -A
+git_c commit -qm "minified escaped JSON module key"
+git_c push -q origin modulejsonescapemid
+
+git_c checkout -qb modulejsonescapevalue main
+printf '{"output":{"x":{"value":"caf\\u00e9"}}}\n' > main.tf.json
+git_c add -A
+git_c commit -qm "escaped JSON string value"
+git_c push -q origin modulejsonescapevalue
 
 git_c checkout -qb modulesrcattached main
 mkdir -p modules/m
@@ -769,7 +809,7 @@ out="$(bash "$SCRIPT" main 2>"$WORK/modulesrcjson.err")" || rc=$?
 if [ "$rc" -ne 0 ]; then ok "JSON local module source: rc non-zero"; else bad "JSON local module source: rc=$rc"; fi
 is "JSON local module source: no count on stdout" "" "$out"
 if grep -q '::error::' "$WORK/modulesrcjson.err"; then ok "JSON local module source: ::error:: annotation"; else bad "JSON local module source: no ::error::"; fi
-for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached modulecloseattachedlabel moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose; do
+for variant in modulesrcattached modulesrccomment modulesrcesc dottofumodule modulecblock moduleattachedlabel modulebom modulejsonsplit dottofujsonmodule moduleleadcomment moduleleadcommentnl moduleclosecomment modulestars modulestarspace modulecloseattached modulecloseattachedlabel moduleclosetab modulebomcomment moduleindented modulejsonspaced moduleattr moduleheredocclose modulecolonprose modulejsonescape modulejsonescapemid; do
   git_c checkout -q "$variant"
   rc=0
   out="$(bash "$SCRIPT" main 2>"$WORK/$variant.err")" || rc=$?
@@ -822,7 +862,7 @@ if [ -n "$gate_line" ] && [ "$(grep -c . <<<"$gate_line")" = "1" ]; then
 else
   bad "the executed gate line is missing or multiline"
 fi
-canonical_closeleg_re='^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$'
+canonical_closeleg_re='^[[:space:]]*module([^[:alnum:]_]|$)|\*+/[[:space:]]*module([^[:alnum:]_]|$)|"module"[[:space:]]*:|"module"[[:space:]]*$|"[^"]*\\[uU][0-9a-fA-F]{4}[^"]*"[[:space:]]*:'
 gate_re="$(sed -E "s/^.*-qE '([^']*)'.*\$/\1/" <<<"$gate_line")"
 if [ "$gate_re" = "$canonical_closeleg_re" ]; then
   ok "the executed gate line carries the exact canonical close-leg regex argument"
@@ -916,7 +956,37 @@ rc=0
 count="$(bash "$SCRIPT" main)" || rc=$?
 is "heredoc source text: counted (not refused)" "1" "$count"
 is "heredoc source text: rc" "0" "$rc"
+git_c checkout -q modulejsonescapevalue
+rc=0
+count="$(bash "$SCRIPT" main)" || rc=$?
+is "JSON value escape (not a key): counted (not refused)" "1" "$count"
+is "JSON value escape (not a key): rc" "0" "$rc"
 git_c checkout -q behind
+
+# --- (s) ambient git environment must not change the verdict ---------------
+# GIT_LITERAL_PATHSPECS/GIT_NOGLOB_PATHSPECS/GIT_GLOB_PATHSPECS/
+# GIT_ICASE_PATHSPECS make the pathspec magic literal, so every pathspec and
+# the module gate's `git grep` match nothing and the card renders a false
+# UNCHANGED; GIT_DIR/GIT_WORK_TREE/GIT_OBJECT_DIRECTORY/GIT_INDEX_FILE can
+# point the diff at another checkout (red-team seeded HIGH). The script must
+# neutralise them and still return the true count.
+env_pins_line='unset GIT_LITERAL_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_GLOB_PATHSPECS GIT_ICASE_PATHSPECS GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE'
+if [ "$(grep -cF "$env_pins_line" "$SCRIPT")" = "1" ]; then
+  ok "the script neutralises the ambient git pathspec/repository environment"
+else
+  bad "the ambient git environment neutralisation line was removed or duplicated"
+fi
+git_c checkout -q behind
+for envvar in GIT_LITERAL_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_GLOB_PATHSPECS GIT_ICASE_PATHSPECS; do
+  rc=0
+  count="$(env "$envvar=1" bash "$SCRIPT" main)" || rc=$?
+  is "$envvar=1: count unaffected" "2" "$count"
+  is "$envvar=1: rc" "0" "$rc"
+done
+rc=0
+count="$(GIT_DIR="$WORK/elsewhere.git" GIT_WORK_TREE="$WORK" bash "$SCRIPT" main)" || rc=$?
+is "hostile GIT_DIR/GIT_WORK_TREE: count unaffected" "2" "$count"
+is "hostile GIT_DIR/GIT_WORK_TREE: rc" "0" "$rc"
 
 # --- (e) wiring --------------------------------------------------------------
 # Comment- and continuation-proof pins: a commented-out call line, a second
@@ -1046,6 +1116,69 @@ banner_active="$override_probe_saved"
 stray_count="$(awk -v call="$call_line" 'index($0, call) { next } /\$\{?COUNT/ { next } /(^|[^[:alnum:]_])COUNT([^[:alnum:]_]|$)/ { print }' <<<"$banner_active")"
 if [ -z "$stray_count" ]; then ok "every COUNT mention outside the call line is a read"; else bad "a COUNT mention outside the call line is not a read: $stray_count"; fi
 if [ "$(grep -oE '\-eq[[:space:]]+0' <<<"$banner_active" | grep -c .)" = "1" ] && ! grep -qE '\-(ge|gt|le|lt|ne)[[:space:]]' <<<"$banner_active"; then ok "the UNCHANGED branch compares COUNT exactly to 0 (no widened/decoy comparison)"; else bad "the COUNT comparison is missing, widened, or decoyed"; fi
+# The comparison's LEFT OPERAND is pinned too: the `-eq 0` count alone is
+# satisfied by `if [ 0 -eq 0 ]` (red-team seeded MEDIUM).
+if [ "$(grep -cE '^[[:space:]]*if \[ "\$COUNT" -eq 0 \]; then$' <<<"$banner_active")" = "1" ]; then
+  ok "the UNCHANGED branch compares \$COUNT (not a literal) exactly once"
+else
+  bad "the UNCHANGED branch comparison lost its \$COUNT operand (or gained a decoy)"
+fi
+# The count CONSUMERS are pinned too (red-team seeded MEDIUM): a
+# `workflow_files=0` write, a swapped `workflows_changed` verdict, or an ntfy
+# `WORKFLOW_FILES` decoy could report a false UNCHANGED / skip the
+# acknowledge gate while the card shows the real count.
+if [ "$(grep -cF 'echo "workflow_files=$COUNT" >> "$GITHUB_OUTPUT"' <<<"$banner_active")" = "1" ]; then
+  ok "the banner step writes the real count to workflow_files exactly once"
+else
+  bad "the workflow_files output write is missing, decoyed, or duplicated"
+fi
+if [ "$(grep -cF 'echo "workflows_changed=false" >> "$GITHUB_OUTPUT"' <<<"$banner_active")" = "1" ] && [ "$(grep -cF 'echo "workflows_changed=true" >> "$GITHUB_OUTPUT"' <<<"$banner_active")" = "1" ]; then
+  ok "both workflows_changed verdict writes exist exactly once"
+else
+  bad "a workflows_changed verdict write is missing or duplicated"
+fi
+# Adjacency: the false write must sit in the COUNT -eq 0 branch and the true
+# write in the else branch — a swap keeps both counts at one.
+banner_adj() {
+  awk -v a="$1" -v b="$2" '
+    { line=$0; sub(/^[[:space:]]+/, "", line) }
+    prev == a && line == b { found=1 }
+    { prev=line }
+    END { exit !found }' <<<"$banner_active"
+}
+if banner_adj 'if [ "$COUNT" -eq 0 ]; then' 'echo "workflows_changed=false" >> "$GITHUB_OUTPUT"'; then
+  ok "the false verdict is written in the COUNT -eq 0 branch"
+else
+  bad "the false verdict is not adjacent to the COUNT -eq 0 branch (swapped?)"
+fi
+if banner_adj 'else' 'echo "workflows_changed=true" >> "$GITHUB_OUTPUT"'; then
+  ok "the true verdict is written in the else branch"
+else
+  bad "the true verdict is not adjacent to the else branch (swapped?)"
+fi
+ntfy_step="$(awk '/- name: ntfy verdict/{f=1; next} f && /^      - name:/{exit} f' "$PROV")"
+if [ -n "$ntfy_step" ]; then ok "the ntfy step was located for the scoped pins"; else bad "the ntfy step was not located (pin scope lost)"; fi
+if [ "$(grep -cF 'WORKFLOW_FILES: ${{ steps.banner.outputs.workflow_files }}' <<<"$ntfy_step")" = "1" ]; then
+  ok "the ntfy step consumes the card's workflow_files output"
+else
+  bad "the ntfy WORKFLOW_FILES env is missing, decoyed, or duplicated"
+fi
+if [ "$(grep -cF 'if [ "$WORKFLOW_FILES" -eq 0 ]; then' <<<"$ntfy_step")" = "1" ]; then
+  ok "the ntfy step branches on the real WORKFLOW_FILES"
+else
+  bad "the ntfy WORKFLOW_FILES comparison was rewritten"
+fi
+# ANSI-C quoting (`$'\x66etch'`) executes as `fetch` while a textual no-fetch
+# pin sees only `\x66etch` — refuse the construct outright in the banner job
+# (red-team seeded LOW). The rest of the workflow legitimately uses `$'...'`
+# (newline injection guards), so the refusal is scoped to the banner job.
+if grep -qF "\$'" <<<"$banner_job"; then
+  bad "the banner job carries ANSI-C quoting (\$'…) — a fetch/override can hide behind it"
+else
+  ok "no ANSI-C quoting in the banner job"
+fi
+ansic_probe="git \$'\x66etch' origin main --depth=1"
+if grep -qF "\$'" <<<"$ansic_probe"; then ok "the ANSI-C refusal matches an ANSI-C fetch spelling"; else bad "the ANSI-C refusal misses an ANSI-C fetch spelling"; fi
 no_fetch_re="(^|[^[:alnum:]_])[\"']?git[\"']?([[:space:]]+[^[:space:];&|]+)*[[:space:]]+[\"']?(fetch|pull)[\"']?"
 if no_fetch_scan; then bad "provision.yml still carries a fetch/pull"; else ok "provision.yml carries no fetch/pull (continuation-, option-, quote-, newline-, backslash-splice- and whitespace-tolerant)"; fi
 if printf 'git -c protocol.version=2 fetch origin main --depth=1\n' | grep -qE "$no_fetch_re"; then ok "the no-fetch pin matches global-option variants"; else bad "the no-fetch pin misses global-option variants"; fi
@@ -1083,7 +1216,7 @@ if grep -qF 'bash tests/banner-workflow-diff/run-test.sh' "$CI"; then ok "ci.yml
 # silently reporting one fewer ok (the disclosed multi-line-rewrite residual
 # removes the real call and drops exactly one executed check). Update together
 # with the harness.
-CHECK_FLOOR=245
+CHECK_FLOOR=274
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
