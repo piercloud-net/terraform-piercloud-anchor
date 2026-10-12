@@ -76,11 +76,29 @@ on:
         required: false
         default: false
         type: boolean
+      tenant:
+        description: "Managed (a′) dispatch: tenant environment to select (environment-scoped vars/secrets override repo-level). Empty = the shared `anchor` environment (manual/template runs)."
+        required: false
+        default: ""
+        type: string
+      anchor_ref:
+        description: "Managed (a′) dispatch: opaque anchor/account reference — the concurrency lane key (`anchor-<ref>`; one writer per netcup account). Empty = the static fallback lane."
+        required: false
+        default: ""
+        type: string
 
-# Static global mutex: one mutex serializes ALL tenants' policy mutations.
-# Static literal — dynamic values are FORBIDDEN in concurrency.group.
+# Single-writer-per-account lane (docs/invariants.md §Invariant 3): every run
+# that mutates a netcup account serializes on `anchor-<anchor_ref>` — the
+# opaque registry reference for the anchor's account (anchor↔account is 1:1,
+# so one lane == one writer per account). The `inputs` context is legal in
+# concurrency.group; only `secrets` is forbidden (R6 pipeline §9, gate 6).
+# An empty ref falls back to the static lane — manual and template-created
+# runs are unchanged — but every run that can touch a managed account MUST
+# carry the same ref: the platform dispatcher sets it, and a manual run on a
+# managed account passes it explicitly; a managed (tenant) dispatch without
+# it fails closed at the resolve step.
 concurrency:
-  group: piercloud-netcup-policy
+  group: ${{ inputs.anchor_ref != '' && format('anchor-{0}', inputs.anchor_ref) || 'piercloud-netcup-policy' }}
   cancel-in-progress: false
 
 permissions:
@@ -216,7 +234,15 @@ jobs:
     # approval); only then does the merged request → card → poll step below
     # mint the device card (account approval). Two taps, correct order.
     # Banner stays ungated so the card exists to review first.
-    environment: anchor
+    # Managed (a′) dispatch: `tenant` selects the tenant environment — the
+    # job then reads environment-scoped vars/secrets (they override
+    # repo-level). Empty keeps the shared `anchor` environment (manual and
+    # template runs are unchanged). Caveat carried from R6: an unknown
+    # environment name is auto-created by GitHub with no protection rules —
+    # the platform lifecycle (verify-after-write, can_admins_bypass:false)
+    # is the control; the approver guard below still fails closed on a
+    # wrong-account approval.
+    environment: ${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}
     outputs:
       thumbprint: ${{ steps.a1-provision.outputs.thumbprint }}
       anchor_ipv4: ${{ steps.resolve.outputs.anchor_ipv4 }}
@@ -243,6 +269,45 @@ jobs:
           # (.github/scripts/020-provision-anchor.sh) — the device-flow job
           # must check it out to call it (full checkout: tofu below needs
           # the module files too).
+
+      - name: Managed-input preflight (tenant/anchor_ref — fail closed before anything runs)
+        # (a′) dispatch hygiene: the runner evaluates the environment name
+        # (`tenant`) and the concurrency lane key (`anchor_ref`) BEFORE any
+        # step can run, so this preflight is the earliest fail-closed check
+        # that a managed dispatch is well-formed — a malformed one never
+        # reaches the device card. The lane key is a concurrency identifier
+        # (never a path or shell value). The environment name cannot be
+        # verified to exist: GitHub auto-creates an unknown name unprotected;
+        # the platform lifecycle (verify-after-write, can_admins_bypass:false)
+        # is the control, and the approver guard still fails closed on a
+        # wrong-account approval.
+        env:
+          TENANT_INPUT: ${{ inputs.tenant }}
+          ANCHOR_REF: ${{ inputs.anchor_ref }}
+        run: |
+          set -euo pipefail
+          # Default both for `set -u` (the workflow always passes them;
+          # hand-extracted step bodies may not).
+          TENANT_INPUT="${TENANT_INPUT:-}"
+          ANCHOR_REF="${ANCHOR_REF:-}"
+          case "$TENANT_INPUT" in
+            '') ;;
+            -* | *- | *[!a-z0-9_-]*) echo "::error::tenant input must match [a-z0-9][a-z0-9_-]{0,39} (no leading/trailing hyphen) — refusing."; exit 1 ;;
+          esac
+          [ "${#TENANT_INPUT}" -le 40 ] || { echo "::error::tenant input exceeds 40 characters — refusing."; exit 1; }
+          case "$ANCHOR_REF" in
+            '') ;;
+            *[!A-Za-z0-9._-]*) echo "::error::anchor_ref input must match [A-Za-z0-9._-]{1,64} — refusing."; exit 1 ;;
+          esac
+          [ "${#ANCHOR_REF}" -le 64 ] || { echo "::error::anchor_ref input exceeds 64 characters — refusing."; exit 1; }
+          # A managed dispatch must carry the lane: without it the run would
+          # fall into the static lane while other runs for the same account
+          # use `anchor-<ref>` — two writers on one account (invariant 3).
+          if [ -n "$TENANT_INPUT" ] && [ -z "$ANCHOR_REF" ]; then
+            echo "::error::a managed (tenant) dispatch must carry anchor_ref — the account lane key; refusing (a lane-less run could overlap a live run on the same account)."
+            exit 1
+          fi
+          echo "Managed-input preflight ok."
 
       - name: Red-banner acknowledge gate (C-E, no-GitHub path)
         if: needs.visibility-banner.outputs.workflows_changed == 'true'
@@ -546,6 +611,8 @@ jobs:
           # prefixes (anchor/status/pcu) fail closed too. The lib returns
           # zone-less names; STATUS_HOST adds the zone here because the
           # on-box Caddy render consumes it as the dashboard FQDN.
+          # (Managed-dispatch inputs are validated by the preflight step
+          # above, before any netcup use — nothing to re-check here.)
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
           # ANCHOR_ROLE (issue #134): optional operator-plane repo variable.
           # Empty or `tenant` = the platform row is monitor-only; `operator` =
@@ -1321,8 +1388,10 @@ jobs:
     needs: [device-flow]
     if: inputs.mode == 'apply'
     # Same gate as device-flow: tenant approves DNS writes too (operator
-    # token, tenant decision). Settings-side, see above.
-    environment: anchor
+    # token, tenant decision). Settings-side, see above. Same dynamic
+    # environment selection as the device-flow job — both must resolve the
+    # same tenant environment (expression kept identical on purpose).
+    environment: ${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}
     env:
       TENANT_USER: ${{ vars.TENANT_USER }}
       # Resolved target — the device-flow job's validated output, never the

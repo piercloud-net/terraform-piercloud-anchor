@@ -30,6 +30,34 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 
 **Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate requiring the secret header from every peer except the main box and loopback), and inspection of the module surface.
 
+## Invariant 3 — one netcup account per anchor; one writer per account
+
+> One netcup account holds **exactly one anchor** — never several anchors per
+> account. Every provisioning run that mutates an account carries the
+> account's opaque reference (`anchor_ref`) and serializes on the
+> `anchor-<ref>` concurrency lane: **one writer per account**. A **family /
+> group anchor** (one anchor shared by several people) is the supported
+> sharing shape and shares that one lane; per-tenant lanes are wrong there —
+> two members' runs on one anchor must not overlap. Registry
+> `netcup_account_ref` uniqueness at anchor create is the platform-side
+> enforcement of the 1:1 relation.
+
+**Rationale.** The pre-sweep (`020-provision-anchor.sh` `cmd_sweep_pre`)
+retires every foreign `piercloud-tmp-*` firewall policy on the account, and
+that is only safe if no other writer can hold a live window on the same
+account. Two writers on one account would let one run retire a live run's
+window (killing its SSH mid-provision) — and the account token reaches every
+server on the account, not just the anchor (R8 finding F4: one tenant's run
+could enumerate the account and reset root on servers that are not theirs).
+Making the account the single-writer unit keeps the sweep truthful.
+Enforced by: the `anchor-<ref>` concurrency lane in `provision.yml`, the
+managed-dispatch validation (a `tenant` dispatch must carry `anchor_ref`),
+the approver guard (`API_USER == CUSTOMER_NUMBER` — the approval came from
+the account the environment expects), and the registry's
+`netcup_account_ref` uniqueness. The static `piercloud-netcup-policy`
+fallback lane keeps manual and template-created runs on one lane; each such
+account must have exactly one writer.
+
 ## S1 — every netcup use human-approved per run
 
 > No stored tokens, no crons. Each run authenticates via the tenant's
