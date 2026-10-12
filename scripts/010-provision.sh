@@ -1157,7 +1157,7 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
     url="$(printf '%s' "$pair" | cut -d= -f2- | tr -d '[:space:]')"
     case "$name" in ''|*[!a-zA-Z0-9_-]*) die "bad GATUS_ENDPOINTS pair (want name=url, name chars [a-zA-Z0-9_-]): $pair";; esac
     case "$url" in http://*|https://*) ;; *) die "bad GATUS_ENDPOINTS pair (v1 supports http(s) URLs only): $pair";; esac
-    name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    name_lc="$(printf '%s' "$name" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
     case " ${BUILTIN_NAMES} " in *" ${name_lc} "*) die "GATUS_ENDPOINTS pair name '${name}' collides with a built-in endpoint (${BUILTIN_NAMES// /, }) — pick another name";; esac
     ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: ${name}
     url: ${url}
