@@ -66,6 +66,7 @@ All notable changes to this project will be documented in this file.
 - *(010)* Force the Caddy reload — a chain-only cert change is never re-read (closes #174)
 - *(010)* Enforce the ORIGIN_CA_CERT_PEM chain + prove the A2 edge (closes #172)
 - *(anchor-dns)* Explicit per-tenant dashboard CNAME (wildcard-ENT immunity) (closes #178)
+- *(banner)* Count workflows against the full base ref + fail loud (closes #130)
 
 ### 💼 Other
 
