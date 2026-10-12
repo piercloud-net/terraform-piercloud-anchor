@@ -113,10 +113,10 @@ Planned — enforcement (including the canary-fail proof gate) lands with live M
 
 ## 9. Explore later: push alerts + extra monitors (optional, after the bind)
 
-The anchor already watches your homepage and tang itself, and prints statuses into the run log. When you want taps on the shoulder instead:
+The anchor already watches your homepage, tang itself, and the platform. The platform row is monitor-only on your page — it exists so you can tell "platform problem" from "my problem". The operator anchor watches the same platform and alerts on it. When you want taps on the shoulder instead:
 
 - install the [ntfy app](https://ntfy.sh), subscribe to any random topic name (yours), then set repo secrets `NTFY_TOPIC` (that name) + `NTFY_TOKEN` only if your ntfy server needs auth (empty for ntfy.sh hosted) — re-dispatch `mode=apply` to take effect.
-- extra targets: `GATUS_ENDPOINTS` repo secret, comma-separated `name=url` (`blog=https://blog.example.com`, HTTP(S) only) + re-dispatch.
+- extra targets: `GATUS_ENDPOINTS` repo secret, comma-separated `name=url` (`blog=https://blog.example.com`, HTTP(S) only) + re-dispatch. `main` and `platform` are reserved monitor names — a `GATUS_ENDPOINTS` pair using either fails the run.
 
 ## 10. External watch: always-on, GitHub-side (automatic)
 
