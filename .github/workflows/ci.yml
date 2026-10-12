@@ -338,12 +338,16 @@ jobs:
           # and fail on anything else netcup-shaped in the CI-called surface
           # (provision.yml + .github/scripts). Permitted today:
           #   URLs: the SCP REST base, the two A1 egress-IP endpoints, ntfy,
-          #   the Cloudflare DNS API (anchor A-record upsert + verify), and
-          #   the Gcore DNS API (A2 writer; the `.net` provider switch is B).
+          #   the Cloudflare DNS API (anchor A-record upsert + verify), the
+          #   Gcore DNS API (A2 writer; the `.net` provider switch is B), and
+          #   the pc-control broker report endpoint (`broker.piercloud.net`,
+          #   M1 broker leg (b) b2 — the managed-run anchor-IPv4 push; the
+          #   caller authenticates with a per-run GitHub OIDC token, never a
+          #   standing credential).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com|api\.gcore\.com)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com|api\.gcore\.com|broker\.piercloud\.net)(/|$)'
           # Passwordless bootstrap (issue #50) extends the surface with task
           # polling (/tasks) and the approver guard (/users/{id}); the
           # provisioning-only stems above stay intact (sanity check enforces).
