@@ -1,12 +1,16 @@
 # broker-report-selftest.yml — dispatch-only canary for the pc-control broker
-# report path (M1 broker leg (b) b2; pc-control #123).
+# paths (M1 broker leg (b) b2 report + b3a DNS writes; pc-control #123/#131).
 #
 # It proves the OIDC trust chain end to end (token mint -> broker verify ->
-# registry write) without touching netcup: the job selects the caller-provided
-# environment (so the token's `sub` matches a real registry-bound
-# environment), mints a token with the broker audience and POSTs a
-# documentation-range IPv4 for the given anchor_ref. Use it to verify a broker
-# deploy/rotation, or as the live-proof driver for the pc-control b2 slice.
+# registry write -> provider write) without touching netcup: the job selects
+# the caller-provided environment (so the token's `sub` matches a real
+# registry-bound environment), mints a token with the broker audience and
+# POSTs a documentation-range IPv4 for the given anchor_ref (b2), then writes
+# the anchor A + dashboard CNAME and a DNS-01 challenge TXT through the broker
+# (b3a — the same run id, which the A-write cross-check requires), and
+# optionally proves a mismatched A value is refused. Use it to verify a broker
+# deploy/rotation, or as the live-proof driver for the pc-control b2/b3a
+# slices.
 #
 # Security: the broker allowlists this workflow ONLY during a proof window
 # (see the pc-control broker role defaults) — a permanent allowlist entry
@@ -33,6 +37,21 @@ on:
         description: "IPv4 to report (default: TEST-NET-1 documentation range)."
         required: false
         default: "192.0.2.10"
+        type: string
+      challenge_name:
+        description: "DNS-01 challenge FQDN to present/clean (must be _acme-challenge.<registered dns_name> of the tenant)."
+        required: false
+        default: "_acme-challenge.anchor-01-envproof.piercloud.net"
+        type: string
+      challenge_value:
+        description: "DNS-01 challenge TXT value (bounded base64url; proof-only)."
+        required: false
+        default: "b3a-proof-token-0123456789"
+        type: string
+      negative_ipv4:
+        description: "When set, attempt an A write with this IPv4 and require a 409 refusal (cross-check proof)."
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -62,3 +81,42 @@ jobs:
           set -euo pipefail
           . .github/scripts/lib/broker-report.sh
           report_anchor_ip "$ANCHOR_REF" "$ANCHOR_IPV4"
+
+      # b3a: the DNS write steps MUST run in this same job — the broker's
+      # A-write cross-check requires the report's run id to equal the write
+      # request's run id.
+      - name: Write the anchor DNS records through the broker
+        env:
+          BROKER_URL: https://broker.piercloud.net
+          ANCHOR_REF: ${{ inputs.anchor_ref }}
+          ANCHOR_IPV4: ${{ inputs.ipv4 }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/lib/broker-dns.sh
+          write_anchor_dns "$ANCHOR_REF" "$ANCHOR_IPV4"
+
+      - name: Present and clean up a DNS-01 challenge TXT
+        env:
+          BROKER_URL: https://broker.piercloud.net
+          CHALLENGE_NAME: ${{ inputs.challenge_name }}
+          CHALLENGE_VALUE: ${{ inputs.challenge_value }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/lib/broker-dns.sh
+          write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" present
+          write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" cleanup
+
+      - name: Mismatched A value is refused (negative)
+        if: inputs.negative_ipv4 != ''
+        env:
+          BROKER_URL: https://broker.piercloud.net
+          ANCHOR_REF: ${{ inputs.anchor_ref }}
+          NEGATIVE_IPV4: ${{ inputs.negative_ipv4 }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/lib/broker-dns.sh
+          if write_anchor_dns "$ANCHOR_REF" "$NEGATIVE_IPV4"; then
+            echo "::error::the broker accepted a mismatched A value — the cross-check is broken"
+            exit 1
+          fi
+          echo "mismatched A value refused as expected."
