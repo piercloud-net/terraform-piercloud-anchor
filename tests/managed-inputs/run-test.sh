@@ -277,6 +277,15 @@ is "b3 mismatching marker rc" "1" "$rc"
 # commented-out line or a decoy scalar cannot satisfy them.
 CI_STRUCT="$(awk '
 function indent(s,   m) { match(s, /^ */); return RLENGTH }
+function qprefix(s,   i, c, q) {
+  q = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { q = 1 - q }
+    else if (c == "#" && q == 0) { return substr(s, 1, i - 1) }
+  }
+  return s
+}
 {
   if (skip) {
     if ($0 ~ /^[[:space:]]*$/) next
@@ -286,7 +295,7 @@ function indent(s,   m) { match(s, /^ */); return RLENGTH }
     } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+  if (($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) && qprefix($0) ~ /[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*$/) {
     ihdr = indent($0)
     if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
@@ -298,7 +307,12 @@ ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1
 ci_unit=""
 [ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
 [ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
-is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
+is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"unit-tests-scripts\"|'unit-tests-scripts'|unit-tests-scripts)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
+# Spelling-agnostic census for ci.yml (same doctrine as provision.yml):
+# every raw indent-2 non-space/non-comment line is a structural line of the
+# top level (on/concurrency/permissions children plus the job keys). A
+# duplicate or decoy job key in ANY spelling adds one.
+is "ci.yml structural indent-2 line count" "15" "$(grep -cE '^  [^[:space:]#]' "$CI")"
 gate_line="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
@@ -310,7 +324,7 @@ gate_pattern="$(printf '%s\n' "$gate_raw" | head -n1 | sed -e "s/^grep -qE '//" 
 [ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
 gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
 if [ -n "$gate_ln" ]; then
-  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
+  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|\$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
   is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
 else
   bad "gate elif line not found in the unit-tests job"

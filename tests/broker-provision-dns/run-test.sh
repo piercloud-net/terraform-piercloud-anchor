@@ -165,8 +165,8 @@ is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&
 is "exactly one job-level if in the anchor-dns job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
 is "exactly one strict apply-gate if" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')" 
 for k in if strategy defaults continue-on-error; do
-  is "no job-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*\"?${k}\"?[[:space:]]*$")"
-  is "no step-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^        \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*\"?${k}\"?[[:space:]]*$")"
+  is "no job-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
+  is "no step-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^        \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
 done
 is "no workflow-level defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$PROV")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
@@ -244,6 +244,15 @@ ci_live="$(grep -v '^[[:space:]]*#' "$CI")"
 # spoof either.
 CI_STRUCT="$(awk '
 function indent(s,   m) { match(s, /^ */); return RLENGTH }
+function qprefix(s,   i, c, q) {
+  q = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { q = 1 - q }
+    else if (c == "#" && q == 0) { return substr(s, 1, i - 1) }
+  }
+  return s
+}
 {
   if (skip) {
     if ($0 ~ /^[[:space:]]*$/) next
@@ -253,7 +262,7 @@ function indent(s,   m) { match(s, /^ */); return RLENGTH }
     } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+  if (($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) && qprefix($0) ~ /[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*$/) {
     ihdr = indent($0)
     if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
@@ -301,7 +310,12 @@ else
   bad "harness-run step span not found in ci.yml"
 fi
 is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the committed script harnesses \(cheap first\)$' "$CI")"
-is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
+is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"unit-tests-scripts\"|'unit-tests-scripts'|unit-tests-scripts)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
+# Spelling-agnostic census for ci.yml (same doctrine as provision.yml):
+# every raw indent-2 non-space/non-comment line is a structural line of the
+# top level (on/concurrency/permissions children plus the job keys). A
+# duplicate or decoy job key in ANY spelling adds one.
+is "ci.yml structural indent-2 line count" "15" "$(grep -cE '^  [^[:space:]#]' "$CI")"
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
 # variables anywhere in ci.yml, and the allowlist must no longer name the
@@ -321,7 +335,7 @@ lacks "ci allowlist no longer names the Gcore DNS API" 'api.gcore.com' "$(cat "$
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
 gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
 if [ -n "$gate_ln" ]; then
-  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
+  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|\$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
   is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
 else
   bad "gate elif line not found in the unit-tests job"
@@ -343,16 +357,16 @@ is "unit-tests job has no strategy" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '
 is "unit-tests job has no continue-on-error" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
 is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
 for k in if strategy defaults continue-on-error; do
-  is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*\"?${k}\"?[[:space:]]*$")"
+  is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
 done
 is "ci.yml has no workflow defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
 for f in "$CI" "$PROV"; do
-  if grep -qE '\\[uUxX][0-9a-fA-F]' "$f"; then
-    bad "$(basename "$f") contains a YAML hex escape (key-assembly route)"
+  if grep -qE '\\[uUxX][0-9a-fA-F]|\\[0-7]' "$f"; then
+    bad "$(basename "$f") contains a hex/octal escape (name-assembly route, banned blanket)"
   else
-    ok "$(basename "$f") has no YAML hex escape"
+    ok "$(basename "$f") has no hex/octal escape"
   fi
 done
 # The in-tree allowlist default must not admit the retired provider APIs
