@@ -234,7 +234,7 @@ EDGE_CI_UNIT_END="$(awk -F'\t' -v s="$EDGE_CI_UNIT_START" '$1 > s && $2 ~ /^  [^
 EDGE_CI_UNIT=""
 [ -n "$EDGE_CI_UNIT_START" ] && [ -n "$EDGE_CI_UNIT_END" ] && EDGE_CI_UNIT="$(sed -n "$((EDGE_CI_UNIT_START + 1)),$((EDGE_CI_UNIT_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
 is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
-gate_line_ci="$(printf '%s\n' "$EDGE_CI_UNIT" | grep -m1 -F "elif grep -qE '^(\\.github/scripts/" || true)"
+gate_line_ci="$(grep -m1 -F "elif grep -qE '^(\\.github/scripts/" <<<"$EDGE_CI_UNIT" || true)"
 case "${gate_line_ci}" in
   *'.*\.tf$'*) ok "ci.yml unit-tests gate runs on .tf-only changes" ;;
   *) bad "ci.yml unit-tests gate skips .tf-only changes (the sync tooth would not run)" ;;

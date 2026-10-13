@@ -309,18 +309,19 @@ ci_unit=""
 [ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
 is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"unit-tests-scripts\"|'unit-tests-scripts'|unit-tests-scripts)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
 # Spelling-agnostic census for ci.yml (same doctrine as provision.yml):
-# every raw indent-2 non-space/non-comment line is a structural line of the
-# top level (on/concurrency/permissions children plus the job keys). A
+# every indent-2 non-space/non-comment line of the stripped view is a
+# structural line of the top level (on/env/permissions children plus the job
+# keys). A
 # duplicate or decoy job key in ANY spelling adds one.
 is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
-gate_line="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
+gate_line="$(grep -m1 -F "elif grep -qE '^(\.github/scripts/" <<<"$ci_unit" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
 # Extract the regex from the gate LINE itself, exactly one match: a decoy
 # `grep -qE` elsewhere in the job cannot satisfy the functional check.
 gate_raw="$(printf '%s\n' "$gate_line" | grep -oE "grep -qE '[^']*'" || true)"
 is "exactly one gate regex on the gate line" "1" "$(printf '%s\n' "$gate_raw" | grep -c . || true)"
-gate_pattern="$(printf '%s\n' "$gate_raw" | head -n1 | sed -e "s/^grep -qE '//" -e "s/'$//")"
+gate_pattern="$(head -n1 <<<"$gate_raw" | sed -e "s/^grep -qE '//" -e "s/'$//")"
 [ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
 gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
 if [ -n "$gate_ln" ]; then

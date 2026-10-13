@@ -277,7 +277,7 @@ ci_unit=""
 # The gate and run-list assertions are scoped to the unit-tests-scripts job
 # block: a mention in another job's run line or a commented-out line cannot
 # satisfy them.
-ci_gate="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
+ci_gate="$(grep -m1 -F "elif grep -qE '^(\.github/scripts/" <<<"$ci_unit" || true)"
 [ -n "$ci_gate" ] || bad "ci.yml unit-tests gate line not found"
 contains "ci runs this harness" 'bash tests/broker-provision-dns/run-test.sh' "$ci_unit"
 lacks "ci no longer runs the retired harness" 'tests/anchor-dns/run-test.sh' "$ci_live"
@@ -288,7 +288,7 @@ lacks "ci path gate no longer names the retired harness" 'anchor-dns' "$ci_live"
 # inline comment, cannot satisfy it.
 gate_raw="$(printf '%s\n' "$ci_gate" | grep -oE "grep -qE '[^']*'" || true)"
 is "exactly one gate regex on the gate line" "1" "$(printf '%s\n' "$gate_raw" | grep -c . || true)"
-gate_pattern="$(printf '%s\n' "$gate_raw" | head -n1 | sed -e "s/^grep -qE '//" -e "s/'$//")"
+gate_pattern="$(head -n1 <<<"$gate_raw" | sed -e "s/^grep -qE '//" -e "s/'$//")"
 [ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
 if [ -n "$gate_pattern" ]; then
   if grep -qE "$gate_pattern" <<<"tests/broker-provision-dns/run-test.sh"; then
@@ -312,8 +312,9 @@ fi
 is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the committed script harnesses \(cheap first\)$' "$CI")"
 is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"unit-tests-scripts\"|'unit-tests-scripts'|unit-tests-scripts)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
 # Spelling-agnostic census for ci.yml (same doctrine as provision.yml):
-# every raw indent-2 non-space/non-comment line is a structural line of the
-# top level (on/concurrency/permissions children plus the job keys). A
+# every indent-2 non-space/non-comment line of the stripped view is a
+# structural line of the top level (on/env/permissions children plus the job
+# keys). A
 # duplicate or decoy job key in ANY spelling adds one.
 is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 # The unit-tests job itself must stay live and shell-predictable: no
@@ -369,8 +370,8 @@ is "provision.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:sp
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Neither workflow uses merge keys, so they are
 # banned blanket.
-is "ci.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}<<:' "$CI")"
-is "provision.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}<<:' "$PROV")"
+is "ci.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}((&|!)[^[:space:]]+[[:space:]]+)*<<[[:space:]]*:' "$CI")"
+is "provision.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}((&|!)[^[:space:]]+[[:space:]]+)*<<[[:space:]]*:' "$PROV")"
 is "ci.yml has no workflow defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
