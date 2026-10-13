@@ -57,6 +57,15 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # exactly-one job-key count catches the duplicate.
 PROV_STRUCT="$(awk '
 function indent(s,   m) { match(s, /^ */); return RLENGTH }
+function qprefix(s,   i, c, q) {
+  q = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { q = 1 - q }
+    else if (c == "#" && q == 0) { return substr(s, 1, i - 1) }
+  }
+  return s
+}
 {
   if (skip) {
     if ($0 ~ /^[[:space:]]*$/) next
@@ -66,7 +75,7 @@ function indent(s,   m) { match(s, /^ */); return RLENGTH }
     } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+  if (($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) && qprefix($0) ~ /[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*$/) {
     ihdr = indent($0)
     if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
@@ -84,7 +93,7 @@ JOB="$(printf '%s\n' "$JOB_RAW" | grep -v '^[[:space:]]*#' || true)"
 [ -n "$JOB" ] || { printf 'FAIL anchor-dns job body not found in %s\n' "$PROV"; exit 1; }
 # Exactly one job key at top level: a decoy scalar the stripper does not
 # recognise would add a second (and the structural view would pick it first).
-is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE '^  anchor-dns:' "$PROV")"
+is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?(\"anchor-dns\"|'anchor-dns'|anchor-dns)[[:space:]]*:?[[:space:]]*(#.*)?$" "$PROV")"
 
 # ---- the broker-dns lib is the one writer --------------------------------
 contains "broker-dns lib defines write_anchor_dns" 'write_anchor_dns()' "$(cat "$LIB")"
@@ -123,8 +132,8 @@ if [ -n "$src_line" ] && [ -n "$call_line" ] && [ "$src_line" -lt "$call_line" ]
 # A dead step or a shadowed function defeats the line pins above: no
 # step-level `if:`/`continue-on-error` may appear (the job's own apply gate
 # is the only `if:` at 4-space indent), and the call/source may appear once.
-is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )"?if"?[[:space:]]*:')"
-is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )"?continue-on-error"?[[:space:]]*:')"
+is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
+is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
 is "job-level if is exactly the apply gate" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')"
 is "exactly one write_anchor_dns source line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          \. \.github/scripts/lib/broker-dns\.sh$')"
 # The step set is pinned: an extra unpinned step (e.g. a direct provider
@@ -132,17 +141,25 @@ is "exactly one write_anchor_dns source line" "1" "$(printf '%s\n' "$JOB_LINES" 
 is "exactly three steps in the anchor-dns job" "3" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^      - name: ')"
 # A step item need not carry a name (`- uses:` / `- run:`): count the
 # sequence items too, so a nameless extra step is caught.
-is "exactly three step items in the anchor-dns job" "3" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^      - ')"
-is "anchor-dns step names in order" "Checkout (no credentials persisted)|Managed-lane guard (b3b #189 retired the direct-token writer)|Upsert anchor A + dashboard CNAME through the broker" "$(printf '%s\n' "$JOB_LINES" | grep -E '^      - name: ' | sed -e 's/^      - name: //' | paste -sd '|')"
+is "exactly three step items in the anchor-dns job" "3" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^      -($|[[:space:]])')"
+expected_step_names='Checkout (no credentials persisted)
+Managed-lane guard (b3b #189 retired the direct-token writer)
+Upsert anchor A + dashboard CNAME through the broker'
+actual_step_names="$(printf '%s\n' "$JOB_LINES" | grep -E '^      - name: ' | sed -e 's/^      - name: //')"
+is "anchor-dns step names in order" "$expected_step_names" "$actual_step_names"
 is "exactly one write_anchor_dns call line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$')"
 is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^[[:space:]]*(function[[:space:]]+)?write_anchor_dns[[:space:]]*(\(\))?[[:space:]]*(\{|$)')"
 # Job-level switches change how every step runs without touching the pinned
 # step text: `continue-on-error` swallows a guard/write failure, `defaults`
 # can replace the shell with a no-op. Both are banned, as are the bash
 # startup-file variables that can neuter the job's `set -euo pipefail`.
-is "no job-level continue-on-error" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    "?continue-on-error"?[[:space:]]*:')"
-is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    "?defaults"?[[:space:]]*:')"
-is "no workflow-level defaults" "0" "$(grep -cE '^"?defaults"?[[:space:]]*:' "$PROV")"
+is "no job-level continue-on-error" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
+is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
+for k in if strategy defaults continue-on-error; do
+  is "no job-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    \\?[[:space:]]*\"?${k}\"?[[:space:]]*$")"
+  is "no step-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^        \\?[[:space:]]*\"?${k}\"?[[:space:]]*$")"
+done
+is "no workflow-level defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$PROV")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
   lacks_word "job does not set $v" "$v" "$JOB"
 done
@@ -227,7 +244,7 @@ function indent(s,   m) { match(s, /^ */); return RLENGTH }
     } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
     ihdr = indent($0)
     if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
@@ -280,10 +297,10 @@ is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  u
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
 # variables anywhere in ci.yml, and the allowlist must no longer name the
 # retired direct provider APIs.
-is "no job-level if on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?if"?[[:space:]]*:')"
-is "no job-level defaults on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?defaults"?[[:space:]]*:')"
-is "no job-level strategy on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?strategy"?[[:space:]]*:')"
-is "no workflow-level defaults in ci.yml" "0" "$(grep -cE '^"?defaults"?[[:space:]]*:' "$CI")"
+is "no job-level if on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
+is "no job-level defaults on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
+is "no job-level strategy on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?strategy"?[[:space:]]*:')"
+is "no workflow-level defaults in ci.yml" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
   lacks_word "ci.yml does not set $v" "$v" "$ci_live"
 done
@@ -293,28 +310,57 @@ lacks "ci allowlist no longer names the Gcore DNS API" 'api.gcore.com' "$(cat "$
 # override, or a workflow-level shell default would make every harness
 # assertion moot.
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
-gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1)"
-gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1))p")"
-is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
-is "unit-tests job has no if" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?if"?[[:space:]]*:')"
-is "unit-tests job has no strategy" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?strategy"?[[:space:]]*:')"
-is "unit-tests job has no continue-on-error" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?continue-on-error"?[[:space:]]*:')"
-is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    "?defaults"?[[:space:]]*:')"
-is "ci.yml has no workflow defaults" "0" "$(grep -cE '^"?defaults"?[[:space:]]*:' "$CI")"
+gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
+if [ -n "$gate_ln" ]; then
+  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
+  is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
+else
+  bad "gate elif line not found in the unit-tests job"
+fi
+# The whole gate step is byte-pinned: a later run=no write, a redefined
+# GITHUB_OUTPUT, a shadowed grep, or any other subversion inside it must
+# update the pin.
+GATE_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts or harnesses)" {print $1; exit}')"
+GATE_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}')"
+if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
+  GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
+  is "gate step blob hash" "0f85dbbe46c2abad81a846cc32397163ec1a3cb9a50afe5c674849b1ebcd18e9" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+else
+  bad "gate step span not found in ci.yml"
+fi
+is "exactly one gate-step header" "1" "$(grep -cE '^      - name: Gate on changed paths \(CI scripts or harnesses\)$' "$CI")"
+is "unit-tests job has no if" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
+is "unit-tests job has no strategy" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?strategy"?[[:space:]]*:')"
+is "unit-tests job has no continue-on-error" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
+is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
+for k in if strategy defaults continue-on-error; do
+  is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*\"?${k}\"?[[:space:]]*$")"
+done
+is "ci.yml has no workflow defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
-lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$(cat "$CI")"
+lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
+for f in "$CI" "$PROV"; do
+  if grep -qE '\\[uU]005[fF]|\\[uU]0000005[fF]|\\[xX]5[fF]' "$f"; then
+    bad "$(basename "$f") contains an escaped BASH_ENV spelling"
+  else
+    ok "$(basename "$f") has no escaped BASH_ENV spelling"
+  fi
+done
 # The in-tree allowlist default must not admit the retired provider APIs
 # (PR runs use origin/main's fetched pattern; this pins the post-merge state).
 allowed_default="$(grep -E '^[[:space:]]*allowed_url=' "$CI" || true)"
 [ -n "$allowed_default" ] || bad "ci.yml allowed_url default not found"
+is "exactly one line-leading allowed_url assignment" "1" "$(grep -cE '^[[:space:]]*allowed_url=' "$CI")"
+lacks "ci.yml does not append to allowed_url" 'allowed_url+=' "$(cat "$CI")"
 lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed_default"
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
 
 # ---- production surfaces carry no retired name ----------------------------
-# Every shell script and workflow/YAML file in the repo outside tests/ and
-# .git is a production surface (plus every non-.md file under the script
-# directories, extensionless included): a new `tools/evil.sh`, `evil.bash`
-# or `.github/workflows/evil.yaml` must not sit outside the scan. Word
+# Every non-Markdown file in the repo outside tests/, .git/ and the
+# gitignored .local/ proof config is a production surface (extensionless
+# included): a new `tools/evil.sh`, `tools/dns-fallback.env`, `evil.bash`,
+# `.github/workflows/evil.yaml` or `scripts/lib/helper` must not sit outside
+# the scan. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
 # legal while the retired repo variable is caught. Comments are INCLUDED: a
 # stale comment is drift too. The named groups are still checked explicitly
@@ -328,11 +374,11 @@ for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' 'scripts/*.sh'; do
   compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
 done
 surface_files=()
-while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests \) -prune -o -type f \( -name '*.sh' -o -name '*.yml' -o -name '*.yaml' -o -name '*.bash' -o -path './.github/scripts/*' -o -path './scripts/*' \) ! -name '*.md' -print | sort)
+while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type f ! -name '*.md' -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
 # closed instead (the tree has none).
-symlinks="$(find . \( -path ./.git -o -path ./tests \) -prune -o -type l -print | sort)"
+symlinks="$(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type l -print | sort)"
 if [ -z "$symlinks" ]; then ok "no symlinks in the production surface"; else bad "symlink in the production surface: $symlinks"; fi
 for f in "${surface_files[@]}"; do
   [ -f "$f" ] || bad "scanned surface missing: $f"
