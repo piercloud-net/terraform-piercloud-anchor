@@ -68,6 +68,16 @@ is_broker_anchor_ref() { # $1 = candidate string
   [ "${#s}" -le 64 ]
 }
 
+# _broker_token_ok <value> — 0 iff the value is JWT/base64url-shaped and safe
+# to embed in a curl config line: no quotes, backslashes, whitespace or
+# control characters that could inject another config directive.
+_broker_token_ok() { # $1 = token candidate
+  case "${1:-}" in
+    '' | *[!A-Za-z0-9=._~+/-]*) return 1 ;;
+  esac
+  return 0
+}
+
 # _broker_mint_token <audience> <workdir> <label> — mint a GitHub OIDC token
 # for the audience and print it on stdout. The request token and the minted
 # token travel in 0600 curl config files inside the caller's 0700 workdir;
@@ -80,6 +90,26 @@ _broker_mint_token() { # $1 = audience, $2 = workdir, $3 = label
   req_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
   if [ -z "$req_url" ] || [ -z "$req_token" ]; then
     echo "::error::${label}: no OIDC request context (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN empty) — the job needs permissions: id-token: write. Refusing." >&2
+    return 1
+  fi
+  # The runner supplies the token endpoint; require https and no fragment so a
+  # misconfigured runner cannot send the request token in cleartext or land
+  # the audience in the fragment (the broker would then refuse the token).
+  case "$req_url" in
+    https://*) ;;
+    *)
+      echo "::error::${label}: OIDC request URL must be https — refusing." >&2
+      return 1
+      ;;
+  esac
+  case "$req_url" in
+    *'#'*)
+      echo "::error::${label}: OIDC request URL must not carry a fragment — refusing." >&2
+      return 1
+      ;;
+  esac
+  if ! _broker_token_ok "$req_token"; then
+    echo "::error::${label}: OIDC request token carries unexpected characters — refusing." >&2
     return 1
   fi
 
@@ -113,16 +143,26 @@ EOF
     echo "::error::${label}: OIDC token response carried no value — refusing." >&2
     return 1
   fi
+  if ! _broker_token_ok "$token"; then
+    echo "::error::${label}: OIDC token carries unexpected characters — refusing." >&2
+    return 1
+  fi
   printf '%s' "$token"
 }
 
-# _broker_validate_base <base> — 0 iff base is an https URL (the broker's
-# ingress is TLS-only; a plaintext base would leak the minted token).
+# _broker_validate_base <base> — 0 iff base is a plain https origin/path base
+# with no userinfo, query, fragment, backslash or whitespace (the broker's
+# ingress is TLS-only; a plaintext base would leak the minted token, and a
+# query/fragment would silently retarget the request).
 _broker_validate_base() { # $1 = base URL
   case "$1" in
-    https:*//*) return 0 ;;
+    https://[A-Za-z0-9]*) ;;
     *) return 1 ;;
   esac
+  case "$1" in
+    *[!A-Za-z0-9.:/-]*) return 1 ;;
+  esac
+  return 0
 }
 
 # _broker_post_json <label> <base> <path> <body> <workdir> — mint a
@@ -178,7 +218,9 @@ report_anchor_ip() { # $1 = anchor_ref, $2 = ipv4
   fi
 
   base="${BROKER_URL:-https://broker.piercloud.net}"
-  base="${base%/}"
+  # Strip every trailing slash: a single `${base%/}` leaves `https://host/`
+  # and joins to `//v1/...` (the path builder adds `/v1/...`).
+  while [ "$base" != "${base%/}" ]; do base="${base%/}"; done
   if ! _broker_validate_base "$base"; then
     echo "::error::broker report: BROKER_URL must be an https URL (got a non-https value) — refusing." >&2
     return 1

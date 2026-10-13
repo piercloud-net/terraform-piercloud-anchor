@@ -64,7 +64,9 @@ is_broker_challenge_value() { # $1 = candidate
 # _broker_dns_base — echo the validated https broker base (or fail).
 _broker_dns_base() {
   local base="${BROKER_URL:-https://broker.piercloud.net}"
-  base="${base%/}"
+  # Strip every trailing slash: a single `${base%/}` leaves `https://host/`
+  # and joins to `//v1/...` (the path builder adds `/v1/...`).
+  while [ "$base" != "${base%/}" ]; do base="${base%/}"; done
   _broker_validate_base "$base" || return 1
   printf '%s' "$base"
 }

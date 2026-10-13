@@ -179,6 +179,10 @@ rc="$(RUN oktraildns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https:/
 is "dns trailing-slash base rc=0" 0 "$rc"
 trail_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns trailing-slash base POST URL exact" "https://broker.example/v1/anchors/dns" "$trail_url"
+rc="$(RUN okdblslshdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example//)"
+is "dns double-trailing-slash base rc=0" 0 "$rc"
+dbl_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns double-trailing-slash POST URL exact" "https://broker.example/v1/anchors/dns" "$dbl_url"
 rc="$(RUN okaltch write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present BROKER_URL=https://broker.example)"
 is "challenge alternate base rc=0" 0 "$rc"
 alt_ch_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
@@ -204,11 +208,44 @@ is "trailing-dot IPv4 refused" 1 "$(RUN ipdot write_anchor_dns broker-ref-1 192.
 is "double-dot challenge name refused" 1 "$(RUN chddot write_challenge '_acme-challenge.a..b.piercloud.net' abc present)"
 is "trailing-dot challenge name refused" 1 "$(RUN chtdot write_challenge '_acme-challenge.anchor-01-envproof.piercloud.net.' abc present)"
 contains "challenge name refusal names the shape" "_acme-challenge." "$(cat "$WORK/err.chwild")"
+contains "anchor_ref refusal names the grammar" "::error::broker dns: anchor_ref must match [a-z0-9._-]{1,64}" "$(cat "$WORK/err.refempty")"
+contains "ipv4 refusal names the shape" "::error::broker dns: ipv4 is not a canonical dotted-quad" "$(cat "$WORK/err.ipdot")"
+contains "challenge name refusal names the wildcard rule" "::error::broker dns: challenge name must be _acme-challenge.<lowercase dns name> with no wildcard" "$(cat "$WORK/err.chwild")"
+contains "challenge value refusal names the token rule" "::error::broker dns: challenge value must be a bounded base64url token" "$(cat "$WORK/err.chval")"
+contains "challenge action refusal names the actions" "::error::broker dns: action must be present|cleanup" "$(cat "$WORK/err.chaction")"
 lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 
 # ---- behavior: environment and upstream failures -------------------------
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
 contains "non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.httpurl")"
+# A query/fragment/userinfo/backslash in the base would retarget the request
+# (curl folds `?q/v1/...` into the query and posts to `/`); the validator
+# requires a plain https host/path base and refuses all of them.
+is "query BROKER_URL refused" 1 "$(RUN urlquery write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example?x=1')"
+contains "query BROKER_URL error carries the prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.urlquery")"
+is "fragment BROKER_URL refused" 1 "$(RUN urlfrag write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example#f')"
+is "userinfo BROKER_URL refused" 1 "$(RUN urluser write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://u@broker.example')"
+is "backslash BROKER_URL refused" 1 "$(RUN urlbs write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example\evil')"
+lacks "no curl call for refused broker URLs" "CALL " "$(cat "$WORK/curl.log")"
+# The runner supplies the OIDC endpoint; require https and no fragment (a
+# fragment would land the audience outside the query the endpoint reads).
+is "http OIDC request URL refused" 1 "$(RUN ctxhttp write_anchor_dns broker-ref-1 192.0.2.10 'ACTIONS_ID_TOKEN_REQUEST_URL=http://oidc.example/req')"
+contains "http OIDC URL error names the rule" "::error::broker dns: OIDC request URL must be https" "$(cat "$WORK/err.ctxhttp")"
+is "fragment OIDC request URL refused" 1 "$(RUN ctxfrag write_anchor_dns broker-ref-1 192.0.2.10 'ACTIONS_ID_TOKEN_REQUEST_URL=https://oidc.example/req?a=b#frag')"
+contains "fragment OIDC URL error names the rule" "::error::broker dns: OIDC request URL must not carry a fragment" "$(cat "$WORK/err.ctxfrag")"
+# A token value with a quote or newline could inject a curl config directive;
+# the minted-token shape check refuses it before the header file is written.
+is "request token with newline refused" 1 "$(RUN reqnl write_anchor_dns broker-ref-1 192.0.2.10 $'ACTIONS_ID_TOKEN_REQUEST_TOKEN=abc\ndef')"
+contains "request token newline error names the rule" "::error::broker dns: OIDC request token carries unexpected characters" "$(cat "$WORK/err.reqnl")"
+is "minted token with quote refused" 1 "$(RUN tokquote write_anchor_dns broker-ref-1 192.0.2.10 'STUB_TOKEN_BODY={"value":"x\"injected"}')"
+contains "minted token quote error names the rule" "::error::broker dns: OIDC token carries unexpected characters" "$(cat "$WORK/err.tokquote")"
+toknl_body=$'STUB_TOKEN_BODY={"value":"x\\nheader = \\"X-Evil: yes\\""}'
+is "minted token with newline refused" 1 "$(RUN toknl write_anchor_dns broker-ref-1 192.0.2.10 "$toknl_body")"
+contains "minted token newline error names the rule" "::error::broker dns: OIDC token carries unexpected characters" "$(cat "$WORK/err.toknl")"
+# The challenge path carries its own BROKER_URL refusal literal (the anchor
+# case above does not exercise it).
+is "challenge non-https BROKER_URL refused" 1 "$(RUN chhttpurl write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present BROKER_URL=http://broker.example)"
+contains "challenge non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.chhttpurl")"
 is "missing OIDC context refused" 1 "$(RUN noctx write_anchor_dns broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
 contains "no-OIDC error carries the broker dns prefix" "::error::broker dns: no OIDC request context" "$(cat "$WORK/err.noctx")"
 # The challenge path's label handoff needs its own no-OIDC case (the anchor
@@ -259,16 +296,29 @@ step_block() { # $1 = exact step name
 }
 report_block="$(step_block 'Report the anchor IPv4')"
 dns_block="$(step_block 'Write the anchor DNS records through the broker')"
-challenge_block="$(step_block 'Present and clean up a DNS-01 challenge TXT')"
+challenge_block="$(step_block 'Present a DNS-01 challenge TXT')"
+cleanup_block="$(step_block 'Clean up the DNS-01 challenge TXT')"
 negative_block="$(step_block 'Mismatched A value is refused with 409 (negative)')"
 [ -n "$report_block" ] || bad "report step block not found"
 [ -n "$dns_block" ] || bad "dns step block not found"
 [ -n "$challenge_block" ] || bad "challenge step block not found"
+[ -n "$cleanup_block" ] || bad "cleanup step block not found"
 [ -n "$negative_block" ] || bad "negative step block not found"
 contains "dns step binds the anchor_ref input" 'ANCHOR_REF: ${{ inputs.anchor_ref }}' "$dns_block"
 contains "dns step binds the ipv4 input" 'ANCHOR_IPV4: ${{ inputs.ipv4 }}' "$dns_block"
 contains "challenge step binds the name input" 'CHALLENGE_NAME: ${{ inputs.challenge_name }}' "$challenge_block"
 contains "challenge step binds the value input" 'CHALLENGE_VALUE: ${{ inputs.challenge_value }}' "$challenge_block"
+contains "cleanup step binds the name input" 'CHALLENGE_NAME: ${{ inputs.challenge_name }}' "$cleanup_block"
+contains "cleanup step binds the value input" 'CHALLENGE_VALUE: ${{ inputs.challenge_value }}' "$cleanup_block"
+contains "cleanup step runs unconditionally" 'if: always()' "$cleanup_block"
+# Every broker step must fail the job on a refusal: strict mode in the step
+# body and no continue-on-error anywhere in the workflow.
+contains "report step runs under strict mode" 'set -euo pipefail' "$report_block"
+contains "dns step runs under strict mode" 'set -euo pipefail' "$dns_block"
+contains "challenge step runs under strict mode" 'set -euo pipefail' "$challenge_block"
+contains "cleanup step runs under strict mode" 'set -euo pipefail' "$cleanup_block"
+contains "negative step runs under strict mode" 'set -euo pipefail' "$negative_block"
+lacks "selftest does not swallow step failures" 'continue-on-error' "$self_live"
 contains "negative step gated on the input" "if: inputs.negative_ipv4 != ''" "$negative_block"
 contains "negative step requires a 409" '*"HTTP 409"*' "$negative_block"
 contains "negative step refuses any other failure" 'expected a 409 cross-check refusal' "$negative_block"
@@ -279,6 +329,13 @@ if [ -n "$dns_step_line" ] && [ -n "$report_step_line" ] && [ "$dns_step_line" -
   ok "DNS write step follows the report step in the same job"
 else
   bad "DNS write step ordering/report step missing (report=$report_step_line dns=$dns_step_line)"
+fi
+present_step_line="$(printf '%s\n' "$self_live" | grep -n '^      - name: Present a DNS-01 challenge TXT$' | cut -d: -f1)"
+cleanup_step_line="$(printf '%s\n' "$self_live" | grep -n '^      - name: Clean up the DNS-01 challenge TXT$' | cut -d: -f1)"
+if [ -n "$present_step_line" ] && [ -n "$cleanup_step_line" ] && [ "$cleanup_step_line" -gt "$present_step_line" ]; then
+  ok "cleanup step follows the present step"
+else
+  bad "cleanup step ordering/present step missing (present=$present_step_line cleanup=$cleanup_step_line)"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

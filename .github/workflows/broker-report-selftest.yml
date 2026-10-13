@@ -95,7 +95,7 @@ jobs:
           . .github/scripts/lib/broker-dns.sh
           write_anchor_dns "$ANCHOR_REF" "$ANCHOR_IPV4"
 
-      - name: Present and clean up a DNS-01 challenge TXT
+      - name: Present a DNS-01 challenge TXT
         env:
           BROKER_URL: https://broker.piercloud.net
           CHALLENGE_NAME: ${{ inputs.challenge_name }}
@@ -104,6 +104,21 @@ jobs:
           set -euo pipefail
           . .github/scripts/lib/broker-dns.sh
           write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" present
+
+      # Cleanup runs even when an earlier step failed or the run is cancelled
+      # after the present step: present-then-abort otherwise leaves the TXT in
+      # the zone until the next proof. A cleanup after a failed present can
+      # itself refuse (the TXT was never written); the job has already failed,
+      # and a 409 there is the exact-match delete proving nothing to remove.
+      - name: Clean up the DNS-01 challenge TXT
+        if: always()
+        env:
+          BROKER_URL: https://broker.piercloud.net
+          CHALLENGE_NAME: ${{ inputs.challenge_name }}
+          CHALLENGE_VALUE: ${{ inputs.challenge_value }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/lib/broker-dns.sh
           write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" cleanup
 
       - name: Mismatched A value is refused with 409 (negative)
