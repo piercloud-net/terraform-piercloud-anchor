@@ -96,7 +96,7 @@ case "$LANE" in *github.*|*needs.*|*strategy.*|*matrix.*) bad "lane references a
 
 # Per-job environment extraction: every job's own `environment:` line.
 ENV_LINES="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '
-  $2 ~ /^  [A-Za-z0-9_.-]+:$/ { job=$2; sub(/:$/, "", job); sub(/^  /, "", job) }
+  $2 ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*(#.*)?$/ { job=$2; sub(/:[[:space:]]*(#.*)?$/, "", job); sub(/^  /, "", job) }
   $2 ~ /^    environment:/ { line=$2; sub(/^    environment: /, "", line); gsub(/^['"'"'"]|['"'"'"]$/, "", line); print job "|" line }
 ')"
 is "exactly two jobs carry an environment" "2" "$(printf '%s\n' "$ENV_LINES" | grep -c '|')"
@@ -110,15 +110,15 @@ is "anchor_ref input declared" "1" "$(grep -c '^      anchor_ref:$' "$PROV")"
 # Preflight placement: the preflight must be the FIRST step of the ungated job
 # that owns it, and device-flow must `needs:` that job — a new ungated job
 # owning the preflight between banner and device-flow must not stay green.
-PREFLIGHT_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '$2 ~ /^      - name: Managed-input preflight/ {print $1; exit}')"
-DEVFLOW_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '$2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+PREFLIGHT_LINE="$(awk -F'\t' '$2 ~ /^      - name: Managed-input preflight/ {print $1; exit}' <<<"$PROV_STRUCT")"
+DEVFLOW_LINE="$(awk -F'\t' '$2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 [ -n "$PREFLIGHT_LINE" ] && ok "preflight step present" || bad "preflight step missing"
 # The owning job = nearest 2-space job header at/before the preflight line.
-OWNER_JOB="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v n="$PREFLIGHT_LINE" '$1<=n && $2 ~ /^  [A-Za-z0-9_.-]+:$/ { job=$2; sub(/:$/, "", job); sub(/^  /, "", job) } END { print job }')"
+OWNER_JOB="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v n="$PREFLIGHT_LINE" '$1<=n && $2 ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*(#.*)?$/ { job=$2; sub(/:[[:space:]]*(#.*)?$/, "", job); sub(/^  /, "", job) } END { print job }')"
 OWNER_HEADER_LINE=""
-[ -n "$OWNER_JOB" ] && OWNER_HEADER_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v j="$OWNER_JOB" '$2 == "  " j ":" {print $1; exit}')"
+[ -n "$OWNER_JOB" ] && OWNER_JOB_RE="${OWNER_JOB//./[.]}" && OWNER_HEADER_LINE="$(awk -F'\t' -v j="$OWNER_JOB_RE" '$2 ~ ("^  " j ":[[:space:]]*(#.*)?$") {print $1; exit}' <<<"$PROV_STRUCT")"
 FIRST_STEP_LINE=""
-[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v n="$OWNER_HEADER_LINE" '$1>n && $2 ~ /^      - name: / {print $1; exit}')"
+[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(awk -F'\t' -v n="$OWNER_HEADER_LINE" '$1>n && $2 ~ /^      - name: / {print $1; exit}' <<<"$PROV_STRUCT")"
 is "preflight is the first step of its own job" "$PREFLIGHT_LINE" "$FIRST_STEP_LINE"
 # …and it must still precede the device-flow job in the file (the banner job
 # is scheduled before device-flow).
@@ -149,9 +149,9 @@ contains "binding check compares marker to input" 'if [ -n "$TENANT_INPUT" ] && 
 # ---- behavior helpers ------------------------------------------------------
 extract_step() { # $1 = step name needle, $2 = out file
   local start end
-  start="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v needle="$1" 'index($2, "- name: " needle) {print $1; exit}')"
+  start="$(awk -F'\t' -v needle="$1" 'index($2, "- name: " needle) {print $1; exit}' <<<"$PROV_STRUCT")"
   [ -n "$start" ] || return 1
-  end="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v s="$start" '$1 > s && $2 ~ /^      - name: / {print $1; exit}')"
+  end="$(awk -F'\t' -v s="$start" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$PROV_STRUCT")"
   [ -n "$end" ] || end=$(( $(wc -l < "$PROV") + 1 ))
   awk -v s="$start" -v e="$end" 'NR>s && NR<e' "$PROV" | awk '
     /^        run: \|$/ { inrun=1; next }
@@ -302,8 +302,8 @@ function qprefix(s,   i, c, q) {
     skip = 1
   }
 }'  "$CI")"
-ci_unit_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
-ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit_START="$(awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+ci_unit_END="$(awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
 ci_unit=""
 [ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
 [ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"

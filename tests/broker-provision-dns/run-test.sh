@@ -84,9 +84,9 @@ function qprefix(s,   i, c, q) {
 }'  "$PROV")"
 [ -n "$PROV_STRUCT" ] || { printf 'FAIL structural view of %s is empty\n' "$PROV"; exit 1; }
 prov_raw_live="$(grep -v '^[[:space:]]*#' "$PROV")"
-JOB_START="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '$2 ~ /^  anchor-dns:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+JOB_START="$(awk -F'\t' '$2 ~ /^  anchor-dns:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 [ -n "$JOB_START" ] || { printf 'FAIL anchor-dns job key not found in %s\n' "$PROV"; exit 1; }
-JOB_END="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v s="$JOB_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+JOB_END="$(awk -F'\t' -v s="$JOB_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 [ -n "$JOB_END" ] || { printf 'FAIL anchor-dns job end not found in %s\n' "$PROV"; exit 1; }
 JOB_RAW="$(sed -n "$((JOB_START + 1)),$((JOB_END - 1))p" "$PROV")"
 JOB="$(printf '%s\n' "$JOB_RAW" | grep -v '^[[:space:]]*#' || true)"
@@ -269,8 +269,8 @@ function qprefix(s,   i, c, q) {
     skip = 1
   }
 }'  "$CI")"
-ci_unit_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
-ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit_START="$(awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+ci_unit_END="$(awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
 ci_unit=""
 [ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
 [ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
@@ -300,8 +300,8 @@ fi
 # The harness-run step is byte-pinned and located structurally: an
 # `if: false` rewrite, an early `exit 0`, or a `set +e` inside it must
 # update the pin.
-RUN_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Run the committed script harnesses (cheap first)" {print $1; exit}')"
-RUN_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}')"
+RUN_START="$(awk -F'\t' '$2 == "      - name: Run the committed script harnesses (cheap first)" {print $1; exit}' <<<"$CI_STRUCT")"
+RUN_END="$(awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
   RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
   is "harness-run step blob hash" "286baff6b596031b9d0faaa716dac758b1515251ee3fafa2454d639184991182" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
@@ -343,8 +343,8 @@ fi
 # The whole gate step is byte-pinned: a later run=no write, a redefined
 # GITHUB_OUTPUT, a shadowed grep, or any other subversion inside it must
 # update the pin.
-GATE_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts or harnesses)" {print $1; exit}')"
-GATE_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}')"
+GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts or harnesses)" {print $1; exit}' <<<"$CI_STRUCT")"
+GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
   is "gate step blob hash" "0f85dbbe46c2abad81a846cc32397163ec1a3cb9a50afe5c674849b1ebcd18e9" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"

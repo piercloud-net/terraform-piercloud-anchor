@@ -229,8 +229,8 @@ function qprefix(s,   i, c, q) {
     skip = 1
   }
 }'  "$CI")"
-EDGE_CI_UNIT_START="$(printf '%s\n' "$EDGE_CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
-EDGE_CI_UNIT_END="$(printf '%s\n' "$EDGE_CI_STRUCT" | awk -F'\t' -v s="$EDGE_CI_UNIT_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+EDGE_CI_UNIT_START="$(awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$EDGE_CI_STRUCT")"
+EDGE_CI_UNIT_END="$(awk -F'\t' -v s="$EDGE_CI_UNIT_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$EDGE_CI_STRUCT")"
 EDGE_CI_UNIT=""
 [ -n "$EDGE_CI_UNIT_START" ] && [ -n "$EDGE_CI_UNIT_END" ] && EDGE_CI_UNIT="$(sed -n "$((EDGE_CI_UNIT_START + 1)),$((EDGE_CI_UNIT_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
 is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
