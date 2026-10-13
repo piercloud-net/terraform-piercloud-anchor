@@ -253,7 +253,7 @@ shopt -s nullglob
 edge_harnesses=(tests/*/run-test.sh)
 [ ${#edge_harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
 for t in "${edge_harnesses[@]}"; do
-  if printf '%s\n' "$EDGE_CI_UNIT" | grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$"; then
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" <<<"$EDGE_CI_UNIT"; then
     ok "ci.yml run list includes $t"
   else
     bad "ci.yml run list includes $t"

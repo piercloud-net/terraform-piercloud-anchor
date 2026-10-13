@@ -128,16 +128,16 @@ else
   bad "preflight does not precede device-flow ($PREFLIGHT_LINE / $DEVFLOW_LINE)"
 fi
 # device-flow must `needs:` the owning job (dependency, not line proximity).
-DEVFLOW_NEEDS="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '
+DEVFLOW_NEEDS="$(awk -F'\t' '
   $2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {f=1; next}
   f && $2 ~ /^  [A-Za-z0-9_.-]+:$/ {exit}
   f && $2 ~ /^    needs:/ {line=$2; sub(/^    needs: */, "", line); print line; exit}
-')"
+' <<<"$PROV_STRUCT")"
 case "$DEVFLOW_NEEDS" in *"$OWNER_JOB"*) ok "device-flow needs the preflight's job ($OWNER_JOB)";; *) bad "device-flow does not need $OWNER_JOB (needs: $DEVFLOW_NEEDS)";; esac
 # Step header (name .. run:) must carry no `if:` — a disabled preflight is a
 # silent bypass (quoted keys and space-before-colon included).
 awk -v n="$PREFLIGHT_LINE" 'NR>=n && /^      - name:/ && NR>n { exit } NR>=n { print }' "$PROV" > "$WORK/preflight-header.txt"
-is "preflight step has no if: guard" "0" "$(grep -cE '^        "?if"?[[:space:]]*:' "$WORK/preflight-header.txt")"
+is "preflight step has no if: guard" "0" "$(grep -cE "^        [\"']?if[\"']?[[:space:]]*:" "$WORK/preflight-header.txt")"
 # The owning job must be ungated (no `environment:` for it in the per-job extraction).
 OWNER_ENV="$(printf '%s\n' "$ENV_LINES" | grep "^${OWNER_JOB}|" || true)"
 is "preflight's job is ungated" "" "$OWNER_ENV"
@@ -312,7 +312,7 @@ is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (
 # every raw indent-2 non-space/non-comment line is a structural line of the
 # top level (on/concurrency/permissions children plus the job keys). A
 # duplicate or decoy job key in ANY spelling adds one.
-is "ci.yml structural indent-2 line count" "15" "$(grep -cE '^  [^[:space:]#]' "$CI")"
+is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 gate_line="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
@@ -324,7 +324,7 @@ gate_pattern="$(printf '%s\n' "$gate_raw" | head -n1 | sed -e "s/^grep -qE '//" 
 [ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
 gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
 if [ -n "$gate_ln" ]; then
-  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|\$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
+  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
   is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
 else
   bad "gate elif line not found in the unit-tests job"
@@ -335,12 +335,12 @@ harnesses=(tests/*/run-test.sh)
 for t in "${harnesses[@]}"; do
   dir="$(basename "$(dirname "$t")")"
   contains "unit-tests gate covers tests/$dir" "$dir" "$gate_line"
-  if [ -n "$gate_pattern" ] && printf '%s\n' "$t" | grep -qE "$gate_pattern"; then
+  if [ -n "$gate_pattern" ] && grep -qE "$gate_pattern" <<<"$t"; then
     ok "unit-tests gate regex matches $t"
   else
     bad "unit-tests gate regex does not match $t"
   fi
-  if printf '%s\n' "$ci_unit" | grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$"; then
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" <<<"$ci_unit"; then
     ok "ci.yml run list includes $t"
   else
     bad "ci.yml run list includes $t"

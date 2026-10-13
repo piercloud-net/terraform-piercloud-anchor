@@ -36,7 +36,7 @@ lacks() { # $1 label, $2 needle, $3 haystack -- ok when the needle is ABSENT
   case "$3" in *"$2"*) bad "$1 (found '$2')" ;; *) ok "$1" ;; esac
 }
 lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
-  if printf '%s\n' "$3" | grep -qwE -- "$2"; then bad "$1 (found '$2')"; else ok "$1"; fi
+  if grep -qwE -- "$2" <<<"$3"; then bad "$1 (found '$2')"; else ok "$1"; fi
 }
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
@@ -100,7 +100,7 @@ is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\
 # keys). A duplicate or decoy job key in ANY spelling (tags, quotes, hex
 # escapes, explicit keys) adds one, so it fails until the pin is deliberately
 # updated.
-is "provision.yml structural indent-2 line count" "12" "$(grep -cE '^  [^[:space:]#]' "$PROV")"
+is "provision.yml structural indent-2 line count (pin: update for a new top-level line)" "12" "$(printf '%s\n' "$PROV_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 
 # ---- the broker-dns lib is the one writer --------------------------------
 contains "broker-dns lib defines write_anchor_dns" 'write_anchor_dns()' "$(cat "$LIB")"
@@ -139,8 +139,8 @@ if [ -n "$src_line" ] && [ -n "$call_line" ] && [ "$src_line" -lt "$call_line" ]
 # A dead step or a shadowed function defeats the line pins above: no
 # step-level `if:`/`continue-on-error` may appear (the job's own apply gate
 # is the only `if:` at 4-space indent), and the call/source may appear once.
-is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
-is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
+is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^(      - |        )(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?if[\"']?[[:space:]]*:")"
+is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^(      - |        )(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?continue-on-error[\"']?[[:space:]]*:")"
 is "job-level if is exactly the apply gate" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')"
 is "exactly one write_anchor_dns source line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          \. \.github/scripts/lib/broker-dns\.sh$')"
 # The step set is pinned: an extra unpinned step (e.g. a direct provider
@@ -160,15 +160,15 @@ is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$
 # step text: `continue-on-error` swallows a guard/write failure, `defaults`
 # can replace the shell with a no-op. Both are banned, as are the bash
 # startup-file variables that can neuter the job's `set -euo pipefail`.
-is "no job-level continue-on-error" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
-is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
-is "exactly one job-level if in the anchor-dns job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
+is "no job-level continue-on-error" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?continue-on-error[\"']?[[:space:]]*:")"
+is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:")"
+is "exactly one job-level if in the anchor-dns job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?if[\"']?[[:space:]]*:")"
 is "exactly one strict apply-gate if" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')" 
 for k in if strategy defaults continue-on-error; do
   is "no job-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
   is "no step-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^        \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
 done
-is "no workflow-level defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$PROV")"
+is "no workflow-level defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$PROV")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
   lacks_word "job does not set $v" "$v" "$JOB"
 done
@@ -291,7 +291,7 @@ is "exactly one gate regex on the gate line" "1" "$(printf '%s\n' "$gate_raw" | 
 gate_pattern="$(printf '%s\n' "$gate_raw" | head -n1 | sed -e "s/^grep -qE '//" -e "s/'$//")"
 [ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
 if [ -n "$gate_pattern" ]; then
-  if printf 'tests/broker-provision-dns/run-test.sh\n' | grep -qE "$gate_pattern"; then
+  if grep -qE "$gate_pattern" <<<"tests/broker-provision-dns/run-test.sh"; then
     ok "unit-tests gate regex matches this harness path"
   else
     bad "unit-tests gate regex does not match this harness path"
@@ -315,15 +315,15 @@ is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (
 # every raw indent-2 non-space/non-comment line is a structural line of the
 # top level (on/concurrency/permissions children plus the job keys). A
 # duplicate or decoy job key in ANY spelling adds one.
-is "ci.yml structural indent-2 line count" "15" "$(grep -cE '^  [^[:space:]#]' "$CI")"
+is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
 # variables anywhere in ci.yml, and the allowlist must no longer name the
 # retired direct provider APIs.
-is "no job-level if on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
-is "no job-level defaults on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
-is "no job-level strategy on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?strategy"?[[:space:]]*:')"
-is "no workflow-level defaults in ci.yml" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
+is "no job-level if on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?if[\"']?[[:space:]]*:")"
+is "no job-level defaults on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:")"
+is "no job-level strategy on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?strategy[\"']?[[:space:]]*:")"
+is "no workflow-level defaults in ci.yml" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
   lacks_word "ci.yml does not set $v" "$v" "$ci_live"
 done
@@ -335,7 +335,7 @@ lacks "ci allowlist no longer names the Gcore DNS API" 'api.gcore.com' "$(cat "$
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
 gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
 if [ -n "$gate_ln" ]; then
-  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|\$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
+  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
   is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
 else
   bad "gate elif line not found in the unit-tests job"
@@ -352,10 +352,10 @@ else
   bad "gate step span not found in ci.yml"
 fi
 is "exactly one gate-step header" "1" "$(grep -cE '^      - name: Gate on changed paths \(CI scripts or harnesses\)$' "$CI")"
-is "unit-tests job has no if" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
-is "unit-tests job has no strategy" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?strategy"?[[:space:]]*:')"
-is "unit-tests job has no continue-on-error" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
-is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
+is "unit-tests job has no if" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?if[\"']?[[:space:]]*:")"
+is "unit-tests job has no strategy" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?strategy[\"']?[[:space:]]*:")"
+is "unit-tests job has no continue-on-error" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?continue-on-error[\"']?[[:space:]]*:")"
+is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:")"
 for k in if strategy defaults continue-on-error; do
   is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
 done
@@ -365,11 +365,11 @@ done
 # per-key checks above stay as diagnostics.
 is "ci.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$CI")"
 is "provision.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$PROV")"
-is "ci.yml has no workflow defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
+is "ci.yml has no workflow defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
 for f in "$CI" "$PROV"; do
-  if grep -qE '\\[uUxX][0-9a-fA-F]|\\[0-7]' "$f"; then
+  if grep -qE '\\[uUxX][0-9a-fA-F]|\\[0-7]' <<<"$(grep -v '^[[:space:]]*#' "$f")"; then
     bad "$(basename "$f") contains a hex/octal escape (name-assembly route, banned blanket)"
   else
     ok "$(basename "$f") has no hex/octal escape"
@@ -490,7 +490,7 @@ for t in "${harnesses[@]}"; do
   # Whole-line, indentation-tolerant match inside the unit-tests-scripts job:
   # an `echo skipped # bash ...` decoy, a commented-out line, or a run line
   # in any other job does not satisfy it.
-  if printf '%s\n' "$ci_unit" | grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$"; then
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" <<<"$ci_unit"; then
     ok "ci.yml run list includes $t"
   else
     bad "ci.yml run list includes $t"
