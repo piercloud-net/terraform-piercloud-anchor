@@ -208,21 +208,23 @@ function indent(s,   m) { match(s, /^ */); return RLENGTH }
   if (skip) {
     if ($0 ~ /^[[:space:]]*$/) next
     i = indent($0)
-    if (sind < 0) { sind = i; next }
-    if (i >= sind) next
-    skip = 0
+    if (sind < 0) {
+      if (i <= ihdr) { skip = 0 } else { sind = i; next }
+    } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
-    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    ihdr = indent($0)
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
     skip = 1
   }
 }'  "$CI")"
 EDGE_CI_UNIT_START="$(printf '%s\n' "$EDGE_CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
-EDGE_CI_UNIT_END="$(printf '%s\n' "$EDGE_CI_STRUCT" | awk -F'\t' -v s="$EDGE_CI_UNIT_START" '$1 > s && $2 ~ /^  [^ ].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+EDGE_CI_UNIT_END="$(printf '%s\n' "$EDGE_CI_STRUCT" | awk -F'\t' -v s="$EDGE_CI_UNIT_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
 EDGE_CI_UNIT=""
-[ -n "$EDGE_CI_UNIT_START" ] && [ -n "$EDGE_CI_UNIT_END" ] && EDGE_CI_UNIT="$(sed -n "$((EDGE_CI_UNIT_START + 1)),$((EDGE_CI_UNIT_END - 1))p" "$CI" | grep -v '^[[:space:]]*#')"
+[ -n "$EDGE_CI_UNIT_START" ] && [ -n "$EDGE_CI_UNIT_END" ] && EDGE_CI_UNIT="$(sed -n "$((EDGE_CI_UNIT_START + 1)),$((EDGE_CI_UNIT_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
+is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
 gate_line_ci="$(printf '%s\n' "$EDGE_CI_UNIT" | grep -m1 -F "elif grep -qE '^(\\.github/scripts/" || true)"
 case "${gate_line_ci}" in
   *'.*\.tf$'*) ok "ci.yml unit-tests gate runs on .tf-only changes" ;;

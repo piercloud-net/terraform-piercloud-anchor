@@ -53,20 +53,23 @@ DYN_ENV="\${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}"
 
 # Block-scalar-stripped structural view (NR + text): every extraction below
 # reads THIS, so a decoy `|`/`>` scalar quoting the job (a `run-name: |2`
-# copy) can never satisfy a pin meant for the real job.
+# copy, anchors/tags/quoted keys included) can never satisfy a pin meant for
+# the real job; the raw exactly-one job-key count backstops a form the
+# stripper does not recognise.
 PROV_STRUCT="$(awk '
 function indent(s,   m) { match(s, /^ */); return RLENGTH }
 {
   if (skip) {
     if ($0 ~ /^[[:space:]]*$/) next
     i = indent($0)
-    if (sind < 0) { sind = i; next }
-    if (i >= sind) next
-    skip = 0
+    if (sind < 0) {
+      if (i <= ihdr) { skip = 0 } else { sind = i; next }
+    } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
-    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    ihdr = indent($0)
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
     skip = 1
   }
@@ -123,9 +126,9 @@ DEVFLOW_NEEDS="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '
 ')"
 case "$DEVFLOW_NEEDS" in *"$OWNER_JOB"*) ok "device-flow needs the preflight's job ($OWNER_JOB)";; *) bad "device-flow does not need $OWNER_JOB (needs: $DEVFLOW_NEEDS)";; esac
 # Step header (name .. run:) must carry no `if:` — a disabled preflight is a
-# silent bypass.
+# silent bypass (quoted keys and space-before-colon included).
 awk -v n="$PREFLIGHT_LINE" 'NR>=n && /^      - name:/ && NR>n { exit } NR>=n { print }' "$PROV" > "$WORK/preflight-header.txt"
-is "preflight step has no if: guard" "0" "$(grep -c '^        if:' "$WORK/preflight-header.txt")"
+is "preflight step has no if: guard" "0" "$(grep -cE '^        "?if"?[[:space:]]*:' "$WORK/preflight-header.txt")"
 # The owning job must be ungated (no `environment:` for it in the per-job extraction).
 OWNER_ENV="$(printf '%s\n' "$ENV_LINES" | grep "^${OWNER_JOB}|" || true)"
 is "preflight's job is ungated" "" "$OWNER_ENV"
@@ -269,27 +272,35 @@ function indent(s,   m) { match(s, /^ */); return RLENGTH }
   if (skip) {
     if ($0 ~ /^[[:space:]]*$/) next
     i = indent($0)
-    if (sind < 0) { sind = i; next }
-    if (i >= sind) next
-    skip = 0
+    if (sind < 0) {
+      if (i <= ihdr) { skip = 0 } else { sind = i; next }
+    } else if (i >= sind) { next } else { skip = 0 }
   }
   printf "%d\t%s\n", NR, $0
-  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
-    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+  if ($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    ihdr = indent($0)
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
     else { sind = -1 }
     skip = 1
   }
 }'  "$CI")"
 ci_unit_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
-ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ ].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
 ci_unit=""
-[ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#')"
+[ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
 [ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
+is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
 gate_line="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
-gate_raw="$(printf '%s\n' "$ci_unit" | grep -m1 -oE "grep -qE '[^']*'" || true)"
-gate_pattern="$(printf '%s\n' "$gate_raw" | sed -e "s/^grep -qE '//" -e "s/'$//")"
+# Extract the regex from the gate LINE itself, exactly one match: a decoy
+# `grep -qE` elsewhere in the job cannot satisfy the functional check.
+gate_raw="$(printf '%s\n' "$gate_line" | grep -oE "grep -qE '[^']*'" || true)"
+is "exactly one gate regex on the gate line" "1" "$(printf '%s\n' "$gate_raw" | grep -c . || true)"
+gate_pattern="$(printf '%s\n' "$gate_raw" | head -n1 | sed -e "s/^grep -qE '//" -e "s/'$//")"
 [ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
+gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1)"
+gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1))p")"
+is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
 shopt -s nullglob
 harnesses=(tests/*/run-test.sh)
 [ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"

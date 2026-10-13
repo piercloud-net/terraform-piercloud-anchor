@@ -342,8 +342,9 @@ jobs:
           #   M1 broker leg (b) b2/b3a — the managed-run anchor-IPv4 push and
           #   the broker-owned DNS writes; the caller authenticates with a
           #   per-run GitHub OIDC token, never a standing credential). The
-          #   direct Cloudflare/Gcore DNS APIs are retired (b3b #189): a
-          #   re-appearance fails this gate.
+          #   direct Cloudflare/Gcore DNS APIs are retired (b3b #189): once
+          #   this lands, a re-appearance fails this gate (PR runs use the
+          #   pattern fetched from origin/main).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
