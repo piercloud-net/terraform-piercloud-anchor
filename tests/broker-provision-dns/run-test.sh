@@ -359,6 +359,12 @@ is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '
 for k in if strategy defaults continue-on-error; do
   is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*[\"']?${k}[\"']?[[:space:]]*(#.*)?$")"
 done
+# An explicit mapping key can carry its name across lines (`? "i\` + `f"`),
+# which no single-line regex sees. Neither workflow has a legitimate explicit
+# key at any mapping level (indent 0-8), so the form is banned blanket; the
+# per-key checks above stay as diagnostics.
+is "ci.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$CI")"
+is "provision.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$PROV")"
 is "ci.yml has no workflow defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
@@ -374,18 +380,20 @@ done
 allowed_default="$(grep -E '^[[:space:]]*allowed_url=' "$CI" || true)"
 [ -n "$allowed_default" ] || bad "ci.yml allowed_url default not found"
 is "exactly one line-leading allowed_url assignment" "1" "$(grep -cE '^[[:space:]]*allowed_url=' "$CI")"
+is "ci.yml allowed_url default blob hash" "2995ad1ff3581328f07a567d6ffa840d3dad8cc14627869d8dc2288ff7b57617" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
 lacks "ci.yml does not append to allowed_url" 'allowed_url+=' "$(cat "$CI")"
 lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed_default"
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
 
 # ---- production surfaces carry no retired name ----------------------------
-# Every non-Markdown file in the repo outside tests/, .git/ and the
-# gitignored .local/ proof config is a production surface (extensionless
-# included), plus any `.md` under `.github/` or `scripts/` (a sourced
-# `evil.md` is production; top-level docs/README stay out): a new
+# Every file in the repo outside tests/, .git/ and the gitignored .local/
+# proof config is a production surface (extensionless and Markdown included),
+# except the two records that name the retired identifiers by design:
+# docs/security-posture.md (the retirement record) and docs/verification.md
+# (the b3b verification row naming the retired harness). A new
 # `tools/evil.sh`, `tools/dns-fallback.env`, `evil.bash`,
-# `.github/workflows/evil.yaml` or `scripts/lib/helper` must not sit outside
-# the scan. Word
+# `.github/workflows/evil.yaml`, `scripts/lib/helper` or sourced
+# `docs/evil.md` must not sit outside the scan. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
 # legal while the retired repo variable is caught. Comments are INCLUDED: a
 # stale comment is drift too. The named groups are still checked explicitly
@@ -399,7 +407,7 @@ for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' 'scripts/*.sh'; do
   compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
 done
 surface_files=()
-while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type f \( ! -name '*.md' -o -path './.github/*' -o -path './scripts/*' \) -print | sort)
+while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type f ! -path './docs/security-posture.md' ! -path './docs/verification.md' -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
 # closed instead (the tree has none).
