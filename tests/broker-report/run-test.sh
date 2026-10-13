@@ -129,7 +129,9 @@ contains "happy path note" "anchor IP reported to the broker (anchor_ref=broker-
 log="$(cat "$WORK/curl.log")"
 contains "token request carries the audience" "audience=piercloud-broker" "$log"
 contains "token request method GET" "CALL method=GET" "$log"
-contains "broker POST method + URL" "CALL method=POST url=https://broker.piercloud.net/v1/anchors/ip" "$log"
+contains "broker POST method" "CALL method=POST" "$log"
+post_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "broker POST URL exact" "https://broker.piercloud.net/v1/anchors/ip" "$post_url"
 contains "POST Authorization header is the MINTED token" "Authorization: Bearer minted-oidc-token" "$log"
 contains "POST body JSON carries ref + ip" '"anchor_ref":"broker-ref-1"' "$log"
 contains "POST body JSON carries ip" '"ipv4":"192.0.2.10"' "$log"
@@ -156,6 +158,7 @@ contains "refusal message names the grammar" "[a-z0-9._-]{1,64}" "$(cat "$WORK/e
 lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
 is "missing OIDC context refused" 1 "$(RUN noctx broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
+contains "no-OIDC error carries the broker report prefix" "::error::broker report: no OIDC request context" "$(cat "$WORK/err.noctx")"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
