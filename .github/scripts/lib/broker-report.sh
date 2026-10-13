@@ -41,6 +41,11 @@ is_broker_ipv4() { # $1 = candidate string
   case "$s" in
     '' | *[!0-9.]*) return 1 ;;
   esac
+  # A trailing dot or a 4th separator survives `read` as an empty/short
+  # field; refuse them before the split so the shape is exactly dotted-quad.
+  case "$s" in
+    *. | *.*.*.*.*) return 1 ;;
+  esac
   IFS=. read -r a b c d extra <<<"$s"
   [ -z "$extra" ] || return 1
   for oct in "$a" "$b" "$c" "$d"; do
@@ -63,60 +68,136 @@ is_broker_anchor_ref() { # $1 = candidate string
   [ "${#s}" -le 64 ]
 }
 
-# _broker_report_post <ref> <ip> <base> <aud_url> <req_token> <workdir> —
-# the two network calls. Internal; callers go through report_anchor_ip.
-_broker_report_post() { # $1..$6 as above
-  local ref="$1" ip="$2" base="$3" aud_url="$4" req_token="$5" work="$6"
-  local code token hdr cfg
+# _broker_token_ok <value> — 0 iff the value is JWT/base64url-shaped and safe
+# to embed in a curl config line: no quotes, backslashes, whitespace or
+# control characters that could inject another config directive.
+_broker_token_ok() { # $1 = token candidate
+  case "${1:-}" in
+    '' | *[!A-Za-z0-9=._~+/-]*) return 1 ;;
+  esac
+  return 0
+}
 
-  # Token request. The request token is a credential: it goes in a 0600 curl
-  # config file, never argv. The umask subshell keeps the mode explicit
-  # without leaking a umask change into the caller. A heredoc (not printf)
-  # keeps the auth line off the CI's "print builtin + bearer" pattern while
-  # the semantics stay "write a curl config file".
+# _broker_mint_token <audience> <workdir> <label> — mint a GitHub OIDC token
+# for the audience and print it on stdout. The request token and the minted
+# token travel in 0600 curl config files inside the caller's 0700 workdir;
+# neither ever reaches argv or the log. Fails closed on any unexpected
+# answer. The label keeps each caller's diagnostic prefix stable (the b2
+# report path's `broker report:` prefix is part of its runbook contract).
+_broker_mint_token() { # $1 = audience, $2 = workdir, $3 = label
+  local aud="$1" work="$2" label="$3" req_url req_token aud_url code token hdr
+  req_url="${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+  req_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+  if [ -z "$req_url" ] || [ -z "$req_token" ]; then
+    echo "::error::${label}: no OIDC request context (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN empty) — the job needs permissions: id-token: write. Refusing." >&2
+    return 1
+  fi
+  # The runner supplies the token endpoint; require https and no fragment so a
+  # misconfigured runner cannot send the request token in cleartext or land
+  # the audience in the fragment (the broker would then refuse the token).
+  case "$req_url" in
+    "https://"*) ;;
+    *)
+      echo "::error::${label}: OIDC request URL must be https — refusing." >&2
+      return 1
+      ;;
+  esac
+  case "$req_url" in
+    *'#'*)
+      echo "::error::${label}: OIDC request URL must not carry a fragment — refusing." >&2
+      return 1
+      ;;
+  esac
+  if ! _broker_token_ok "$req_token"; then
+    echo "::error::${label}: OIDC request token carries unexpected characters — refusing." >&2
+    return 1
+  fi
+
+  # GitHub's OIDC token endpoint takes one `audience` query parameter; append
+  # it to whatever query the runner already put in the URL.
+  case "$req_url" in
+    *\?*) aud_url="${req_url}&audience=${aud}" ;;
+    *) aud_url="${req_url}?audience=${aud}" ;;
+  esac
+
+  # The request token is a credential: it goes in a 0600 curl config file,
+  # never argv. The umask subshell keeps the mode explicit without leaking a
+  # umask change into the caller. A heredoc (not printf) keeps the auth line
+  # off the CI's "print builtin + bearer" pattern while the semantics stay
+  # "write a curl config file".
   hdr="${work}/token.hdr"
   (umask 077; cat >"$hdr" <<EOF
 header = "Authorization: Bearer ${req_token}"
 EOF
   )
   code="$(curl -sS --config "$hdr" --max-time 10 -o "${work}/token.json" -w '%{http_code}' "$aud_url")" || {
-    echo "::error::broker report: OIDC token request failed (network/curl error)." >&2
+    echo "::error::${label}: OIDC token request failed (network/curl error)." >&2
     return 1
   }
   if [ "$code" != "200" ]; then
-    echo "::error::broker report: OIDC token request answered HTTP ${code} — refusing (is id-token: write set on the job?)." >&2
+    echo "::error::${label}: OIDC token request answered HTTP ${code} — refusing (is id-token: write set on the job?)." >&2
     return 1
   fi
   token="$(jq -r '.value // empty' "${work}/token.json" 2>/dev/null)"
   if [ -z "$token" ]; then
-    echo "::error::broker report: OIDC token response carried no value — refusing." >&2
+    echo "::error::${label}: OIDC token response carried no value — refusing." >&2
     return 1
   fi
+  if ! _broker_token_ok "$token"; then
+    echo "::error::${label}: OIDC token carries unexpected characters — refusing." >&2
+    return 1
+  fi
+  printf '%s' "$token"
+}
 
-  # Report POST. Same argv discipline for the minted token; the body (anchor
-  # ref + IPv4, both non-secret) goes through a config file too, so the whole
-  # request line stays out of argv.
+# _broker_validate_base <base> — 0 iff base is a plain https origin/path base
+# with no userinfo, query, fragment, backslash or whitespace (the broker's
+# ingress is TLS-only; a plaintext base would leak the minted token, and a
+# query/fragment would silently retarget the request).
+_broker_validate_base() { # $1 = base URL
+  case "$1" in
+    https://[A-Za-z0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!A-Za-z0-9.:/-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# _broker_post_json <label> <base> <path> <body> <workdir> — mint a
+# broker-audience token and POST the JSON body to ${base}${path}. The body
+# (never a secret) and the minted token go through 0600 curl config files, so
+# the whole request line stays out of argv. A non-200 is refused with one
+# sanitized body line (CR/LF stripped, bounded) so a failed run is
+# diagnosable without a rerun. Internal; callers are report_anchor_ip /
+# write_anchor_dns / write_challenge.
+_broker_post_json() { # $1..$5 as above
+  local label="$1" base="$2" path="$3" body="$4" work="$5"
+  local token hdr cfg code
+
+  token="$(_broker_mint_token "piercloud-broker" "$work" "$label")" || return 1
   hdr="${work}/post.hdr"
   (umask 077; cat >"$hdr" <<EOF
 header = "Authorization: Bearer ${token}"
 header = "Content-Type: application/json"
 EOF
   )
+  (umask 077; printf '%s' "$body" >"${work}/body.json")
   cfg="${work}/post.cfg"
-  (umask 077; jq -cn --arg ref "$ref" --arg ip "$ip" '{anchor_ref:$ref,ipv4:$ip}' >"${work}/body.json")
   printf 'data = "@%s"\n' "${work}/body.json" >"$cfg"
   code="$(curl -sS --config "$hdr" --config "$cfg" --max-time 15 -o "${work}/resp.json" -w '%{http_code}' \
-    -X POST "${base}/v1/anchors/ip")" || {
-    echo "::error::broker report: POST to the broker failed (network/curl error)." >&2
+    -X POST "${base}${path}")" || {
+    echo "::error::${label}: POST to the broker failed (network/curl error)." >&2
     return 1
   }
   if [ "$code" != "200" ]; then
     # The broker's refusal bodies are short JSON diagnostics (unknown
-    # environment, repo mismatch, unknown/ambiguous anchor, bad token) — log
-    # one sanitized line so a failed run is diagnosable without a rerun. The
-    # body is broker-authored, but strip CR/LF and bound it anyway so a
+    # environment, repo mismatch, unknown/ambiguous anchor/name, cross-check
+    # mismatch, bad token) — log one sanitized line. The body is
+    # broker-authored, but strip CR/LF and bound it anyway so a
     # compromised/misbehaving endpoint cannot inject log lines.
-    echo "::error::broker report refused (HTTP ${code}): $(tr -d '\r\n' <"${work}/resp.json" | cut -c1-200)" >&2
+    echo "::error::${label} refused (HTTP ${code}): $(tr -d '\r\n' <"${work}/resp.json" | cut -c1-200)" >&2
     return 1
   fi
   return 0
@@ -125,7 +206,7 @@ EOF
 # report_anchor_ip <anchor_ref> <ipv4> — validate, mint a broker-audience OIDC
 # token and POST the report. Fail closed on anything unexpected.
 report_anchor_ip() { # $1 = anchor_ref, $2 = ipv4
-  local ref="${1:-}" ip="${2:-}" base aud_url req_url req_token work rc=0
+  local ref="${1:-}" ip="${2:-}" base body work rc=0
 
   if ! is_broker_anchor_ref "$ref"; then
     echo "::error::broker report: anchor_ref must match [a-z0-9._-]{1,64} — refusing." >&2
@@ -137,34 +218,23 @@ report_anchor_ip() { # $1 = anchor_ref, $2 = ipv4
   fi
 
   base="${BROKER_URL:-https://broker.piercloud.net}"
-  base="${base%/}"
-  case "$base" in
-    https:*//*) ;;
-    *)
-      echo "::error::broker report: BROKER_URL must be an https URL (got a non-https value) — refusing." >&2
-      return 1
-      ;;
-  esac
-
-  req_url="${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
-  req_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
-  if [ -z "$req_url" ] || [ -z "$req_token" ]; then
-    echo "::error::broker report: no OIDC request context (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN empty) — the job needs permissions: id-token: write. Refusing." >&2
+  # Strip every trailing slash: a single `${base%/}` leaves one trailing
+  # slash and the join then doubles the separator (`//v1/...`).
+  while [ "$base" != "${base%/}" ]; do base="${base%/}"; done
+  if ! _broker_validate_base "$base"; then
+    echo "::error::broker report: BROKER_URL must be a plain https URL (no userinfo/query/fragment) — refusing." >&2
     return 1
   fi
 
-  # GitHub's OIDC token endpoint takes one `audience` query parameter; append
-  # it to whatever query the runner already put in the URL.
-  case "$req_url" in
-    *\?*) aud_url="${req_url}&audience=piercloud-broker" ;;
-    *) aud_url="${req_url}?audience=piercloud-broker" ;;
-  esac
-
+  body="$(jq -cn --arg ref "$ref" --arg ip "$ip" '{anchor_ref:$ref,ipv4:$ip}')" || {
+    echo "::error::broker report: cannot encode the request body — refusing." >&2
+    return 1
+  }
   work="$(mktemp -d "${TMPDIR:-/tmp}/broker-report.XXXXXX")" || {
     echo "::error::broker report: cannot create a temp dir — refusing." >&2
     return 1
   }
-  _broker_report_post "$ref" "$ip" "$base" "$aud_url" "$req_token" "$work" || rc=$?
+  _broker_post_json "broker report" "$base" "/v1/anchors/ip" "$body" "$work" || rc=$?
   rm -rf "$work"
   [ "$rc" -eq 0 ] || return "$rc"
   echo "anchor IP reported to the broker (anchor_ref=${ref})."

@@ -58,22 +58,39 @@ mkdir -p "$WORK/bin"
 cat >"$WORK/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-out=""; url=""; method="GET"; argv="$*"; declare -a cfgs=()
+out=""; url=""; method="GET"; argv="$*"; declare -a cfgs=() urls=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) cfgs+=("$2"); shift 2 ;;
+    --config=*) cfgs+=("${1#--config=}"); shift ;;
     -o) out="$2"; shift 2 ;;
     -w) shift 2 ;;
     --max-time) shift 2 ;;
     -X) method="$2"; shift 2 ;;
+    -X*) method="${1#-X}"; shift ;;
+    --request) method="$2"; shift 2 ;;
+    --request=*) method="${1#--request=}"; shift ;;
+    --url) urls+=("$2"); shift 2 ;;
+    --url=*) urls+=("${1#--url=}"); shift ;;
+    -d | --data | --data-raw | --data-binary | --data-ascii | --data-urlencode | --json | -F | --form | --form-string) method="POST"; shift 2 ;;
+    -d* | --data=* | --data-raw=* | --data-binary=* | --data-ascii=* | --data-urlencode=* | --json=* | -F* | --form=* | --form-string=*) method="POST"; shift ;;
     -H | --header) shift 2 ;;
     -sS | -s | -f | -fsS) shift ;;
     -*) shift ;;
-    *) url="$1"; shift ;;
+    *) urls+=("$1"); shift ;;
   esac
 done
+: "${url:=${urls[0]:-}}"
 {
-  printf 'CALL method=%s url=%s\n' "$method" "$url"
+  # One CALL record per positional URL: curl performs one transfer per URL, so
+  # a second URL in the same invocation must be visible to the count pins.
+  if [ ${#urls[@]} -gt 0 ]; then
+    for u in "${urls[@]}"; do
+      printf 'CALL method=%s url=%s\n' "$method" "$u"
+    done
+  else
+    printf 'CALL method=%s url=%s\n' "$method" "$url"
+  fi
   printf 'ARGV %s\n' "$argv"
   for c in "${cfgs[@]}"; do
     printf 'CONFIG %s mode=%s\n' "$c" "$(stat -c %a "$c")"
@@ -85,6 +102,7 @@ done
           f="${line#data = \"@}"; f="${f%\"}"
           printf 'DATA %s mode=%s\n' "$f" "$(stat -c %a "$f")"
           sed 's/^/DATALINE /' "$f"
+          printf '\n' # terminate: the lib writes body.json without a trailing newline
           ;;
       esac
     done <"$c"
@@ -129,7 +147,9 @@ contains "happy path note" "anchor IP reported to the broker (anchor_ref=broker-
 log="$(cat "$WORK/curl.log")"
 contains "token request carries the audience" "audience=piercloud-broker" "$log"
 contains "token request method GET" "CALL method=GET" "$log"
-contains "broker POST method + URL" "CALL method=POST url=https://broker.piercloud.net/v1/anchors/ip" "$log"
+contains "broker POST method" "CALL method=POST" "$log"
+post_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "broker POST URL exact" "https://broker.piercloud.net/v1/anchors/ip" "$post_url"
 contains "POST Authorization header is the MINTED token" "Authorization: Bearer minted-oidc-token" "$log"
 contains "POST body JSON carries ref + ip" '"anchor_ref":"broker-ref-1"' "$log"
 contains "POST body JSON carries ip" '"ipv4":"192.0.2.10"' "$log"
@@ -155,21 +175,123 @@ is "empty IPv4 refused" 1 "$(RUN ipempty broker-ref-1 '')"
 contains "refusal message names the grammar" "[a-z0-9._-]{1,64}" "$(cat "$WORK/err.refempty")"
 lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
+contains "non-https error carries the broker report prefix" "::error::broker report: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.httpurl")"
+# A query/fragment/userinfo base would retarget the request; refused like the
+# DNS lib (both share the validator).
+is "query BROKER_URL refused" 1 "$(RUN urlquery broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example?x=1')"
+contains "query BROKER_URL error carries the prefix" "::error::broker report: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.urlquery")"
+is "fragment BROKER_URL refused" 1 "$(RUN urlfrag broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example#f')"
+lacks "no curl call for refused broker URLs" "CALL " "$(cat "$WORK/curl.log")"
+# The runner supplies the OIDC endpoint; require https and no fragment.
+is "http OIDC request URL refused" 1 "$(RUN ctxhttp broker-ref-1 192.0.2.10 'ACTIONS_ID_TOKEN_REQUEST_URL=http://oidc.example/req')"
+contains "http OIDC URL error carries the prefix" "::error::broker report: OIDC request URL must be https" "$(cat "$WORK/err.ctxhttp")"
+is "fragment OIDC request URL refused" 1 "$(RUN ctxfrag broker-ref-1 192.0.2.10 'ACTIONS_ID_TOKEN_REQUEST_URL=https://oidc.example/req?a=b#frag')"
+contains "fragment OIDC URL error carries the prefix" "::error::broker report: OIDC request URL must not carry a fragment" "$(cat "$WORK/err.ctxfrag")"
+is "request token with newline refused" 1 "$(RUN reqnl broker-ref-1 192.0.2.10 $'ACTIONS_ID_TOKEN_REQUEST_TOKEN=abc\ndef')"
+contains "request token newline error carries the prefix" "::error::broker report: OIDC request token carries unexpected characters" "$(cat "$WORK/err.reqnl")"
+# A minted token carrying a quote could inject a curl config directive.
+is "minted token with quote refused" 1 "$(RUN tokquote broker-ref-1 192.0.2.10 'STUB_TOKEN_BODY={"value":"x\"injected"}')"
+contains "minted token quote error carries the prefix" "::error::broker report: OIDC token carries unexpected characters" "$(cat "$WORK/err.tokquote")"
 is "missing OIDC context refused" 1 "$(RUN noctx broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
+contains "no-OIDC error carries the broker report prefix" "::error::broker report: no OIDC request context" "$(cat "$WORK/err.noctx")"
+# A non-default BROKER_URL must actually be used, and a trailing slash must
+# not produce a double-slash path.
+rc="$(RUN okalt broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example)"
+is "alternate base rc=0" 0 "$rc"
+alt_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "alternate base POST URL exact" "https://broker.example/v1/anchors/ip" "$alt_url"
+rc="$(RUN oktrail broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example/)"
+is "trailing-slash base rc=0" 0 "$rc"
+trail_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "$trail_url"
+# Every trailing slash must be stripped regardless of count, a path base must
+# survive, and the join must not add a `//` for a trailing-slash base (the
+# invariant checked below, so a bounded strip mutant cannot hide behind a
+# larger slash count). Production BROKER_URL is pathless; the join is shared.
+# The 4096 sample is a practical sampling ceiling: by construction, a bounded
+# strip whose bound is at least the largest sampled count is indistinguishable
+# from the unbounded loop, so the ceiling is disclosed rather than chased.
+for n in 2 3 4 5 64 65 4096; do
+  slashes="$(printf '%.0s/' $(seq 1 "$n"))"
+  rc="$(RUN "slash$n" broker-ref-1 192.0.2.10 "BROKER_URL=https://broker.example$slashes")"
+  is "trailing-slash x$n rc=0" 0 "$rc"
+  u="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+  is "trailing-slash x$n POST URL exact" "https://broker.example/v1/anchors/ip" "$u"
+  case "$u" in
+    https://*//*) bad "trailing-slash x$n leaves a double slash: $u" ;;
+    *) ok "trailing-slash x$n has no double slash after the authority" ;;
+  esac
+done
+rc="$(RUN okpath broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/prefix//')"
+is "path-base rc=0" 0 "$rc"
+path_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "path-base POST URL exact" "https://broker.example/prefix/v1/anchors/ip" "$path_url"
+rc="$(RUN okdeep broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b//')"
+is "deep-path base rc=0" 0 "$rc"
+deep_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "deep-path POST URL exact" "https://broker.example/a/b/v1/anchors/ip" "$deep_url"
+# An internal `//` in the base path is preserved, not collapsed: the strip is
+# trailing-only, so the (otherwise invisible) whole-URL collapse normalizer is
+# caught by this exact URL.
+rc="$(RUN okinner broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b')"
+is "internal-double-slash base rc=0" 0 "$rc"
+inner_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "internal-double-slash POST URL exact" "https://broker.example/a//b/v1/anchors/ip" "$inner_url"
+# Internal `//` and trailing slashes combine: the trailing strip must not
+# trigger a collapse of the internal duplicates (the r11 test-only survivor).
+rc="$(RUN okcombo broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b//')"
+is "internal-plus-trailing base rc=0" 0 "$rc"
+combo_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "internal-plus-trailing POST URL exact" "https://broker.example/a//b/v1/anchors/ip" "$combo_url"
+# A run of three internal slashes is preserved too (the r11 collapse-runs
+# survivor); with the single-`//` and combined-shape pins above this samples
+# the internal-duplicate class instead of one literal shape. The POST count
+# pins the first-POST assumption: one call, one POST.
+rc="$(RUN okrun3 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a///b')"
+is "internal-triple-slash base rc=0" 0 "$rc"
+run3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "internal-triple-slash POST URL exact" "https://broker.example/a///b/v1/anchors/ip" "$run3_url"
+is "internal-triple-slash single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+lacks "POST config carries no url line" "url = " "$(cat "$WORK/curl.log")"
+# Depth-3 trailing base and multi-run internal shapes (r12 red-team): the
+# strip is trailing-only and must preserve internal duplicates whatever their
+# count or path depth — a depth-gated or run-collapsing strip mutant survives
+# the shallower samples. The POST count now distinguishes exactly one POST
+# (the stub terminates its log entries; long-option POSTs are recognised too).
+rc="$(RUN okdeep3 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b/c//')"
+is "depth-3 base rc=0" 0 "$rc"
+deep3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "depth-3 POST URL exact" "https://broker.example/a/b/c/v1/anchors/ip" "$deep3_url"
+is "depth-3 single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+rc="$(RUN okruns4 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a////b')"
+is "quad-slash internal base rc=0" 0 "$rc"
+runs4_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "quad-slash POST URL exact" "https://broker.example/a////b/v1/anchors/ip" "$runs4_url"
+is "quad-slash single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+rc="$(RUN okrunsmix broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b/c///d')"
+is "mixed-runs base rc=0" 0 "$rc"
+mix_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "mixed-runs POST URL exact" "https://broker.example/a//b/c///d/v1/anchors/ip" "$mix_url"
+is "mixed-runs single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
 contains "token 500 message" "OIDC token request answered HTTP 500" "$(cat "$WORK/err.tok500")"
 is "token body without value refused" 1 "$(RUN toknone broker-ref-1 192.0.2.10 'STUB_TOKEN_BODY={}')"
 is "token network error refused" 1 "$(RUN tokfail broker-ref-1 192.0.2.10 STUB_FAIL=token)"
+contains "token network error carries the broker report prefix" "::error::broker report: OIDC token request failed" "$(cat "$WORK/err.tokfail")"
 is "post 401 refused" 1 "$(RUN post401 broker-ref-1 192.0.2.10 STUB_POST_CODE=401 'STUB_POST_BODY={\"error\":\"unauthorized\"}')"
 is "post 409 refused" 1 "$(RUN post409 broker-ref-1 192.0.2.10 STUB_POST_CODE=409 'STUB_POST_BODY={\"error\":\"ambiguous anchor\"}')"
 is "post network error refused" 1 "$(RUN postfail broker-ref-1 192.0.2.10 STUB_FAIL=post)"
+contains "post network error carries the broker report prefix" "::error::broker report: POST to the broker failed" "$(cat "$WORK/err.postfail")"
 # A multi-line refusal body is flattened to one log line.
 RUN postml broker-ref-1 192.0.2.10 'STUB_POST_CODE=409' 'STUB_POST_BODY={"error":"ambiguous anchor"}' >/dev/null
 errlines="$(wc -l <"$WORK/err.postml")"
 is "refusal body flattened to one line" 1 "$errlines"
 contains "refusal body preserved on the line" "ambiguous" "$(cat "$WORK/err.postml")"
+# The label must stay pinned on the refusal path too (a hardcoded label
+# would otherwise pass every test).
+contains "refusal carries the broker report prefix" "::error::broker report refused" "$(cat "$WORK/err.postml")"
 
 # ---- static wiring: provision.yml -----------------------------------------
 prov_live="$(grep -v '^[[:space:]]*#' "$PROV")"
