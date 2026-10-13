@@ -30,6 +30,27 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 
 **Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate requiring the secret header from every peer except the main box and loopback), and inspection of the module surface.
 
+### Scoped amendment — dynamic status-page endpoints (2026-10-12, issue #186)
+
+> Invariant 2's "admin is dispatch-only" is amended for exactly one scoped
+> component: the puller may change monitor rows in the Gatus fragment, and
+> nothing else; it holds no credential, reaches no other file, and every
+> other admin action stays dispatch-only.
+
+**Rationale.** The dynamic status-page puller fetches public manifests (the
+tenant's `pc-status.json`, the platform's) and re-renders
+`/etc/gatus/tenant-endpoints.yaml` on a timer. Monitor rows carry no key
+capability: the fragment cannot reach tang, Caddy, the firewall, pins or any
+credential, so auto-applying it does not widen invariant 2's blast radius.
+The puller runs with a hardened systemd unit (`ProtectSystem=strict`,
+`ReadWritePaths` limited to the config dir + state dir), holds no gate/probe
+credential (gate rows probe the gate's own anonymous login endpoint), and
+the fragment is the only file it writes (`.last-good` alongside). Every other
+anchor change — including `config.yaml` — stays dispatch-only (#51 keeps the
+staged/approved path). Enforced by: the puller's file ownership (it never
+writes `config.yaml`), the systemd unit's `ReadWritePaths`, and
+`tests/gatus-pull` (validation + the two-writer boundary).
+
 ## Invariant 3 — one netcup account per anchor; one writer per account
 
 > One netcup account holds **exactly one anchor** — never several anchors per
