@@ -365,6 +365,12 @@ done
 # per-key checks above stay as diagnostics.
 is "ci.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$CI")"
 is "provision.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$PROV")"
+# A YAML merge key (`<<: *anchor`) can inject a mapping — including
+# `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
+# invisible to every key regex. Neither workflow uses merge keys, so they are
+# banned blanket.
+is "ci.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}<<:' "$CI")"
+is "provision.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}<<:' "$PROV")"
 is "ci.yml has no workflow defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
