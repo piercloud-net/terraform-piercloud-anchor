@@ -391,6 +391,17 @@ is "ci.yml allowed_url default blob hash" "2995ad1ff3581328f07a567d6ffa840d3dad8
 lacks "ci.yml does not append to allowed_url" 'allowed_url+=' "$(cat "$CI")"
 lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed_default"
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
+# The whole allowlist step is byte-pinned: the default-line pin above cannot
+# see a later re-assignment (`declare allowed_url=...`) that re-admits the
+# retired provider APIs without touching the pinned line.
+ALLOW_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Fail on anything netcup-shaped outside the allowlist" {print $1; exit}')"
+ALLOW_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ALLOW_START" '$1 > s && ($2 ~ /^      - / || $2 ~ /^  [^ #]/) {print $1; exit}')"
+if [ -n "$ALLOW_START" ] && [ -n "$ALLOW_END" ]; then
+  ALLOW_STEP_BLOB="$(sed -n "${ALLOW_START},$((ALLOW_END - 1))p" "$CI")"
+  is "allowlist step blob hash" "9af2491dbc47cd000e75bfb7b682891c25d710ec6f0552837c5e426c60bcdc57" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+else
+  bad "allowlist step span not found in ci.yml"
+fi
 
 # ---- production surfaces carry no retired name ----------------------------
 # Every file in the repo outside tests/, .git/ and the gitignored .local/
