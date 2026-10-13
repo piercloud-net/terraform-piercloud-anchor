@@ -1,0 +1,88 @@
+# DISPATCH-MANAGED by terraform-piercloud-anchor (gatus puller).
+# DO NOT EDIT BY HAND - re-rendered from the tenant + platform manifests.
+endpoints:
+  - name: platform
+    group: platform
+    url: https://platform.piercloud.net/healthz
+    interval: 60s
+    conditions:
+      - "[STATUS] == 200"
+    client:
+      ignore-redirect: true
+    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: "5"
+              RESOLVED: "3"
+  - name: your piercloud
+    group: pier
+    url: https://meta-pier.piercloud.site/healthz
+    interval: 60s
+    conditions:
+      - "[STATUS] == 200"
+    client:
+      ignore-redirect: true
+    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: "5"
+              RESOLVED: "3"
+  - name: private (gate)
+    group: pier
+    url: https://teleport.pier.piercloud.net/web/login
+    interval: 60s
+    conditions:
+      - "[STATUS] == 200"
+    client:
+      ignore-redirect: true
+    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: "5"
+              RESOLVED: "3"
+  - name: host-01
+    group: platform
+    url: https://host-01.piercloud.net/healthz
+    interval: 60s
+    conditions:
+      - "[STATUS] == 200"
+    client:
+      ignore-redirect: true
+    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: "5"
+              RESOLVED: "3"
+  - name: blog
+    group: pier
+    url: https://blog-pier.piercloud.site
+    interval: 60s
+    conditions:
+      - "[STATUS] == 200"
+    client:
+      ignore-redirect: true
+    alerts:
+      - type: custom
+        failure-threshold: 3
+        send-on-resolved: true
+        provider-override:
+          placeholders:
+            ALERT_TRIGGERED_OR_RESOLVED:
+              TRIGGERED: "5"
+              RESOLVED: "3"
