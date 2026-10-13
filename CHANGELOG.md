@@ -82,6 +82,7 @@ All notable changes to this project will be documented in this file.
 - \Z-anchor the provisioned span key classifiers (closes #152)
 - Built-in platform row + role gate + collision guard + alert bridge (closes #134)
 - Dynamic status-page endpoints — pull slice + platform manifests (closes #186)
+- Group the anchor-local rows under `anchor` (closes #190)
 
 ### 📚 Documentation
 
