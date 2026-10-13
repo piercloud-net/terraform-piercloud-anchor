@@ -9,7 +9,9 @@
 # proves the retired provider surface (script, harness, variable and secret
 # names) is gone from every production surface, and cross-checks that the
 # committed CI wiring still names every harness (a dropped run-list line
-# cannot silently skip one).
+# cannot silently skip one). All extractions are block-scalar-aware: a decoy
+# `|`/`>` scalar that quotes the job or the CI run step cannot stand in for
+# the real one.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,15 +43,38 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 [ -f "$LIB" ] || { printf 'FAIL broker-dns lib not found: %s\n' "$LIB"; exit 1; }
 [ -f "$REPORT_LIB" ] || { printf 'FAIL broker-report lib not found: %s\n' "$REPORT_LIB"; exit 1; }
 
-# The anchor-dns job text, comments stripped: a stray comment must not fake a
-# wiring assertion (the lib call, guard message and env are live YAML). The
-# job sits between `anchor-dns:` and the next top-level job key — the
-# boundary regex admits `_` and uppercase (a renamed `anchor_dns_helper:`
-# job or a capitalised decoy key must still END the extraction, not sit
-# inside it).
-JOB_RAW="$(awk '/^  anchor-dns:/{f=1;next} f && /^  [A-Za-z_][A-Za-z0-9_-]*:$/{exit} f' "$PROV")"
+# A line-based extraction cannot tell a real job from a block scalar that
+# quotes one (`run-name: |2` + a byte-copy of the job satisfies every text
+# pin while the real job is gutted). Build a block-scalar-stripped structural
+# view (NR + text) and locate the job THERE, then extract its lines from the
+# original file: content lines of `key: |`/`>` scalars (any indicator form)
+# are dropped, the header line stays. An unknown scalar form fails closed
+# (the job key is not found or its body is incomplete).
+PROV_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) { sind = i; next }
+    if (i >= sind) next
+    skip = 0
+  }
+  printf "%d\t%s\n", NR, $0
+  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$PROV")"
+[ -n "$PROV_STRUCT" ] || { printf 'FAIL structural view of %s is empty\n' "$PROV"; exit 1; }
+JOB_START="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '$2 ~ /^  anchor-dns:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+[ -n "$JOB_START" ] || { printf 'FAIL anchor-dns job key not found in %s\n' "$PROV"; exit 1; }
+JOB_END="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v s="$JOB_START" '$1 > s && $2 ~ /^  [^ ].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+[ -n "$JOB_END" ] || { printf 'FAIL anchor-dns job end not found in %s\n' "$PROV"; exit 1; }
+JOB_RAW="$(sed -n "$((JOB_START + 1)),$((JOB_END - 1))p" "$PROV")"
 JOB="$(printf '%s\n' "$JOB_RAW" | grep -v '^[[:space:]]*#')"
-[ -n "$JOB" ] || { printf 'FAIL anchor-dns job not found in %s\n' "$PROV"; exit 1; }
+[ -n "$JOB" ] || { printf 'FAIL anchor-dns job body not found in %s\n' "$PROV"; exit 1; }
 
 # ---- the broker-dns lib is the one writer --------------------------------
 contains "broker-dns lib defines write_anchor_dns" 'write_anchor_dns()' "$(cat "$LIB")"
@@ -88,18 +113,29 @@ if [ -n "$src_line" ] && [ -n "$call_line" ] && [ "$src_line" -lt "$call_line" ]
 # A dead step or a shadowed function defeats the line pins above: no
 # step-level `if:`/`continue-on-error` may appear (the job's own apply gate
 # is the only `if:` at 4-space indent), and the call/source may appear once.
-is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^        if:')"
-is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^        continue-on-error')"
+is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )if:')"
+is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^(      - |        )continue-on-error:')"
 is "job-level if is exactly the apply gate" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')"
 is "exactly one write_anchor_dns source line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          \. \.github/scripts/lib/broker-dns\.sh$')"
 is "exactly one write_anchor_dns call line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$')"
 is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^[[:space:]]*(function[[:space:]]+)?write_anchor_dns[[:space:]]*(\(\))?[[:space:]]*(\{|$)')"
+# Job-level switches change how every step runs without touching the pinned
+# step text: `continue-on-error` swallows a guard/write failure, `defaults`
+# can replace the shell with a no-op. Both are banned, as are the bash
+# startup-file variables that can neuter the job's `set -euo pipefail`.
+is "no job-level continue-on-error" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    continue-on-error:')"
+is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    defaults:')"
+is "no workflow-level defaults" "0" "$(grep -cE '^defaults:' "$PROV")"
+for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
+  lacks_word "job does not set $v" "$v" "$JOB"
+done
 
 # Byte-exact pin of the write step: the line pins above cannot see a
 # same-indent `exit 0`/`if false` wrap, a `function` keyword shadow or an
 # injected step-level `env:`, because YAML strips the body indent and bash
 # does not care about the residual indentation. The whole step (comments
-# included) is hashed, so any edit — however indented — must update the pin.
+# included) is hashed, so any content edit must update the pin (a trailing
+# blank line is stripped by $( ) and cannot change the executed script).
 # Extraction is job-scoped: the step must live inside the anchor-dns job,
 # so a decoy step in a workflow-level block scalar / another job cannot
 # satisfy the pin, and the same `_`/uppercase job boundary applies.
@@ -110,11 +146,27 @@ STEP_BLOB="$(awk '
   f {print}
 ' <<<"$JOB_RAW")"
 is "write step blob hash" "5293b16c734b119a757a0653e8824f44b224910d9909bc5f18f4b8bef9c5f806" "$(printf '%s\n' "$STEP_BLOB" | sha256sum | cut -d' ' -f1)"
-# Exactly one write step anywhere in the workflow and exactly one
-# write_anchor_dns token in the job: a second (unpinned) writer step that
-# runs `... || true`, or a relocated copy, is caught here.
+# The guard step is byte-pinned too: its body decides whether a ref-less
+# apply can reach the write (a prefix such as
+# `ANCHOR_REF="${ANCHOR_REF:-anchor-01}"` inside the run block would neuter
+# it without touching any pinned line).
+GUARD_BLOB="$(awk '
+  /^      - name: Managed-lane guard \(b3b #189 retired the direct-token writer\)$/ {f=1}
+  f && /^      - name: / && $0 !~ /Managed-lane guard/ {exit}
+  f && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ {exit}
+  f {print}
+' <<<"$JOB_RAW")"
+is "guard step blob hash" "ef59e00c3696d06e3b3c2ed4fe2e9d20ab317fa110a619613fd13b1c86a46fe7" "$(printf '%s\n' "$GUARD_BLOB" | sha256sum | cut -d' ' -f1)"
+# Exactly one guard step and one write step anywhere in the workflow, and
+# exactly one write_anchor_dns token in the job: a second (unpinned) writer
+# step that runs `... || true`, or a relocated copy, is caught here.
+is "exactly one guard-step header in the workflow" "1" "$(grep -cE '^      - name: Managed-lane guard \(b3b #189 retired the direct-token writer\)$' "$PROV")"
 is "exactly one write-step header in the workflow" "1" "$(grep -cE '^      - name: Upsert anchor A \+ dashboard CNAME through the broker$' "$PROV")"
 is "exactly one write_anchor_dns token in the job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -c 'write_anchor_dns')"
+# The writer may live only here: a second call in another job, or an
+# obfuscated same-job call (`write_anchor_""dns`), adds a token.
+is "exactly one write_anchor mention in the job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -c 'write_anchor')"
+is "exactly one write_anchor_dns token in provision.yml" "1" "$(grep -c 'write_anchor_dns' "$PROV")"
 
 # ---- the managed-lane guard fails closed ----------------------------------
 contains "guard names the b3b broker path" 'anchor DNS now goes through the pc-control broker (b3b, #189)' "$JOB"
@@ -127,7 +179,7 @@ lacks "job does not call the retired writer" '030-anchor-dns.sh' "$JOB"
 lacks "job does not name a provider zone override" 'NET_DNS_ZONE' "$JOB"
 
 # ---- workflow wiring: fail before any thumbprint --------------------------
-prov_live="$(grep -v '^[[:space:]]*#' "$PROV")"
+prov_live="$(printf '%s\n' "$PROV_STRUCT" | cut -f2- | grep -v '^[[:space:]]*#')"
 contains "thumbprint waits for the DNS job" 'needs: [device-flow, anchor-dns]' "$prov_live"
 lacks "provision no longer references the retired writer" '030-anchor-dns.sh' "$prov_live"
 for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
@@ -140,35 +192,92 @@ if [ -e tests/anchor-dns ]; then bad "retired harness still present"; else ok "r
 
 # ---- CI: the new harness is wired, the old one is not ---------------------
 ci_live="$(grep -v '^[[:space:]]*#' "$CI")"
-# The gate assertion is scoped to the unit-tests gate LINE (extracted from
-# comment-stripped text): a commented-out or unrelated mention of the
-# harness elsewhere in ci.yml must not satisfy it.
-ci_gate="$(printf '%s\n' "$ci_live" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
+# ci.yml gets the same block-scalar-aware structural view: the unit-tests
+# job and its run step are located structurally, so a decoy scalar cannot
+# spoof either.
+CI_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) { sind = i; next }
+    if (i >= sind) next
+    skip = 0
+  }
+  printf "%d\t%s\n", NR, $0
+  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$CI")"
+ci_unit_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ ].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit=""
+[ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#')"
+[ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
+# The gate and run-list assertions are scoped to the unit-tests-scripts job
+# block: a mention in another job's run line or a commented-out line cannot
+# satisfy them.
+ci_gate="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
 [ -n "$ci_gate" ] || bad "ci.yml unit-tests gate line not found"
 contains "ci path gate triggers this harness" 'broker-provision-dns' "$ci_gate"
-contains "ci runs this harness" 'bash tests/broker-provision-dns/run-test.sh' "$ci_live"
+contains "ci runs this harness" 'bash tests/broker-provision-dns/run-test.sh' "$ci_unit"
 lacks "ci no longer runs the retired harness" 'tests/anchor-dns/run-test.sh' "$ci_live"
 lacks "ci path gate no longer names the retired harness" 'anchor-dns' "$ci_live"
+# The gate is checked FUNCTIONALLY: extract the regex literal from the gate
+# line and prove it matches this harness's path, so a token mentioned only
+# in an inline comment no longer satisfies the check.
+gate_raw="$(printf '%s\n' "$ci_unit" | grep -m1 -oE "grep -qE '[^']*'" || true)"
+gate_pattern="$(printf '%s\n' "$gate_raw" | sed -e "s/^grep -qE '//" -e "s/'$//")"
+[ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
+if [ -n "$gate_pattern" ]; then
+  if printf 'tests/broker-provision-dns/run-test.sh\n' | grep -qE "$gate_pattern"; then
+    ok "unit-tests gate regex matches this harness path"
+  else
+    bad "unit-tests gate regex does not match this harness path"
+  fi
+fi
+# The harness-run step is byte-pinned and located structurally: an
+# `if: false` rewrite, an early `exit 0`, or a `set +e` inside it must
+# update the pin.
+RUN_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Run the committed script harnesses (cheap first)" {print $1; exit}')"
+RUN_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}')"
+if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
+  RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
+  is "harness-run step blob hash" "286baff6b596031b9d0faaa716dac758b1515251ee3fafa2454d639184991182" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "harness-run step keeps the gate expression" "1" "$(printf '%s\n' "$RUN_STEP_BLOB" | grep -cE '^        if: steps\.gate\.outputs\.run == .yes.$')"
+else
+  bad "harness-run step span not found in ci.yml"
+fi
+is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the committed script harnesses \(cheap first\)$' "$CI")"
 
 # ---- production surfaces carry no retired name ----------------------------
-# Every workflow + every shell script in the run's code surface. Word
+# Every shell script and workflow/YAML file in the repo outside tests/ and
+# .git is a production surface: a new `tools/evil.sh` or
+# `.github/workflows/evil.yaml` must not sit outside the scan. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
 # legal while the retired repo variable is caught. Comments are INCLUDED: a
-# stale comment is drift too. Each group must be non-empty and every surface
-# must exist, so a renamed/moved file cannot silently drop out of the scan; a
-# grep error (rc>1) is a failure, not a pass.
+# stale comment is drift too. The named groups are still checked explicitly
+# so a renamed/moved directory cannot silently empty the scan; a grep error
+# (rc>1) is a failure, not a pass.
 shopt -s nullglob
-for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' '.github/scripts/lib/*.sh' 'scripts/*.sh' 'scripts/lib/*.sh'; do
+for d in .github/workflows .github/scripts scripts; do
+  [ -d "$d" ] || bad "surface directory missing: $d"
+done
+for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' 'scripts/*.sh'; do
   compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
 done
-surfaces=(.github/workflows/*.yml .github/scripts/*.sh .github/scripts/lib/*.sh scripts/*.sh scripts/lib/*.sh)
-[ "${#surfaces[@]}" -gt 0 ] || bad "no production surfaces matched"
-for f in "${surfaces[@]}"; do
+surface_files=()
+while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests \) -prune -o -type f \( -name '*.sh' -o -name '*.yml' -o -name '*.yaml' \) -print | sort)
+[ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
+for f in "${surface_files[@]}"; do
   [ -f "$f" ] || bad "scanned surface missing: $f"
 done
 for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
   rc=0
-  hits="$(grep -lnwE -- "$v" "${surfaces[@]}")" || rc=$?
+  hits="$(grep -lnwE -- "$v" "${surface_files[@]}")" || rc=$?
   case "$rc" in
     0) bad "production surface uses $v: $hits" ;;
     1) ok "no production surface uses $v" ;;
@@ -176,7 +285,7 @@ for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKE
   esac
 done
 rc=0
-hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surfaces[@]}")" || rc=$?
+hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surface_files[@]}")" || rc=$?
 case "$rc" in
   0) bad "production surface references the retired writer/harness: $hits" ;;
   1) ok "no production surface references the retired writer/harness" ;;
@@ -231,15 +340,16 @@ for pat in 'secrets[[:space:]]*\[' 'vars[[:space:]]*\['; do
 done
 
 # A dropped run-list line silently skips a harness and no harness can catch
-# its own absence — the cross-check lives here and in managed-inputs, so
-# removing either checker's line still leaves the other one to fail.
+# its own absence — the cross-check lives here, in managed-inputs and in
+# edge-origin-auth, so removing one checker's line still leaves two failing.
 shopt -s nullglob
 harnesses=(tests/*/run-test.sh)
 [ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
 for t in "${harnesses[@]}"; do
-  # Whole-line, indentation-tolerant match: an `echo skipped # bash ...`
-  # decoy or a removed line does not satisfy it (the line must be the run).
-  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" "$CI"; then
+  # Whole-line, indentation-tolerant match inside the unit-tests-scripts job:
+  # an `echo skipped # bash ...` decoy, a commented-out line, or a run line
+  # in any other job does not satisfy it.
+  if printf '%s\n' "$ci_unit" | grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$"; then
     ok "ci.yml run list includes $t"
   else
     bad "ci.yml run list includes $t"

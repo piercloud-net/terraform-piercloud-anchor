@@ -24,8 +24,7 @@
 #   - WIRING COMPLETENESS: every committed `tests/*/run-test.sh` is named in
 #     the ci.yml run list and its directory is in the unit-tests path gate;
 #     a dropped line would silently skip that harness (no harness can catch
-#     its own absence — broker-provision-dns and edge-origin-auth carry the
-#     same cross-check).
+#     its own absence — broker-provision-dns carries the same cross-check).
 #
 # Cred-free, offline: no network, no credentials.
 set -euo pipefail
@@ -52,6 +51,28 @@ contains() { # $1 label, $2 needle, $3 haystack
 
 DYN_ENV="\${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}"
 
+# Block-scalar-stripped structural view (NR + text): every extraction below
+# reads THIS, so a decoy `|`/`>` scalar quoting the job (a `run-name: |2`
+# copy) can never satisfy a pin meant for the real job.
+PROV_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) { sind = i; next }
+    if (i >= sind) next
+    skip = 0
+  }
+  printf "%d\t%s\n", NR, $0
+  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$PROV")"
+[ -n "$PROV_STRUCT" ] || { printf 'FAIL structural view of %s is empty\n' "$PROV"; exit 1; }
+
 # ---- static wiring over provision.yml ------------------------------------
 # The lane must be a STABLE function of anchor_ref alone: pin the exact
 # group value (a run-id suffix or any other variable would split the lane).
@@ -62,10 +83,10 @@ is "lane group is the pinned anchor_ref expression" \
 case "$LANE" in *github.*|*needs.*|*strategy.*|*matrix.*) bad "lane references a non-input context";; *) ok "lane references no non-input context";; esac
 
 # Per-job environment extraction: every job's own `environment:` line.
-ENV_LINES="$(awk '
-  /^  [A-Za-z0-9_.-]+:$/ { job=$1; sub(/:$/, "", job) }
-  /^    environment:/ { line=$0; sub(/^    environment: /, "", line); gsub(/^['"'"'"]|['"'"'"]$/, "", line); print job "|" line }
-' "$PROV")"
+ENV_LINES="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '
+  $2 ~ /^  [A-Za-z0-9_.-]+:$/ { job=$2; sub(/:$/, "", job); sub(/^  /, "", job) }
+  $2 ~ /^    environment:/ { line=$2; sub(/^    environment: /, "", line); gsub(/^['"'"'"]|['"'"'"]$/, "", line); print job "|" line }
+')"
 is "exactly two jobs carry an environment" "2" "$(printf '%s\n' "$ENV_LINES" | grep -c '|')"
 is "device-flow binds the dynamic environment" "device-flow|$DYN_ENV" "$(printf '%s\n' "$ENV_LINES" | grep '^device-flow|')"
 is "anchor-dns binds the dynamic environment" "anchor-dns|$DYN_ENV" "$(printf '%s\n' "$ENV_LINES" | grep '^anchor-dns|')"
@@ -77,15 +98,15 @@ is "anchor_ref input declared" "1" "$(grep -c '^      anchor_ref:$' "$PROV")"
 # Preflight placement: the preflight must be the FIRST step of the ungated job
 # that owns it, and device-flow must `needs:` that job — a new ungated job
 # owning the preflight between banner and device-flow must not stay green.
-PREFLIGHT_LINE="$(grep -n '^      - name: Managed-input preflight' "$PROV" | head -1 | cut -d: -f1)"
-DEVFLOW_LINE="$(grep -n '^  device-flow:' "$PROV" | cut -d: -f1)"
+PREFLIGHT_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '$2 ~ /^      - name: Managed-input preflight/ {print $1; exit}')"
+DEVFLOW_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '$2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {print $1; exit}')"
 [ -n "$PREFLIGHT_LINE" ] && ok "preflight step present" || bad "preflight step missing"
 # The owning job = nearest 2-space job header at/before the preflight line.
-OWNER_JOB="$(awk -v n="$PREFLIGHT_LINE" 'NR<=n && /^  [A-Za-z0-9_.-]+:$/ { job=$1; sub(/:$/, "", job) } END { print job }' "$PROV")"
+OWNER_JOB="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v n="$PREFLIGHT_LINE" '$1<=n && $2 ~ /^  [A-Za-z0-9_.-]+:$/ { job=$2; sub(/:$/, "", job); sub(/^  /, "", job) } END { print job }')"
 OWNER_HEADER_LINE=""
-[ -n "$OWNER_JOB" ] && OWNER_HEADER_LINE="$(grep -n "^  ${OWNER_JOB}:" "$PROV" | head -1 | cut -d: -f1)"
+[ -n "$OWNER_JOB" ] && OWNER_HEADER_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v j="$OWNER_JOB" '$2 == "  " j ":" {print $1; exit}')"
 FIRST_STEP_LINE=""
-[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(awk -v n="$OWNER_HEADER_LINE" 'NR>n && /^      - name: / { print NR; exit }' "$PROV")"
+[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v n="$OWNER_HEADER_LINE" '$1>n && $2 ~ /^      - name: / {print $1; exit}')"
 is "preflight is the first step of its own job" "$PREFLIGHT_LINE" "$FIRST_STEP_LINE"
 # …and it must still precede the device-flow job in the file (the banner job
 # is scheduled before device-flow).
@@ -95,7 +116,11 @@ else
   bad "preflight does not precede device-flow ($PREFLIGHT_LINE / $DEVFLOW_LINE)"
 fi
 # device-flow must `needs:` the owning job (dependency, not line proximity).
-DEVFLOW_NEEDS="$(awk '/^  device-flow:/{f=1; next} f && /^    needs:/{line=$0; sub(/^    needs: */, "", line); print line; exit} f && /^  [A-Za-z0-9_.-]+:$/{exit}' "$PROV")"
+DEVFLOW_NEEDS="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '
+  $2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {f=1; next}
+  f && $2 ~ /^  [A-Za-z0-9_.-]+:$/ {exit}
+  f && $2 ~ /^    needs:/ {line=$2; sub(/^    needs: */, "", line); print line; exit}
+')"
 case "$DEVFLOW_NEEDS" in *"$OWNER_JOB"*) ok "device-flow needs the preflight's job ($OWNER_JOB)";; *) bad "device-flow does not need $OWNER_JOB (needs: $DEVFLOW_NEEDS)";; esac
 # Step header (name .. run:) must carry no `if:` — a disabled preflight is a
 # silent bypass.
@@ -111,12 +136,16 @@ contains "binding check compares marker to input" 'if [ -n "$TENANT_INPUT" ] && 
 
 # ---- behavior helpers ------------------------------------------------------
 extract_step() { # $1 = step name needle, $2 = out file
-  awk -v needle="$1" '
-    index($0, "- name: " needle) { inblock=1; next }
-    inblock && $0 == "        run: |" { inrun=1; next }
+  local start end
+  start="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v needle="$1" 'index($2, "- name: " needle) {print $1; exit}')"
+  [ -n "$start" ] || return 1
+  end="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v s="$start" '$1 > s && $2 ~ /^      - name: / {print $1; exit}')"
+  [ -n "$end" ] || end=$(( $(wc -l < "$PROV") + 1 ))
+  awk -v s="$start" -v e="$end" 'NR>s && NR<e' "$PROV" | awk '
+    /^        run: \|$/ { inrun=1; next }
     inrun && /^      - name: / { exit }
     inrun { line=$0; sub(/^          /, "", line); print line }
-  ' "$PROV" > "$2"
+  ' > "$2"
 }
 PREFLIGHT_BODY="$WORK/preflight-body.sh"
 BINDING_BODY="$WORK/binding-body.sh"
@@ -227,22 +256,52 @@ is "b3 mismatching marker rc" "1" "$rc"
 # The unit-tests gate line (anchored on its own prefix) must name every
 # committed harness directory, and the run list must name every harness
 # script. Removing a single token or line then fails HERE — broker-provision-dns
-# carries the same cross-check, so dropping either checker's own line still
-# leaves the other one failing. (Removing BOTH checkers is a two-line,
-# review-visible edit and remains the disclosed drift-guard residual.)
-# The gate line comes from comment-stripped text, so a commented-out gate
-# cannot satisfy the check; the run-list match is whole-line and
-# indentation-tolerant, so a decoy `echo skipped # bash ...` cannot either.
-ci_live="$(grep -v '^[[:space:]]*#' "$CI")"
-gate_line="$(printf '%s\n' "$ci_live" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
+# and edge-origin-auth carry the same cross-check, so dropping one checker's
+# own line still leaves two failing. (Removing all three checkers is a
+# three-line, review-visible edit and remains the disclosed drift-guard
+# residual.) The gate and run-list assertions are scoped to the
+# unit-tests-scripts job block of a block-scalar-stripped structural view: a
+# mention in another job's run line, a decoy `echo skipped # bash ...`, a
+# commented-out line or a decoy scalar cannot satisfy them.
+CI_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) { sind = i; next }
+    if (i >= sind) next
+    skip = 0
+  }
+  printf "%d\t%s\n", NR, $0
+  if ($0 ~ /^[[:space:]]*[^#]*:[[:space:]]*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) {
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$CI")"
+ci_unit_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ ].*:[[:space:]]*(#.*)?$/ {print $1; exit}')"
+ci_unit=""
+[ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#')"
+[ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
+gate_line="$(printf '%s\n' "$ci_unit" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
+gate_raw="$(printf '%s\n' "$ci_unit" | grep -m1 -oE "grep -qE '[^']*'" || true)"
+gate_pattern="$(printf '%s\n' "$gate_raw" | sed -e "s/^grep -qE '//" -e "s/'$//")"
+[ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
 shopt -s nullglob
 harnesses=(tests/*/run-test.sh)
 [ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
 for t in "${harnesses[@]}"; do
   dir="$(basename "$(dirname "$t")")"
   contains "unit-tests gate covers tests/$dir" "$dir" "$gate_line"
-  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" "$CI"; then
+  if [ -n "$gate_pattern" ] && printf '%s\n' "$t" | grep -qE "$gate_pattern"; then
+    ok "unit-tests gate regex matches $t"
+  else
+    bad "unit-tests gate regex does not match $t"
+  fi
+  if printf '%s\n' "$ci_unit" | grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$"; then
     ok "ci.yml run list includes $t"
   else
     bad "ci.yml run list includes $t"
