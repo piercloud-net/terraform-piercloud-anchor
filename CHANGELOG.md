@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
 - *(a2)* Nested status host + provider-switched DNS writer + CloudFront origin auth (closes #166)
 - *(provision)* Run-name + dispatch_intent input for control-plane run discovery (closes #176)
 - *(broker)* Report the anchor IPv4 to the pc-control broker (closes #183)
+- *(broker)* Write anchor DNS records + DNS-01 challenges through the pc-control broker (closes #185)
 
 ### 🐛 Bug Fixes
 
