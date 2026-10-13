@@ -187,6 +187,23 @@ rc="$(RUN oktripledns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https:
 is "dns triple-trailing-slash base rc=0" 0 "$rc"
 triple_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns triple-trailing-slash POST URL exact" "https://broker.example/v1/anchors/dns" "$triple_url"
+# Any trailing-slash count must strip, no `//` may appear after the authority
+# (invariant), and a path base must survive — the DNS lib has its own join.
+for n in 4 5 64; do
+  slashes="$(printf '%.0s/' $(seq 1 "$n"))"
+  rc="$(RUN "dnsslash$n" write_anchor_dns broker-ref-1 192.0.2.10 "BROKER_URL=https://broker.example$slashes")"
+  is "dns trailing-slash x$n rc=0" 0 "$rc"
+  u="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+  is "dns trailing-slash x$n POST URL exact" "https://broker.example/v1/anchors/dns" "$u"
+  case "$u" in
+    https://*//*) bad "dns trailing-slash x$n leaves a double slash: $u" ;;
+    *) ok "dns trailing-slash x$n has no double slash after the authority" ;;
+  esac
+done
+rc="$(RUN okpathdns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/prefix//')"
+is "dns path-base rc=0" 0 "$rc"
+path_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns path-base POST URL exact" "https://broker.example/prefix/v1/anchors/dns" "$path_url"
 # A hyphenated host must stay accepted: the validator charset carries `-`.
 rc="$(RUN okhyphdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker-1.example)"
 is "hyphenated broker host accepted" 0 "$rc"

@@ -186,19 +186,29 @@ rc="$(RUN oktrail broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example/)"
 is "trailing-slash base rc=0" 0 "$rc"
 trail_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "$trail_url"
-# Every trailing slash must be stripped regardless of count, and a path base
-# must survive (production BROKER_URL is pathless, but the join is shared).
-for n in 2 3 4 5; do
+# Every trailing slash must be stripped regardless of count, a path base must
+# survive, and no `//` may ever appear after the authority (an invariant, so a
+# bounded strip mutant cannot hide behind a larger slash count). Production
+# BROKER_URL is pathless; the join is shared.
+for n in 2 3 4 5 64; do
   slashes="$(printf '%.0s/' $(seq 1 "$n"))"
   rc="$(RUN "slash$n" broker-ref-1 192.0.2.10 "BROKER_URL=https://broker.example$slashes")"
   is "trailing-slash x$n rc=0" 0 "$rc"
   u="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
   is "trailing-slash x$n POST URL exact" "https://broker.example/v1/anchors/ip" "$u"
+  case "$u" in
+    https://*//*) bad "trailing-slash x$n leaves a double slash: $u" ;;
+    *) ok "trailing-slash x$n has no double slash after the authority" ;;
+  esac
 done
 rc="$(RUN okpath broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/prefix//')"
 is "path-base rc=0" 0 "$rc"
 path_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "path-base POST URL exact" "https://broker.example/prefix/v1/anchors/ip" "$path_url"
+rc="$(RUN okdeep broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b//')"
+is "deep-path base rc=0" 0 "$rc"
+deep_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "deep-path POST URL exact" "https://broker.example/a/b/v1/anchors/ip" "$deep_url"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
