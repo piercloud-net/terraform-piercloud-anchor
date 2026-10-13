@@ -164,12 +164,25 @@ jobs:
             echo "::error::a managed (tenant) dispatch must carry anchor_ref — the account lane key; refusing (a lane-less run could overlap a live run on the same account)."
             exit 1
           fi
-          # A mutating run without the lane key on a managed account is the
-          # disclosed residual (invariant 3): warn loudly, never fail —
-          # template/standalone repos legitimately dispatch without one.
+          # b3b (#189): apply is managed-dispatch-only now. The anchor DNS
+          # stage writes through the pc-control broker, which authorizes
+          # from the env->tenant->lane binding and cross-checks the same-run
+          # IPv4 report — a ref-less (static fallback lane) or tenant-less
+          # apply cannot complete it, and device-flow would provision the
+          # box before the DNS job refuses. Fail here, BEFORE the
+          # environment gate and before any provisioning, naming the
+          # retirement.
+          if [ "$MODE" = "apply" ] && { [ -z "$TENANT_INPUT" ] || [ -z "$ANCHOR_REF" ]; }; then
+            echo "::error::apply now requires a managed dispatch (tenant + anchor_ref): anchor DNS writes through the pc-control broker (b3b, #189), which needs the account lane and the same-run IPv4 report; the direct provider-token writer was retired. Refusing before any provisioning."
+            exit 1
+          fi
+          # update-ip/destroy do not touch anchor DNS: a ref-less run still
+          # warns loudly — on a managed account it uses the static fallback
+          # lane and can overlap a managed run (the disclosed invariant-3
+          # residual).
           if [ -z "$ANCHOR_REF" ]; then
             case "$MODE" in
-              apply|update-ip|destroy) echo "::warning::no anchor_ref — this run uses the static fallback lane. On a managed netcup account pass the account's anchor_ref so runs on it serialize (one writer per account)." ;;
+              update-ip|destroy) echo "::warning::no anchor_ref — this run uses the static fallback lane. On a managed netcup account pass the account's anchor_ref so runs on it serialize (one writer per account)." ;;
             esac
           fi
           echo "Managed-input preflight ok."
@@ -284,8 +297,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [visibility-banner]
     # OIDC: the broker report step below mints a token with the
-    # `piercloud-broker` audience (pc-control #123). Scoped to this job — no
-    # other job in this workflow needs id-token.
+    # `piercloud-broker` audience (pc-control #123); the anchor-dns job
+    # mints one too for the DNS write (b3b). No other job needs id-token.
     permissions:
       contents: read
       id-token: write
@@ -1473,8 +1486,9 @@ jobs:
     # same tenant environment (expression kept identical on purpose).
     environment: ${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}
     # OIDC: the broker mints/verifies a `piercloud-broker`-audience token
-    # (pc-control b2/b3a). Scoped to this job — no other job needs write
-    # access to the broker, and no standing DNS credential exists anymore.
+    # (pc-control b2/b3a). The device-flow job holds id-token too (the IPv4
+    # report); this job is the only one with the broker's DNS-write surface,
+    # and no standing DNS credential exists anymore (b3b retired it).
     permissions:
       contents: read
       id-token: write
@@ -1499,12 +1513,12 @@ jobs:
       - name: Managed-lane guard (b3b #189 retired the direct-token writer)
         run: |
           set -euo pipefail
-          # The broker path requires the env->tenant->lane binding (b2) and
-          # the same-run anchor-IP report that its A-write cross-check
-          # compares against; a ref-less (static fallback lane) apply has no
-          # registry binding, so anchor DNS no longer has a writer for it.
-          # Fail closed and loud (a skipped job would let a ref-less apply
-          # proceed without DNS, which is worse than a red run).
+          # Defense in depth: the managed-input preflight already refuses a
+          # ref-less or tenant-less apply before any provisioning (the
+          # broker path requires the env->tenant->lane binding (b2) and the
+          # same-run anchor-IP report its A-write cross-check compares
+          # against). Kept fail-closed and loud anyway so a reverted
+          # preflight still cannot let a ref-less apply reach a DNS write.
           if [ -z "$ANCHOR_REF" ]; then
             echo "::error::anchor DNS now goes through the pc-control broker (b3b, #189) and requires a managed dispatch (tenant + anchor_ref); the direct provider-token writer was retired. Re-dispatch with the account's anchor_ref — refusing."
             exit 1

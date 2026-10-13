@@ -19,7 +19,8 @@
 #     uses the MANAGED_TENANT marker.
 #   - BEHAVIORAL: the REAL preflight and binding step bodies (extracted,
 #     never copies) run under `env -i`; refusals must fail closed and valid
-#     shapes must pass (incl. the ref-less mutating-run warning).
+#     shapes must pass (incl. the b3b managed-apply refusal and the
+#     ref-less update-ip/destroy warning — those modes do not touch DNS).
 #
 # Cred-free, offline: no network, no credentials.
 set -euo pipefail
@@ -138,8 +139,14 @@ is "p0 empty inputs rc" "0" "$rc"
 contains "p0 preflight ok" "Managed-input preflight ok." "$(OUT p0)"
 
 rc="$(RUN_BODY p0b "$PREFLIGHT_BODY" MODE=apply)"
-is "p0b ref-less apply rc" "0" "$rc"
-contains "p0b ref-less apply warns" "::warning::no anchor_ref" "$(OUT p0b)"
+is "p0b ref-less apply rc" "1" "$rc"
+contains "p0b ref-less apply names the managed requirement" "apply now requires a managed dispatch" "$(OUT p0b)"
+contains "p0b ref-less apply names the broker" "anchor DNS writes through the pc-control broker (b3b, #189)" "$(OUT p0b)"
+contains "p0b ref-less apply names the early refusal" "Refusing before any provisioning" "$(OUT p0b)"
+
+rc="$(RUN_BODY p0d "$PREFLIGHT_BODY" MODE=update-ip)"
+is "p0d ref-less update-ip rc" "0" "$rc"
+contains "p0d ref-less update-ip warns" "::warning::no anchor_ref" "$(OUT p0d)"
 
 rc="$(RUN_BODY p0c "$PREFLIGHT_BODY" MODE=check)"
 case "$(OUT p0c)" in *"::warning::"*) bad "p0c check mode must not warn";; *) ok "p0c check mode emits no warning";; esac
@@ -150,6 +157,14 @@ contains "p1 names the lane requirement" "must carry anchor_ref" "$(OUT p1)"
 
 rc="$(RUN_BODY p1b "$PREFLIGHT_BODY" ANCHOR_REF=ok MODE=check)"
 is "p1b ref without tenant rc" "0" "$rc"
+
+rc="$(RUN_BODY p1c "$PREFLIGHT_BODY" ANCHOR_REF=ok MODE=apply)"
+is "p1c tenant-less apply rc" "1" "$rc"
+contains "p1c names the managed-apply requirement" "apply now requires a managed dispatch" "$(OUT p1c)"
+
+rc="$(RUN_BODY p1d "$PREFLIGHT_BODY" TENANT_INPUT=foo MODE=update-ip)"
+is "p1d ref-less managed update-ip rc" "1" "$rc"
+contains "p1d names the lane requirement" "must carry anchor_ref" "$(OUT p1d)"
 
 rc="$(RUN_BODY p2 "$PREFLIGHT_BODY" TENANT_INPUT=Foo ANCHOR_REF=ok MODE=check)"
 is "p2 bad tenant charset rc" "1" "$rc"

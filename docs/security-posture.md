@@ -26,9 +26,9 @@ The A2 interim tokens below were the pre-b3b mechanism; the custody record stays
 | Secret (org-level, all repositories) | Pre-b3b scope | Retirement (b3b, #189) |
 |---|---|---|
 | `CLOUDFLARE_DNS_TOKEN` | `DNS:Edit` + `Zone:Read` on the `piercloud.net` zone only (Cloudflare tokens cannot be scoped below a zone) | No workflow consumes it; pending owner deletion of the org secret |
-| `GCORE_DNS_TOKEN` | **No zone scoping** — Gcore tokens are account-wide, so this was near-account-wide DNS write authority over the **dedicated platform account** | No workflow consumes it; pending owner deletion of the org secret |
+| `GCORE_DNS_TOKEN` | **No zone scoping** — Gcore tokens are account-wide: while the org secret exists, any workflow in the org that references it (a repo-write actor could add the reference) reads near-account-wide DNS write authority over the **dedicated platform account** | No workflow consumes it; pending owner deletion of the org secret |
 
-The invariants the retired writer enforced (mask-first, token via a mode-0600 header file, `curl` + `jq` only, fail-closed without the active provider's token, verify-after-write before any thumbprint) are now the broker's own contract for the provider leg; the runner-side invariants that remain are the OIDC mint, the registry authorization and the broker's cross-check/report binding. The M1 broker cutover is reached for DNS: no org-level DNS-write credential is consumed anywhere.
+The invariants the retired writer enforced (mask-first, token via a mode-0600 header file, `curl` + `jq` only, fail-closed without the active provider's token, verify-after-write before any thumbprint) are now the broker's own contract for the provider leg. The runner-side invariants that remain are the OIDC mint and the 0600 token/body files; registry authorization, the report cross-check and verify-after-write are broker-side. The M1 broker cutover for DNS completes when the two org secrets are deleted — no workflow consumes an org-level DNS-write credential anymore (the repo variables `NET_DNS_PROVIDER`/`STATUS_EDGE_DOMAIN` are deleted with the b3b merge and read back absent).
 
 ## Why the witness key is acceptable
 

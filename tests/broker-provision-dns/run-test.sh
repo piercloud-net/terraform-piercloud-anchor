@@ -60,14 +60,35 @@ contains "job keeps contents read" 'contents: read' "$JOB"
 contains "job sets the broker base" 'BROKER_URL: https://broker.piercloud.net' "$JOB"
 contains "job passes the anchor_ref input" 'ANCHOR_REF: ${{ inputs.anchor_ref }}' "$JOB"
 contains "job passes the device-flow resolved IPv4" 'ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}' "$JOB"
-contains "job sources the broker-dns lib" '. .github/scripts/lib/broker-dns.sh' "$JOB"
-contains "job calls write_anchor_dns with ref + ipv4" 'write_anchor_dns "$ANCHOR_REF" "$ANCHOR_IPV4"' "$JOB"
 contains "job checks out without persisted credentials" 'persist-credentials: false' "$JOB"
+
+# The security-relevant lines are pinned as WHOLE lines at the exact YAML
+# body indentation (10 spaces), and ordered: a substring pin survives
+# comment decoys, `: '...'` no-ops, deeper indentation (wrapping in a dead
+# `if`) and step reorder.
+JOB_LINES="$(printf '%s\n' "$JOB")"
+src_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          \. \.github/scripts/lib/broker-dns\.sh$' | cut -d: -f1)"
+call_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$' | cut -d: -f1)"
+guard_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          if \[ -z "\$ANCHOR_REF" \]; then$' | cut -d: -f1)"
+guard_exit="$(printf '%s\n' "$JOB_LINES" | grep -cE '^            exit 1$')"
+[ -n "$src_line" ] && ok "job sources the broker-dns lib (exact line)" || bad "broker-dns source line not found at the expected indentation"
+[ -n "$call_line" ] && ok "job calls write_anchor_dns with ref + ipv4 (exact line)" || bad "write_anchor_dns call line not found at the expected indentation"
+[ -n "$guard_line" ] && ok "guard is a live if (exact line)" || bad "guard if line not found at the expected indentation"
+is "guard exits non-zero" "1" "$guard_exit"
+if [ -n "$guard_line" ] && [ -n "$call_line" ] && [ "$guard_line" -lt "$call_line" ]; then ok "guard runs before the write"; else bad "guard line ($guard_line) must precede the write line ($call_line)"; fi
+if [ -n "$src_line" ] && [ -n "$call_line" ] && [ "$src_line" -lt "$call_line" ]; then ok "lib sourced before the write"; else bad "source line ($src_line) must precede the write line ($call_line)"; fi
+# A dead step or a shadowed function defeats the line pins above: no
+# step-level `if:`/`continue-on-error` may appear (the job's own apply gate
+# is the only `if:` at 4-space indent), and the call/source may appear once.
+is "no step-level if in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^        if:')"
+is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^        continue-on-error')"
+is "job-level if is exactly the apply gate" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')"
+is "exactly one write_anchor_dns source line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          \. \.github/scripts/lib/broker-dns\.sh$')"
+is "exactly one write_anchor_dns call line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$')"
+is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          write_anchor_dns\(\)')"
 
 # ---- the managed-lane guard fails closed ----------------------------------
 contains "guard names the b3b broker path" 'anchor DNS now goes through the pc-control broker (b3b, #189)' "$JOB"
-contains "guard refuses a ref-less apply" '[ -z "$ANCHOR_REF" ]' "$JOB"
-contains "guard exits non-zero" 'exit 1' "$JOB"
 
 # ---- the retired provider surface is absent from the job ------------------
 for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
@@ -96,19 +117,37 @@ lacks "ci no longer runs the retired harness" 'tests/anchor-dns/run-test.sh' "$c
 lacks "ci path gate no longer names the retired harness" 'anchor-dns' "$ci_live"
 
 # ---- production surfaces carry no retired name ----------------------------
-# Word-boundary matching keeps the live broker config name
-# (`PC_BROKER_STATUS_EDGE_DOMAIN`) legal while the retired repo variable is
-# caught. Comments are INCLUDED: a stale comment is drift too.
-surfaces=(.github/workflows/provision.yml)
-for f in .github/scripts/lib/*.sh scripts/*.sh scripts/lib/*.sh; do
-  surfaces+=("$f")
+# Every workflow + every shell script in the run's code surface. Word
+# boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
+# legal while the retired repo variable is caught. Comments are INCLUDED: a
+# stale comment is drift too. Each group must be non-empty and every surface
+# must exist, so a renamed/moved file cannot silently drop out of the scan; a
+# grep error (rc>1) is a failure, not a pass.
+shopt -s nullglob
+for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' '.github/scripts/lib/*.sh' 'scripts/*.sh' 'scripts/lib/*.sh'; do
+  compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
+done
+surfaces=(.github/workflows/*.yml .github/scripts/*.sh .github/scripts/lib/*.sh scripts/*.sh scripts/lib/*.sh)
+[ "${#surfaces[@]}" -gt 0 ] || bad "no production surfaces matched"
+for f in "${surfaces[@]}"; do
+  [ -f "$f" ] || bad "scanned surface missing: $f"
 done
 for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
-  hits="$(grep -lnwE -- "$v" "${surfaces[@]}" || true)"
-  is "no production surface uses $v" "" "$hits"
+  rc=0
+  hits="$(grep -lnwE -- "$v" "${surfaces[@]}")" || rc=$?
+  case "$rc" in
+    0) bad "production surface uses $v: $hits" ;;
+    1) ok "no production surface uses $v" ;;
+    *) bad "grep failed scanning for $v (rc=$rc)" ;;
+  esac
 done
-hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surfaces[@]}" || true)"
-is "no production surface references the retired writer/harness" "" "$hits"
+rc=0
+hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surfaces[@]}")" || rc=$?
+case "$rc" in
+  0) bad "production surface references the retired writer/harness: $hits" ;;
+  1) ok "no production surface references the retired writer/harness" ;;
+  *) bad "grep failed scanning for the retired writer/harness (rc=$rc)" ;;
+esac
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
