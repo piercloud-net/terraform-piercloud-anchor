@@ -213,6 +213,26 @@ rc="$(RUN okinnerdns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https:
 is "dns internal-double-slash base rc=0" 0 "$rc"
 inner_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns internal-double-slash POST URL exact" "https://broker.example/a//b/v1/anchors/dns" "$inner_url"
+# Internal `//` combined with trailing slashes: the trailing strip must not
+# collapse the internal duplicates (mirrors the report harness's r11 case).
+rc="$(RUN okcombo write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b//')"
+is "dns internal-plus-trailing base rc=0" 0 "$rc"
+combo_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns internal-plus-trailing POST URL exact" "https://broker.example/a//b/v1/anchors/dns" "$combo_url"
+# A run of three internal slashes is preserved too (mirrors the report
+# harness); the single-POST count pins the first-POST assumption.
+rc="$(RUN okrun3 write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a///b')"
+is "dns internal-triple-slash base rc=0" 0 "$rc"
+run3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns internal-triple-slash POST URL exact" "https://broker.example/a///b/v1/anchors/dns" "$run3_url"
+is "dns internal-triple-slash single POST" 1 "$(grep -c '^CALL method=POST' "$WORK/curl.log")"
+# Deep-path base with a trailing slash: the strip loop is duplicated between
+# the two libs, so the DNS copy needs its own regression pin (r11 red-team).
+rc="$(RUN okdeepdns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b//')"
+is "dns deep-path base rc=0" 0 "$rc"
+deepdns_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns deep-path POST URL exact" "https://broker.example/a/b/v1/anchors/dns" "$deepdns_url"
+is "dns deep-path single POST" 1 "$(grep -c '^CALL method=POST' "$WORK/curl.log")"
 # A hyphenated host must stay accepted: the validator charset carries `-`.
 rc="$(RUN okhyphdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker-1.example)"
 is "hyphenated broker host accepted" 0 "$rc"

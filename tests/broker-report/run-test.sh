@@ -219,6 +219,21 @@ rc="$(RUN okinner broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//
 is "internal-double-slash base rc=0" 0 "$rc"
 inner_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "internal-double-slash POST URL exact" "https://broker.example/a//b/v1/anchors/ip" "$inner_url"
+# Internal `//` and trailing slashes combine: the trailing strip must not
+# trigger a collapse of the internal duplicates (the r11 test-only survivor).
+rc="$(RUN okcombo broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b//')"
+is "internal-plus-trailing base rc=0" 0 "$rc"
+combo_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "internal-plus-trailing POST URL exact" "https://broker.example/a//b/v1/anchors/ip" "$combo_url"
+# A run of three internal slashes is preserved too (the r11 collapse-runs
+# survivor); with the single-`//` and combined-shape pins above this samples
+# the internal-duplicate class instead of one literal shape. The POST count
+# pins the first-POST assumption: one call, one POST.
+rc="$(RUN okrun3 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a///b')"
+is "internal-triple-slash base rc=0" 0 "$rc"
+run3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "internal-triple-slash POST URL exact" "https://broker.example/a///b/v1/anchors/ip" "$run3_url"
+is "internal-triple-slash single POST" 1 "$(grep -c '^CALL method=POST' "$WORK/curl.log")"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
