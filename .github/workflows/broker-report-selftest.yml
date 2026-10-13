@@ -106,7 +106,7 @@ jobs:
           write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" present
           write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" cleanup
 
-      - name: Mismatched A value is refused (negative)
+      - name: Mismatched A value is refused with 409 (negative)
         if: inputs.negative_ipv4 != ''
         env:
           BROKER_URL: https://broker.piercloud.net
@@ -115,8 +115,18 @@ jobs:
         run: |
           set -euo pipefail
           . .github/scripts/lib/broker-dns.sh
-          if write_anchor_dns "$ANCHOR_REF" "$NEGATIVE_IPV4"; then
+          # The refusal must be the broker's cross-check 409, not a local
+          # validation/network failure: any other outcome fails the step.
+          out=""
+          if out="$(write_anchor_dns "$ANCHOR_REF" "$NEGATIVE_IPV4" 2>&1)"; then
             echo "::error::the broker accepted a mismatched A value — the cross-check is broken"
             exit 1
           fi
-          echo "mismatched A value refused as expected."
+          case "$out" in
+            *"HTTP 409"*) ;;
+            *)
+              echo "::error::expected a 409 cross-check refusal, got: $(printf '%s' "$out" | tr -d '\r\n' | cut -c1-200)"
+              exit 1
+              ;;
+          esac
+          echo "mismatched A value refused with 409 as expected."

@@ -46,7 +46,7 @@ is_broker_challenge_name() { # $1 = candidate
     *) return 1 ;;
   esac
   case "$rest" in
-    '' | *'*'* | *[!a-z0-9.-]*) return 1 ;;
+    '' | .* | *. | *..* | *'*'* | *[!a-z0-9.-]*) return 1 ;;
   esac
   [ "${#s}" -le 253 ]
 }

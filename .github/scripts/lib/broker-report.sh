@@ -41,6 +41,11 @@ is_broker_ipv4() { # $1 = candidate string
   case "$s" in
     '' | *[!0-9.]*) return 1 ;;
   esac
+  # A trailing dot or a 4th separator survives `read` as an empty/short
+  # field; refuse them before the split so the shape is exactly dotted-quad.
+  case "$s" in
+    *. | *.*.*.*.*) return 1 ;;
+  esac
   IFS=. read -r a b c d extra <<<"$s"
   [ -z "$extra" ] || return 1
   for oct in "$a" "$b" "$c" "$d"; do
@@ -63,16 +68,18 @@ is_broker_anchor_ref() { # $1 = candidate string
   [ "${#s}" -le 64 ]
 }
 
-# _broker_mint_token <audience> <workdir> — mint a GitHub OIDC token for the
-# audience and print it on stdout. The request token and the minted token
-# travel in 0600 curl config files inside the caller's 0700 workdir; neither
-# ever reaches argv or the log. Fails closed on any unexpected answer.
-_broker_mint_token() { # $1 = audience, $2 = workdir
-  local aud="$1" work="$2" req_url req_token aud_url code token hdr
+# _broker_mint_token <audience> <workdir> <label> — mint a GitHub OIDC token
+# for the audience and print it on stdout. The request token and the minted
+# token travel in 0600 curl config files inside the caller's 0700 workdir;
+# neither ever reaches argv or the log. Fails closed on any unexpected
+# answer. The label keeps each caller's diagnostic prefix stable (the b2
+# report path's `broker report:` prefix is part of its runbook contract).
+_broker_mint_token() { # $1 = audience, $2 = workdir, $3 = label
+  local aud="$1" work="$2" label="$3" req_url req_token aud_url code token hdr
   req_url="${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
   req_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
   if [ -z "$req_url" ] || [ -z "$req_token" ]; then
-    echo "::error::broker: no OIDC request context (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN empty) — the job needs permissions: id-token: write. Refusing." >&2
+    echo "::error::${label}: no OIDC request context (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN empty) — the job needs permissions: id-token: write. Refusing." >&2
     return 1
   fi
 
@@ -94,16 +101,16 @@ header = "Authorization: Bearer ${req_token}"
 EOF
   )
   code="$(curl -sS --config "$hdr" --max-time 10 -o "${work}/token.json" -w '%{http_code}' "$aud_url")" || {
-    echo "::error::broker: OIDC token request failed (network/curl error)." >&2
+    echo "::error::${label}: OIDC token request failed (network/curl error)." >&2
     return 1
   }
   if [ "$code" != "200" ]; then
-    echo "::error::broker: OIDC token request answered HTTP ${code} — refusing (is id-token: write set on the job?)." >&2
+    echo "::error::${label}: OIDC token request answered HTTP ${code} — refusing (is id-token: write set on the job?)." >&2
     return 1
   fi
   token="$(jq -r '.value // empty' "${work}/token.json" 2>/dev/null)"
   if [ -z "$token" ]; then
-    echo "::error::broker: OIDC token response carried no value — refusing." >&2
+    echo "::error::${label}: OIDC token response carried no value — refusing." >&2
     return 1
   fi
   printf '%s' "$token"
@@ -129,7 +136,7 @@ _broker_post_json() { # $1..$5 as above
   local label="$1" base="$2" path="$3" body="$4" work="$5"
   local token hdr cfg code
 
-  token="$(_broker_mint_token "piercloud-broker" "$work")" || return 1
+  token="$(_broker_mint_token "piercloud-broker" "$work" "$label")" || return 1
   hdr="${work}/post.hdr"
   (umask 077; cat >"$hdr" <<EOF
 header = "Authorization: Bearer ${token}"

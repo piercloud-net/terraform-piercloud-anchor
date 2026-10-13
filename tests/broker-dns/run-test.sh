@@ -134,7 +134,9 @@ is "anchor dns happy path rc=0" 0 "$rc"
 log="$(cat "$WORK/curl.log")"
 contains "anchor dns note" "anchor DNS records written through the broker (anchor_ref=broker-ref-1)" "$(cat "$WORK/out.okdns")"
 contains "token request carries the audience" "audience=piercloud-broker" "$log"
-contains "anchor dns POST method + URL" "CALL method=POST url=https://broker.piercloud.net/v1/anchors/dns" "$log"
+contains "anchor dns POST method" "CALL method=POST" "$log"
+post_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "anchor dns POST URL exact" "https://broker.piercloud.net/v1/anchors/dns" "$post_url"
 contains "anchor dns POST Authorization is the MINTED token" "Authorization: Bearer minted-oidc-token" "$log"
 contains "anchor dns body carries ref" '"anchor_ref":"broker-ref-1"' "$log"
 contains "anchor dns body carries ip" '"ipv4":"192.0.2.10"' "$log"
@@ -144,6 +146,9 @@ datamode="$(awk '/^DATA / { print $3; exit }' "$WORK/curl.log")"
 is "body data file mode is 0600" "mode=600" "$datamode"
 lacks "argv carries no minted token" "minted-oidc-token" "$(grep '^ARGV' "$WORK/curl.log")"
 lacks "argv carries no request token" "runner-req-token" "$(grep '^ARGV' "$WORK/curl.log")"
+lacks "minted token not on stdout" "minted-oidc-token" "$(cat "$WORK/out.okdns")"
+lacks "minted token not on stderr" "minted-oidc-token" "$(cat "$WORK/err.okdns")"
+lacks "request token not on stdout" "runner-req-token" "$(cat "$WORK/out.okdns")"
 cfgpath="$(awk '/^CONFIG / { print $2; exit }' "$WORK/curl.log")"
 if [ -n "$cfgpath" ] && [ ! -e "$cfgpath" ]; then ok "temp config removed after the call"; else bad "temp config still present: $cfgpath"; fi
 
@@ -151,7 +156,9 @@ if [ -n "$cfgpath" ] && [ ! -e "$cfgpath" ]; then ok "temp config removed after 
 rc="$(RUN chpresent write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc_DEF-123 present)"
 is "challenge present rc=0" 0 "$rc"
 log="$(cat "$WORK/curl.log")"
-contains "challenge POST URL" "CALL method=POST url=https://broker.piercloud.net/v1/dns/challenges" "$log"
+contains "challenge POST method" "CALL method=POST" "$log"
+ch_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "challenge POST URL exact" "https://broker.piercloud.net/v1/dns/challenges" "$ch_url"
 contains "challenge body carries name" '"name":"_acme-challenge.anchor-01-envproof.piercloud.net"' "$log"
 contains "challenge body carries value" '"value":"abc_DEF-123"' "$log"
 contains "challenge body carries action present" '"action":"present"' "$log"
@@ -177,6 +184,9 @@ is "empty challenge value refused" 1 "$(RUN chval write_challenge _acme-challeng
 is "non-base64url challenge value refused" 1 "$(RUN chvalbad write_challenge _acme-challenge.anchor-01-envproof.piercloud.net 'bad value!' present)"
 is "over-long challenge value refused" 1 "$(RUN chvallen write_challenge _acme-challenge.anchor-01-envproof.piercloud.net "$(printf 'a%.0s' $(seq 1 129))" present)"
 is "bad action refused" 1 "$(RUN chaction write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc delete)"
+is "trailing-dot IPv4 refused" 1 "$(RUN ipdot write_anchor_dns broker-ref-1 192.0.2.10.)"
+is "double-dot challenge name refused" 1 "$(RUN chddot write_challenge '_acme-challenge.a..b.piercloud.net' abc present)"
+is "trailing-dot challenge name refused" 1 "$(RUN chtdot write_challenge '_acme-challenge.anchor-01-envproof.piercloud.net.' abc present)"
 contains "challenge name refusal names the shape" "_acme-challenge." "$(cat "$WORK/err.chwild")"
 lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 
@@ -202,7 +212,7 @@ contains "selftest sources the dns lib" '.github/scripts/lib/broker-dns.sh' "$se
 contains "selftest calls write_anchor_dns" 'write_anchor_dns "$ANCHOR_REF" "$ANCHOR_IPV4"' "$self_live"
 contains "selftest presents the challenge" 'write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" present' "$self_live"
 contains "selftest cleans the challenge" 'write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" cleanup' "$self_live"
-contains "selftest negative requires refusal" 'if write_anchor_dns "$ANCHOR_REF" "$NEGATIVE_IPV4"; then' "$self_live"
+contains "selftest negative requires refusal" 'if out="$(write_anchor_dns "$ANCHOR_REF" "$NEGATIVE_IPV4" 2>&1)"; then' "$self_live"
 contains "selftest carries id-token: write" 'id-token: write' "$self_live"
 contains "selftest selects the environment input" 'environment: ${{ inputs.environment }}' "$self_live"
 contains "selftest checkout does not persist credentials" 'persist-credentials: false' "$self_live"
@@ -212,8 +222,34 @@ contains "selftest checkout does not persist credentials" 'persist-credentials: 
 # Count the job keys under `jobs:` (2-space keys), not the `on:` keys above it.
 job_count="$(printf '%s\n' "$self_live" | awk '/^jobs:/{inj=1; next} inj && /^  [a-z0-9_-]+:$/{n++} END{print n+0}')"
 is "selftest has exactly one job" 1 "$job_count"
-dns_step_line="$(printf '%s\n' "$self_live" | grep -n 'Write the anchor DNS records through the broker' | cut -d: -f1)"
-report_step_line="$(printf '%s\n' "$self_live" | grep -n 'Report the anchor IPv4' | head -1 | cut -d: -f1)"
+
+# Extract one step block (from its `      - name:` line to the next one) so
+# assertions bind to the step that actually runs, not to any occurrence.
+step_block() { # $1 = exact step name
+  printf '%s\n' "$self_live" | awk -v want="      - name: $1" '
+    $0 == want { inblock = 1 }
+    inblock && $0 != want && $0 ~ /^      - name: / { exit }
+    inblock { print }
+  '
+}
+report_block="$(step_block 'Report the anchor IPv4')"
+dns_block="$(step_block 'Write the anchor DNS records through the broker')"
+challenge_block="$(step_block 'Present and clean up a DNS-01 challenge TXT')"
+negative_block="$(step_block 'Mismatched A value is refused with 409 (negative)')"
+[ -n "$report_block" ] || bad "report step block not found"
+[ -n "$dns_block" ] || bad "dns step block not found"
+[ -n "$challenge_block" ] || bad "challenge step block not found"
+[ -n "$negative_block" ] || bad "negative step block not found"
+contains "dns step binds the anchor_ref input" 'ANCHOR_REF: ${{ inputs.anchor_ref }}' "$dns_block"
+contains "dns step binds the ipv4 input" 'ANCHOR_IPV4: ${{ inputs.ipv4 }}' "$dns_block"
+contains "challenge step binds the name input" 'CHALLENGE_NAME: ${{ inputs.challenge_name }}' "$challenge_block"
+contains "challenge step binds the value input" 'CHALLENGE_VALUE: ${{ inputs.challenge_value }}' "$challenge_block"
+contains "negative step gated on the input" "if: inputs.negative_ipv4 != ''" "$negative_block"
+contains "negative step requires a 409" '*"HTTP 409"*' "$negative_block"
+contains "negative step refuses any other failure" 'expected a 409 cross-check refusal' "$negative_block"
+
+dns_step_line="$(printf '%s\n' "$self_live" | grep -n '^      - name: Write the anchor DNS records through the broker$' | cut -d: -f1)"
+report_step_line="$(printf '%s\n' "$self_live" | grep -n '^      - name: Report the anchor IPv4$' | cut -d: -f1)"
 if [ -n "$dns_step_line" ] && [ -n "$report_step_line" ] && [ "$dns_step_line" -gt "$report_step_line" ]; then
   ok "DNS write step follows the report step in the same job"
 else
