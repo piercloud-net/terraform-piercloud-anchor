@@ -62,6 +62,7 @@ out=""; url=""; method="GET"; argv="$*"; declare -a cfgs=() urls=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) cfgs+=("$2"); shift 2 ;;
+    --config=*) cfgs+=("${1#--config=}"); shift ;;
     -o) out="$2"; shift 2 ;;
     -w) shift 2 ;;
     --max-time) shift 2 ;;
