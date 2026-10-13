@@ -143,11 +143,15 @@ jobs:
                   manifest_code="$(curl -sS -o "$work/manifest-${manifest_channel}.json" -w '%{http_code}' \
                     --proto '=https' --max-redirs 0 --max-time 20 --max-filesize 65536 \
                     "$manifest_url" 2>"$work/manifest-${manifest_channel}.err" || true)"
+                  if [ "$manifest_code" = "404" ] || [ "$manifest_code" = "410" ]; then
+                    echo "manifest watch: ${manifest_channel} manifest not published (HTTP ${manifest_code}) - keeping last-known-good"
+                    continue
+                  fi
                   if [ "$manifest_code" != "200" ]; then
                     manifest_fail="${manifest_fail}${manifest_channel} manifest HTTP ${manifest_code:-<none>}; "
                     continue
                   fi
-                  manifest_gen="$(jq -r '.generated_at // ""' "$work/manifest-${manifest_channel}.json" 2>/dev/null || true)"
+                  manifest_gen="$(jq -r '.generated_at // ""' "$work/manifest-${manifest_channel}.json" 2>/dev/null | tr -d '\r\n' || true)"
                   manifest_epoch="$(date -u -d "$manifest_gen" +%s 2>/dev/null || echo 0)"
                   manifest_age=$(( $(date -u +%s) - manifest_epoch ))
                   if [ -z "$manifest_gen" ] || [ "$manifest_epoch" -le 0 ] || [ "$manifest_age" -gt 86400 ]; then
@@ -171,15 +175,20 @@ jobs:
                 # shellcheck disable=SC2086  # controlled $work paths
                 jq -s 'add // []' $manifest_files >"$work/manifest-expected.json" 2>/dev/null \
                   || printf '[]\n' >"$work/manifest-expected.json"
-                manifest_missing="$(jq -rn --slurpfile expected "$work/manifest-expected.json" --slurpfile api "$work/api" '
-                  ($api[0] | if type == "array" then . else [] end | map({name:(.name // ""), group:(.group // "")})) as $have
-                  | [ $expected[0][] | . as $e | select(any($have[]; .name == $e.name and .group == $e.group) | not) | "\($e.group)/\($e.name)" ]
-                  | join(", ")' 2>/dev/null || echo "statuses API unreadable")"
-                if [ -n "$manifest_missing" ]; then
-                  manifest_fail="${manifest_fail}manifest rows missing from the dashboard: ${manifest_missing}; "
+                # The key-set check needs the statuses-API response; when the
+                # probe failed before fetching it, the probe failure is the
+                # verdict (do not clobber it with a derived error).
+                if [ -f "$work/api" ]; then
+                  manifest_missing="$(jq -rn --slurpfile expected "$work/manifest-expected.json" --slurpfile api "$work/api" '
+                    ($api[0] | if type == "array" then . else [] end | map({name:(.name // ""), group:(.group // "")})) as $have
+                    | [ $expected[0][] | . as $e | select(any($have[]; .name == $e.name and .group == $e.group) | not) | "\($e.group)/\($e.name)" ]
+                    | join(", ")' 2>/dev/null | tr -d '\r\n' || echo "statuses API unreadable")"
+                  if [ -n "$manifest_missing" ]; then
+                    manifest_fail="${manifest_fail}manifest rows missing from the dashboard: ${manifest_missing}; "
+                  fi
                 fi
                 if [ -n "$manifest_fail" ]; then
-                  fail="manifest watch: ${manifest_fail}"
+                  fail="${fail:+$fail }manifest watch: ${manifest_fail}"
                 fi
               ;;
             esac
@@ -196,8 +205,12 @@ jobs:
           else
             echo "external-watch: FAIL — ${fail}"
             if [ -n "${GITHUB_OUTPUT:-}" ]; then
-              echo "ok=false" >> "$GITHUB_OUTPUT"
-              echo "detail=${fail}" >> "$GITHUB_OUTPUT"
+              {
+                echo "ok=false"
+                echo "detail<<PC_WATCH_EOF"
+                printf '%s\n' "${fail}" | tr -d '\r'
+                echo "PC_WATCH_EOF"
+              } >> "$GITHUB_OUTPUT"
             fi
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "### external-watch: FAIL — ${fail}" >> "$GITHUB_STEP_SUMMARY"; fi
             exit 1

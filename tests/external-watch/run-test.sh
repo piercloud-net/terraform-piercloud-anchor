@@ -12,7 +12,8 @@
 #     dashboard's public statuses API is green;
 #   - a manifest row missing from the dashboard fails (puller-timer death /
 #     frozen fragment), including the seeded platform / gate / slice rows;
-#   - a manifest 404 or an aged generated_at fails (producer staleness);
+#   - a manifest 5xx or an aged generated_at fails (producer staleness); a
+#     404/410 is not-published (no page; the puller keeps last-known-good);
 #   - TENANT_USER unset degrades to the platform channel only.
 set -euo pipefail
 
@@ -155,12 +156,20 @@ printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group"
 out="$(run_block "$CASE")"
 lacks "disabled entries are not required" "$out" "gone"
 
-# ---- 404 fails -------------------------------------------------------------
+# ---- 404/410 is not-published: no page (puller keeps last-known-good) ------
 new_case notfound
-printf '[{"name":"platform","group":"platform"}]' | api_json
+printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"blog","group":"pier"}]' | api_json
 printf '404' >"$CASE/${platform_key}.code"
 out="$(run_block "$CASE")"
-has "404: reported as an HTTP failure" "$out" "platform manifest HTTP 404"
+has "404/410: not published is logged, not failed" "$out" "not published (HTTP 404)"
+lacks "404/410: no HTTP-failure verdict" "$out" "manifest HTTP 404"
+
+# ---- a 5xx fetch failure still fails ---------------------------------------
+new_case server-error
+printf '[{"name":"platform","group":"platform"}]' | api_json
+printf '500' >"$CASE/${platform_key}.code"
+out="$(run_block "$CASE")"
+has "5xx: reported as an HTTP failure" "$out" "platform manifest HTTP 500"
 
 # ---- stale generated_at fails ----------------------------------------------
 new_case stale

@@ -132,9 +132,18 @@ render_gatus_puller_service >"${WORK}/puller.service"
 render_gatus_puller_timer >"${WORK}/puller.timer"
 for tooth in "NoNewPrivileges=yes" "ProtectSystem=strict" "ProtectHome=yes" "PrivateTmp=yes" \
              "CapabilityBoundingSet=" "ReadWritePaths=/etc/gatus /var/lib/piercloud" \
-             "ExecStart=/usr/bin/flock -n -E 0 /run/piercloud-gatus-pull.lock /usr/local/sbin/piercloud-gatus-pull.sh"; do
+             "ExecStart=/usr/bin/flock -n -E 0 /var/lib/piercloud/gatus-pull.lock /usr/local/sbin/piercloud-gatus-pull.sh"; do
   has "service hardening: ${tooth}" "$(cat "${WORK}/puller.service")" "$tooth"
 done
+# ProtectSystem=strict makes /run read-only, so the lock must sit inside a
+# ReadWritePaths entry or the first `systemctl start` fails on flock.
+lock_path="$(sed -n 's|^ExecStart=/usr/bin/flock -n -E 0 \([^ ]*\) .*|\1|p' "${WORK}/puller.service")"
+lock_dir="$(dirname "$lock_path")"
+rw_paths="$(sed -n 's/^ReadWritePaths=//p' "${WORK}/puller.service")"
+case " $rw_paths " in
+  *" $lock_dir "*) ok "lock dir is writable under ProtectSystem=strict" ;;
+  *) bad "lock dir ${lock_dir} is not in ReadWritePaths (${rw_paths})" ;;
+esac
 has "timer cadence 10 min" "$(cat "${WORK}/puller.timer")" "OnUnitInactiveSec=10min"
 has "timer jitter" "$(cat "${WORK}/puller.timer")" "RandomizedDelaySec=2min"
 
@@ -363,6 +372,15 @@ case "$(cat "$FRAGMENT")" in
   *"shared (gate)"*) bad "no shared-gate row is seeded (no install-time signal)" ;;
   *) ok "no shared-gate row is seeded (no install-time signal)" ;;
 esac
+# Alert classes (D5): class 5 (night-emergency bridge) on platform/slice/gate
+# rows, class 4 (native ntfy, priority 4, no resolve) on public tenant rows.
+row_block() { awk -v n="$1" '$0 == "  - name: " n { f=1 } f && /^  - name: / && $0 != "  - name: " n { exit } f { print }' "$FRAGMENT"; }
+has "class 4: tenant row uses native ntfy" "$(row_block blog)" "- type: ntfy"
+lacks "class 4: tenant row carries no resolve bridge" "$(row_block blog)" "send-on-resolved"
+has "class 4: tenant row pins priority 4" "$(row_block blog)" "priority: 4"
+has "class 5: gate row uses the ntfy-JSON bridge" "$(row_block 'private (gate)')" "- type: custom"
+has "class 5: gate row resolves at priority 3" "$(row_block 'private (gate)')" 'RESOLVED: "3"'
+has "class 5: slice row uses the ntfy-JSON bridge" "$(row_block 'your piercloud')" "- type: custom"
 is "valid manifests: no notices" "" "$(notices)"
 [ -f "${FRAGMENT}.last-good" ] && ok "last-good sibling exists" || bad "last-good sibling missing"
 if cmp -s "${FRAGMENT}.last-good" "$GOLDEN"; then bad "last-good is not the accepted candidate"; else ok "last-good is not the accepted candidate"; fi
@@ -573,6 +591,29 @@ has "accept: rejection notice pushed" "$(notices)" "candidate rejected"
 is "accept: rejected entries are not committed" "2" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["tenant"]["entries"]))' "$STATE")"
 printf 'ok\n' >"${WORK}/status.mode"
 
+# ---- (g2) crash window: an unaccepted in-place candidate is re-gated -------
+new_case crash
+python3 "${HARNESS_DIR}/fixtures.py" tenant valid >"$CASE/tenant.json"
+set_topic
+seed_once
+pull_rc >/dev/null
+cp "$FRAGMENT" "$CASE/accepted.yaml"
+# Simulate a kill between the write and the acceptance commit: the fragment
+# bytes are the fresh candidate, the state never recorded them as accepted.
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1]))
+state.pop("rendered_hash", None)
+open(sys.argv[1], "w").write(json.dumps(state))
+PY
+printf 'drop:blog\n' >"${WORK}/status.mode"
+rc="$(pull_rc)"
+is "crash window: unaccepted no-op candidate exits 1" "1" "$rc"
+has "crash window: re-acceptance rejects and notices" "$(notices)" "candidate rejected"
+has "crash window: no-op was re-gated, not adopted" "$(cat "$CASE/stderr.log")" "fragment unchanged but not yet accepted"
+printf 'ok\n' >"${WORK}/status.mode"
+
 # ---- (h) removal notice ----------------------------------------------------
 new_case removal
 python3 "${HARNESS_DIR}/fixtures.py" tenant valid-two >"$CASE/tenant.json"
@@ -599,8 +640,10 @@ cp "$CONFIG" "$CASE/config.before"
 seed_once
 cp "$FRAGMENT" "$CASE/before.yaml"
 rc="$(pull_rc)"
-is "merged uniqueness: collision exits 2" "2" "$rc"
+is "merged uniqueness: collision exits 1 (counted, not fatal)" "1" "$rc"
 has "merged uniqueness: names the collision" "$(cat "$CASE/stderr.log")" "collide"
+is "merged uniqueness: tenant failure counted" "1" "$(state_field tenant failures)"
+is "merged uniqueness: platform failure counted" "1" "$(state_field platform failures)"
 cmp -s "$FRAGMENT" "$CASE/before.yaml" && ok "merged uniqueness: fragment not written" || bad "merged uniqueness: fragment not written"
 cmp -s "$CONFIG" "$CASE/config.before" && ok "two-writer boundary: config.yaml untouched" || bad "two-writer boundary: config.yaml untouched"
 

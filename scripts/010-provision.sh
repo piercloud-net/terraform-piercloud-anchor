@@ -1395,7 +1395,10 @@ GATUS_PULLER_STATE_DIR="${GATUS_PULLER_STATE_DIR:-/var/lib/piercloud}"
 GATUS_PULLER_STATE_FILE="${GATUS_PULLER_STATE_FILE:-/var/lib/piercloud/gatus-pull.state}"
 GATUS_PULLER_FRAGMENT="${GATUS_PULLER_FRAGMENT:-/etc/gatus/tenant-endpoints.yaml}"
 GATUS_PULLER_CONFIG_DIR="${GATUS_PULLER_CONFIG_DIR:-/etc/gatus}"
-GATUS_PULLER_LOCK_FILE="${GATUS_PULLER_LOCK_FILE:-/run/piercloud-gatus-pull.lock}"
+# The lock lives under the state dir: the unit runs with
+# ProtectSystem=strict, so /run is read-only and flock could not create its
+# lock there; the state dir is already covered by ReadWritePaths.
+GATUS_PULLER_LOCK_FILE="${GATUS_PULLER_LOCK_FILE:-${GATUS_PULLER_STATE_DIR}/gatus-pull.lock}"
 GATUS_PULLER_SERVICE="${GATUS_PULLER_SERVICE:-/etc/systemd/system/piercloud-gatus-pull.service}"
 GATUS_PULLER_TIMER="${GATUS_PULLER_TIMER:-/etc/systemd/system/piercloud-gatus-pull.timer}"
 
@@ -1476,10 +1479,10 @@ DEFAULT_NTFY_URL = "https://ntfy.sh"
 DEFAULT_ACCEPT_TIMEOUT = 90
 DEFAULT_ACCEPT_INTERVAL = 5
 RESERVED_TENANT_NAMES = frozenset(("platform", "slice", "home"))
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}\Z")
 PLATFORM_HOST_NAME_RE = re.compile(r"^host-[0-9]{1,3}$")
 GATUS_KEY_NORMALIZE = re.compile(r"[/_.,#+&]")
-ISO8601_RE = re.compile(
+TIMESTAMP_RE = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
     r"(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$"
 )
@@ -1497,6 +1500,16 @@ ALERT_STANZA = (
     "            ALERT_TRIGGERED_OR_RESOLVED:\n"
     '              TRIGGERED: "5"\n'
     '              RESOLVED: "3"\n'
+)
+# Class-4 rows (public tenant sites; optional monitor-only per-site gate rows)
+# keep the native ntfy provider: time-sensitive priority 4, never a night
+# emergency, and no resolve message (the dashboard/journal is the record).
+ALERT_STANZA_CLASS4 = (
+    "    alerts:\n"
+    "      - type: ntfy\n"
+    "        failure-threshold: 3\n"
+    "        provider-override:\n"
+    "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)\n"
 )
 TENANT_TOP_KEYS = frozenset(("version", "generated_at", "tenant", "note", "endpoints", "disabled"))
 PLATFORM_TOP_KEYS = frozenset(("version", "generated_at", "note", "platform", "hosts", "disabled"))
@@ -1684,19 +1697,19 @@ def _scalar_text(value):
 def parse_generated_at(value):
     if not isinstance(value, str):
         raise ManifestError("generated_at must be a string")
-    match = ISO8601_RE.match(value)
+    match = TIMESTAMP_RE.match(value)
     if not match:
-        raise ManifestError("generated_at must be ISO-8601 with a timezone")
+        raise ManifestError("generated_at must be an RFC 3339 timestamp with a timezone")
     year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
     micro = int((match.group(7) or "0").ljust(6, "0"))
-    if match.group(8) == "Z":
-        tzinfo = datetime.timezone.utc
-    else:
-        sign = 1 if match.group(8)[0] == "+" else -1
-        hours = int(match.group(8)[1:3])
-        minutes = int(match.group(8)[4:6])
-        tzinfo = datetime.timezone(sign * datetime.timedelta(hours=hours, minutes=minutes))
     try:
+        if match.group(8) == "Z":
+            tzinfo = datetime.timezone.utc
+        else:
+            sign = 1 if match.group(8)[0] == "+" else -1
+            hours = int(match.group(8)[1:3])
+            minutes = int(match.group(8)[4:6])
+            tzinfo = datetime.timezone(sign * datetime.timedelta(hours=hours, minutes=minutes))
         stamp = datetime.datetime(year, month, day, hour, minute, second, micro, tzinfo)
     except ValueError as exc:
         raise ManifestError("generated_at is not a real timestamp: %s" % exc)
@@ -1763,21 +1776,29 @@ def _validate_url(value, allow_host):
         code = ord(char)
         if code < 0x20 or code == 0x7F:
             raise ManifestError("url contains a control character")
+        if code > 0x7E:
+            raise ManifestError("url contains a non-ASCII character")
         if char in " ?#\"'\\$<>|^`":
             raise ManifestError("url contains a forbidden character")
     if not value.startswith("https://"):
         raise ManifestError("url must start with https://")
-    parts = urllib.parse.urlsplit(value)
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+    except ValueError as exc:
+        raise ManifestError("url is not a valid https URL: %s" % exc)
     if parts.scheme != "https" or not parts.netloc:
         raise ManifestError("url is not a valid https URL")
     if "@" in parts.netloc or parts.username or parts.password:
         raise ManifestError("url must not carry userinfo")
-    if parts.port is not None:
+    if port is not None:
         raise ManifestError("url must not carry an explicit port")
     if parts.query or parts.fragment:
         raise ManifestError("url must not carry a query or fragment")
     host = parts.hostname or ""
-    if not host or host != host.lower():
+    if not host:
+        raise ManifestError("url host must be lowercase")
+    if parts.netloc != parts.netloc.lower():
         raise ManifestError("url host must be lowercase")
     if not allow_host(host):
         raise ManifestError("url host %r is outside the allowlist" % host)
@@ -1937,7 +1958,7 @@ def validate_platform(doc, resolver):
 # ---------------------------------------------------------------------------
 # rendering
 # ---------------------------------------------------------------------------
-def render_row(name, group, url, alerting):
+def render_row(name, group, url, alerting, alert_class=5):
     out = [
         "  - name: %s" % name,
         "    group: %s" % group,
@@ -1949,7 +1970,8 @@ def render_row(name, group, url, alerting):
         "      ignore-redirect: true",
     ]
     if alerting:
-        out.append(ALERT_STANZA.rstrip("\n"))
+        stanza = ALERT_STANZA if alert_class == 5 else ALERT_STANZA_CLASS4
+        out.append(stanza.rstrip("\n"))
     return "\n".join(out)
 
 
@@ -1978,8 +2000,9 @@ def render_fragment(alias, role, alerting, platform_entries, tenant_entries):
     for entry in tenant_entries or []:
         if entry.get("disabled"):
             continue
+        # Public tenant rows are class 4 (D5): native ntfy, no resolve.
         rows.append(render_row(entry["name"], alias, entry["url"],
-                               bool(entry.get("alerts")) and alerting))
+                               bool(entry.get("alerts")) and alerting, alert_class=4))
     return FRAGMENT_HEADER + "endpoints:\n" + "\n".join(rows) + "\n"
 
 
@@ -2044,10 +2067,27 @@ def verify_fragment_text(text):
                 fields["client"] = True
             elif line == "    alerts:" and not fields["alerts"]:
                 index += 1
-                for expected in ALERT_STANZA.rstrip("\n").split("\n")[1:]:
-                    if index >= total or lines[index] != expected:
-                        raise FragmentError("row %r has a non-canonical alert stanza" % name)
-                    index += 1
+                class5_stanza = ALERT_STANZA.rstrip("\n").split("\n")[1:]
+                class4_stanza = ALERT_STANZA_CLASS4.rstrip("\n").split("\n")[1:]
+                if lines[index:index + len(class5_stanza)] == class5_stanza:
+                    index += len(class5_stanza)
+                    stanza_class = 5
+                elif lines[index:index + len(class4_stanza)] == class4_stanza:
+                    index += len(class4_stanza)
+                    stanza_class = 4
+                else:
+                    raise FragmentError("row %r has a non-canonical alert stanza" % name)
+                # Class policy (D5): platform / slice / gate rows are
+                # night-emergency (class 5, ntfy-JSON bridge); public tenant
+                # rows are class 4 (native ntfy, no resolve).
+                is_class5_row = (
+                    name in ("platform", "your piercloud", "private (gate)", "shared (gate)")
+                    or fields["group"] == "platform"
+                )
+                if is_class5_row and stanza_class != 5:
+                    raise FragmentError("row %r must carry the class-5 alert stanza" % name)
+                if not is_class5_row and stanza_class != 4:
+                    raise FragmentError("row %r must carry the class-4 alert stanza" % name)
                 fields["alerts"] = True
                 continue
             else:
@@ -2354,31 +2394,49 @@ def run_pull(cfg):
     try:
         parsed = verify_fragment_text(candidate)
     except FragmentError as exc:
-        raise PullError("rendered candidate does not parse: %s" % exc)
+        reason = "rendered candidate does not parse: %s" % exc
+        note_failure(cfg, state, "tenant", reason)
+        note_failure(cfg, state, "platform", reason)
+        save_state(cfg.state, state)
+        log(reason)
+        return 1
     expected = [(group, name) for group, name in parsed]
     collisions = sorted(set(expected) & config_static_keys(cfg.config))
     if collisions:
-        raise PullError("rendered rows collide with config.yaml static rows: %s"
-                        % ", ".join("%s/%s" % (g or "-", n) for g, n in collisions))
+        reason = "rendered rows collide with config.yaml static rows: %s" % ", ".join(
+            "%s/%s" % (g or "-", n) for g, n in collisions)
+        note_failure(cfg, state, "tenant", reason)
+        note_failure(cfg, state, "platform", reason)
+        save_state(cfg.state, state)
+        log(reason)
+        return 1
     current = read_text(cfg.fragment)
-    if current == candidate:
+    candidate_hash = "sha256:" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    last_good = cfg.fragment + ".last-good"
+    if current == candidate and state.get("rendered_hash") == candidate_hash:
         log("fragment unchanged (identical bytes) - no write")
         commit_channel_state(state, outcome)
-        state["rendered_hash"] = "sha256:" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        state["rendered_hash"] = candidate_hash
         state["updated_at"] = utc_stamp()
         save_state(cfg.state, state)
         return 0
-    last_good = cfg.fragment + ".last-good"
-    if current is not None:
+    if current == candidate:
+        # Crash window: the candidate is in place but the state never recorded
+        # it as accepted (a kill between write and acceptance commit, or a
+        # first run with no last-good). Fall through so acceptance gates it
+        # before this no-op pull can adopt it.
+        log("fragment unchanged but not yet accepted - re-running acceptance")
+    else:
+        if current is not None:
+            try:
+                write_atomic(last_good, current)
+            except OSError as exc:
+                raise PullError("cannot write %s: %s" % (last_good, exc))
         try:
-            write_atomic(last_good, current)
+            write_atomic(cfg.fragment, candidate)
         except OSError as exc:
-            raise PullError("cannot write %s: %s" % (last_good, exc))
-    try:
-        write_atomic(cfg.fragment, candidate)
-    except OSError as exc:
-        raise PullError("cannot write %s: %s" % (cfg.fragment, exc))
-    log("fragment written (%d row(s))" % len(expected))
+            raise PullError("cannot write %s: %s" % (cfg.fragment, exc))
+        log("fragment written (%d row(s))" % len(expected))
     if not acceptance_ok(cfg, expected):
         restored = False
         previous = read_text(last_good)
@@ -2402,7 +2460,7 @@ def run_pull(cfg):
                "removed by the tenant manifest: " + ", ".join(removed))
     state["last_tenant_names"] = sorted(new_names)
     commit_channel_state(state, outcome)
-    state["rendered_hash"] = "sha256:" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    state["rendered_hash"] = candidate_hash
     state["updated_at"] = utc_stamp()
     save_state(cfg.state, state)
     return 0

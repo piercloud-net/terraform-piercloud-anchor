@@ -78,11 +78,7 @@ endpoints:
     client:
       ignore-redirect: true
     alerts:
-      - type: custom
+      - type: ntfy
         failure-threshold: 3
-        send-on-resolved: true
         provider-override:
-          placeholders:
-            ALERT_TRIGGERED_OR_RESOLVED:
-              TRIGGERED: "5"
-              RESOLVED: "3"
+          priority: 4  # alert class 4 (time-sensitive; never a night emergency)

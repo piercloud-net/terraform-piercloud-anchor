@@ -34,8 +34,8 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 
 > Invariant 2's "admin is dispatch-only" is amended for exactly one scoped
 > component: the puller may change monitor rows in the Gatus fragment, and
-> nothing else; it holds no credential, reaches no other file, and every
-> other admin action stays dispatch-only.
+> nothing else; it holds no gate/probe credential, and every other admin
+> action stays dispatch-only.
 
 **Rationale.** The dynamic status-page puller fetches public manifests (the
 tenant's `pc-status.json`, the platform's) and re-renders
@@ -44,8 +44,12 @@ capability: the fragment cannot reach tang, Caddy, the firewall, pins or any
 credential, so auto-applying it does not widen invariant 2's blast radius.
 The puller runs with a hardened systemd unit (`ProtectSystem=strict`,
 `ReadWritePaths` limited to the config dir + state dir), holds no gate/probe
-credential (gate rows probe the gate's own anonymous login endpoint), and
-the fragment is the only file it writes (`.last-good` alongside). Every other
+credential (gate rows probe the gate's own anonymous login endpoint), reads
+`config.yaml` to keep rows collision-free but never writes it, and writes
+only the fragment, `.last-good`, and its own state file. Its only secret is
+the pre-existing ntfy publish token (a second 0600 root-only copy at
+`/etc/piercloud/gatus-pull.env`; inventoried in
+[security-posture.md](security-posture.md)). Every other
 anchor change — including `config.yaml` — stays dispatch-only (#51 keeps the
 staged/approved path). Enforced by: the puller's file ownership (it never
 writes `config.yaml`), the systemd unit's `ReadWritePaths`, and
