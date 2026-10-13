@@ -21,6 +21,10 @@
 #     never copies) run under `env -i`; refusals must fail closed and valid
 #     shapes must pass (incl. the b3b managed-apply refusal and the
 #     ref-less update-ip/destroy warning — those modes do not touch DNS).
+#   - WIRING COMPLETENESS: every committed `tests/*/run-test.sh` is named in
+#     the ci.yml run list and its directory is in the unit-tests path gate;
+#     a dropped line would silently skip that harness (no harness can catch
+#     its own absence — broker-provision-dns carries the same cross-check).
 #
 # Cred-free, offline: no network, no credentials.
 set -euo pipefail
@@ -28,6 +32,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PROV="$ROOT/.github/workflows/provision.yml"
+CI="$ROOT/.github/workflows/ci.yml"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -216,6 +221,21 @@ is "b2 matching marker rc" "0" "$rc"
 
 rc="$(RUN_BODY b3 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=bar)"
 is "b3 mismatching marker rc" "1" "$rc"
+
+# ---- wiring completeness: no harness can be silently un-wired ------------
+# The unit-tests gate line (anchored on its own prefix) must name every
+# committed harness directory, and the run list must name every harness
+# script. Removing a single token or line then fails HERE — broker-provision-dns
+# carries the same cross-check, so dropping either checker's own line still
+# leaves the other one failing. (Removing BOTH checkers is a two-line,
+# review-visible edit and remains the disclosed drift-guard residual.)
+gate_line="$(grep -m1 -F "elif grep -qE '^(\.github/scripts/" "$CI" || true)"
+[ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
+for t in tests/*/run-test.sh; do
+  dir="$(basename "$(dirname "$t")")"
+  contains "unit-tests gate covers tests/$dir" "$dir" "$gate_line"
+  contains "ci.yml run list includes $t" "bash $t" "$(cat "$CI")"
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

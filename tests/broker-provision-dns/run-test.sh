@@ -5,9 +5,11 @@
 #
 # Static, offline harness (no network, no credentials): pins the shape of the
 # provision.yml `anchor-dns` job (broker lib call over OIDC, managed-lane
-# guard, tenant environment, resolved IPv4, fail-before-thumbprint ordering)
-# and proves the retired provider surface (script, harness, variable and
-# secret names) is gone from every production surface.
+# guard, tenant environment, resolved IPv4, fail-before-thumbprint ordering),
+# proves the retired provider surface (script, harness, variable and secret
+# names) is gone from every production surface, and cross-checks that the
+# committed CI wiring still names every harness (a dropped run-list line
+# cannot silently skip one).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -42,7 +44,7 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # The anchor-dns job text, comments stripped: a stray comment must not fake a
 # wiring assertion (the lib call, guard message and env are live YAML). The
 # job sits between `anchor-dns:` and the next top-level job key.
-JOB="$(awk '/^  anchor-dns:/{f=1} /^  apply-placeholder:/{f=0} f' "$PROV" | grep -v '^[[:space:]]*#')"
+JOB="$(awk '/^  anchor-dns:/{f=1;next} f && /^  [a-z0-9][a-z0-9-]*:$/{exit} f' "$PROV" | grep -v '^[[:space:]]*#')"
 [ -n "$JOB" ] || { printf 'FAIL anchor-dns job not found in %s\n' "$PROV"; exit 1; }
 
 # ---- the broker-dns lib is the one writer --------------------------------
@@ -67,10 +69,12 @@ contains "job checks out without persisted credentials" 'persist-credentials: fa
 # comment decoys, `: '...'` no-ops, deeper indentation (wrapping in a dead
 # `if`) and step reorder.
 JOB_LINES="$(printf '%s\n' "$JOB")"
-src_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          \. \.github/scripts/lib/broker-dns\.sh$' | cut -d: -f1)"
-call_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$' | cut -d: -f1)"
-guard_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          if \[ -z "\$ANCHOR_REF" \]; then$' | cut -d: -f1)"
-guard_exit="$(printf '%s\n' "$JOB_LINES" | grep -cE '^            exit 1$')"
+# `|| true` keeps the diagnostics: under `set -e` + pipefail a missing line
+# would abort the harness before the intended `bad` message prints.
+src_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          \. \.github/scripts/lib/broker-dns\.sh$' | cut -d: -f1 || true)"
+call_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$' | cut -d: -f1 || true)"
+guard_line="$(printf '%s\n' "$JOB_LINES" | grep -nE '^          if \[ -z "\$ANCHOR_REF" \]; then$' | cut -d: -f1 || true)"
+guard_exit="$(printf '%s\n' "$JOB_LINES" | grep -cE '^            exit 1$' || true)"
 [ -n "$src_line" ] && ok "job sources the broker-dns lib (exact line)" || bad "broker-dns source line not found at the expected indentation"
 [ -n "$call_line" ] && ok "job calls write_anchor_dns with ref + ipv4 (exact line)" || bad "write_anchor_dns call line not found at the expected indentation"
 [ -n "$guard_line" ] && ok "guard is a live if (exact line)" || bad "guard if line not found at the expected indentation"
@@ -85,7 +89,20 @@ is "no continue-on-error in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -c
 is "job-level if is exactly the apply gate" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')"
 is "exactly one write_anchor_dns source line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          \. \.github/scripts/lib/broker-dns\.sh$')"
 is "exactly one write_anchor_dns call line" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          write_anchor_dns "\$ANCHOR_REF" "\$ANCHOR_IPV4"$')"
-is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^          write_anchor_dns\(\)')"
+is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^[[:space:]]*(function[[:space:]]+)?write_anchor_dns[[:space:]]*(\(\))?[[:space:]]*(\{|$)')"
+
+# Byte-exact pin of the write step: the line pins above cannot see a
+# same-indent `exit 0`/`if false` wrap, a `function` keyword shadow or an
+# injected step-level `env:`, because YAML strips the body indent and bash
+# does not care about the residual indentation. The whole step (comments
+# included) is hashed, so any edit — however indented — must update the pin.
+STEP_BLOB="$(awk '
+  /^      - name: Upsert anchor A \+ dashboard CNAME through the broker$/ {f=1}
+  f && /^      - name: / && $0 !~ /Upsert anchor A \+ dashboard CNAME through the broker$/ {exit}
+  f && /^  [a-z0-9][a-z0-9-]*:$/ {exit}
+  f {print}
+' "$PROV")"
+is "write step blob hash" "5293b16c734b119a757a0653e8824f44b224910d9909bc5f18f4b8bef9c5f806" "$(printf '%s\n' "$STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 
 # ---- the managed-lane guard fails closed ----------------------------------
 contains "guard names the b3b broker path" 'anchor DNS now goes through the pc-control broker (b3b, #189)' "$JOB"
@@ -148,6 +165,44 @@ case "$rc" in
   1) ok "no production surface references the retired writer/harness" ;;
   *) bad "grep failed scanning for the retired writer/harness (rc=$rc)" ;;
 esac
+
+# Composite actions are optional today but would execute in the same context:
+# fold them into the scan the moment the directory exists.
+if [ -d .github/actions ]; then
+  for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
+    rc=0
+    hits="$(grep -rlnwE -- "$v" .github/actions)" || rc=$?
+    case "$rc" in
+      0) bad "composite action uses $v: $hits" ;;
+      1) ok "no composite action uses $v" ;;
+      *) bad "grep failed scanning composite actions for $v (rc=$rc)" ;;
+    esac
+  done
+fi
+
+# Dynamic secret/variable indexing can reconstruct any banned name from split
+# literals (`secrets[format('{0}{1}', 'CLOUDFLARE', '_DNS_TOKEN')]`), which no
+# word-boundary grep can see — ban the bracket form across the whole
+# executable .github surface. Literal `secrets.NAME` / `vars.NAME` stays the
+# only admitted spelling.
+gh_files="$(find .github -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' \) | sort)"
+[ -n "$gh_files" ] || bad "no .github files found for the dynamic-index scan"
+for pat in 'secrets[' 'vars['; do
+  rc=0
+  hits="$(grep -lnF -- "$pat" $gh_files)" || rc=$?
+  case "$rc" in
+    0) bad "dynamic indexing '$pat' in .github: $hits" ;;
+    1) ok "no dynamic indexing '$pat' in .github" ;;
+    *) bad "grep failed scanning for '$pat' (rc=$rc)" ;;
+  esac
+done
+
+# A dropped run-list line silently skips a harness and no harness can catch
+# its own absence — the cross-check lives here and in managed-inputs, so
+# removing either checker's line still leaves the other one to fail.
+for t in tests/*/run-test.sh; do
+  contains "ci.yml run list includes $t" "bash $t" "$ci_live"
+done
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -41,9 +41,12 @@ Every step below runs from any browser — laptop or phone; phone browsers work 
 #    Debian-family OS. The run discovers the server itself — no IP to copy.
 # 1. "Use this template" on GitHub, set the repo values
 #    (customer number — the one required secret — plus monitor targets) — no netcup tokens stored.
-# 2. Dispatch the provision.yml workflow (Actions tab, mode=apply)
-#    from any browser (no identifiers to enter), and approve the device-flow
-#    code at netcup's Keycloak.
+# 2. Dispatch the provision.yml workflow (Actions tab, mode=apply, with the
+#    managed inputs tenant + anchor_ref), from any browser, and approve the
+#    device-flow code at netcup's Keycloak. Since b3b (#189) the apply path is
+#    managed-dispatch-only: a ref-less or tenant-less apply is refused at the
+#    preflight, before anything is provisioned (the template/static apply
+#    lane is retired until a broker binding for it ships).
 # 3. Save the tang thumbprint (run artifact under the Actions run —
 #    ntfy push + committed break-glass file pending) in your password manager NOW.
 ```

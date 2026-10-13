@@ -42,9 +42,12 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 > must not overlap. A **manual** run that omits `anchor_ref` uses the static
 > fallback lane `piercloud-netcup-policy`; on a managed account that is a
 > *different* lane from `anchor-<ref>`, so it can overlap a live managed run
-> — the operator passes the account's ref (a ref-less mutating run emits a
-> loud `::warning::`; a managed `tenant` dispatch without a ref fails
-> closed).
+> — the operator passes the account's ref. Since b3b (#189) `mode=apply` is
+> managed-dispatch-only: a ref-less or tenant-less apply fails closed at the
+> preflight before any provisioning; a **tenant-less**, ref-less
+> `update-ip`/`destroy` (neither touches anchor DNS) emits a loud
+> `::warning::`, and a managed `tenant` dispatch without a ref still fails
+> closed.
 
 **Rationale.** The pre-sweep (`020-provision-anchor.sh` `cmd_sweep_pre`)
 retires every foreign `piercloud-tmp-*` firewall policy on the account, and
