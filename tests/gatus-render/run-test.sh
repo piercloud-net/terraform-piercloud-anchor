@@ -16,7 +16,8 @@
 #       fails, a `main=` pair fails only when the `main` built-in rendered;
 #   (d) the role gate fails closed on an unknown ANCHOR_ROLE;
 #   (e) with no NTFY_TOPIC the config is alert-free (checks only);
-#   (f) regression: tang + dashboard TLS rows and their conditions survive;
+#   (f) regression: tang + dashboard TLS rows and their conditions survive,
+#       and both carry `group: anchor` (owner 2026-10-13: no "No Group" section);
 #   (g) PULLER MODE (issue #186, STATUS_PULLER=on): the single-owner split —
 #       010 renders ONLY tang + dashboard TLS, drops GATUS_ENDPOINTS loudly,
 #       and renders skip-invalid-config-update + ui.default-sort-by: group.
@@ -127,7 +128,9 @@ has "pairs carry priority 4" "$pairs_block" "priority: 4"
 dashboard_block="$(block "dashboard TLS (via edge)" "$CFG")"
 has "dashboard TLS carries priority 4" "$dashboard_block" "priority: 4"
 has "dashboard TLS keeps the cert condition" "$dashboard_block" "[CERTIFICATE_EXPIRATION] > 720h"
+has "dashboard TLS carries the anchor group" "$dashboard_block" "group: anchor"
 has "tang row survives" "$(block "tang (via Caddy)" "$CFG")" "url: http://hostanchor/adv"
+has "tang carries the anchor group" "$(block "tang (via Caddy)" "$CFG")" "group: anchor"
 alerting="$(sed -n '/^alerting:/,/^endpoints:/p' "$CFG")"
 has "alerting carries the native ntfy provider" "$alerting" "url: https://ntfy.sh"
 has "alerting carries the JSON bridge" "$alerting" "https://ntfy.sh/"
@@ -271,7 +274,9 @@ lacks "puller mode: no main row" "$(cat "$CFG")" "- name: main"
 lacks "puller mode: no platform row" "$(cat "$CFG")" "- name: platform"
 lacks "puller mode: no GATUS_ENDPOINTS rows" "$(cat "$CFG")" "blog"
 has "puller mode: tang row survives" "$(block "tang (via Caddy)" "$CFG")" "url: http://hostanchor/adv"
+has "puller mode: tang carries the anchor group" "$(block "tang (via Caddy)" "$CFG")" "group: anchor"
 has "puller mode: dashboard TLS survives" "$(block "dashboard TLS (via edge)" "$CFG")" "[CERTIFICATE_EXPIRATION] > 720h"
+has "puller mode: dashboard TLS carries the anchor group" "$(block "dashboard TLS (via edge)" "$CFG")" "group: anchor"
 has "puller mode: skip-invalid-config-update present" "$(cat "$CFG")" "skip-invalid-config-update: true"
 has "puller mode: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by: group"
 has "puller mode: dropped pairs logged loudly" "$(cat "$WORK/puller_mode/stderr.log")" "no longer rendered"
