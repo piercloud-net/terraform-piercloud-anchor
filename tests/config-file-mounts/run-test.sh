@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # tests/config-file-mounts/run-test.sh — bind-mounted config installs.
 #
-# The caddy and gatus containers bind-mount their config as FILES
-# (/etc/caddy/Caddyfile, /config/config.yaml). A file bind mount pins the
-# inode: an `mv` install swaps the inode and the container keeps reading the
-# OLD bytes forever — the live A2 cutover (2026-10-07) rendered the nested
+# The caddy container bind-mounts its config as a FILE and the gatus
+# container now bind-mounts the /etc/gatus DIRECTORY (Gatus directory mode,
+# issue #186): config.yaml + the puller-owned fragment merge, and
+# GATUS_CONFIG_PATH=/config activates it. A file bind mount pins the inode:
+# an `mv` install swaps the inode and the container keeps reading the OLD
+# bytes forever — the live A2 cutover (2026-10-07) rendered the nested
 # dashboard, "installed" it, and `caddy reload` reported "config is
 # unchanged" while the running container served the flat config. This
 # harness pins:
@@ -14,6 +16,9 @@
 #     to the rendered path and recreates on divergence (caddy + gatus, plus
 #     the bind-mounted cert/key/AOP PEMs — the live run-E class where the
 #     chain landed on the host while the container served the old inode);
+#   - gatus mount-SHAPE guard (D8): the directory mount + GATUS_CONFIG_PATH
+#     are detected on the running container and a legacy file-mount
+#     container is recreated once at the cutover;
 #   - CI wiring: this harness is listed + path-gated.
 # Cred-free, offline (no docker, no caddy, no network).
 set -euo pipefail
@@ -69,7 +74,16 @@ hasnt "${PROVISION_SH}" 'mv "$TMP_CFG" "${GATUS_CONFIG}"' "no mv install for the
 has "${PROVISION_SH}" 'cmp -s "/proc/${caddy_pid}/root/etc/caddy/Caddyfile" "${CADDY_CONFIG}"' "Caddy guard compares the container view"
 has "${PROVISION_SH}" 'cmp -s "/proc/${gatus_pid}/root/config/config.yaml" "${GATUS_CONFIG}"' "Gatus guard compares the container view"
 has "${PROVISION_SH}" '&& [ "${CADDY_MOUNT_STALE}" = "0" ]' "Caddy recreate condition includes the stale flag"
-has "${PROVISION_SH}" '&& [ "${GATUS_MOUNT_STALE}" = "0" ]' "Gatus recreate condition includes the stale flag"
+has "${PROVISION_SH}" '&& [ "${GATUS_MOUNT_STALE}" = "0" ] && [ "${GATUS_SHAPE_STALE}" = "0" ]' "Gatus recreate condition includes byte + shape stale flags"
+
+# ---- gatus directory-mount shape (issue #186, D8) -------------------------
+has "${PROVISION_SH}" '-e GATUS_CONFIG_PATH=/config' "Gatus runs with the directory-mode env"
+has "${PROVISION_SH}" '-v "$(dirname "${GATUS_CONFIG}")":/config:ro' "Gatus mounts the config directory, not the file"
+hasnt "${PROVISION_SH}" '-v "${GATUS_CONFIG}:/config/config.yaml:ro"' "no legacy file bind remains in docker run"
+has "${PROVISION_SH}" "docker inspect --format '{{json .HostConfig.Binds}}' gatus" "Gatus shape guard inspects the container binds"
+has "${PROVISION_SH}" '*":/config/config.yaml"*) GATUS_SHAPE_STALE=1' "Gatus shape guard flags the legacy file-mount destination"
+has "${PROVISION_SH}" '"GATUS_CONFIG_PATH=/config"' "Gatus shape guard requires the directory-mode env on the container"
+has "${PROVISION_SH}" 'GATUS_SHAPE_STALE=1' "Gatus shape guard recreates on divergence"
 
 # ---- stale-mount guard: the deployed PEM files (same class) ----------------
 # The cert/key/AOP PEMs are bind-mounted FILES too. A container created before

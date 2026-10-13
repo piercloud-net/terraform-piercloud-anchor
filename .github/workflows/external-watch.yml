@@ -57,6 +57,12 @@ jobs:
           # dashboard URL. Until then it is unset and the shell default below
           # probes the flat name.
           PROBE_URL: ${{ inputs.probe_url || vars.STATUS_PROBE_URL }}
+          # D6 "who watches the puller": when the puller is enabled on this
+          # anchor, also assert the manifest freshness + the dashboard key set
+          # (see the manifest-watch block below). TENANT_USER derives the
+          # tenant manifest URL (meta-<alias>.piercloud.site).
+          STATUS_PULLER: ${{ vars.STATUS_PULLER }}
+          TENANT_USER: ${{ vars.TENANT_USER }}
           MIN_CERT_DAYS: "14"
           ATTEMPTS: "3"
           RETRY_SLEEP: "10"
@@ -112,6 +118,81 @@ jobs:
                 fail="edge certificate expires within ${MIN_CERT_DAYS}d (${host}:443)"
               fi
             fi
+            # --- manifest-watch:start (tests/external-watch extracts this block) ---
+            # D6 "who watches the puller": producer freshness (HTTP 200 +
+            # generated_at <= 24h) AND the manifest entry set against the
+            # dashboard's public endpoint keys (a changed manifest that never
+            # reached Gatus = a dead puller timer / a frozen fragment). Runs
+            # only when the puller is enabled (STATUS_PULLER); same fetch
+            # discipline as the puller (HTTPS only, no redirects, bounded
+            # time/size).
+            case "${STATUS_PULLER:-}" in
+              1|true|yes|on)
+                manifest_fail=""
+                manifest_files=""
+                for manifest_channel in tenant platform; do
+                  if [ "$manifest_channel" = "tenant" ]; then
+                    if [ -z "${TENANT_USER:-}" ]; then
+                      echo "manifest watch: TENANT_USER unset - checking the platform channel only"
+                      continue
+                    fi
+                    manifest_url="https://meta-${TENANT_USER}.piercloud.site/.well-known/pc-status.json"
+                  else
+                    manifest_url="https://platform.piercloud.net/.well-known/pc-status.json"
+                  fi
+                  manifest_code="$(curl -sS -o "$work/manifest-${manifest_channel}.json" -w '%{http_code}' \
+                    --proto '=https' --max-redirs 0 --max-time 20 --max-filesize 65536 \
+                    "$manifest_url" 2>"$work/manifest-${manifest_channel}.err" || true)"
+                  if [ "$manifest_code" = "404" ] || [ "$manifest_code" = "410" ]; then
+                    echo "manifest watch: ${manifest_channel} manifest not published (HTTP ${manifest_code}) - keeping last-known-good"
+                    continue
+                  fi
+                  if [ "$manifest_code" != "200" ]; then
+                    manifest_fail="${manifest_fail}${manifest_channel} manifest HTTP ${manifest_code:-<none>}; "
+                    continue
+                  fi
+                  manifest_gen="$(jq -r '.generated_at // ""' "$work/manifest-${manifest_channel}.json" 2>/dev/null | tr -d '\r\n' || true)"
+                  manifest_epoch="$(date -u -d "$manifest_gen" +%s 2>/dev/null || echo 0)"
+                  manifest_age=$(( $(date -u +%s) - manifest_epoch ))
+                  if [ -z "$manifest_gen" ] || [ "$manifest_epoch" -le 0 ] || [ "$manifest_age" -gt 86400 ]; then
+                    manifest_fail="${manifest_fail}${manifest_channel} manifest stale (generated_at=${manifest_gen:-missing}); "
+                    continue
+                  fi
+                  if [ "$manifest_channel" = "tenant" ]; then
+                    jq -n --arg alias "${TENANT_USER:-}" --slurpfile doc "$work/manifest-tenant.json" \
+                      '[{name:"platform",group:"platform"},{name:"your piercloud",group:$alias},{name:"private (gate)",group:$alias}]
+                       + ($doc[0].endpoints // [] | map(select((.disabled // false) == false) | {name:.name, group:$alias}))' \
+                      >"$work/manifest-expected-tenant.json" || manifest_fail="${manifest_fail}tenant manifest parse failed; "
+                    manifest_files="${manifest_files} $work/manifest-expected-tenant.json"
+                  else
+                    jq -n --slurpfile doc "$work/manifest-platform.json" \
+                      '($doc[0].platform // [] | map(select((.disabled // false) == false) | {name:.name, group:"platform"}))
+                       + ($doc[0].hosts // [] | map(select((.disabled // false) == false) | {name:.name, group:"platform"}))' \
+                      >"$work/manifest-expected-platform.json" || manifest_fail="${manifest_fail}platform manifest parse failed; "
+                    manifest_files="${manifest_files} $work/manifest-expected-platform.json"
+                  fi
+                done
+                # shellcheck disable=SC2086  # controlled $work paths
+                jq -s 'add // []' $manifest_files >"$work/manifest-expected.json" 2>/dev/null \
+                  || printf '[]\n' >"$work/manifest-expected.json"
+                # The key-set check needs the statuses-API response; when the
+                # probe failed before fetching it, the probe failure is the
+                # verdict (do not clobber it with a derived error).
+                if [ -f "$work/api" ]; then
+                  manifest_missing="$(jq -rn --slurpfile expected "$work/manifest-expected.json" --slurpfile api "$work/api" '
+                    ($api[0] | if type == "array" then . else [] end | map({name:(.name // ""), group:(.group // "")})) as $have
+                    | [ $expected[0][] | . as $e | select(any($have[]; .name == $e.name and .group == $e.group) | not) | "\($e.group)/\($e.name)" ]
+                    | join(", ")' 2>/dev/null | tr -d '\r\n' || echo "statuses API unreadable")"
+                  if [ -n "$manifest_missing" ]; then
+                    manifest_fail="${manifest_fail}manifest rows missing from the dashboard: ${manifest_missing}; "
+                  fi
+                fi
+                if [ -n "$manifest_fail" ]; then
+                  fail="${fail:+$fail }manifest watch: ${manifest_fail}"
+                fi
+              ;;
+            esac
+            # --- manifest-watch:end ---
             rm -rf "$work"
             [ -z "$fail" ] && break
             echo "attempt ${attempt}/${ATTEMPTS} failed: ${fail}"
@@ -124,8 +205,12 @@ jobs:
           else
             echo "external-watch: FAIL — ${fail}"
             if [ -n "${GITHUB_OUTPUT:-}" ]; then
-              echo "ok=false" >> "$GITHUB_OUTPUT"
-              echo "detail=${fail}" >> "$GITHUB_OUTPUT"
+              {
+                echo "ok=false"
+                echo "detail<<PC_WATCH_EOF"
+                printf '%s\n' "${fail}" | tr -d '\r'
+                echo "PC_WATCH_EOF"
+              } >> "$GITHUB_OUTPUT"
             fi
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "### external-watch: FAIL — ${fail}" >> "$GITHUB_STEP_SUMMARY"; fi
             exit 1

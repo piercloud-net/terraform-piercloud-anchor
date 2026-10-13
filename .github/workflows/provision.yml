@@ -1130,6 +1130,11 @@ jobs:
           BOOTSTRAP_ROOT_PASSWORD: ${{ env.BOOTSTRAP_ROOT_PASSWORD }}
           TENANT_USER: ${{ vars.TENANT_USER }}
           ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE }}
+          # STATUS_PULLER (issue #186): repo VARIABLE, unset = legacy shape
+          # (platform/main + GATUS_ENDPOINTS in config.yaml). On a
+          # slice-managed anchor set it and the on-box render drops the pairs
+          # with a loud dispatch-time log (D10); they move to the manifest.
+          STATUS_PULLER: ${{ vars.STATUS_PULLER }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
