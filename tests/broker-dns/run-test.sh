@@ -56,7 +56,7 @@ mkdir -p "$WORK/bin"
 cat >"$WORK/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-out=""; url=""; method="GET"; argv="$*"; declare -a cfgs=()
+out=""; url=""; method="GET"; argv="$*"; declare -a cfgs=() urls=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) cfgs+=("$2"); shift 2 ;;
@@ -64,18 +64,28 @@ while [ $# -gt 0 ]; do
     -w) shift 2 ;;
     --max-time) shift 2 ;;
     -X) method="$2"; shift 2 ;;
+    -X*) method="${1#-X}"; shift ;;
     --request) method="$2"; shift 2 ;;
     --request=*) method="${1#--request=}"; shift ;;
-    -d | --data | --data-raw | --data-binary | --data-ascii) method="POST"; shift 2 ;;
-    --data=* | --data-raw=* | --data-binary=* | --data-ascii=*) method="POST"; shift ;;
+    -d | --data | --data-raw | --data-binary | --data-ascii | --data-urlencode | --json | -F | --form | --form-string) method="POST"; shift 2 ;;
+    -d* | --data=* | --data-raw=* | --data-binary=* | --data-ascii=* | --data-urlencode=* | --json=* | -F* | --form=* | --form-string=*) method="POST"; shift ;;
     -H | --header) shift 2 ;;
     -sS | -s | -f | -fsS) shift ;;
     -*) shift ;;
-    *) url="$1"; shift ;;
+    *) urls+=("$1"); shift ;;
   esac
 done
+: "${url:=${urls[0]:-}}"
 {
-  printf 'CALL method=%s url=%s\n' "$method" "$url"
+  # One CALL record per positional URL: curl performs one transfer per URL, so
+  # a second URL in the same invocation must be visible to the count pins.
+  if [ ${#urls[@]} -gt 0 ]; then
+    for u in "${urls[@]}"; do
+      printf 'CALL method=%s url=%s\n' "$method" "$u"
+    done
+  else
+    printf 'CALL method=%s url=%s\n' "$method" "$url"
+  fi
   printf 'ARGV %s\n' "$argv"
   for c in "${cfgs[@]}"; do
     printf 'CONFIG %s mode=%s\n' "$c" "$(stat -c %a "$c")"
