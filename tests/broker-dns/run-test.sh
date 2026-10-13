@@ -183,6 +183,15 @@ rc="$(RUN okdblslshdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https
 is "dns double-trailing-slash base rc=0" 0 "$rc"
 dbl_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns double-trailing-slash POST URL exact" "https://broker.example/v1/anchors/dns" "$dbl_url"
+rc="$(RUN oktripledns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example///)"
+is "dns triple-trailing-slash base rc=0" 0 "$rc"
+triple_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns triple-trailing-slash POST URL exact" "https://broker.example/v1/anchors/dns" "$triple_url"
+# A hyphenated host must stay accepted: the validator charset carries `-`.
+rc="$(RUN okhyphdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker-1.example)"
+is "hyphenated broker host accepted" 0 "$rc"
+hyph_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "hyphenated broker host POST URL exact" "https://broker-1.example/v1/anchors/dns" "$hyph_url"
 rc="$(RUN okaltch write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present BROKER_URL=https://broker.example)"
 is "challenge alternate base rc=0" 0 "$rc"
 alt_ch_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
@@ -217,15 +226,16 @@ lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 
 # ---- behavior: environment and upstream failures -------------------------
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
-contains "non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.httpurl")"
+contains "non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.httpurl")"
 # A query/fragment/userinfo/backslash in the base would retarget the request
 # (curl folds `?q/v1/...` into the query and posts to `/`); the validator
 # requires a plain https host/path base and refuses all of them.
 is "query BROKER_URL refused" 1 "$(RUN urlquery write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example?x=1')"
-contains "query BROKER_URL error carries the prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.urlquery")"
+contains "query BROKER_URL error carries the prefix" "::error::broker dns: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.urlquery")"
 is "fragment BROKER_URL refused" 1 "$(RUN urlfrag write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example#f')"
 is "userinfo BROKER_URL refused" 1 "$(RUN urluser write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://u@broker.example')"
 is "backslash BROKER_URL refused" 1 "$(RUN urlbs write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example\evil')"
+is "empty-host BROKER_URL refused" 1 "$(RUN urlempty write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https:///path')"
 lacks "no curl call for refused broker URLs" "CALL " "$(cat "$WORK/curl.log")"
 # The runner supplies the OIDC endpoint; require https and no fragment (a
 # fragment would land the audience outside the query the endpoint reads).
@@ -242,10 +252,14 @@ contains "minted token quote error names the rule" "::error::broker dns: OIDC to
 toknl_body=$'STUB_TOKEN_BODY={"value":"x\\nheader = \\"X-Evil: yes\\""}'
 is "minted token with newline refused" 1 "$(RUN toknl write_anchor_dns broker-ref-1 192.0.2.10 "$toknl_body")"
 contains "minted token newline error names the rule" "::error::broker dns: OIDC token carries unexpected characters" "$(cat "$WORK/err.toknl")"
+# The accepted token charset must keep base64url/base64 characters, `=` padding
+# and `~` working (a token-refusal over-approximation would break real tokens).
+is "base64-shaped minted token accepted" 0 "$(RUN tokb64 write_anchor_dns broker-ref-1 192.0.2.10 'STUB_TOKEN_BODY={"value":"YQ==a+b/c~d"}')"
+contains "base64 token reaches the POST header" "Authorization: Bearer YQ==a+b/c~d" "$(cat "$WORK/curl.log")"
 # The challenge path carries its own BROKER_URL refusal literal (the anchor
 # case above does not exercise it).
 is "challenge non-https BROKER_URL refused" 1 "$(RUN chhttpurl write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present BROKER_URL=http://broker.example)"
-contains "challenge non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.chhttpurl")"
+contains "challenge non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.chhttpurl")"
 is "missing OIDC context refused" 1 "$(RUN noctx write_anchor_dns broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
 contains "no-OIDC error carries the broker dns prefix" "::error::broker dns: no OIDC request context" "$(cat "$WORK/err.noctx")"
 # The challenge path's label handoff needs its own no-OIDC case (the anchor
@@ -276,6 +290,8 @@ contains "selftest presents the challenge" 'write_challenge "$CHALLENGE_NAME" "$
 contains "selftest cleans the challenge" 'write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" cleanup' "$self_live"
 contains "selftest negative requires refusal" 'if out="$(write_anchor_dns "$ANCHOR_REF" "$NEGATIVE_IPV4" 2>&1)"; then' "$self_live"
 contains "selftest carries id-token: write" 'id-token: write' "$self_live"
+contains "selftest serializes runs per environment" 'group: broker-report-selftest-${{ inputs.environment }}' "$self_live"
+contains "selftest does not cancel in-progress proofs" 'cancel-in-progress: false' "$self_live"
 contains "selftest selects the environment input" 'environment: ${{ inputs.environment }}' "$self_live"
 contains "selftest checkout does not persist credentials" 'persist-credentials: false' "$self_live"
 # The report and the DNS writes must live in the SAME job: the broker's

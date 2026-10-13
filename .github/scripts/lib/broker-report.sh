@@ -222,7 +222,7 @@ report_anchor_ip() { # $1 = anchor_ref, $2 = ipv4
   # and joins to `//v1/...` (the path builder adds `/v1/...`).
   while [ "$base" != "${base%/}" ]; do base="${base%/}"; done
   if ! _broker_validate_base "$base"; then
-    echo "::error::broker report: BROKER_URL must be an https URL (got a non-https value) — refusing." >&2
+    echo "::error::broker report: BROKER_URL must be a plain https URL (no userinfo/query/fragment) — refusing." >&2
     return 1
   fi
 

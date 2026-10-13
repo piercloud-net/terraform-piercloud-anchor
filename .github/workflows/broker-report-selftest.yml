@@ -57,6 +57,14 @@ on:
 permissions:
   contents: read
 
+# One run per environment: the challenge TXT value is a fixed constant and the
+# cleanup matches on name+value only (no presenter binding), so a second
+# late-failing run's always() cleanup could delete the first run's live TXT.
+# Serializing per environment keeps each cleanup scoped to its own proof.
+concurrency:
+  group: broker-report-selftest-${{ inputs.environment }}
+  cancel-in-progress: false
+
 jobs:
   report:
     name: "Report the anchor IPv4 to the broker"
@@ -106,10 +114,12 @@ jobs:
           write_challenge "$CHALLENGE_NAME" "$CHALLENGE_VALUE" present
 
       # Cleanup runs even when an earlier step failed or the run is cancelled
-      # after the present step: present-then-abort otherwise leaves the TXT in
-      # the zone until the next proof. A cleanup after a failed present can
-      # itself refuse (the TXT was never written); the job has already failed,
-      # and a 409 there is the exact-match delete proving nothing to remove.
+      # after the present step (GitHub runs always() steps on cooperative
+      # cancellation; a hard runner loss cannot execute them): present-then-abort
+      # otherwise leaves the TXT in the zone until the next proof. A cleanup
+      # after a failed present can itself refuse (the TXT was never written);
+      # the job has already failed, and a 409 there is the exact-match delete
+      # proving nothing to remove.
       - name: Clean up the DNS-01 challenge TXT
         if: always()
         env:

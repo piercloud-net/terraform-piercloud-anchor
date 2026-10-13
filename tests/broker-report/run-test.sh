@@ -157,11 +157,11 @@ is "empty IPv4 refused" 1 "$(RUN ipempty broker-ref-1 '')"
 contains "refusal message names the grammar" "[a-z0-9._-]{1,64}" "$(cat "$WORK/err.refempty")"
 lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
-contains "non-https error carries the broker report prefix" "::error::broker report: BROKER_URL must be an https URL" "$(cat "$WORK/err.httpurl")"
+contains "non-https error carries the broker report prefix" "::error::broker report: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.httpurl")"
 # A query/fragment/userinfo base would retarget the request; refused like the
 # DNS lib (both share the validator).
 is "query BROKER_URL refused" 1 "$(RUN urlquery broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example?x=1')"
-contains "query BROKER_URL error carries the prefix" "::error::broker report: BROKER_URL must be an https URL" "$(cat "$WORK/err.urlquery")"
+contains "query BROKER_URL error carries the prefix" "::error::broker report: BROKER_URL must be a plain https URL" "$(cat "$WORK/err.urlquery")"
 is "fragment BROKER_URL refused" 1 "$(RUN urlfrag broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example#f')"
 lacks "no curl call for refused broker URLs" "CALL " "$(cat "$WORK/curl.log")"
 # The runner supplies the OIDC endpoint; require https and no fragment.
@@ -169,6 +169,8 @@ is "http OIDC request URL refused" 1 "$(RUN ctxhttp broker-ref-1 192.0.2.10 'ACT
 contains "http OIDC URL error carries the prefix" "::error::broker report: OIDC request URL must be https" "$(cat "$WORK/err.ctxhttp")"
 is "fragment OIDC request URL refused" 1 "$(RUN ctxfrag broker-ref-1 192.0.2.10 'ACTIONS_ID_TOKEN_REQUEST_URL=https://oidc.example/req?a=b#frag')"
 contains "fragment OIDC URL error carries the prefix" "::error::broker report: OIDC request URL must not carry a fragment" "$(cat "$WORK/err.ctxfrag")"
+is "request token with newline refused" 1 "$(RUN reqnl broker-ref-1 192.0.2.10 $'ACTIONS_ID_TOKEN_REQUEST_TOKEN=abc\ndef')"
+contains "request token newline error carries the prefix" "::error::broker report: OIDC request token carries unexpected characters" "$(cat "$WORK/err.reqnl")"
 # A minted token carrying a quote could inject a curl config directive.
 is "minted token with quote refused" 1 "$(RUN tokquote broker-ref-1 192.0.2.10 'STUB_TOKEN_BODY={"value":"x\"injected"}')"
 contains "minted token quote error carries the prefix" "::error::broker report: OIDC token carries unexpected characters" "$(cat "$WORK/err.tokquote")"

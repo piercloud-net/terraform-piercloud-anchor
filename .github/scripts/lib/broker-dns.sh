@@ -86,7 +86,7 @@ write_anchor_dns() { # $1 = anchor_ref, $2 = ipv4
     return 1
   fi
   base="$(_broker_dns_base)" || {
-    echo "::error::broker dns: BROKER_URL must be an https URL (got a non-https value) — refusing." >&2
+    echo "::error::broker dns: BROKER_URL must be a plain https URL (no userinfo/query/fragment) — refusing." >&2
     return 1
   }
   body="$(jq -cn --arg ref "$ref" --arg ip "$ip" '{anchor_ref:$ref,ipv4:$ip}')" || {
@@ -126,7 +126,7 @@ write_challenge() { # $1 = name, $2 = value, $3 = action
       ;;
   esac
   base="$(_broker_dns_base)" || {
-    echo "::error::broker dns: BROKER_URL must be an https URL (got a non-https value) — refusing." >&2
+    echo "::error::broker dns: BROKER_URL must be a plain https URL (no userinfo/query/fragment) — refusing." >&2
     return 1
   }
   body="$(jq -cn --arg n "$name" --arg v "$value" --arg a "$action" '{name:$n,value:$v,action:$a}')" || {
