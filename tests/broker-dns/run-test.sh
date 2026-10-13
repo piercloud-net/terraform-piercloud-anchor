@@ -67,6 +67,8 @@ while [ $# -gt 0 ]; do
     -X*) method="${1#-X}"; shift ;;
     --request) method="$2"; shift 2 ;;
     --request=*) method="${1#--request=}"; shift ;;
+    --url) urls+=("$2"); shift 2 ;;
+    --url=*) urls+=("${1#--url=}"); shift ;;
     -d | --data | --data-raw | --data-binary | --data-ascii | --data-urlencode | --json | -F | --form | --form-string) method="POST"; shift 2 ;;
     -d* | --data=* | --data-raw=* | --data-binary=* | --data-ascii=* | --data-urlencode=* | --json=* | -F* | --form=* | --form-string=*) method="POST"; shift ;;
     -H | --header) shift 2 ;;
@@ -248,6 +250,7 @@ is "dns deep-path base rc=0" 0 "$rc"
 deepdns_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns deep-path POST URL exact" "https://broker.example/a/b/v1/anchors/dns" "$deepdns_url"
 is "dns deep-path single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+lacks "dns POST config carries no url line" "url = " "$(cat "$WORK/curl.log")"
 # Depth-3 trailing base and multi-run internal shapes (r12 red-team), mirroring
 # the report harness: a depth-gated or run-collapsing strip mutant must fail.
 rc="$(RUN okdeep3dns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b/c//')"
