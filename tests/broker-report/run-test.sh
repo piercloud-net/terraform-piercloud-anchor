@@ -66,6 +66,10 @@ while [ $# -gt 0 ]; do
     -w) shift 2 ;;
     --max-time) shift 2 ;;
     -X) method="$2"; shift 2 ;;
+    --request) method="$2"; shift 2 ;;
+    --request=*) method="${1#--request=}"; shift ;;
+    -d | --data | --data-raw | --data-binary | --data-ascii) method="POST"; shift 2 ;;
+    --data=* | --data-raw=* | --data-binary=* | --data-ascii=*) method="POST"; shift ;;
     -H | --header) shift 2 ;;
     -sS | -s | -f | -fsS) shift ;;
     -*) shift ;;
@@ -85,6 +89,7 @@ done
           f="${line#data = \"@}"; f="${f%\"}"
           printf 'DATA %s mode=%s\n' "$f" "$(stat -c %a "$f")"
           sed 's/^/DATALINE /' "$f"
+          printf '\n' # terminate: the lib writes body.json without a trailing newline
           ;;
       esac
     done <"$c"
@@ -233,7 +238,27 @@ rc="$(RUN okrun3 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a///
 is "internal-triple-slash base rc=0" 0 "$rc"
 run3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "internal-triple-slash POST URL exact" "https://broker.example/a///b/v1/anchors/ip" "$run3_url"
-is "internal-triple-slash single POST" 1 "$(grep -c '^CALL method=POST' "$WORK/curl.log")"
+is "internal-triple-slash single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+# Depth-3 trailing base and multi-run internal shapes (r12 red-team): the
+# strip is trailing-only and must preserve internal duplicates whatever their
+# count or path depth — a depth-gated or run-collapsing strip mutant survives
+# the shallower samples. The POST count now distinguishes exactly one POST
+# (the stub terminates its log entries; long-option POSTs are recognised too).
+rc="$(RUN okdeep3 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b/c//')"
+is "depth-3 base rc=0" 0 "$rc"
+deep3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "depth-3 POST URL exact" "https://broker.example/a/b/c/v1/anchors/ip" "$deep3_url"
+is "depth-3 single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+rc="$(RUN okruns4 broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a////b')"
+is "quad-slash internal base rc=0" 0 "$rc"
+runs4_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "quad-slash POST URL exact" "https://broker.example/a////b/v1/anchors/ip" "$runs4_url"
+is "quad-slash single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+rc="$(RUN okrunsmix broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b/c///d')"
+is "mixed-runs base rc=0" 0 "$rc"
+mix_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "mixed-runs POST URL exact" "https://broker.example/a//b/c///d/v1/anchors/ip" "$mix_url"
+is "mixed-runs single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"

@@ -64,6 +64,10 @@ while [ $# -gt 0 ]; do
     -w) shift 2 ;;
     --max-time) shift 2 ;;
     -X) method="$2"; shift 2 ;;
+    --request) method="$2"; shift 2 ;;
+    --request=*) method="${1#--request=}"; shift ;;
+    -d | --data | --data-raw | --data-binary | --data-ascii) method="POST"; shift 2 ;;
+    --data=* | --data-raw=* | --data-binary=* | --data-ascii=*) method="POST"; shift ;;
     -H | --header) shift 2 ;;
     -sS | -s | -f | -fsS) shift ;;
     -*) shift ;;
@@ -82,6 +86,7 @@ done
           f="${line#data = \"@}"; f="${f%\"}"
           printf 'DATA %s mode=%s\n' "$f" "$(stat -c %a "$f")"
           sed 's/^/DATALINE /' "$f"
+          printf '\n' # terminate: the lib writes body.json without a trailing newline
           ;;
       esac
     done <"$c"
@@ -225,14 +230,31 @@ rc="$(RUN okrun3 write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://br
 is "dns internal-triple-slash base rc=0" 0 "$rc"
 run3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns internal-triple-slash POST URL exact" "https://broker.example/a///b/v1/anchors/dns" "$run3_url"
-is "dns internal-triple-slash single POST" 1 "$(grep -c '^CALL method=POST' "$WORK/curl.log")"
+is "dns internal-triple-slash single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
 # Deep-path base with a trailing slash: the strip loop is duplicated between
 # the two libs, so the DNS copy needs its own regression pin (r11 red-team).
 rc="$(RUN okdeepdns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b//')"
 is "dns deep-path base rc=0" 0 "$rc"
 deepdns_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "dns deep-path POST URL exact" "https://broker.example/a/b/v1/anchors/dns" "$deepdns_url"
-is "dns deep-path single POST" 1 "$(grep -c '^CALL method=POST' "$WORK/curl.log")"
+is "dns deep-path single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+# Depth-3 trailing base and multi-run internal shapes (r12 red-team), mirroring
+# the report harness: a depth-gated or run-collapsing strip mutant must fail.
+rc="$(RUN okdeep3dns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b/c//')"
+is "dns depth-3 base rc=0" 0 "$rc"
+deep3_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns depth-3 POST URL exact" "https://broker.example/a/b/c/v1/anchors/dns" "$deep3_url"
+is "dns depth-3 single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+rc="$(RUN okruns4dns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a////b')"
+is "dns quad-slash internal base rc=0" 0 "$rc"
+runs4_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns quad-slash POST URL exact" "https://broker.example/a////b/v1/anchors/dns" "$runs4_url"
+is "dns quad-slash single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
+rc="$(RUN okrunsmixdns write_anchor_dns broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b/c///d')"
+is "dns mixed-runs base rc=0" 0 "$rc"
+mix_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns mixed-runs POST URL exact" "https://broker.example/a//b/c///d/v1/anchors/dns" "$mix_url"
+is "dns mixed-runs single POST" 1 "$(grep -o 'CALL method=POST' "$WORK/curl.log" | wc -l)"
 # A hyphenated host must stay accepted: the validator charset carries `-`.
 rc="$(RUN okhyphdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker-1.example)"
 is "hyphenated broker host accepted" 0 "$rc"
