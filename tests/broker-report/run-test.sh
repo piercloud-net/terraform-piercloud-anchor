@@ -189,8 +189,11 @@ is "trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "
 # Every trailing slash must be stripped regardless of count, a path base must
 # survive, and no `//` may ever appear after the authority (an invariant, so a
 # bounded strip mutant cannot hide behind a larger slash count). Production
-# BROKER_URL is pathless; the join is shared.
-for n in 2 3 4 5 64; do
+# BROKER_URL is pathless; the join is shared. The 4096 sample is a practical
+# sampling ceiling: by construction, a bounded strip whose bound is at least
+# the largest sampled count is indistinguishable from the unbounded loop, so
+# the ceiling is disclosed rather than chased.
+for n in 2 3 4 5 64 65 4096; do
   slashes="$(printf '%.0s/' $(seq 1 "$n"))"
   rc="$(RUN "slash$n" broker-ref-1 192.0.2.10 "BROKER_URL=https://broker.example$slashes")"
   is "trailing-slash x$n rc=0" 0 "$rc"

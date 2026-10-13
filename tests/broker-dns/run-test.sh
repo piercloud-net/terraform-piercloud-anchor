@@ -189,7 +189,9 @@ triple_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | se
 is "dns triple-trailing-slash POST URL exact" "https://broker.example/v1/anchors/dns" "$triple_url"
 # Any trailing-slash count must strip, no `//` may appear after the authority
 # (invariant), and a path base must survive — the DNS lib has its own join.
-for n in 4 5 64; do
+# 4096 is the disclosed sampling ceiling (a bounded strip with a bound at
+# least this large is indistinguishable from the unbounded loop).
+for n in 4 5 64 65 4096; do
   slashes="$(printf '%.0s/' $(seq 1 "$n"))"
   rc="$(RUN "dnsslash$n" write_anchor_dns broker-ref-1 192.0.2.10 "BROKER_URL=https://broker.example$slashes")"
   is "dns trailing-slash x$n rc=0" 0 "$rc"
