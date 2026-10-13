@@ -26,7 +26,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist (the list also carries the pc-control broker report endpoint `broker.piercloud.net` — the managed-run anchor-IPv4 push, authenticated by a per-run GitHub OIDC token, never a standing credential); also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
 | `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (banner workflow diff, token refresh, anchor IP selection, managed-input preflight/binding, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, anchor DNS, edge origin-auth, config file mounts, per-anchor origin-ca, Gatus render, dynamic status-page puller, external watch, recording-witness, broker report) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (banner workflow diff, token refresh, anchor IP selection, managed-input preflight/binding, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, anchor DNS, edge origin-auth, config file mounts, per-anchor origin-ca, Gatus render, dynamic status-page puller, external watch, recording-witness, broker report, broker DNS) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|gatus-pull|external-watch|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|gatus-pull|external-watch|managed-inputs|broker-dns|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -92,6 +92,13 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] **Fail-closed**: a report against an unknown/ambiguous anchor_ref, a non-registry environment, or a foreign repository answers non-200 and the run fails at the report step (before the A1 window) — reproduce one locally with the selftest workflow or a bad ref.
 - [ ] **Selftest canary**: dispatch `broker-report-selftest.yml` with the proof environment + a seeded anchor ref (the broker allowlists the selftest workflow only during the proof window) and record the run URL + registry read-back.
 - [ ] **Unmanaged runs unaffected**: a manual/template run (empty `tenant`) skips the step (no report, no OIDC token request).
+
+### Broker DNS write path (`broker-dns.sh`, b3a companion)
+
+- [ ] CI green; `tests/broker-dns/run-test.sh` exercises the real lib against a stubbed curl (audience-tagged OIDC request, both POST paths + bodies, token-never-in-argv, input validation, every refusal path) and pins the selftest wiring — including that the report and the DNS write steps live in the **same job** (the broker's A-write cross-check compares the report's stored run id with the write request's run id).
+- [ ] **Selftest canary (b3a live proof)**: dispatch `broker-report-selftest.yml` (proof environment + seeded anchor/`dns_name` rows + a challenge name under the tenant's registered name, `negative_ipv4` set) and record: the run URL; the A/CNAME + challenge TXT served by the zone (dig auth-NS + DoH); the broker audit rows (`anchor.dns_written`, `dns.challenge_presented`, `dns.challenge_cleared`); the mismatched-A step refused 409; cleanup.
+- [ ] **No token on the runner**: the run log carries no provider token, and the workflow's OIDC token reaches curl only through 0600 config files (the harness pins this).
+- [ ] The production `030-anchor-dns.sh` path is **unchanged** in b3a (the direct-token switch + org-secret retirement is b3b).
 
 ### Retention cap / `mode=check` assert (workflow + docs)
 
