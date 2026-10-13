@@ -157,6 +157,7 @@ is "empty IPv4 refused" 1 "$(RUN ipempty broker-ref-1 '')"
 contains "refusal message names the grammar" "[a-z0-9._-]{1,64}" "$(cat "$WORK/err.refempty")"
 lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
+contains "non-https error carries the broker report prefix" "::error::broker report: BROKER_URL must be an https URL" "$(cat "$WORK/err.httpurl")"
 is "missing OIDC context refused" 1 "$(RUN noctx broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
 contains "no-OIDC error carries the broker report prefix" "::error::broker report: no OIDC request context" "$(cat "$WORK/err.noctx")"
 # A non-default BROKER_URL must actually be used, and a trailing slash must
@@ -175,9 +176,11 @@ is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB
 contains "token 500 message" "OIDC token request answered HTTP 500" "$(cat "$WORK/err.tok500")"
 is "token body without value refused" 1 "$(RUN toknone broker-ref-1 192.0.2.10 'STUB_TOKEN_BODY={}')"
 is "token network error refused" 1 "$(RUN tokfail broker-ref-1 192.0.2.10 STUB_FAIL=token)"
+contains "token network error carries the broker report prefix" "::error::broker report: OIDC token request failed" "$(cat "$WORK/err.tokfail")"
 is "post 401 refused" 1 "$(RUN post401 broker-ref-1 192.0.2.10 STUB_POST_CODE=401 'STUB_POST_BODY={\"error\":\"unauthorized\"}')"
 is "post 409 refused" 1 "$(RUN post409 broker-ref-1 192.0.2.10 STUB_POST_CODE=409 'STUB_POST_BODY={\"error\":\"ambiguous anchor\"}')"
 is "post network error refused" 1 "$(RUN postfail broker-ref-1 192.0.2.10 STUB_FAIL=post)"
+contains "post network error carries the broker report prefix" "::error::broker report: POST to the broker failed" "$(cat "$WORK/err.postfail")"
 # A multi-line refusal body is flattened to one log line.
 RUN postml broker-ref-1 192.0.2.10 'STUB_POST_CODE=409' 'STUB_POST_BODY={"error":"ambiguous anchor"}' >/dev/null
 errlines="$(wc -l <"$WORK/err.postml")"

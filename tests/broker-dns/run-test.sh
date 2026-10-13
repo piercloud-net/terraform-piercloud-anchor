@@ -169,6 +169,21 @@ log="$(cat "$WORK/curl.log")"
 contains "cleanup body carries action cleanup" '"action":"cleanup"' "$log"
 contains "cleanup note" "challenge cleanup accepted by the broker" "$(cat "$WORK/out.chcleanup")"
 
+# A non-default BROKER_URL must actually be used by the DNS base helper, and a
+# trailing slash must not produce a double-slash path (mirrors the report lib).
+rc="$(RUN okaltdns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example)"
+is "dns alternate base rc=0" 0 "$rc"
+alt_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns alternate base POST URL exact" "https://broker.example/v1/anchors/dns" "$alt_url"
+rc="$(RUN oktraildns write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example/)"
+is "dns trailing-slash base rc=0" 0 "$rc"
+trail_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "dns trailing-slash base POST URL exact" "https://broker.example/v1/anchors/dns" "$trail_url"
+rc="$(RUN okaltch write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present BROKER_URL=https://broker.example)"
+is "challenge alternate base rc=0" 0 "$rc"
+alt_ch_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "challenge alternate base POST URL exact" "https://broker.example/v1/dns/challenges" "$alt_ch_url"
+
 # ---- behavior: input validation (no curl call) ---------------------------
 is "empty anchor_ref refused" 1 "$(RUN refempty write_anchor_dns '' 192.0.2.10)"
 is "uppercase anchor_ref refused" 1 "$(RUN refupper write_anchor_dns BrokerRef 192.0.2.10)"
@@ -193,6 +208,7 @@ lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 
 # ---- behavior: environment and upstream failures -------------------------
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
+contains "non-https error carries the broker dns prefix" "::error::broker dns: BROKER_URL must be an https URL" "$(cat "$WORK/err.httpurl")"
 is "missing OIDC context refused" 1 "$(RUN noctx write_anchor_dns broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
 contains "no-OIDC error carries the broker dns prefix" "::error::broker dns: no OIDC request context" "$(cat "$WORK/err.noctx")"
 # The challenge path's label handoff needs its own no-OIDC case (the anchor
@@ -202,11 +218,13 @@ contains "challenge no-OIDC error carries the broker dns prefix" "::error::broke
 is "token endpoint non-200 refused" 1 "$(RUN tok500 write_anchor_dns broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
 contains "token 500 message" "OIDC token request answered HTTP 500" "$(cat "$WORK/err.tok500")"
 is "token network error refused" 1 "$(RUN tokfail write_anchor_dns broker-ref-1 192.0.2.10 STUB_FAIL=token)"
+contains "token network error carries the broker dns prefix" "::error::broker dns: OIDC token request failed" "$(cat "$WORK/err.tokfail")"
 is "anchor dns post 409 refused" 1 "$(RUN post409 write_anchor_dns broker-ref-1 192.0.2.10 STUB_POST_CODE=409 'STUB_POST_BODY={"error":"A value does not match the registry anchor IP reported by this run"}')"
 is "anchor dns post 502 refused" 1 "$(RUN post502 write_anchor_dns broker-ref-1 192.0.2.10 STUB_POST_CODE=502)"
 is "challenge post 404 refused" 1 "$(RUN ch404 write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present STUB_POST_CODE=404)"
 contains "challenge refusal carries the broker dns prefix" "::error::broker dns refused" "$(cat "$WORK/err.ch404")"
 is "post network error refused" 1 "$(RUN postfail write_anchor_dns broker-ref-1 192.0.2.10 STUB_FAIL=post)"
+contains "post network error carries the broker dns prefix" "::error::broker dns: POST to the broker failed" "$(cat "$WORK/err.postfail")"
 RUN postml write_anchor_dns broker-ref-1 192.0.2.10 STUB_POST_CODE=409 'STUB_POST_BODY={"error":"ambiguous anchor"}' >/dev/null
 errlines="$(wc -l <"$WORK/err.postml")"
 is "refusal body flattened to one line" 1 "$errlines"
