@@ -1069,6 +1069,16 @@ case "${ANCHOR_ROLE:-}" in
   operator)  PLATFORM_ALERTS=1 ;;
   *) die "bad ANCHOR_ROLE (want empty/tenant/operator): ${ANCHOR_ROLE}" ;;
 esac
+# Dynamic-endpoints mode (issue #186): STATUS_PULLER=on moves every watched
+# HTTP row into the puller-owned fragment (single-owner rule, D1/D8/D10) —
+# `platform`, the slice row and the gate rows are seeded by the puller, and
+# tenant pairs live in the manifest. The legacy shape (switch unset) renders
+# exactly as before (standalone/template/BYOH; D10). Fail closed on a typo.
+case "${STATUS_PULLER:-}" in
+  ''|0|false|no|off) PULLER_MODE=0 ;;
+  1|true|yes|on)     PULLER_MODE=1 ;;
+  *) die "bad STATUS_PULLER (want unset/true/false): ${STATUS_PULLER}" ;;
+esac
 log "Rendering dispatch-managed Gatus config (${GATUS_CONFIG})"
 mkdir -p "$(dirname "${GATUS_CONFIG}")"
 caddy_status_names
@@ -1091,6 +1101,32 @@ alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
   ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
   printf -v ALERTS_EXPECTED_NAMES '%s%s\n' "${ALERTS_EXPECTED_NAMES}" "${1}"
 }
+if [ "$PULLER_MODE" -eq 1 ]; then
+  # The fragment owns every watched row. The dispatch-env pairs cannot reach
+  # the box as monitors anymore, so drop them LOUDLY here (dispatch time is
+  # the only place the secret lives) and let the tenant move them into the
+  # manifest (D10: one migration dispatch, then delete the secret).
+  if [ -n "${GATUS_ENDPOINTS:-}" ]; then
+    _pull_dropped=""
+    _pull_count=0
+    set -f
+    OLD_IFS="$IFS"; IFS=","
+    # shellcheck disable=SC2086
+    for pair in ${GATUS_ENDPOINTS}; do
+      [ -z "$pair" ] && continue
+      name="$(printf '%s' "$pair" | cut -d= -f1 | tr -d '[:space:]')"
+      _pull_count=$((_pull_count + 1))
+      case "$name" in
+        ''|*[!a-zA-Z0-9_-]*) _pull_dropped="${_pull_dropped} <unprintable>" ;;
+        *) _pull_dropped="${_pull_dropped} ${name}" ;;
+      esac
+    done
+    IFS="$OLD_IFS"
+    set +f
+    warn "STATUS_PULLER=on: ${_pull_count} GATUS_ENDPOINTS pair(s) are no longer rendered - the tenant manifest is the monitor source now. Publish these names in the manifest and delete the secret after the migration:${_pull_dropped}"
+  fi
+  BUILTIN_NAMES=""
+else
 # Default target: the tenant homepage derives from TENANT_USER — no input
 # needed (pier → https://pier.piercloud.net). Skipped only for hand runs
 # without env (console fallback = self-check only, as documented).
@@ -1178,6 +1214,7 @@ if [ -n "${GATUS_ENDPOINTS:-}" ]; then
   IFS="$OLD_IFS"
   set +f
 fi
+fi
 if [ -n "${NTFY_TOPIC:-}" ]; then
   # Fail fast on YAML injection: topic/token interpolate into config-as-data.
   case "$NTFY_TOPIC" in ''|*[!a-zA-Z0-9_-]*) die "bad NTFY_TOPIC (chars [a-zA-Z0-9_-] only): ${NTFY_TOPIC}";; esac
@@ -1240,6 +1277,11 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "$ALERTING_YAML"
   printf '%s\n' ""
   printf '%s\n' "metrics: false"
+  printf '%s\n' ""
+  printf '%s\n' "skip-invalid-config-update: true   # keep the old config when a pulled fragment still slips through (the puller validates its candidate first)"
+  printf '%s\n' ""
+  printf '%s\n' "ui:"
+  printf '%s\n' "  default-sort-by: group   # platform / <alias> groups (the fragment owns the grouped rows)"
   printf '%s\n' ""
   printf '%s\n' "endpoints:"
   printf '%s\n' "  # The anchor through Caddy's :80 (proves the proxy path clevis"
@@ -1304,7 +1346,7 @@ EOF
 # operator anchor must carry the platform alert stanza — a platform block
 # removed together with its intent would otherwise render monitor-only
 # silently (the C4 ledger cannot see a synchronized drop).
-if [ -n "${NTFY_TOPIC:-}" ] && [ "$PLATFORM_ALERTS" -eq 1 ]; then
+if [ "$PULLER_MODE" -eq 0 ] && [ -n "${NTFY_TOPIC:-}" ] && [ "$PLATFORM_ALERTS" -eq 1 ]; then
   grep -qx 'platform' <<<"$ALERTS_EXPECTED_NAMES" \
     || die "Gatus render assertion failed: ANCHOR_ROLE=operator with a push channel must render the platform alert stanza — refusing to install"
 fi
@@ -1334,6 +1376,1247 @@ else
   log "Gatus config installed in place (rendered from dispatch env)"
 fi
 # --- gatus-render:end ---
+
+# --- BEGIN GATUS PULLER (tests/gatus-pull extracts this span; keep markers) ---
+# Dynamic status-page puller - optional component, on with STATUS_PULLER=on.
+# Renders /usr/local/sbin/piercloud-gatus-pull.sh (bash wrapper + embedded
+# stdlib-only Python), a 0600 env file, the seed fragment, and a 10-minute
+# systemd timer with jitter. The puller owns /etc/gatus/tenant-endpoints.yaml
+# (plus its .last-good sibling); #51 may replace config.yaml only; 010 seeds
+# the fragment once and never touches it afterwards. Design decisions D1-D12
+# (issue #186); operator notes: docs/dr.md; the scoped invariant-2 amendment
+# is in docs/invariants.md.
+#
+# Paths are overridable so the committed harness can render/install into
+# throwaway paths; the dispatch env never exports these names.
+GATUS_PULLER_SBIN="${GATUS_PULLER_SBIN:-/usr/local/sbin/piercloud-gatus-pull.sh}"
+GATUS_PULLER_ENV_FILE="${GATUS_PULLER_ENV_FILE:-/etc/piercloud/gatus-pull.env}"
+GATUS_PULLER_STATE_DIR="${GATUS_PULLER_STATE_DIR:-/var/lib/piercloud}"
+GATUS_PULLER_STATE_FILE="${GATUS_PULLER_STATE_FILE:-/var/lib/piercloud/gatus-pull.state}"
+GATUS_PULLER_FRAGMENT="${GATUS_PULLER_FRAGMENT:-/etc/gatus/tenant-endpoints.yaml}"
+GATUS_PULLER_CONFIG_DIR="${GATUS_PULLER_CONFIG_DIR:-/etc/gatus}"
+GATUS_PULLER_LOCK_FILE="${GATUS_PULLER_LOCK_FILE:-/run/piercloud-gatus-pull.lock}"
+GATUS_PULLER_SERVICE="${GATUS_PULLER_SERVICE:-/etc/systemd/system/piercloud-gatus-pull.service}"
+GATUS_PULLER_TIMER="${GATUS_PULLER_TIMER:-/etc/systemd/system/piercloud-gatus-pull.timer}"
+
+gatus_puller_mode() { # on | off | bad - STATUS_PULLER is the enabling switch
+  case "${STATUS_PULLER:-}" in
+    ''|0|false|no|off) printf 'off' ;;
+    1|true|yes|on)     printf 'on' ;;
+    *)                 printf 'bad' ;;
+  esac
+}
+
+render_gatus_puller() { # print the on-box puller wrapper (bash + embedded Python)
+  cat <<'GATUS_PULLER_FILE_EOF'
+#!/usr/bin/env bash
+# piercloud-gatus-pull.sh - dynamic status-page puller.
+# RENDERED by terraform-piercloud-anchor scripts/010-provision.sh; DO NOT EDIT.
+# Sources the 0600 env file and execs the stdlib-only Python below. Owns
+# /etc/gatus/tenant-endpoints.yaml only; never writes config.yaml. The
+# candidate fragment is parsed by a strict line grammar (no PyYAML on the box).
+set -euo pipefail
+
+ENV_FILE="${GATUS_PULLER_ENV_FILE:-/etc/piercloud/gatus-pull.env}"
+if [ ! -r "$ENV_FILE" ]; then
+  printf '[gatus-pull] FAIL: env file not readable: %s\n' "$ENV_FILE" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090,SC1091  # operator-controlled dispatched env file
+. "$ENV_FILE"
+set +a
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '[gatus-pull] FAIL: python3 is not installed\n' >&2
+  exit 2
+fi
+
+exec python3 - "$@" <<'GATUS_PULLER_PY_EOF'
+"""Gatus dynamic-endpoints puller (tenant + platform manifests -> one fragment).
+
+Rendered by terraform-piercloud-anchor scripts/010-provision.sh
+(`render_gatus_puller`); installed as /usr/local/sbin/piercloud-gatus-pull.sh
+(a bash wrapper that sources the 0600 env file and execs this Python). DO NOT
+EDIT on the box; a dispatch re-renders it.
+
+Stdlib only (the anchor installs python3-minimal; PyYAML is not a dependency).
+The candidate fragment is checked by `verify_fragment_text`, a strict line grammar
+for the exact fragment shape this module renders: the renderer and the
+grammar are the two halves of one contract. Manifest transport goes through
+`curl` (so the offline harness can PATH-stub it); the local Gatus statuses API
+and the ntfy push use http.client (no redirect machinery, no token in argv).
+
+Ownership: this process writes /etc/gatus/tenant-endpoints.yaml (and its
+.last-good sibling) only. It never writes config.yaml. Docs: docs/dr.md;
+invariant-2 amendment in docs/invariants.md.
+"""
+import datetime
+import hashlib
+import http.client
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+MAX_BODY = 65536                 # manifest size cap (64 KiB)
+MAX_TENANT_ENTRIES = 32
+MAX_PLATFORM_HOSTS = 64
+MAX_URL_LEN = 200
+CLOCK_SKEW_SECONDS = 300
+DEFAULT_STATUS_URL = "http://127.0.0.1:8080/api/v1/endpoints/statuses"
+DEFAULT_NTFY_URL = "https://ntfy.sh"
+DEFAULT_ACCEPT_TIMEOUT = 90
+DEFAULT_ACCEPT_INTERVAL = 5
+RESERVED_TENANT_NAMES = frozenset(("platform", "slice", "home"))
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+PLATFORM_HOST_NAME_RE = re.compile(r"^host-[0-9]{1,3}$")
+GATUS_KEY_NORMALIZE = re.compile(r"[/_.,#+&]")
+ISO8601_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$"
+)
+FRAGMENT_HEADER = (
+    "# DISPATCH-MANAGED by terraform-piercloud-anchor (gatus puller).\n"
+    "# DO NOT EDIT BY HAND - re-rendered from the tenant + platform manifests.\n"
+)
+ALERT_STANZA = (
+    "    alerts:\n"
+    "      - type: custom\n"
+    "        failure-threshold: 3\n"
+    "        send-on-resolved: true\n"
+    "        provider-override:\n"
+    "          placeholders:\n"
+    "            ALERT_TRIGGERED_OR_RESOLVED:\n"
+    '              TRIGGERED: "5"\n'
+    '              RESOLVED: "3"\n'
+)
+TENANT_TOP_KEYS = frozenset(("version", "generated_at", "tenant", "note", "endpoints", "disabled"))
+PLATFORM_TOP_KEYS = frozenset(("version", "generated_at", "note", "platform", "hosts", "disabled"))
+ENTRY_KEYS = frozenset(("name", "url", "alerts", "disabled"))
+
+
+class PullError(Exception):
+    """Fatal local error (exit 2): never installs a candidate."""
+
+
+class ManifestError(Exception):
+    """A channel's manifest is invalid: counted per channel, fail closed."""
+
+
+class FragmentError(Exception):
+    """The rendered candidate does not parse under the strict grammar."""
+
+
+def env(name, default=""):
+    return os.environ.get(name, default).strip()
+
+
+def env_int(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def log(message):
+    sys.stderr.write("[gatus-pull] %s\n" % message)
+    sys.stderr.flush()
+
+
+def clip(value, limit):
+    value = str(value)
+    return value if len(value) <= limit else value[:limit] + "..."
+
+
+def utc_stamp():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+class Config:
+    def __init__(self):
+        self.alias = env("GATUS_PULL_ALIAS")
+        self.role = env("GATUS_PULL_ROLE")
+        self.tenant_url = env("GATUS_PULL_TENANT_URL")
+        self.platform_url = env("GATUS_PULL_PLATFORM_URL")
+        self.fragment = env("GATUS_PULL_FRAGMENT")
+        self.config = env("GATUS_PULL_CONFIG")
+        self.state = env("GATUS_PULL_STATE")
+        self.status_url = env("GATUS_PULL_STATUS_URL", DEFAULT_STATUS_URL)
+        self.ntfy_url = env("GATUS_PULL_NTFY_URL", DEFAULT_NTFY_URL).rstrip("/")
+        self.ntfy_topic = env("NTFY_TOPIC")
+        self.ntfy_token = env("NTFY_TOKEN")
+        self.accept_timeout = env_int("GATUS_PULL_ACCEPT_TIMEOUT", DEFAULT_ACCEPT_TIMEOUT)
+        self.accept_interval = max(1, env_int("GATUS_PULL_ACCEPT_INTERVAL", DEFAULT_ACCEPT_INTERVAL))
+        problem = self.problem()
+        if problem:
+            raise PullError(problem)
+
+    def problem(self):
+        if not NAME_RE.match(self.alias):
+            return "GATUS_PULL_ALIAS is missing or not a valid alias"
+        if self.role not in ("", "tenant", "operator"):
+            return "GATUS_PULL_ROLE must be empty/tenant/operator"
+        if not self.tenant_url or not self.platform_url:
+            return "both manifest URLs are required"
+        if not self.fragment or not self.config or not self.state:
+            return "GATUS_PULL_FRAGMENT, GATUS_PULL_CONFIG and GATUS_PULL_STATE are required"
+        if not (self.fragment.endswith(".yaml") or self.fragment.endswith(".yml")):
+            return "the fragment path must end .yaml/.yml (Gatus only loads those)"
+        if os.path.basename(self.fragment).startswith("."):
+            return "the fragment path must not be a hidden file"
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# manifest fetch (curl subprocess; file:// is an explicit local test seam)
+# ---------------------------------------------------------------------------
+def _curl_failure(proc):
+    reason = "curl exit %s" % proc.returncode
+    stderr = (proc.stderr or "").strip().splitlines()
+    if stderr:
+        # curl writes protocol errors here; never manifest content. One line.
+        reason += ": " + clip(stderr[0], 160)
+    return reason
+
+
+def fetch(url, etag):
+    """Fetch one manifest. Returns (kind, body, etag) where kind is one of
+    ok / not_modified / not_published / failure."""
+    if url.startswith("file://"):
+        # Explicit local seam (harness only; 010 never renders a file:// URL).
+        # Entry URLs in a manifest are still https-only.
+        path = url[len("file://"):]
+        if not os.path.isabs(path):
+            return ("failure", b"", None, "file:// URL must be absolute")
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read(MAX_BODY + 1)
+        except OSError as exc:
+            return ("failure", b"", None, "local read failed: %s" % exc.strerror)
+        if len(body) > MAX_BODY:
+            return ("failure", b"", None, "body over %d bytes" % MAX_BODY)
+        return ("ok", body, None, "")
+    if not url.startswith("https://"):
+        return ("failure", b"", None, "unsupported URL scheme (https only)")
+    body_path = head_path = None
+    try:
+        body_fd, body_path = tempfile.mkstemp(prefix="gatus-pull-body-")
+        head_fd, head_path = tempfile.mkstemp(prefix="gatus-pull-head-")
+        os.close(body_fd)
+        os.close(head_fd)
+        args = [
+            "curl", "--proto", "=https", "--max-redirs", "0", "--max-time", "20",
+            "--max-filesize", str(MAX_BODY), "--speed-limit", "1000", "--speed-time", "10",
+            "-sS", "-o", body_path, "-D", head_path, "-w", "%{http_code}",
+        ]
+        if etag:
+            args += ["-H", "If-None-Match: " + etag]
+        args.append(url)
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return ("failure", b"", None, "curl failed to run: %s" % type(exc).__name__)
+        code = (proc.stdout or "").strip()
+        if proc.returncode != 0 and not code:
+            return ("failure", b"", None, _curl_failure(proc))
+        new_etag = None
+        try:
+            with open(head_path, "rb") as handle:
+                headers = handle.read(16384).decode("latin-1")
+            for line in headers.splitlines():
+                if line.lower().startswith("etag:"):
+                    new_etag = line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+        if code == "304":
+            return ("not_modified", b"", new_etag, "")
+        if code in ("404", "410"):
+            return ("not_published", b"", None, "")
+        if code != "200":
+            return ("failure", b"", None, "HTTP %s" % (code or "?"))
+        try:
+            with open(body_path, "rb") as handle:
+                body = handle.read(MAX_BODY + 1)
+        except OSError:
+            return ("failure", b"", None, "could not read the fetched body")
+        if len(body) > MAX_BODY:
+            return ("failure", b"", None, "body over %d bytes" % MAX_BODY)
+        return ("ok", body, new_etag, "")
+    finally:
+        for path in (body_path, head_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# validation
+# ---------------------------------------------------------------------------
+def _string(value, label):
+    if not isinstance(value, str):
+        raise ManifestError("%s must be a string" % label)
+    return value
+
+
+def _scalar_text(value):
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    return text
+
+
+def parse_generated_at(value):
+    if not isinstance(value, str):
+        raise ManifestError("generated_at must be a string")
+    match = ISO8601_RE.match(value)
+    if not match:
+        raise ManifestError("generated_at must be ISO-8601 with a timezone")
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    micro = int((match.group(7) or "0").ljust(6, "0"))
+    if match.group(8) == "Z":
+        tzinfo = datetime.timezone.utc
+    else:
+        sign = 1 if match.group(8)[0] == "+" else -1
+        hours = int(match.group(8)[1:3])
+        minutes = int(match.group(8)[4:6])
+        tzinfo = datetime.timezone(sign * datetime.timedelta(hours=hours, minutes=minutes))
+    try:
+        stamp = datetime.datetime(year, month, day, hour, minute, second, micro, tzinfo)
+    except ValueError as exc:
+        raise ManifestError("generated_at is not a real timestamp: %s" % exc)
+    return stamp.astimezone(datetime.timezone.utc)
+
+
+def validate_generated_at(doc):
+    stamp = parse_generated_at(doc.get("generated_at"))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if stamp > now + datetime.timedelta(seconds=CLOCK_SKEW_SECONDS):
+        raise ManifestError("generated_at is in the future")
+
+
+def validate_version(doc):
+    if doc.get("version") != 1:
+        raise ManifestError("version must be 1")
+
+
+def _check_top_keys(doc, allowed):
+    if not isinstance(doc, dict):
+        raise ManifestError("the manifest must be a JSON object")
+    extra = sorted(set(doc) - allowed)
+    if extra:
+        raise ManifestError("unknown top-level field(s): %s" % ", ".join(extra))
+
+
+def _validate_alerts(entry):
+    if "alerts" not in entry:
+        return False
+    value = entry["alerts"]
+    if not isinstance(value, bool):
+        raise ManifestError("alerts must be a boolean")
+    return value
+
+
+def _validate_disabled(entry):
+    if "disabled" not in entry:
+        return False
+    if entry["disabled"] is not True:
+        raise ManifestError("disabled must be exactly true when present")
+    return True
+
+
+def _validate_name(name):
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise ManifestError("name must match ^[a-z0-9][a-z0-9-]{0,30}$")
+    return name
+
+
+def _validate_tenant_name(name):
+    name = _validate_name(name)
+    normalized = GATUS_KEY_NORMALIZE.sub("-", name)
+    if normalized in RESERVED_TENANT_NAMES or normalized.startswith("host-"):
+        raise ManifestError("name %r is reserved" % name)
+    return name
+
+
+def _validate_url(value, allow_host):
+    if not isinstance(value, str):
+        raise ManifestError("url must be a string")
+    if len(value) > MAX_URL_LEN:
+        raise ManifestError("url is longer than %d characters" % MAX_URL_LEN)
+    for char in value:
+        code = ord(char)
+        if code < 0x20 or code == 0x7F:
+            raise ManifestError("url contains a control character")
+        if char in " ?#\"'\\$<>|^`":
+            raise ManifestError("url contains a forbidden character")
+    if not value.startswith("https://"):
+        raise ManifestError("url must start with https://")
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme != "https" or not parts.netloc:
+        raise ManifestError("url is not a valid https URL")
+    if "@" in parts.netloc or parts.username or parts.password:
+        raise ManifestError("url must not carry userinfo")
+    if parts.port is not None:
+        raise ManifestError("url must not carry an explicit port")
+    if parts.query or parts.fragment:
+        raise ManifestError("url must not carry a query or fragment")
+    host = parts.hostname or ""
+    if not host or host != host.lower():
+        raise ManifestError("url host must be lowercase")
+    if not allow_host(host):
+        raise ManifestError("url host %r is outside the allowlist" % host)
+    path = parts.path or "/"
+    if not path.startswith("/"):
+        raise ManifestError("url path must start with /")
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    return host, path
+
+
+class Resolver:
+    """Resolve each accepted host once; reject non-public targets (SSRF guard)."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def check(self, host):
+        if host in self.cache:
+            reason = self.cache[host]
+            if reason:
+                raise ManifestError("url host %r resolves to a non-public address: %s" % (host, reason))
+            return
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            self.cache[host] = "resolution failed (%s)" % exc
+            raise ManifestError("url host %r does not resolve" % host)
+        for info in infos:
+            address = info[4][0]
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if not ip.is_global:
+                self.cache[host] = str(ip)
+                raise ManifestError("url host %r resolves to a non-public address: %s" % (host, ip))
+        self.cache[host] = ""
+
+
+def validate_tenant(doc, alias, resolver):
+    _check_top_keys(doc, TENANT_TOP_KEYS)
+    validate_version(doc)
+    validate_generated_at(doc)
+    tenant = doc.get("tenant")
+    if tenant != alias:
+        raise ManifestError("tenant does not match this anchor's alias")
+    if "note" in doc:
+        _string(doc["note"], "note")
+    top_disabled = doc.get("disabled", False)
+    if not isinstance(top_disabled, bool):
+        raise ManifestError("disabled must be a boolean")
+    entries = doc.get("endpoints", [])
+    if not isinstance(entries, list):
+        raise ManifestError("endpoints must be a list")
+    if len(entries) > MAX_TENANT_ENTRIES:
+        raise ManifestError("more than %d tenant endpoints" % MAX_TENANT_ENTRIES)
+    if not entries and not top_disabled:
+        raise ManifestError("an empty endpoints list is rejected (set disabled: true to opt out)")
+    if top_disabled and entries:
+        raise ManifestError("disabled: true must not carry endpoints")
+    out = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ManifestError("each endpoint must be an object")
+        extra = sorted(set(entry) - ENTRY_KEYS)
+        if extra:
+            raise ManifestError("unknown endpoint field(s): %s" % ", ".join(extra))
+        name = _validate_tenant_name(entry.get("name"))
+        folded = name.casefold()
+        if folded in seen:
+            raise ManifestError("duplicate endpoint name %r (case-folded)" % name)
+        seen.add(folded)
+        if _validate_disabled(entry):
+            out.append({"name": name, "disabled": True, "url": None, "alerts": False})
+            continue
+        host, _path = _validate_url(entry.get("url"), _tenant_host_allowed(alias))
+        resolver.check(host)
+        out.append({"name": name, "disabled": False, "url": entry.get("url"),
+                    "alerts": _validate_alerts(entry)})
+    return out
+
+
+def _tenant_host_allowed(alias):
+    exact = "anchor-01-%s.piercloud.net" % alias
+    home = "home.%s.piercloud.net" % alias
+    nested_suffix = ".%s.piercloud.net" % alias
+    public_suffix = "-%s.piercloud.site" % alias
+
+    def allowed(host):
+        if host in (home, exact):
+            return True
+        if host.endswith(nested_suffix):
+            prefix = host[: -len(nested_suffix)]
+            labels = prefix.split(".")
+            return 1 <= len(labels) <= 2 and all(labels) and all(label == label.lower() for label in labels)
+        if host.endswith(public_suffix) and host.count(".") == 2:
+            return True
+        return False
+
+    return allowed
+
+
+def validate_platform(doc, resolver):
+    _check_top_keys(doc, PLATFORM_TOP_KEYS)
+    validate_version(doc)
+    validate_generated_at(doc)
+    if "note" in doc:
+        _string(doc["note"], "note")
+    top_disabled = doc.get("disabled", False)
+    if not isinstance(top_disabled, bool):
+        raise ManifestError("disabled must be a boolean")
+    platform = doc.get("platform", [])
+    hosts = doc.get("hosts", [])
+    if not isinstance(platform, list) or not isinstance(hosts, list):
+        raise ManifestError("platform and hosts must be lists")
+    if len(platform) > 1:
+        raise ManifestError("the platform list carries at most one row")
+    if len(hosts) > MAX_PLATFORM_HOSTS:
+        raise ManifestError("more than %d platform host rows" % MAX_PLATFORM_HOSTS)
+    if top_disabled and (platform or hosts):
+        raise ManifestError("disabled: true must not carry rows")
+    out = []
+    seen = set()
+    for entry in list(platform) + list(hosts):
+        if not isinstance(entry, dict):
+            raise ManifestError("each platform row must be an object")
+        extra = sorted(set(entry) - ENTRY_KEYS)
+        if extra:
+            raise ManifestError("unknown platform row field(s): %s" % ", ".join(extra))
+        if "alerts" in entry:
+            raise ManifestError("the platform manifest must not carry alerts (role-derived)")
+        name = _validate_name(entry.get("name"))
+        is_platform_row = not PLATFORM_HOST_NAME_RE.match(name)
+        if is_platform_row and name != "platform":
+            raise ManifestError("platform row name must be platform or host-<n>")
+        if name in seen:
+            raise ManifestError("duplicate platform row name %r" % name)
+        seen.add(name)
+        if _validate_disabled(entry):
+            out.append({"name": name, "disabled": True, "url": None, "is_platform_row": is_platform_row})
+            continue
+        expect_host = "%s.piercloud.net" % name
+        host, path = _validate_url(
+            entry.get("url"),
+            lambda candidate, want=expect_host: candidate == want,
+        )
+        if path != "/healthz":
+            raise ManifestError("platform row url path must be /healthz")
+        resolver.check(host)
+        out.append({"name": name, "disabled": False, "url": entry.get("url"),
+                    "is_platform_row": is_platform_row})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+def render_row(name, group, url, alerting):
+    out = [
+        "  - name: %s" % name,
+        "    group: %s" % group,
+        "    url: %s" % url,
+        "    interval: 60s",
+        "    conditions:",
+        '      - "[STATUS] == 200"',
+        "    client:",
+        "      ignore-redirect: true",
+    ]
+    if alerting:
+        out.append(ALERT_STANZA.rstrip("\n"))
+    return "\n".join(out)
+
+
+def render_fragment(alias, role, alerting, platform_entries, tenant_entries):
+    rows = []
+    platform_url = "https://platform.piercloud.net/healthz"
+    host_rows = []
+    for entry in platform_entries or []:
+        if entry.get("disabled"):
+            continue
+        if entry.get("is_platform_row"):
+            platform_url = entry["url"]
+        else:
+            host_rows.append(entry)
+    rows.append(render_row("platform", "platform", platform_url,
+                           alerting and role == "operator"))
+    rows.append(render_row("your piercloud", alias,
+                           "https://meta-%s.piercloud.site/healthz" % alias, alerting))
+    rows.append(render_row("private (gate)", alias,
+                           "https://teleport.%s.piercloud.net/web/login" % alias, alerting))
+    # `shared (gate)` is intentionally not seeded: no install-time signal that
+    # the shared class is in use (sites/federation S5/S6/S7).
+    for entry in host_rows:
+        rows.append(render_row(entry["name"], "platform", entry["url"],
+                               alerting and role == "operator"))
+    for entry in tenant_entries or []:
+        if entry.get("disabled"):
+            continue
+        rows.append(render_row(entry["name"], alias, entry["url"],
+                               bool(entry.get("alerts")) and alerting))
+    return FRAGMENT_HEADER + "endpoints:\n" + "\n".join(rows) + "\n"
+
+
+def render_seed(alias, role, alerting):
+    return render_fragment(alias, role, alerting, [], [])
+
+
+# ---------------------------------------------------------------------------
+# strict fragment grammar (stdlib-only; no PyYAML)
+# ---------------------------------------------------------------------------
+def verify_fragment_text(text):
+    """Parse the exact fragment shape. Returns [(group, name)] or raises."""
+    if not text.endswith("\n"):
+        raise FragmentError("fragment does not end with a newline")
+    lines = text.split("\n")
+    lines.pop()
+    index = 0
+    total = len(lines)
+
+    def skip_blank():
+        nonlocal index
+        while index < total and (lines[index] == "" or lines[index].startswith("#")):
+            index += 1
+
+    skip_blank()
+    if index >= total or lines[index] != "endpoints:":
+        raise FragmentError("missing the endpoints: root")
+    index += 1
+    keys = []
+    while True:
+        skip_blank()
+        if index >= total:
+            break
+        line = lines[index]
+        if not line.startswith("  - name: "):
+            raise FragmentError("unexpected line %d: %r" % (index + 1, clip(line, 80)))
+        name = line[len("  - name: "):]
+        if not name:
+            raise FragmentError("row without a name")
+        index += 1
+        fields = {"group": None, "url": None, "interval": None, "condition": False,
+                  "client": False, "alerts": False}
+        while index < total:
+            line = lines[index]
+            if line.startswith("  - name: "):
+                break
+            if line.startswith("    group: ") and fields["group"] is None:
+                fields["group"] = line[len("    group: "):]
+            elif line.startswith("    url: ") and fields["url"] is None:
+                fields["url"] = line[len("    url: "):]
+            elif line == "    interval: 60s" and fields["interval"] is None:
+                fields["interval"] = True
+            elif line == "    conditions:" and not fields["condition"]:
+                index += 1
+                if index >= total or lines[index] != '      - "[STATUS] == 200"':
+                    raise FragmentError("row %r has a non-canonical condition" % name)
+                fields["condition"] = True
+            elif line == "    client:" and not fields["client"]:
+                index += 1
+                if index >= total or lines[index] != "      ignore-redirect: true":
+                    raise FragmentError("row %r must carry client.ignore-redirect" % name)
+                fields["client"] = True
+            elif line == "    alerts:" and not fields["alerts"]:
+                index += 1
+                for expected in ALERT_STANZA.rstrip("\n").split("\n")[1:]:
+                    if index >= total or lines[index] != expected:
+                        raise FragmentError("row %r has a non-canonical alert stanza" % name)
+                    index += 1
+                fields["alerts"] = True
+                continue
+            else:
+                raise FragmentError("row %r: unexpected line %d: %r" % (name, index + 1, clip(line, 80)))
+            index += 1
+        for field in ("group", "url", "interval", "condition", "client"):
+            if not fields[field]:
+                raise FragmentError("row %r is missing %s" % (name, field))
+        if not NAME_RE.match(fields["group"]) and fields["group"] not in ("platform",):
+            raise FragmentError("row %r has a non-canonical group" % name)
+        keys.append((fields["group"], name))
+    if not keys:
+        raise FragmentError("fragment carries no rows")
+    return keys
+
+
+def config_static_keys(path):
+    """Endpoint (group, name) keys in the dispatch-managed config.yaml."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(256 * 1024)
+    except OSError:
+        return set()
+    keys = set()
+    name = None
+    for line in text.splitlines():
+        match = re.match(r"^\s*-\s*name:\s*(.*?)\s*$", line)
+        if match:
+            name = _scalar_text(match.group(1))
+            if name:
+                keys.add(("", name))
+            continue
+        match = re.match(r"^\s+group:\s*(.*?)\s*$", line)
+        if match and name is not None:
+            group = _scalar_text(match.group(1))
+            keys.discard(("", name))
+            keys.add((group, name))
+    return keys
+
+
+# ---------------------------------------------------------------------------
+# atomic write + state
+# ---------------------------------------------------------------------------
+def write_atomic(path, text, mode=0o644):
+    directory = os.path.dirname(path) or "."
+    handle_fd, tmp = tempfile.mkstemp(prefix=".gatus-fragment-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def load_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def save_state(path, state):
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        raise PullError("cannot create the state dir %s: %s" % (directory, exc))
+    write_atomic(path, json.dumps(state, sort_keys=True, indent=1) + "\n", mode=0o600)
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ntfy (http.client: no redirects, the token never enters argv)
+# ---------------------------------------------------------------------------
+def ntfy_token_problem(token):
+    if len(token) > 4096:
+        return "token is longer than 4096 characters"
+    for char in token:
+        if not ("!" <= char <= "~"):
+            return "token is not printable ASCII without spaces"
+    return ""
+
+
+def notify(cfg, title, message):
+    if not cfg.ntfy_topic:
+        return False
+    token = cfg.ntfy_token
+    problem = ntfy_token_problem(token) if token else ""
+    if problem:
+        log("ntfy push skipped: %s" % problem)
+        return False
+    parts = urllib.parse.urlsplit(cfg.ntfy_url)
+    path = "/" + urllib.parse.quote(cfg.ntfy_topic, safe="")
+    headers = {
+        "Title": title,
+        "Priority": "3",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        if parts.scheme == "http":
+            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=15)
+        else:
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=15,
+                                               context=ssl.create_default_context())
+        try:
+            conn.request("POST", path, body=clip(message, 800).encode("utf-8"), headers=headers)
+            response = conn.getresponse()
+            response.read()
+        finally:
+            conn.close()
+        return True
+    except (OSError, http.client.HTTPException) as exc:
+        log("ntfy push failed: %s" % clip(exc, 200))
+        return False
+    except (ValueError, UnicodeError) as exc:
+        log("ntfy push failed: %s" % type(exc).__name__)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# local Gatus statuses API acceptance
+# ---------------------------------------------------------------------------
+def http_get_json(url, timeout=10):
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "http":
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    elif parts.scheme == "https":
+        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout,
+                                           context=ssl.create_default_context())
+    else:
+        raise ValueError("unsupported status URL scheme")
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        body = response.read(MAX_BODY + 1)
+        if response.status != 200:
+            raise OSError("HTTP %d" % response.status)
+        if len(body) > MAX_BODY:
+            raise OSError("statuses body over %d bytes" % MAX_BODY)
+    finally:
+        conn.close()
+    return json.loads(body.decode("utf-8"))
+
+
+def status_key_present(group, name, have):
+    if (group, name) in have:
+        return True
+    composite = ("%s_%s" % (group, name)) if group else name
+    return ("", composite) in have or ("__key__", composite) in have
+
+
+def acceptance_ok(cfg, expected):
+    deadline = time.monotonic() + cfg.accept_timeout
+    last = "no attempt"
+    while True:
+        try:
+            doc = http_get_json(cfg.status_url)
+            have = set()
+            for item in doc if isinstance(doc, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or ""
+                group = item.get("group") or ""
+                if name:
+                    have.add((group, name))
+                key = item.get("key") or ""
+                if key:
+                    have.add(("__key__", key))
+            missing = ["%s/%s" % (group or "-", name) for group, name in expected
+                       if not status_key_present(group, name, have)]
+            if not missing:
+                return True
+            last = "missing from the statuses API: %s" % ", ".join(missing[:8])
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            last = "statuses API unavailable: %s" % type(exc).__name__
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(cfg.accept_interval)
+    log("post-install acceptance failed: %s" % last)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# pull orchestration
+# ---------------------------------------------------------------------------
+def _channel_state(state, channel):
+    section = state.get(channel)
+    if not isinstance(section, dict):
+        section = {}
+        state[channel] = section
+    return section
+
+
+def note_failure(cfg, state, channel, reason):
+    section = _channel_state(state, channel)
+    try:
+        failures = int(section.get("failures", 0)) + 1
+    except (TypeError, ValueError):
+        failures = 1
+    section["failures"] = failures
+    log("%s manifest failure (%d consecutive): %s" % (channel, failures, reason))
+    if failures >= 3 and not section.get("notified"):
+        notify(cfg, "gatus puller: %s manifest failing" % channel,
+               "%s manifest has failed %d times consecutively: %s" % (channel, failures, reason))
+        section["notified"] = True
+
+
+def note_success(cfg, state, channel):
+    section = _channel_state(state, channel)
+    if section.get("notified"):
+        notify(cfg, "gatus puller: %s manifest recovered" % channel,
+               "%s manifest fetch is healthy again" % channel)
+        section["notified"] = False
+    section["failures"] = 0
+    section["last_success"] = utc_stamp()
+
+
+def _parse_manifest(raw, validator, cfg, resolver):
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ManifestError("JSON parse failed: %s" % exc)
+    return validator(doc, **({"alias": cfg.alias, "resolver": resolver} if validator is validate_tenant
+                             else {"resolver": resolver}))
+
+
+def pull_channels(cfg, resolver):
+    state = load_state(cfg.state)
+    outcome = {}
+    for channel, url in (("tenant", cfg.tenant_url), ("platform", cfg.platform_url)):
+        section = _channel_state(state, channel)
+        previous = section.get("entries") if isinstance(section.get("entries"), list) else []
+        etag = section.get("etag") or ""
+        kind, body, new_etag, reason = fetch(url, etag)
+        if kind == "not_modified":
+            note_success(cfg, state, channel)
+            outcome[channel] = {"entries": previous, "etag": new_etag or etag,
+                                "fresh": True, "keep": True}
+        elif kind == "not_published":
+            section["failures"] = 0
+            log("%s manifest is not published (404/410) - keeping last-known-good" % channel)
+            outcome[channel] = {"entries": previous, "etag": etag,
+                                "fresh": False, "keep": True}
+        elif kind == "failure":
+            note_failure(cfg, state, channel, reason)
+            outcome[channel] = {"entries": previous, "etag": etag,
+                                "fresh": False, "keep": True}
+        else:
+            try:
+                entries = _parse_manifest(body, validate_tenant if channel == "tenant" else validate_platform,
+                                          cfg, resolver)
+            except ManifestError as exc:
+                note_failure(cfg, state, channel, str(exc))
+                outcome[channel] = {"entries": previous, "etag": etag,
+                                    "fresh": False, "keep": True}
+            else:
+                note_success(cfg, state, channel)
+                outcome[channel] = {"entries": entries, "etag": new_etag or etag,
+                                    "fresh": True, "keep": False}
+    return state, outcome
+
+
+def commit_channel_state(state, outcome):
+    for channel, result in outcome.items():
+        section = _channel_state(state, channel)
+        section["etag"] = result["etag"]
+        if not result["keep"]:
+            section["entries"] = result["entries"]
+
+
+def run_pull(cfg):
+    resolver = Resolver()
+    state, outcome = pull_channels(cfg, resolver)
+    alerting = bool(cfg.ntfy_topic)
+    candidate = render_fragment(
+        cfg.alias, cfg.role, alerting,
+        outcome["platform"]["entries"], outcome["tenant"]["entries"],
+    )
+    try:
+        parsed = verify_fragment_text(candidate)
+    except FragmentError as exc:
+        raise PullError("rendered candidate does not parse: %s" % exc)
+    expected = [(group, name) for group, name in parsed]
+    collisions = sorted(set(expected) & config_static_keys(cfg.config))
+    if collisions:
+        raise PullError("rendered rows collide with config.yaml static rows: %s"
+                        % ", ".join("%s/%s" % (g or "-", n) for g, n in collisions))
+    current = read_text(cfg.fragment)
+    if current == candidate:
+        log("fragment unchanged (identical bytes) - no write")
+        commit_channel_state(state, outcome)
+        state["rendered_hash"] = "sha256:" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        state["updated_at"] = utc_stamp()
+        save_state(cfg.state, state)
+        return 0
+    last_good = cfg.fragment + ".last-good"
+    if current is not None:
+        try:
+            write_atomic(last_good, current)
+        except OSError as exc:
+            raise PullError("cannot write %s: %s" % (last_good, exc))
+    try:
+        write_atomic(cfg.fragment, candidate)
+    except OSError as exc:
+        raise PullError("cannot write %s: %s" % (cfg.fragment, exc))
+    log("fragment written (%d row(s))" % len(expected))
+    if not acceptance_ok(cfg, expected):
+        restored = False
+        previous = read_text(last_good)
+        if previous is not None:
+            try:
+                write_atomic(cfg.fragment, previous)
+                restored = True
+            except OSError as exc:
+                log("could not restore the last-good fragment: %s" % exc)
+        notify(cfg, "gatus puller: candidate rejected by local Gatus",
+               "the rendered fragment did not appear in the local statuses API within %ds; "
+               "last-good restore: %s" % (cfg.accept_timeout, "yes" if restored else "no"))
+        state["updated_at"] = utc_stamp()
+        save_state(cfg.state, state)
+        return 1
+    old_names = set(state.get("last_tenant_names") or [])
+    new_names = {entry["name"] for entry in outcome["tenant"]["entries"] if not entry.get("disabled")}
+    removed = sorted(old_names - new_names)
+    if removed and outcome["tenant"]["fresh"]:
+        notify(cfg, "gatus puller: tenant monitor rows removed",
+               "removed by the tenant manifest: " + ", ".join(removed))
+    state["last_tenant_names"] = sorted(new_names)
+    commit_channel_state(state, outcome)
+    state["rendered_hash"] = "sha256:" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    state["updated_at"] = utc_stamp()
+    save_state(cfg.state, state)
+    return 0
+
+
+def run_seed(cfg):
+    candidate = render_seed(cfg.alias, cfg.role, bool(cfg.ntfy_topic))
+    try:
+        verify_fragment_text(candidate)
+    except FragmentError as exc:
+        raise PullError("seed fragment does not parse: %s" % exc)
+    if os.path.exists(cfg.fragment):
+        log("fragment already present - the seed never overwrites it")
+        return 0
+    try:
+        write_atomic(cfg.fragment, candidate)
+    except OSError as exc:
+        raise PullError("cannot seed %s: %s" % (cfg.fragment, exc))
+    log("fragment seeded with the platform + gate + slice rows")
+    return 0
+
+
+def run_state(cfg):
+    state = load_state(cfg.state)
+    tenant = state.get("tenant") if isinstance(state.get("tenant"), dict) else {}
+    platform = state.get("platform") if isinstance(state.get("platform"), dict) else {}
+    log("state: last_success tenant=%s platform=%s; etag tenant=%s platform=%s; rendered_hash=%s"
+        % (tenant.get("last_success") or "never", platform.get("last_success") or "never",
+           "yes" if tenant.get("etag") else "no", "yes" if platform.get("etag") else "no",
+           state.get("rendered_hash") or "none"))
+    return 0
+
+
+def main():
+    args = [arg for arg in sys.argv[1:] if arg in ("--seed", "--state")]
+    try:
+        cfg = Config()
+        if "--seed" in args:
+            return run_seed(cfg)
+        if "--state" in args:
+            return run_state(cfg)
+        return run_pull(cfg)
+    except PullError as exc:
+        log("FATAL: %s" % exc)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+GATUS_PULLER_PY_EOF
+GATUS_PULLER_FILE_EOF
+}
+
+render_gatus_puller_service() { # print the systemd service unit to stdout
+  cat <<GATUS_PULLER_SERVICE_EOF
+[Unit]
+Description=piercloud Gatus dynamic-endpoints puller (tenant + platform manifests)
+Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/dr.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n -E 0 ${GATUS_PULLER_LOCK_FILE} ${GATUS_PULLER_SBIN}
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=${GATUS_PULLER_CONFIG_DIR} ${GATUS_PULLER_STATE_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+GATUS_PULLER_SERVICE_EOF
+}
+
+render_gatus_puller_timer() { # print the systemd timer unit to stdout
+  cat <<'GATUS_PULLER_TIMER_EOF'
+[Unit]
+Description=Run the piercloud Gatus dynamic-endpoints puller every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=10min
+AccuracySec=1min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
+GATUS_PULLER_TIMER_EOF
+}
+
+gatus_puller_print_state() { # D6: print the puller run state (never a secret)
+  case "$(gatus_puller_mode)" in
+    on) ;;
+    *) return 0 ;;
+  esac
+  GATUS_PULLER_ENV_FILE="$GATUS_PULLER_ENV_FILE" bash "$GATUS_PULLER_SBIN" --state 2>&1 \
+    || warn "could not read the gatus puller state (${GATUS_PULLER_STATE_FILE})"
+}
+
+gatus_puller_install() { # render + install script, env file, seed fragment and units
+  local alias tmp
+  case "$(gatus_puller_mode)" in
+    on) ;;
+    off) return 0 ;;
+    *) die "bad STATUS_PULLER (want unset/true/false)" ;;
+  esac
+  alias="$(printf '%s' "${TENANT_USER:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$alias" in
+    ''|*[!a-z0-9-]*) die "STATUS_PULLER is on but TENANT_USER is missing or not a plain alias (chars [a-z0-9-])" ;;
+  esac
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "Installing python3 (gatus puller runtime)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq python3-minimal >/dev/null
+  fi
+  mkdir -p "$(dirname "$GATUS_PULLER_SBIN")" "$(dirname "$GATUS_PULLER_ENV_FILE")" "$GATUS_PULLER_STATE_DIR" \
+    "$GATUS_PULLER_CONFIG_DIR" "$(dirname "$GATUS_PULLER_SERVICE")" "$(dirname "$GATUS_PULLER_TIMER")"
+  chmod 700 "$GATUS_PULLER_STATE_DIR"
+  tmp="$(mktemp)"
+  render_gatus_puller >"$tmp"
+  bash -n "$tmp" || die "rendered gatus puller failed bash -n - refusing to install"
+  chmod 0755 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$GATUS_PULLER_SBIN"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
+    printf '%s\n' "# DO NOT EDIT BY HAND - re-rendered on every provision run. 0600, root-only."
+    printf 'GATUS_PULL_ALIAS=%q\n' "$alias"
+    printf 'GATUS_PULL_ROLE=%q\n' "${ANCHOR_ROLE:-}"
+    printf 'GATUS_PULL_TENANT_URL=%q\n' "https://meta-${alias}.piercloud.site/.well-known/pc-status.json"
+    printf 'GATUS_PULL_PLATFORM_URL=%q\n' "https://platform.piercloud.net/.well-known/pc-status.json"
+    printf 'GATUS_PULL_FRAGMENT=%q\n' "$GATUS_PULLER_FRAGMENT"
+    printf 'GATUS_PULL_CONFIG=%q\n' "$GATUS_CONFIG"
+    printf 'GATUS_PULL_STATE=%q\n' "$GATUS_PULLER_STATE_FILE"
+    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$GATUS_PULLER_ENV_FILE"
+  mkdir -p "$(dirname "$GATUS_PULLER_FRAGMENT")"
+  if [ ! -e "$GATUS_PULLER_FRAGMENT" ]; then
+    GATUS_PULLER_ENV_FILE="$GATUS_PULLER_ENV_FILE" bash "$GATUS_PULLER_SBIN" --seed \
+      || die "gatus puller seed render failed - refusing to start a Gatus without the shared rows"
+    log "Gatus tenant fragment seeded (${GATUS_PULLER_FRAGMENT}; puller-owned after this)"
+  else
+    log "Gatus tenant fragment already present (${GATUS_PULLER_FRAGMENT}) - leaving the puller-owned file untouched"
+  fi
+  render_gatus_puller_service >"$GATUS_PULLER_SERVICE.tmp.$$"
+  chmod 0644 "$GATUS_PULLER_SERVICE.tmp.$$"
+  mv "$GATUS_PULLER_SERVICE.tmp.$$" "$GATUS_PULLER_SERVICE"
+  render_gatus_puller_timer >"$GATUS_PULLER_TIMER.tmp.$$"
+  chmod 0644 "$GATUS_PULLER_TIMER.tmp.$$"
+  mv "$GATUS_PULLER_TIMER.tmp.$$" "$GATUS_PULLER_TIMER"
+  systemctl daemon-reload
+  systemctl enable piercloud-gatus-pull.timer >/dev/null
+  log "gatus puller installed (10 min timer + jitter; env file 0600; fragment puller-owned)"
+}
+
+gatus_puller_run_once() { # one synchronous run after Gatus is proven; flush the state
+  case "$(gatus_puller_mode)" in
+    on) ;;
+    *) return 0 ;;
+  esac
+  local rc=0
+  systemctl start piercloud-gatus-pull.service >/dev/null 2>&1 || rc=$?
+  gatus_puller_print_state
+  [ "$rc" -eq 0 ] \
+    || die "gatus puller one-shot run failed (systemctl rc=${rc}) - the fragment/state above is authoritative; inspect before dropping Gatus"
+}
+
+gatus_puller_disable() { # remove the puller artifacts + the puller-owned fragment
+  if [ ! -e "$GATUS_PULLER_SERVICE" ] && [ ! -e "$GATUS_PULLER_TIMER" ] && [ ! -e "$GATUS_PULLER_SBIN" ] \
+    && [ ! -e "$GATUS_PULLER_ENV_FILE" ] && [ ! -e "$GATUS_PULLER_FRAGMENT" ]; then
+    return 0
+  fi
+  log "STATUS_PULLER off - removing the puller artifacts and the fragment (the legacy config render owns the rows again)"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now piercloud-gatus-pull.timer >/dev/null 2>&1 || true
+    systemctl stop piercloud-gatus-pull.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$GATUS_PULLER_SERVICE" "$GATUS_PULLER_TIMER" "$GATUS_PULLER_SBIN" "$GATUS_PULLER_ENV_FILE" \
+    "$GATUS_PULLER_FRAGMENT" "$GATUS_PULLER_FRAGMENT.last-good"
+  log "gatus puller state kept at ${GATUS_PULLER_STATE_FILE} (evidence; remove by hand to reset)"
+}
+# --- END GATUS PULLER ---
+
+# ---------------------------------------------------------------------------
+# c0) Gatus dynamic-endpoints puller (optional; STATUS_PULLER=on)
+#    The fragment owns every watched HTTP row; on slice-managed anchors the
+#    puller re-renders it from the tenant + platform manifests on a timer
+#    (design issue #186, D1-D12). STATUS_PULLER unset = the legacy shape:
+#    the config render keeps platform/main + GATUS_ENDPOINTS and no puller
+#    is installed (standalone/template/BYOH). The seed is written here (so
+#    Gatus starts with the shared rows) and never touched by 010 again.
+# ---------------------------------------------------------------------------
+case "$(gatus_puller_mode)" in
+  on)
+    log "Installing the Gatus dynamic-endpoints puller (STATUS_PULLER=on)"
+    gatus_puller_install
+    ;;
+  off)
+    gatus_puller_disable
+    ;;
+  *) die "bad STATUS_PULLER (want unset/true/false): ${STATUS_PULLER:-}" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # c1) Per-anchor Origin CA key + CSR + cert install (issue #123, M2)
@@ -1372,12 +2655,13 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
-# Stale-mount guard: the container bind-mounts the config FILE, and a file
-# bind mount pins the inode — a container created before an `mv` install
-# keeps reading the OLD bytes forever (docker restart does not rebind
-# mounts; live 2026-10-07). Compare the container's view through its root
-# to the rendered path; divergence = recreate once. In-place installs keep
-# this guard quiet on every later run.
+# Stale-mount guard: the container bind-mounts the config directory (D8:
+# /config), so the container's /config/config.yaml is compared through its
+# root to the rendered path; divergence = recreate once. Separately, the
+# mount-SHAPE guard below detects a container created before the directory
+# cutover (the legacy file bind pins the inode and hides sibling fragments)
+# and recreates it. In-place installs keep the byte guard quiet on every
+# later run.
 GATUS_MOUNT_STALE=0
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   gatus_pid="$(docker inspect --format '{{.State.Pid}}' gatus 2>/dev/null || true)"
@@ -1385,13 +2669,31 @@ if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
     GATUS_MOUNT_STALE=1
   fi
 fi
+# Mount-shape recreate guard (D8): directory-mode Gatus only merges the
+# fragment when GATUS_CONFIG_PATH=/config resolves to a directory. A container
+# from the legacy file-mount era has neither; recreate it once at the cutover.
+GATUS_SHAPE_STALE=0
+if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
+  gatus_binds="$(docker inspect --format '{{json .HostConfig.Binds}}' gatus 2>/dev/null || true)"
+  gatus_env="$(docker inspect --format '{{json .Config.Env}}' gatus 2>/dev/null || true)"
+  case "$gatus_binds" in
+    *":/config/config.yaml"*) GATUS_SHAPE_STALE=1 ;;
+  esac
+  case "$gatus_env" in
+    *'"GATUS_CONFIG_PATH=/config"'*) ;;
+    *) GATUS_SHAPE_STALE=1 ;;
+  esac
+  if [ "$GATUS_SHAPE_STALE" = "1" ]; then
+    log "Gatus container predates the directory mount / GATUS_CONFIG_PATH (D8 cutover) - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
+  fi
+fi
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
   if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
-    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ]; then
-      log "Gatus already running on ${GATUS_IMAGE}"
+    if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ] && [ "${GATUS_SHAPE_STALE}" = "0" ]; then
+      log "Gatus already running on ${GATUS_IMAGE} (directory mount, GATUS_CONFIG_PATH=/config)"
     else
-      log "Gatus container predates the hostanchor mapping or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
+      log "Gatus container predates the hostanchor mapping, the directory mount or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
       docker rm -f gatus >/dev/null
     fi
   else
@@ -1405,7 +2707,8 @@ if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   docker run -d --name gatus --restart unless-stopped \
     -p 127.0.0.1:${GATUS_PORT}:8080 \
     --add-host=hostanchor:host-gateway \
-    -v "${GATUS_CONFIG}:/config/config.yaml:ro" \
+    -e GATUS_CONFIG_PATH=/config \
+    -v "$(dirname "${GATUS_CONFIG}")":/config:ro \
     --mount type=volume,source=gatus-data,target=/data \
     "${GATUS_IMAGE}" >/dev/null
 fi
@@ -1431,6 +2734,9 @@ if [ "$ok" != "1" ]; then
   docker logs gatus 2>&1 | tail -20 || true
   die "Gatus did not answer /api/v1/endpoints/statuses after restart — refusing to finish blind"
 fi
+# Gatus is proven: run the puller once so the fragment/state are converged
+# before the dispatch ends (D6 prints the run state; no secrets).
+gatus_puller_run_once
 
 # ---------------------------------------------------------------------------
 # e) Caddy — dashboard TLS + tang proxy (DISPATCH-MANAGED Caddyfile, same
