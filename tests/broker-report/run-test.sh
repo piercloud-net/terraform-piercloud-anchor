@@ -187,12 +187,12 @@ is "trailing-slash base rc=0" 0 "$rc"
 trail_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "$trail_url"
 # Every trailing slash must be stripped regardless of count, a path base must
-# survive, and no `//` may ever appear after the authority (an invariant, so a
-# bounded strip mutant cannot hide behind a larger slash count). Production
-# BROKER_URL is pathless; the join is shared. The 4096 sample is a practical
-# sampling ceiling: by construction, a bounded strip whose bound is at least
-# the largest sampled count is indistinguishable from the unbounded loop, so
-# the ceiling is disclosed rather than chased.
+# survive, and the join must not add a `//` for a trailing-slash base (the
+# invariant checked below, so a bounded strip mutant cannot hide behind a
+# larger slash count). Production BROKER_URL is pathless; the join is shared.
+# The 4096 sample is a practical sampling ceiling: by construction, a bounded
+# strip whose bound is at least the largest sampled count is indistinguishable
+# from the unbounded loop, so the ceiling is disclosed rather than chased.
 for n in 2 3 4 5 64 65 4096; do
   slashes="$(printf '%.0s/' $(seq 1 "$n"))"
   rc="$(RUN "slash$n" broker-ref-1 192.0.2.10 "BROKER_URL=https://broker.example$slashes")"
@@ -212,6 +212,13 @@ rc="$(RUN okdeep broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a/b/
 is "deep-path base rc=0" 0 "$rc"
 deep_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "deep-path POST URL exact" "https://broker.example/a/b/v1/anchors/ip" "$deep_url"
+# An internal `//` in the base path is preserved, not collapsed: the strip is
+# trailing-only, so the (otherwise invisible) whole-URL collapse normalizer is
+# caught by this exact URL.
+rc="$(RUN okinner broker-ref-1 192.0.2.10 'BROKER_URL=https://broker.example/a//b')"
+is "internal-double-slash base rc=0" 0 "$rc"
+inner_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "internal-double-slash POST URL exact" "https://broker.example/a//b/v1/anchors/ip" "$inner_url"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
