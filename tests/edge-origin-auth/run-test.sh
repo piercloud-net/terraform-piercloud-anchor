@@ -207,5 +207,21 @@ case "${gate_line_ci}" in
   *) bad "ci.yml unit-tests gate skips .tf-only changes (the sync tooth would not run)" ;;
 esac
 
+# Third independent wiring-completeness checker (b3b #189): every committed
+# harness must be named in the ci.yml run list; no harness can catch its own
+# removal. Three checkers in three harnesses mean dropping one still leaves
+# two failing. Whole-line, indentation-tolerant match, so a decoy
+# `echo skipped # bash ...` or a removed line fails here.
+shopt -s nullglob
+edge_harnesses=(tests/*/run-test.sh)
+[ ${#edge_harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
+for t in "${edge_harnesses[@]}"; do
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" "$CI"; then
+    ok "ci.yml run list includes $t"
+  else
+    bad "ci.yml run list includes $t"
+  fi
+done
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

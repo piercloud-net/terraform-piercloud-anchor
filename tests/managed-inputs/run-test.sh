@@ -24,7 +24,8 @@
 #   - WIRING COMPLETENESS: every committed `tests/*/run-test.sh` is named in
 #     the ci.yml run list and its directory is in the unit-tests path gate;
 #     a dropped line would silently skip that harness (no harness can catch
-#     its own absence — broker-provision-dns carries the same cross-check).
+#     its own absence — broker-provision-dns and edge-origin-auth carry the
+#     same cross-check).
 #
 # Cred-free, offline: no network, no credentials.
 set -euo pipefail
@@ -229,12 +230,23 @@ is "b3 mismatching marker rc" "1" "$rc"
 # carries the same cross-check, so dropping either checker's own line still
 # leaves the other one failing. (Removing BOTH checkers is a two-line,
 # review-visible edit and remains the disclosed drift-guard residual.)
-gate_line="$(grep -m1 -F "elif grep -qE '^(\.github/scripts/" "$CI" || true)"
+# The gate line comes from comment-stripped text, so a commented-out gate
+# cannot satisfy the check; the run-list match is whole-line and
+# indentation-tolerant, so a decoy `echo skipped # bash ...` cannot either.
+ci_live="$(grep -v '^[[:space:]]*#' "$CI")"
+gate_line="$(printf '%s\n' "$ci_live" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
-for t in tests/*/run-test.sh; do
+shopt -s nullglob
+harnesses=(tests/*/run-test.sh)
+[ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
+for t in "${harnesses[@]}"; do
   dir="$(basename "$(dirname "$t")")"
   contains "unit-tests gate covers tests/$dir" "$dir" "$gate_line"
-  contains "ci.yml run list includes $t" "bash $t" "$(cat "$CI")"
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" "$CI"; then
+    ok "ci.yml run list includes $t"
+  else
+    bad "ci.yml run list includes $t"
+  fi
 done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

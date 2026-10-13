@@ -43,8 +43,12 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 
 # The anchor-dns job text, comments stripped: a stray comment must not fake a
 # wiring assertion (the lib call, guard message and env are live YAML). The
-# job sits between `anchor-dns:` and the next top-level job key.
-JOB="$(awk '/^  anchor-dns:/{f=1;next} f && /^  [a-z0-9][a-z0-9-]*:$/{exit} f' "$PROV" | grep -v '^[[:space:]]*#')"
+# job sits between `anchor-dns:` and the next top-level job key — the
+# boundary regex admits `_` and uppercase (a renamed `anchor_dns_helper:`
+# job or a capitalised decoy key must still END the extraction, not sit
+# inside it).
+JOB_RAW="$(awk '/^  anchor-dns:/{f=1;next} f && /^  [A-Za-z_][A-Za-z0-9_-]*:$/{exit} f' "$PROV")"
+JOB="$(printf '%s\n' "$JOB_RAW" | grep -v '^[[:space:]]*#')"
 [ -n "$JOB" ] || { printf 'FAIL anchor-dns job not found in %s\n' "$PROV"; exit 1; }
 
 # ---- the broker-dns lib is the one writer --------------------------------
@@ -96,13 +100,21 @@ is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$
 # injected step-level `env:`, because YAML strips the body indent and bash
 # does not care about the residual indentation. The whole step (comments
 # included) is hashed, so any edit — however indented — must update the pin.
+# Extraction is job-scoped: the step must live inside the anchor-dns job,
+# so a decoy step in a workflow-level block scalar / another job cannot
+# satisfy the pin, and the same `_`/uppercase job boundary applies.
 STEP_BLOB="$(awk '
   /^      - name: Upsert anchor A \+ dashboard CNAME through the broker$/ {f=1}
   f && /^      - name: / && $0 !~ /Upsert anchor A \+ dashboard CNAME through the broker$/ {exit}
-  f && /^  [a-z0-9][a-z0-9-]*:$/ {exit}
+  f && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ {exit}
   f {print}
-' "$PROV")"
+' <<<"$JOB_RAW")"
 is "write step blob hash" "5293b16c734b119a757a0653e8824f44b224910d9909bc5f18f4b8bef9c5f806" "$(printf '%s\n' "$STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+# Exactly one write step anywhere in the workflow and exactly one
+# write_anchor_dns token in the job: a second (unpinned) writer step that
+# runs `... || true`, or a relocated copy, is caught here.
+is "exactly one write-step header in the workflow" "1" "$(grep -cE '^      - name: Upsert anchor A \+ dashboard CNAME through the broker$' "$PROV")"
+is "exactly one write_anchor_dns token in the job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -c 'write_anchor_dns')"
 
 # ---- the managed-lane guard fails closed ----------------------------------
 contains "guard names the b3b broker path" 'anchor DNS now goes through the pc-control broker (b3b, #189)' "$JOB"
@@ -128,7 +140,12 @@ if [ -e tests/anchor-dns ]; then bad "retired harness still present"; else ok "r
 
 # ---- CI: the new harness is wired, the old one is not ---------------------
 ci_live="$(grep -v '^[[:space:]]*#' "$CI")"
-contains "ci path gate triggers this harness" 'broker-provision-dns' "$ci_live"
+# The gate assertion is scoped to the unit-tests gate LINE (extracted from
+# comment-stripped text): a commented-out or unrelated mention of the
+# harness elsewhere in ci.yml must not satisfy it.
+ci_gate="$(printf '%s\n' "$ci_live" | grep -m1 -F "elif grep -qE '^(\.github/scripts/" || true)"
+[ -n "$ci_gate" ] || bad "ci.yml unit-tests gate line not found"
+contains "ci path gate triggers this harness" 'broker-provision-dns' "$ci_gate"
 contains "ci runs this harness" 'bash tests/broker-provision-dns/run-test.sh' "$ci_live"
 lacks "ci no longer runs the retired harness" 'tests/anchor-dns/run-test.sh' "$ci_live"
 lacks "ci path gate no longer names the retired harness" 'anchor-dns' "$ci_live"
@@ -166,18 +183,34 @@ case "$rc" in
   *) bad "grep failed scanning for the retired writer/harness (rc=$rc)" ;;
 esac
 
-# Composite actions are optional today but would execute in the same context:
-# fold them into the scan the moment the directory exists.
-if [ -d .github/actions ]; then
+# Composite and local actions execute in the same context: every action
+# manifest anywhere outside tests/ (a `uses: ./actions/foo` local action
+# included) and every file under an actions/ or .github/actions/ directory
+# joins the scan. Retired names must not appear in any of them.
+action_files=()
+while IFS= read -r f; do action_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests \) -prune -o -type f \( -name 'action.yml' -o -name 'action.yaml' \) -print | sort)
+for d in .github/actions actions; do
+  if [ -d "$d" ]; then
+    while IFS= read -r f; do action_files+=("$f"); done < <(find "$d" -type f | sort)
+  fi
+done
+if [ "${#action_files[@]}" -gt 0 ]; then
   for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
     rc=0
-    hits="$(grep -rlnwE -- "$v" .github/actions)" || rc=$?
+    hits="$(grep -lnwE -- "$v" "${action_files[@]}")" || rc=$?
     case "$rc" in
-      0) bad "composite action uses $v: $hits" ;;
-      1) ok "no composite action uses $v" ;;
-      *) bad "grep failed scanning composite actions for $v (rc=$rc)" ;;
+      0) bad "action manifest/script uses $v: $hits" ;;
+      1) ok "no action manifest/script uses $v" ;;
+      *) bad "grep failed scanning action files for $v (rc=$rc)" ;;
     esac
   done
+  rc=0
+  hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${action_files[@]}")" || rc=$?
+  case "$rc" in
+    0) bad "action manifest/script references the retired writer/harness: $hits" ;;
+    1) ok "no action manifest/script references the retired writer/harness" ;;
+    *) bad "grep failed scanning action files for the retired writer/harness (rc=$rc)" ;;
+  esac
 fi
 
 # Dynamic secret/variable indexing can reconstruct any banned name from split
@@ -187,12 +220,12 @@ fi
 # only admitted spelling.
 gh_files="$(find .github -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' \) | sort)"
 [ -n "$gh_files" ] || bad "no .github files found for the dynamic-index scan"
-for pat in 'secrets[' 'vars['; do
+for pat in 'secrets[[:space:]]*\[' 'vars[[:space:]]*\['; do
   rc=0
-  hits="$(grep -lnF -- "$pat" $gh_files)" || rc=$?
+  hits="$(grep -lnE -- "$pat" $gh_files)" || rc=$?
   case "$rc" in
-    0) bad "dynamic indexing '$pat' in .github: $hits" ;;
-    1) ok "no dynamic indexing '$pat' in .github" ;;
+    0) bad "dynamic indexing matching '$pat' in .github: $hits" ;;
+    1) ok "no dynamic indexing matching '$pat' in .github" ;;
     *) bad "grep failed scanning for '$pat' (rc=$rc)" ;;
   esac
 done
@@ -200,8 +233,17 @@ done
 # A dropped run-list line silently skips a harness and no harness can catch
 # its own absence — the cross-check lives here and in managed-inputs, so
 # removing either checker's line still leaves the other one to fail.
-for t in tests/*/run-test.sh; do
-  contains "ci.yml run list includes $t" "bash $t" "$ci_live"
+shopt -s nullglob
+harnesses=(tests/*/run-test.sh)
+[ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
+for t in "${harnesses[@]}"; do
+  # Whole-line, indentation-tolerant match: an `echo skipped # bash ...`
+  # decoy or a removed line does not satisfy it (the line must be the run).
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" "$CI"; then
+    ok "ci.yml run list includes $t"
+  else
+    bad "ci.yml run list includes $t"
+  fi
 done
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -89,7 +89,9 @@ Making the account the single-writer unit keeps the sweep truthful.
   fallback; the lane is assigned when the run is created, before input
   validation — a bad dispatch with a valid ref still occupies the lane and
   can cancel its single pending run, which is why the backend ledger, not
-  GitHub, is the queue);
+  GitHub, is the queue; the ref is matched verbatim, so two spellings of one
+  account's ref (e.g. `acct` vs `acct.`) occupy different lanes — the
+  registry mints one canonical ref per account);
 - the managed-input preflight (ungated `visibility-banner` job): a `tenant`
   dispatch without `anchor_ref`, or with a malformed, uppercase or
   over-long value, fails before the environment gate and the device card;
