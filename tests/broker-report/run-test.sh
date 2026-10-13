@@ -190,6 +190,10 @@ rc="$(RUN okdblslsh broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example//)
 is "double-trailing-slash base rc=0" 0 "$rc"
 dbl_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
 is "double-trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "$dbl_url"
+rc="$(RUN oktriple broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example///)"
+is "triple-trailing-slash base rc=0" 0 "$rc"
+triple_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "triple-trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "$triple_url"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
