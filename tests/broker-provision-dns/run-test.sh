@@ -94,6 +94,13 @@ JOB="$(printf '%s\n' "$JOB_RAW" | grep -v '^[[:space:]]*#' || true)"
 # Exactly one job key at top level: a decoy scalar the stripper does not
 # recognise would add a second (and the structural view would pick it first).
 is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?(\"anchor-dns\"|'anchor-dns'|anchor-dns)[[:space:]]*:?[[:space:]]*(#.*)?$" "$PROV")"
+# Spelling-agnostic structural census: every raw line that starts at indent 2
+# with a non-space, non-comment character is a structural line of the
+# workflow top level (on/concurrency/permissions children plus the eight job
+# keys). A duplicate or decoy job key in ANY spelling (tags, quotes, hex
+# escapes, explicit keys) adds one, so it fails until the pin is deliberately
+# updated.
+is "provision.yml structural indent-2 line count" "12" "$(grep -cE '^  [^[:space:]#]' "$PROV")"
 
 # ---- the broker-dns lib is the one writer --------------------------------
 contains "broker-dns lib defines write_anchor_dns" 'write_anchor_dns()' "$(cat "$LIB")"
@@ -155,9 +162,11 @@ is "no shadowing write_anchor_dns definition in the job" "0" "$(printf '%s\n' "$
 # startup-file variables that can neuter the job's `set -euo pipefail`.
 is "no job-level continue-on-error" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
 is "no job-level defaults" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
+is "exactly one job-level if in the anchor-dns job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?if"?[[:space:]]*:')"
+is "exactly one strict apply-gate if" "1" "$(printf '%s\n' "$JOB_LINES" | grep -cE '^    if: inputs\.mode == .apply.$')" 
 for k in if strategy defaults continue-on-error; do
-  is "no job-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    \\?[[:space:]]*\"?${k}\"?[[:space:]]*$")"
-  is "no step-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^        \\?[[:space:]]*\"?${k}\"?[[:space:]]*$")"
+  is "no job-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*\"?${k}\"?[[:space:]]*$")"
+  is "no step-level explicit-key $k in the anchor-dns job" "0" "$(printf '%s\n' "$JOB_LINES" | grep -cE "^        \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*\"?${k}\"?[[:space:]]*$")"
 done
 is "no workflow-level defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$PROV")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
@@ -334,16 +343,16 @@ is "unit-tests job has no strategy" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '
 is "unit-tests job has no continue-on-error" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?continue-on-error"?[[:space:]]*:')"
 is "unit-tests job has no defaults" "0" "$(printf '%s\n' "$ci_unit" | grep -cE '^    (&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:')"
 for k in if strategy defaults continue-on-error; do
-  is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*\"?${k}\"?[[:space:]]*$")"
+  is "unit-tests job has no explicit-key $k" "0" "$(printf '%s\n' "$ci_unit" | grep -cE "^    \\?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*\"?${k}\"?[[:space:]]*$")"
 done
 is "ci.yml has no workflow defaults" "0" "$(grep -cE '^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*"?defaults"?[[:space:]]*:' "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
 for f in "$CI" "$PROV"; do
-  if grep -qE '\\[uU]005[fF]|\\[uU]0000005[fF]|\\[xX]5[fF]' "$f"; then
-    bad "$(basename "$f") contains an escaped BASH_ENV spelling"
+  if grep -qE '\\[uUxX][0-9a-fA-F]' "$f"; then
+    bad "$(basename "$f") contains a YAML hex escape (key-assembly route)"
   else
-    ok "$(basename "$f") has no escaped BASH_ENV spelling"
+    ok "$(basename "$f") has no YAML hex escape"
   fi
 done
 # The in-tree allowlist default must not admit the retired provider APIs
@@ -358,7 +367,9 @@ lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
 # ---- production surfaces carry no retired name ----------------------------
 # Every non-Markdown file in the repo outside tests/, .git/ and the
 # gitignored .local/ proof config is a production surface (extensionless
-# included): a new `tools/evil.sh`, `tools/dns-fallback.env`, `evil.bash`,
+# included), plus any `.md` under `.github/` or `scripts/` (a sourced
+# `evil.md` is production; top-level docs/README stay out): a new
+# `tools/evil.sh`, `tools/dns-fallback.env`, `evil.bash`,
 # `.github/workflows/evil.yaml` or `scripts/lib/helper` must not sit outside
 # the scan. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
@@ -374,7 +385,7 @@ for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' 'scripts/*.sh'; do
   compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
 done
 surface_files=()
-while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type f ! -name '*.md' -print | sort)
+while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type f \( ! -name '*.md' -o -path './.github/*' -o -path './scripts/*' \) -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
 # closed instead (the tree has none).
