@@ -195,12 +195,17 @@ lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl write_anchor_dns broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
 is "missing OIDC context refused" 1 "$(RUN noctx write_anchor_dns broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
 contains "no-OIDC error carries the broker dns prefix" "::error::broker dns: no OIDC request context" "$(cat "$WORK/err.noctx")"
+# The challenge path's label handoff needs its own no-OIDC case (the anchor
+# DNS one above does not exercise it).
+is "challenge missing OIDC context refused" 1 "$(RUN chnoctx write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
+contains "challenge no-OIDC error carries the broker dns prefix" "::error::broker dns: no OIDC request context" "$(cat "$WORK/err.chnoctx")"
 is "token endpoint non-200 refused" 1 "$(RUN tok500 write_anchor_dns broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
 contains "token 500 message" "OIDC token request answered HTTP 500" "$(cat "$WORK/err.tok500")"
 is "token network error refused" 1 "$(RUN tokfail write_anchor_dns broker-ref-1 192.0.2.10 STUB_FAIL=token)"
 is "anchor dns post 409 refused" 1 "$(RUN post409 write_anchor_dns broker-ref-1 192.0.2.10 STUB_POST_CODE=409 'STUB_POST_BODY={"error":"A value does not match the registry anchor IP reported by this run"}')"
 is "anchor dns post 502 refused" 1 "$(RUN post502 write_anchor_dns broker-ref-1 192.0.2.10 STUB_POST_CODE=502)"
 is "challenge post 404 refused" 1 "$(RUN ch404 write_challenge _acme-challenge.anchor-01-envproof.piercloud.net abc present STUB_POST_CODE=404)"
+contains "challenge refusal carries the broker dns prefix" "::error::broker dns refused" "$(cat "$WORK/err.ch404")"
 is "post network error refused" 1 "$(RUN postfail write_anchor_dns broker-ref-1 192.0.2.10 STUB_FAIL=post)"
 RUN postml write_anchor_dns broker-ref-1 192.0.2.10 STUB_POST_CODE=409 'STUB_POST_BODY={"error":"ambiguous anchor"}' >/dev/null
 errlines="$(wc -l <"$WORK/err.postml")"

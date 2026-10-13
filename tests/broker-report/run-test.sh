@@ -159,6 +159,16 @@ lacks "no curl call for invalid input" "CALL " "$(cat "$WORK/curl.log")"
 is "non-https BROKER_URL refused" 1 "$(RUN httpurl broker-ref-1 192.0.2.10 BROKER_URL=http://broker.example)"
 is "missing OIDC context refused" 1 "$(RUN noctx broker-ref-1 192.0.2.10 ACTIONS_ID_TOKEN_REQUEST_URL= ACTIONS_ID_TOKEN_REQUEST_TOKEN=)"
 contains "no-OIDC error carries the broker report prefix" "::error::broker report: no OIDC request context" "$(cat "$WORK/err.noctx")"
+# A non-default BROKER_URL must actually be used, and a trailing slash must
+# not produce a double-slash path.
+rc="$(RUN okalt broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example)"
+is "alternate base rc=0" 0 "$rc"
+alt_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "alternate base POST URL exact" "https://broker.example/v1/anchors/ip" "$alt_url"
+rc="$(RUN oktrail broker-ref-1 192.0.2.10 BROKER_URL=https://broker.example/)"
+is "trailing-slash base rc=0" 0 "$rc"
+trail_url="$(awk '/^CALL method=POST/ { print $3; exit }' "$WORK/curl.log" | sed 's/^url=//')"
+is "trailing-slash base POST URL exact" "https://broker.example/v1/anchors/ip" "$trail_url"
 
 # ---- behavior: upstream failures ------------------------------------------
 is "token endpoint non-200 refused" 1 "$(RUN tok500 broker-ref-1 192.0.2.10 STUB_TOKEN_CODE=500)"
@@ -173,6 +183,9 @@ RUN postml broker-ref-1 192.0.2.10 'STUB_POST_CODE=409' 'STUB_POST_BODY={"error"
 errlines="$(wc -l <"$WORK/err.postml")"
 is "refusal body flattened to one line" 1 "$errlines"
 contains "refusal body preserved on the line" "ambiguous" "$(cat "$WORK/err.postml")"
+# The label must stay pinned on the refusal path too (a hardcoded label
+# would otherwise pass every test).
+contains "refusal carries the broker report prefix" "::error::broker report refused" "$(cat "$WORK/err.postml")"
 
 # ---- static wiring: provision.yml -----------------------------------------
 prov_live="$(grep -v '^[[:space:]]*#' "$PROV")"
