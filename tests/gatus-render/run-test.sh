@@ -5,8 +5,9 @@
 # Extracts the REAL render span from scripts/010-provision.sh
 # (`# --- gatus-render:start/end ---`; never a copy) and drives it with
 # fixture env. Proves:
-#   (a) the platform row renders on every anchor, monitor-only on tenant
-#       shapes and alerting on the operator shape (call C1/C2);
+#   (a) the LEGACY shape (STATUS_PULLER unset) still renders the platform row
+#       on every anchor, monitor-only on tenant shapes and alerting on the
+#       operator shape (call C1/C2);
 #   (b) the alert shapes (call C9): class-5 rows (main/platform) publish
 #       through the ntfy-JSON custom bridge with TRIGGERED 5 / RESOLVED 3 and
 #       send-on-resolved; class-4 rows (GATUS_ENDPOINTS pairs, dashboard TLS)
@@ -15,7 +16,10 @@
 #       fails, a `main=` pair fails only when the `main` built-in rendered;
 #   (d) the role gate fails closed on an unknown ANCHOR_ROLE;
 #   (e) with no NTFY_TOPIC the config is alert-free (checks only);
-#   (f) regression: tang + dashboard TLS rows and their conditions survive.
+#   (f) regression: tang + dashboard TLS rows and their conditions survive;
+#   (g) PULLER MODE (issue #186, STATUS_PULLER=on): the single-owner split —
+#       010 renders ONLY tang + dashboard TLS, drops GATUS_ENDPOINTS loudly,
+#       and renders skip-invalid-config-update + ui.default-sort-by: group.
 #
 # The span needs helpers defined earlier in 010 (log/warn/die/caddy_status_names)
 # and GATUS_CONFIG; it is executed in a subshell per case so `die` only ends
@@ -110,6 +114,8 @@ has "tenant: platform row present" "$platform_block" "url: https://platform.pier
 has "tenant: platform interval 60s" "$platform_block" "interval: 60s"
 has "tenant: platform status condition" "$platform_block" '[STATUS] == 200'
 lacks "tenant: platform row is monitor-only (no alerts)" "$platform_block" "alerts:"
+has "tenant: skip-invalid-config-update present" "$(cat "$CFG")" "skip-invalid-config-update: true"
+has "tenant: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by: group"
 main_block="$(block main "$CFG")"
 has "main uses the ntfy-JSON bridge" "$main_block" "type: custom"
 has "main resolves at priority 3" "$main_block" 'RESOLVED: "3"'
@@ -253,6 +259,37 @@ SPAN="${WORK}/span-noplatform.src"
 if render teeth_operator_assertion; then bad "operator assertion catches a dropped platform block"; else ok "operator assertion catches a dropped platform block"; fi
 has "operator assertion names the platform stanza" "$(cat "$WORK/teeth_operator_assertion/stderr.log")" "must render the platform alert stanza"
 SPAN="${WORK}/span.src"
+
+# ---- (h) puller mode (STATUS_PULLER=on): the single-owner split ----------
+fixture_env
+export STATUS_PULLER=on NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator \
+       GATUS_ENDPOINTS="blog=https://blog.example.com,jobs=https://jobs.example.com"
+if render puller_mode; then ok "puller-mode shape renders"; else bad "puller-mode shape renders"; fi
+CFG="$WORK/puller_mode/config.yaml"
+yaml_ok "puller-mode YAML parses" "$CFG"
+lacks "puller mode: no main row" "$(cat "$CFG")" "- name: main"
+lacks "puller mode: no platform row" "$(cat "$CFG")" "- name: platform"
+lacks "puller mode: no GATUS_ENDPOINTS rows" "$(cat "$CFG")" "blog"
+has "puller mode: tang row survives" "$(block "tang (via Caddy)" "$CFG")" "url: http://hostanchor/adv"
+has "puller mode: dashboard TLS survives" "$(block "dashboard TLS (via edge)" "$CFG")" "[CERTIFICATE_EXPIRATION] > 720h"
+has "puller mode: skip-invalid-config-update present" "$(cat "$CFG")" "skip-invalid-config-update: true"
+has "puller mode: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by: group"
+has "puller mode: dropped pairs logged loudly" "$(cat "$WORK/puller_mode/stderr.log")" "no longer rendered"
+has "puller mode: dropped pair names logged" "$(cat "$WORK/puller_mode/stderr.log")" "blog"
+has "puller mode: migration hint logged" "$(cat "$WORK/puller_mode/stderr.log")" "delete the secret"
+has "puller mode: alert ledger counts only dashboard TLS" "$(cat "$WORK/puller_mode/stderr.log")" "Gatus alert stanzas: 1"
+alerting="$(sed -n '/^alerting:/,/^endpoints:/p' "$CFG")"
+has "puller mode: push channel still renders" "$alerting" "https://ntfy.sh"
+
+fixture_env
+export STATUS_PULLER=on ANCHOR_ROLE=bogus
+if render puller_bad_role; then bad "puller-mode bad role fails closed"; else ok "puller-mode bad role fails closed"; fi
+has "puller-mode bad role names the values" "$(cat "$WORK/puller_bad_role/stderr.log")" "bad ANCHOR_ROLE"
+
+fixture_env
+export STATUS_PULLER=maybe
+if render bad_switch; then bad "bad STATUS_PULLER fails closed"; else ok "bad STATUS_PULLER fails closed"; fi
+has "bad switch names the accepted values" "$(cat "$WORK/bad_switch/stderr.log")" "bad STATUS_PULLER"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

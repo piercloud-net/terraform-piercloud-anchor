@@ -26,7 +26,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 | `SCP endpoint allowlist grep (from main)` | always | No forbidden provisioning-adjacent surfaces (the `rescue`/… stem list) in tracked `.tf`/`.sh`/`.yml`, and no netcup/API endpoint outside the allowlist (the list also carries the pc-control broker report endpoint `broker.piercloud.net` — the managed-run anchor-IPv4 push, authenticated by a per-run GitHub OIDC token, never a standing credential); also enforced from `main`. |
 | `secret-print grep (C-A, from main)` | always | No bounded acronym-print, personal-token phrase, CLI auth-subcommand, or bearer-print shapes in `.yml`/`.sh`; from `main`. |
 | `shared-origin grep (from main)` | always | No tracked `.tf`/`.sh`/`.yml` references the retired shared wildcard origin-pair secret prefix (issue #123); the pattern is enforced from `main`, so a PR cannot weaken its own check. |
-| `unit-tests (scripts)` | path-gated | The committed script harnesses (banner workflow diff, token refresh, anchor IP selection, managed-input preflight/binding, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, edge origin-auth, config file mounts, per-anchor origin-ca, Gatus render, recording-witness, broker report, broker DNS, b3b broker-provision-DNS job shape) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
+| `unit-tests (scripts)` | path-gated | The committed script harnesses (banner workflow diff, token refresh, anchor IP selection, managed-input preflight/binding, sweep pre/post, naming scheme, hand-run NTFY_TOKEN guard, retention cap, policy naming, public-log safety, edge origin-auth, config file mounts, per-anchor origin-ca, Gatus render, dynamic status-page puller, external watch, recording-witness, broker report, broker DNS, b3b broker-provision-DNS job shape) pass, and `bash -n` + `shellcheck -S warning` pass over `.github/scripts/**`. |
 | `bind-proof e2e (Caddy fronting mock tang)` | path-gated | A real `clevis luks bind` + unlock runs through the repo's rendered Caddyfile against a mock tang — the Caddy-in-front path stays bind-proven. |
 | `jq boolean-read guard (false != empty)` | always | No boolean field is read with jq's `// empty` (jq treats `false` as empty; live-found 2026-09-10). |
 | `scrub-canary (redactor proof)` | always | The poll-failure redactor still strips passwords, JWK `d`, and PEM bodies from log dumps and respects its byte bound. |
@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|managed-inputs|broker-dns|broker-provision-dns|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|gatus-pull|external-watch|managed-inputs|broker-dns|broker-provision-dns|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -124,6 +124,16 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] Edge ceremony: Cache Rule bypass on `/.well-known/acme-challenge/*`; no WAF / Bot-Fight block on it.
 - [ ] AOP, when `CF_AOP_CA_PEM` is set (interim Cloudflare-edge path only; **retired at the CloudFront cutover — delete `CF_AOP_CA_PEM` before the cutover dispatch and disable the CF zone setting after it**, or the run's edge pull fails because Cloudflare is no longer admitted on `:443`): cert-less origin pull is rejected at the handshake and the edge pull serves `200` — the run asserts both halves.
 - [ ] Tang unaffected throughout: `http://anchor-01-<tenant>.piercloud.net/adv` still answers `200`.
+
+### Dynamic status-page endpoints (puller, issue #186)
+
+Staged proof; the producers (slice `pc-status.json`, pc-control platform manifest) gate the real-source steps. Harnesses: `tests/gatus-pull` (validation + fragment bytes + failure ladder), `tests/external-watch` (the D6 freshness/key-set block).
+
+- [ ] Install dispatch (`mode=apply`, `STATUS_PULLER` set, reviewed SHA): the run log shows the puller install + the fragment seed + the D6 state line; `docker inspect gatus` shows the `GATUS_CONFIG_PATH=/config` env and the `/etc/gatus:/config` directory bind (a legacy file-mount container is recreated once); `/etc/gatus/tenant-endpoints.yaml` carries `platform`, `your piercloud` and `private (gate)`; the legacy `main` row is gone; `curl -s localhost:8080/api/v1/endpoints/statuses` lists the seeded rows. The `your piercloud` row is **RED by design** until the slice image serves `meta-<alias>.piercloud.site/healthz` (the D12 TDD forcing function — disclosed in the PR, not a defect).
+- [ ] Test-seam proof (no producers yet): point the puller at a local `file://` fixture (env override; never dispatch-set), add/remove/rename entries, and verify dashboard pickup + reload; break the JSON and verify `.last-good` + the notice; restore. Record the state file (`last_success`, ETags, rendered hash).
+- [ ] Regression: an identical re-render is a no-op (no reload, fragment mtime unchanged); the puller never writes `config.yaml`.
+- [ ] `external-watch.yml` with `STATUS_PULLER` set: both manifests HTTP 200 + `generated_at` ≤ 24 h and every manifest entry present in the dashboard keys; a removed manifest row or a stale `generated_at` reds the probe (prove one failure path).
+- [ ] Real-source proof (post producers, follow-up): mutate the served tenant manifest and verify pickup **without a dispatch**, plus the external freshness/key-set checks.
 
 ### DNS / migration
 
