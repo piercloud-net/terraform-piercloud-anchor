@@ -2,9 +2,9 @@
 # scripts/lib/naming.sh — canonical tenant naming (issue #105, D8).
 #
 # ONE source for the derived names: the workflow resolve step sources this
-# file, .github/scripts/030-anchor-dns.sh sources it, and scripts/010-provision.sh
-# carries a byte-identical embedded copy of the block below (console-hand-run
-# fallback; nested `# --- BEGIN NAMING ---` / `# --- END NAMING ---` markers
+# file, and scripts/010-provision.sh carries a byte-identical embedded copy of
+# the block below (console-hand-run fallback; nested
+# `# --- BEGIN NAMING ---` / `# --- END NAMING ---` markers
 # INSIDE its CADDY RENDER span). tests/naming-scheme/run-test.sh diffs the
 # embedded block against this file. Edit HERE and copy the block; never fork it.
 #
@@ -13,7 +13,8 @@
 # anchor-01-<tenant>.piercloud.net (NN=01; -02+ is a future multi-anchor
 # case), the dashboard is NESTED under the platform status namespace:
 # <tenant>.status.piercloud.net (written as an explicit CNAME to the
-# CloudFront edge — STATUS_EDGE_DOMAIN; the `_acme-challenge.<tenant>.status`
+# CloudFront edge — target owned broker-side since b3b; the
+# `_acme-challenge.<tenant>.status`
 # node is an ENT that blocks wildcard synthesis on RFC 4592-strict providers,
 # so the explicit record is the durable form; also the anchor's cert SAN).
 #

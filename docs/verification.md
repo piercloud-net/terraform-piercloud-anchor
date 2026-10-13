@@ -35,7 +35,7 @@ Twelve checks run per PR: ten in [`ci.yml`](../.github/workflows/ci.yml) plus `v
 
 Path-gated triggers (from the gates in `ci.yml`):
 
-- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|edge-origin-auth|origin-ca|recording-witness|broker-report|broker-dns)/|.*\.tf$)`.
+- `unit-tests (scripts)` runs when a changed path matches `^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|managed-inputs|broker-dns|broker-provision-dns|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)`.
 - `bind-proof e2e` runs when a changed path matches `^(scripts/|\.github/workflows/|tests/bind-e2e/)|\.tf$`.
 
 On push to `main` both path-gated jobs run unconditionally. If the changed-file list cannot be determined, both run (fail-open to extra proof).
@@ -98,7 +98,7 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] CI green; `tests/broker-dns/run-test.sh` exercises the real lib against a stubbed curl (audience-tagged OIDC request, both POST paths + bodies, token-never-in-argv, input validation, every refusal path) and pins the selftest wiring — including that the report and the DNS write steps live in the **same job** (the broker's A-write cross-check compares the report's stored run id with the write request's run id).
 - [ ] **Selftest canary (b3a live proof)**: dispatch `broker-report-selftest.yml` (proof environment + seeded anchor/`dns_name` rows + a challenge name under the tenant's registered name, `negative_ipv4` set) and record: the run URL; the A/CNAME + challenge TXT served by the zone (dig auth-NS + DoH); the broker audit rows (`anchor.dns_written`, `dns.challenge_presented`, `dns.challenge_cleared`); the mismatched-A step refused 409; cleanup.
 - [ ] **No token on the runner**: the run log carries no provider token, and the workflow's OIDC token reaches curl only through 0600 config files (the harness pins this).
-- [ ] The production `030-anchor-dns.sh` path is **unchanged** in b3a (the direct-token switch + org-secret retirement is b3b).
+- [ ] **b3b (#189)**: the `anchor-dns` job writes through the broker only — managed dispatches (`tenant` + `anchor_ref`), per-run OIDC token, no provider credential on the runner; `tests/broker-provision-dns/` pins the job shape (broker lib call, `id-token: write`, managed-lane guard, env values) and the retired surface (`030-anchor-dns.sh`, `tests/anchor-dns/`) is gone from every production path.
 
 ### Retention cap / `mode=check` assert (workflow + docs)
 
@@ -129,7 +129,7 @@ Live proof means running the real flow against a real anchor and capturing the a
 
 - [ ] Anchor record: `dig +short anchor-01-<tenant>.piercloud.net` returns the anchor IPv4 (proxied `false`, TTL 300).
 - [ ] Dashboard record: the platform `*.status.piercloud.net` wildcard resolves to the CloudFront distribution (live 2026-10-07), and each tenant carries an explicit `<tenant>.status.piercloud.net` CNAME to it (written + verified by the anchor writer — immune to the ACME challenge-node ENT, RFC 4592) — the origin IP must not leak. (Interim: `dig +short status-<tenant>.piercloud.net` returns Cloudflare anycast addresses.)
-- [ ] The run log's verify-after-write step matches name + content (+ proxied flag on Cloudflare / ttl + enabled on Gcore) for BOTH records (anchor A + dashboard CNAME) under the active `NET_DNS_PROVIDER`; a verify miss fails the run fail-closed.
+- [ ] The run log's DNS step shows `anchor DNS records written through the broker (anchor_ref=…)`, the broker's verify-after-write passed and its audit rows (`anchor.dns_written` / `dns.challenge_*`) exist; a verify miss fails the run fail-closed.
 - [ ] Main-box move: `mode=update-ip` ADD-before-move — the new IP is added and the old kept until the main box boots through the new one, then removed; re-check with `dig` and a clevis boot.
 - [ ] Record cutover: after the flip, the DNS-name-based Gatus monitors keep their history and the dashboard still resolves through the edge.
 
@@ -148,13 +148,13 @@ Live proof means running the real flow against a real anchor and capturing the a
 - [ ] Live: SCP server name, firewall policy name, and the DNS record all carry the canonical `anchor-01-<tenant>` form (the anchor name stays on `.net` — clevis binds it).
 - [ ] Dashboard host is the NESTED `<tenant>.status.piercloud.net` under the platform status namespace (wildcard + the explicit per-tenant CNAME — ENT immunity — + CloudFront edge; the flat `status-<tenant>` form is tombstoned).
 
-### A2 — nested status host + provider-switched writer
+### A2 — nested status host + DNS writer
 
-- [ ] Cutover window (before the first post-merge `mode=apply`): `CF_AOP_CA_PEM` deleted, `ORIGIN_CA_CERT_PEM` = the issued leaf-first chain, `STATUS_PROBE_URL=https://<tenant>.status.piercloud.net/` set (the external watch otherwise keeps probing the tombstoned flat name), and the `STATUS_EDGE_DOMAIN` repo variable set to the CloudFront distribution hostname (the writer fails closed without it).
-- [ ] `NET_DNS_PROVIDER=cloudflare` (default) `mode=apply` dispatch from the reviewed branch ×2: the anchor A-record AND the dashboard-CNAME upserts + verify-after-write pass; Gatus renders the `dashboard TLS (via edge)` row against `<tenant>.status.piercloud.net`.
-- [ ] `NET_DNS_PROVIDER=gcore` against the canary zone (`NET_DNS_ZONE=pc-canary.com`): write → GET → verify → delete recorded in the PR (the pre-B proof), plus the explicit `<tenant>.status` dashboard-CNAME rrset write → GET → verify → delete (the ENT-proof record), one literal `*.status` rrset POST, and the CAA triple check.
+- [ ] Cutover window (before the first post-merge `mode=apply`): `CF_AOP_CA_PEM` deleted, `ORIGIN_CA_CERT_PEM` = the issued leaf-first chain, `STATUS_PROBE_URL=https://<tenant>.status.piercloud.net/` set (the external watch otherwise keeps probing the tombstoned flat name); the dashboard-CNAME target is broker-side configuration now (the runner-side repo variable was retired in b3b).
+- [ ] A `mode=apply` dispatch from the reviewed branch ×2 (b3b: through the broker): the anchor A-record AND the dashboard-CNAME upserts + verify-after-write pass; Gatus renders the `dashboard TLS (via edge)` row against `<tenant>.status.piercloud.net`.
+- [ ] Provider-switch rows (pre-b3b record, retired): the canary-zone write → GET → verify → delete proof and the explicit `<tenant>.status` dashboard-CNAME rrset proof were captured on the provider-switched writer; b3b retired that writer and the equivalent live proof is the broker DNS path above.
 - [ ] Dashboard `200` on the nested name through the CloudFront edge (live 2026-10-07; anchor-side cutover pending) + the platform wildcard/CAA records present; the first post-rename dispatch carries the nested-SAN cert in the same run (DR cutover prerequisite — an old flat-SAN pair fails the run closed before the Caddyfile renders, docs/dr.md §Leg 2); Gatus green.
-- [ ] `tests/anchor-dns/` green (the harness drives the real writer; red paths: verify-mismatch both record types, Gcore GET non-200, missing token per provider, missing/invalid `STATUS_EDGE_DOMAIN`).
+- [ ] `tests/broker-provision-dns/` green (static job-shape pins: broker lib call over OIDC, managed-lane guard, tenant environment, resolved-IPv4 env; the four retired provider names absent from every production surface).
 - [ ] `tests/edge-origin-auth/` green (render span extracted; fail-closed secret/main-box, gate content, 010 ↔ `cloudfront_ranges.tf` sync tooth, firewall + pipeline wiring).
 - [ ] `tests/bind-e2e` gate section green (test-scoped AND production-shape adapted route order with a production-prefix presence tooth + the served peer/header matrix: main box/loopback pass, admitted-without/wrong-header abort, admitted + forged viewer-IP header abort, outside peers abort).
 

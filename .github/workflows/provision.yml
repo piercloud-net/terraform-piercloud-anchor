@@ -13,17 +13,19 @@
 # (ephemeral values carry the per-run netcup token; the token never lands in
 # state). The module bump itself lands in M3.
 #
-# DNS stage (anchor-dns job + .github/scripts/030-anchor-dns.sh): anchor
+# DNS stage (anchor-dns job → .github/scripts/lib/broker-dns.sh): anchor
 # A-record upsert + verify-after-write runs after A1 close (needs
 # device-flow) and before thumbprint issuance (thumbprint needs anchor-dns)
 # — a DNS failure fails the run before any thumbprint goes out, always.
-# A2: the writer is provider-switched (`NET_DNS_PROVIDER` repo variable,
-# cloudflare|gcore) so the `.net` zone move flips it without a code change;
-# it upserts BOTH the anchor A and the explicit per-tenant dashboard CNAME
-# `<tenant>.status` (the ACME challenge node is an ENT — wildcard-only goes
-# dark at every renewal on an RFC 4592-strict provider; see
-# 030-anchor-dns.sh). `STATUS_EDGE_DOMAIN` (CloudFront) is required and the
-# job fails closed without it.
+# b3b (#189): the writer is the pc-control broker over the per-run GitHub
+# OIDC token (the A2 provider-switched direct-token writer was retired; no
+# provider credential reaches the runner). The broker upserts BOTH the
+# anchor A and the explicit per-tenant dashboard CNAME `<tenant>.status`
+# from registry-owned names and its own edge-target config (the ACME
+# challenge node is an ENT — wildcard-only goes dark at every renewal on an
+# RFC 4592-strict provider), cross-checks the IPv4 against the same-run
+# report, and verifies after write. Managed dispatches only (tenant +
+# anchor_ref): a ref-less apply refuses at the guard below.
 
 name: provision
 
@@ -1461,7 +1463,7 @@ jobs:
           exit 0
 
   anchor-dns:
-    name: "Anchor DNS upsert + verify (NET_DNS_PROVIDER, fail-closed)"
+    name: "Anchor DNS upsert + verify through the pc-control broker (fail-closed)"
     runs-on: ubuntu-latest
     needs: [device-flow]
     if: inputs.mode == 'apply'
@@ -1470,46 +1472,57 @@ jobs:
     # environment selection as the device-flow job — both must resolve the
     # same tenant environment (expression kept identical on purpose).
     environment: ${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}
+    # OIDC: the broker mints/verifies a `piercloud-broker`-audience token
+    # (pc-control b2/b3a). Scoped to this job — no other job needs write
+    # access to the broker, and no standing DNS credential exists anymore.
+    permissions:
+      contents: read
+      id-token: write
     env:
-      TENANT_USER: ${{ vars.TENANT_USER }}
+      # The broker owns the record names (from the registry `dns_name`
+      # rows) and the dashboard CNAME target (`PC_BROKER_STATUS_EDGE_DOMAIN`
+      # broker config): the workflow sends only the lane ref and the
+      # API-resolved IPv4, and the broker cross-checks the IPv4 against the
+      # same-run report from device-flow before any provider call.
+      BROKER_URL: https://broker.piercloud.net
+      ANCHOR_REF: ${{ inputs.anchor_ref }}
       # Resolved target — the device-flow job's validated output, never the
       # raw repo secret: API-derived, and an explicit ANCHOR_IPV4 can only
       # have selected among the resolved server's own addresses (the
       # producer, resolve_anchor_ipv4, fails closed on any mismatch).
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
-      # A2 provider switch (cloudflare default | gcore post-B). Exactly one
-      # DNS token is injected, selected by the repo variable (anything but
-      # 'gcore' -> cloudflare; the script fails closed on an unknown
-      # provider). This keeps the account-wide Gcore token out of the runner
-      # env unless the gcore path is active — a malicious script edit cannot
-      # exfiltrate a token the workflow never injects. The script fails
-      # closed naming the org secret when the active token is absent.
-      NET_DNS_PROVIDER: ${{ vars.NET_DNS_PROVIDER }}
-      # Dashboard CNAME target (CloudFront distribution hostname) — repo
-      # variable, non-secret. Absent = the writer fails closed: without the
-      # explicit record the dashboard name is wildcard-only and goes dark at
-      # every ACME challenge (the challenge node makes it an ENT on Gcore).
-      STATUS_EDGE_DOMAIN: ${{ vars.STATUS_EDGE_DOMAIN }}
-      CLOUDFLARE_DNS_TOKEN: ${{ vars.NET_DNS_PROVIDER != 'gcore' && secrets.CLOUDFLARE_DNS_TOKEN || '' }}
-      GCORE_DNS_TOKEN: ${{ vars.NET_DNS_PROVIDER == 'gcore' && secrets.GCORE_DNS_TOKEN || '' }}
     steps:
       - name: Checkout (no credentials persisted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
         with:
           persist-credentials: false
-      - name: Upsert anchor A + dashboard CNAME + verify-after-write
+      - name: Managed-lane guard (b3b #189 retired the direct-token writer)
+        run: |
+          set -euo pipefail
+          # The broker path requires the env->tenant->lane binding (b2) and
+          # the same-run anchor-IP report that its A-write cross-check
+          # compares against; a ref-less (static fallback lane) apply has no
+          # registry binding, so anchor DNS no longer has a writer for it.
+          # Fail closed and loud (a skipped job would let a ref-less apply
+          # proceed without DNS, which is worse than a red run).
+          if [ -z "$ANCHOR_REF" ]; then
+            echo "::error::anchor DNS now goes through the pc-control broker (b3b, #189) and requires a managed dispatch (tenant + anchor_ref); the direct provider-token writer was retired. Re-dispatch with the account's anchor_ref — refusing."
+            exit 1
+          fi
+      - name: Upsert anchor A + dashboard CNAME through the broker
         run: |
           set -euo pipefail
           # Load-bearing order: this job needs device-flow (A1 close +
-          # sweep are steps inside it), and the thumbprint job needs THIS
-          # job — DNS failure fails the run before any thumbprint goes
-          # out, so we never bind-by-name against a record we didn't just
-          # verify. Absent provider token on mode=apply = explicit error
-          # from the script naming the org secret (C-A fail-closed: set it,
-          # then re-dispatch). mode=check never runs this job and never
-          # requires a token. Same account lane covers this job
-          # (workflow-level concurrency); no new actions (curl + jq only).
-          bash .github/scripts/030-anchor-dns.sh
+          # sweep and the same-run IPv4 report are inside it), and the
+          # thumbprint job needs THIS job — a broker DNS failure fails the
+          # run before any thumbprint goes out, so we never bind-by-name
+          # against a record we didn't just verify. The broker authorizes
+          # from the registry (no caller-supplied names), refuses a
+          # mismatched/stale IPv4 (409) and verifies after write; the
+          # token/body travel in 0600 curl config files, never argv.
+          # Same account lane covers this job (workflow-level concurrency).
+          . .github/scripts/lib/broker-dns.sh
+          write_anchor_dns "$ANCHOR_REF" "$ANCHOR_IPV4"
 
   apply-placeholder:
     name: "mode=apply (stateless skeleton)"
