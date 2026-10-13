@@ -96,7 +96,7 @@ _broker_mint_token() { # $1 = audience, $2 = workdir, $3 = label
   # misconfigured runner cannot send the request token in cleartext or land
   # the audience in the fragment (the broker would then refuse the token).
   case "$req_url" in
-    https://*) ;;
+    "https://"*) ;;
     *)
       echo "::error::${label}: OIDC request URL must be https — refusing." >&2
       return 1
@@ -218,8 +218,8 @@ report_anchor_ip() { # $1 = anchor_ref, $2 = ipv4
   fi
 
   base="${BROKER_URL:-https://broker.piercloud.net}"
-  # Strip every trailing slash: a single `${base%/}` leaves `https://host/`
-  # and joins to `//v1/...` (the path builder adds `/v1/...`).
+  # Strip every trailing slash: a single `${base%/}` leaves one trailing
+  # slash and the join then doubles the separator (`//v1/...`).
   while [ "$base" != "${base%/}" ]; do base="${base%/}"; done
   if ! _broker_validate_base "$base"; then
     echo "::error::broker report: BROKER_URL must be a plain https URL (no userinfo/query/fragment) — refusing." >&2
