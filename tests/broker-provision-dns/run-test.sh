@@ -43,7 +43,10 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 }
 # End line of a key's span, flow-aware: the span runs from the key's line
 # ($2) to the first column-0 non-comment line seen while the flow depth is
-# zero AND no quoted scalar is open. A mixed-indent flow collection (`on: [`
+# zero, no quoted scalar is open, and the line is neither a block-sequence
+# entry (`- ...`) nor a block-scalar header (`|`/`>...`), both of which
+# continue the key's value instead of starting a new top-level key
+# (r26/r27 HIGH). A mixed-indent flow collection (`on: [`
 # + column-0 entries + a later indent-2 entry) is one collection to YAML, so
 # a plain "next column-0 line" terminator let an added trigger hide between
 # them (r22 functional LOW).
@@ -104,9 +107,12 @@ flow_end() { # $1 file, $2 start line
       # A column-0 BLOCK SEQUENCE entry (`- x`, `-`, `- |`) continues the
       # current key value: YAML lets a block sequence sit at the same
       # indent as its parent key (`on:` then `- push`), and a block-scalar
-      # entry hides indented content that no other pin sees. It is never a
-      # top-level key, so it must not terminate the span (r26 HIGH).
-      if (q == "" && d <= 0 && $0 ~ /^[^[:space:]#]/ && $0 !~ /^-([[:space:]]|$)/) { print NR; exit }
+      # entry hides indented content that no other pin sees (r26 HIGH).
+      # A column-0 BLOCK SCALAR HEADER (`|`, `|-`, `>2-`, ...) is the
+      # value NODE itself when it follows `on:` directly, and its content
+      # is indented (r27 HIGH). Neither form is ever a top-level key, so
+      # neither terminates the span.
+      if (q == "" && d <= 0 && $0 ~ /^[^[:space:]#]/ && $0 !~ /^-([[:space:]]|$)/ && $0 !~ /^[|>]/) { print NR; exit }
       d += depth($0)
     }
   ' "$1"
@@ -143,6 +149,10 @@ fe_case 5 "flow_end: single-quoted close then # is a comment" $'on: [a, \'b\'# ]
 fe_case 4 "flow_end: block-scalar entry under a column-0 sequence is pinned (r26 HIGH)" $'on:\n- >-\n  push\npermissions:\n'
 fe_case 4 "flow_end: mapping entry under a column-0 sequence is pinned (r26 HIGH)" $'on:\n- push: null\n  pull_request_target: null\npermissions:\n'
 fe_case 4 "flow_end: plain column-0 sequence entries are pinned (r26 HIGH)" $'on:\n- push\n- pull_request_target\npermissions:\n'
+fe_case 4 "flow_end: bare column-0 block-scalar header is pinned (r27 HIGH)" $'on:\n|-\n  push\npermissions:\n'
+fe_case 4 "flow_end: folded block-scalar header with indicators is pinned (r27 HIGH)" $'on:\n>2-\n  push\npermissions:\n'
+fe_case 4 "flow_end: literal block-scalar entry under a column-0 sequence is pinned (r27 LOW)" $'on:\n- |\n  push\npermissions:\n'
+fe_case 4 "flow_end: bare column-0 sequence entry is pinned (r27 LOW)" $'on:\n-\n  push\npermissions:\n'
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
@@ -1129,7 +1139,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=242
+CHECK_FLOOR=246
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
