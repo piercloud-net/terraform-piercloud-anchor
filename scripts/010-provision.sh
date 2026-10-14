@@ -1890,7 +1890,7 @@ def validate_tenant(doc, alias, resolver):
             raise ManifestError("duplicate endpoint name %r (case-folded)" % name)
         seen.add(folded)
         site_type = entry.get("type")
-        if site_type not in SITE_TYPES:
+        if not isinstance(site_type, str) or site_type not in SITE_TYPES:
             raise ManifestError("type must be one of: public, shared, private")
         if _validate_disabled(entry):
             out.append({"name": name, "disabled": True, "url": None, "alerts": False,
@@ -1908,9 +1908,17 @@ def validate_tenant(doc, alias, resolver):
     return out
 
 
+def _dns_label_ok(label):
+    # One host label (RFC 1123 LDH): alphanumeric edges, hyphens allowed inside.
+    return re.match(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?\Z", label) is not None
+
+
 def _anchor_host_allowed(host, alias):
     # The anchor's own hostname is infrastructure, not a tenant site: it stays
     # inside the URL allowlist and is exempt from the D13 class cross-check.
+    # Post-D13 an entry pointing at it renders no app-health row (only
+    # `type: public` entries do), so the exemption merely keeps an existing
+    # manifest parseable; `type: public` + the anchor host stays rejected.
     return host == "anchor-01-%s.piercloud.net" % alias
 
 
@@ -1921,12 +1929,15 @@ def _private_site_host_allowed(host, alias):
         return False
     prefix = host[: -len(suffix)]
     labels = prefix.split(".")
-    return 1 <= len(labels) <= 2 and all(labels) and all(label == label.lower() for label in labels)
+    return 1 <= len(labels) <= 2 and all(_dns_label_ok(label) for label in labels)
 
 
 def _public_site_host_allowed(host, alias):
     # `public` sites live in the flat public namespace (S).
-    return host.endswith("-%s.piercloud.site" % alias) and host.count(".") == 2
+    suffix = "-%s.piercloud.site" % alias
+    if not host.endswith(suffix) or host.count(".") != 2:
+        return False
+    return _dns_label_ok(host[: -len(suffix)])
 
 
 def _tenant_host_allowed(alias):
@@ -2057,6 +2068,12 @@ def render_fragment(alias, role, alerting, platform_entries, tenant_entries):
                                alerting and role == "operator"))
     for entry in tenant_entries or []:
         if entry.get("disabled"):
+            continue
+        if entry.get("type") != "public":
+            # D13/D4: `shared`/`private` entries carry the class contract (they
+            # drive the gate-row derivation above), never an app-health row —
+            # an anonymous probe cannot see inside a gate, so the row could
+            # only ever be red.
             continue
         # Public tenant rows are class 4 (D5): native ntfy, no resolve.
         rows.append(render_row(entry["name"], alias, entry["url"],
@@ -2511,9 +2528,11 @@ def run_pull(cfg):
         save_state(cfg.state, state)
         return 1
     old_names = set(state.get("last_tenant_names") or [])
-    new_names = {entry["name"] for entry in outcome["tenant"]["entries"] if not entry.get("disabled")}
-    # D13: the derived `shared (gate)` row is part of the tenant-side row set —
-    # it disappears with the last shared entry (the notice below names it).
+    # D13: the tenant-side row set = public entries only (shared/private entries
+    # render no row) plus the derived `shared (gate)` row when present — the
+    # notice below names exactly the rows that disappeared.
+    new_names = {entry["name"] for entry in outcome["tenant"]["entries"]
+                 if not entry.get("disabled") and entry.get("type") == "public"}
     if any(not entry.get("disabled") and entry.get("type") == "shared"
            for entry in outcome["tenant"]["entries"]):
         new_names.add("shared (gate)")

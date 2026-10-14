@@ -13,6 +13,9 @@
 #   - a manifest row missing from the dashboard fails (puller-timer death /
 #     frozen fragment), including the seeded platform / gate / slice rows and
 #     the D13-derived `shared (gate)` / `public edge` rows;
+#   - a dashboard row in a parsed channel's group that the manifest does not
+#     justify fails too (removal drift: a stale derived or removed site row
+#     means the puller never applied the change);
 #   - a manifest 5xx or an aged generated_at fails (producer staleness); a
 #     404/410 is not-published (no page; the puller keeps last-known-good);
 #   - TENANT_USER unset degrades to the platform channel only.
@@ -27,7 +30,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=34
+MIN_CHECKS=40
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -50,6 +53,7 @@ has "block caps time" "$(cat "${WORK}/block.sh")" "--max-time 20"
 has "block caps size" "$(cat "${WORK}/block.sh")" "--max-filesize 65536"
 has "block checks freshness" "$(cat "${WORK}/block.sh")" "generated_at"
 has "block diffs the dashboard keys" "$(cat "${WORK}/block.sh")" "missing from the dashboard"
+has "block flags stale dashboard rows" "$(cat "${WORK}/block.sh")" "stale dashboard rows not in the manifest"
 has "block counts the seeded rows" "$(cat "${WORK}/block.sh")" 'name:"your piercloud"'
 has "block counts the gate row" "$(cat "${WORK}/block.sh")" 'name:"private (gate)"'
 has "block expects the derived shared gate row" "$(cat "${WORK}/block.sh")" 'shared (gate)'
@@ -174,15 +178,28 @@ PY
 
 new_case shared
 add_shared
-printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"shared (gate)","group":"pier"},{"name":"host-01","group":"platform"},{"name":"blog","group":"pier"},{"name":"fantasy","group":"pier"}]' | api_json
+printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"shared (gate)","group":"pier"},{"name":"host-01","group":"platform"},{"name":"blog","group":"pier"}]' | api_json
 out="$(run_block "$CASE")"
 is "shared: derived gate row satisfies the check" "" "$out"
+lacks "shared: the shared entry is not expected as a row" "$(cat "$CASE/manifest-expected.json")" '"fantasy"'
 
 new_case shared-missing
 add_shared
-printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"host-01","group":"platform"},{"name":"blog","group":"pier"},{"name":"fantasy","group":"pier"}]' | api_json
+printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"host-01","group":"platform"},{"name":"blog","group":"pier"}]' | api_json
 out="$(run_block "$CASE")"
 has "shared missing: names the derived row" "$out" "pier/shared (gate)"
+
+# ---- D13 removal drift: a stale row the manifest does not justify fails ----
+new_case stale-derived
+printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"shared (gate)","group":"pier"},{"name":"host-01","group":"platform"},{"name":"blog","group":"pier"}]' | api_json
+out="$(run_block "$CASE")"
+has "stale derived: names the stale row" "$out" "pier/shared (gate)"
+has "stale derived: reports the removal drift" "$out" "stale dashboard rows not in the manifest"
+
+new_case stale-site
+printf '[{"name":"platform","group":"platform"},{"name":"your piercloud","group":"pier"},{"name":"private (gate)","group":"pier"},{"name":"host-01","group":"platform"},{"name":"blog","group":"pier"},{"name":"old-site","group":"pier"}]' | api_json
+out="$(run_block "$CASE")"
+has "stale site: names the removed row" "$out" "pier/old-site"
 
 # ---- D13: platform `edge: true` makes the public edge row expected ---------
 add_edge() {

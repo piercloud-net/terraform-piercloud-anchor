@@ -130,6 +130,7 @@ jobs:
               1|true|yes|on)
                 manifest_fail=""
                 manifest_files=""
+                manifest_channels=""
                 for manifest_channel in tenant platform; do
                   if [ "$manifest_channel" = "tenant" ]; then
                     if [ -z "${TENANT_USER:-}" ]; then
@@ -163,9 +164,10 @@ jobs:
                       '[{name:"platform",group:"platform"},{name:"your piercloud",group:$alias},{name:"private (gate)",group:$alias}]
                        + (if ($doc[0].endpoints // [] | map(select((.disabled // false) == false and .type == "shared")) | length) > 0
                           then [{name:"shared (gate)",group:$alias}] else [] end)
-                       + ($doc[0].endpoints // [] | map(select((.disabled // false) == false) | {name:.name, group:$alias}))' \
+                       + ($doc[0].endpoints // [] | map(select((.disabled // false) == false and .type == "public") | {name:.name, group:$alias}))' \
                       >"$work/manifest-expected-tenant.json" || manifest_fail="${manifest_fail}tenant manifest parse failed; "
                     manifest_files="${manifest_files} $work/manifest-expected-tenant.json"
+                    manifest_channels="${manifest_channels} tenant"
                   else
                     jq -n --slurpfile doc "$work/manifest-platform.json" \
                       '($doc[0].platform // [] | map(select((.disabled // false) == false) | {name:.name, group:"platform"}))
@@ -173,6 +175,7 @@ jobs:
                        + (if ($doc[0].edge // false) then [{name:"public edge",group:"platform"}] else [] end)' \
                       >"$work/manifest-expected-platform.json" || manifest_fail="${manifest_fail}platform manifest parse failed; "
                     manifest_files="${manifest_files} $work/manifest-expected-platform.json"
+                    manifest_channels="${manifest_channels} platform"
                   fi
                 done
                 # shellcheck disable=SC2086  # controlled $work paths
@@ -188,6 +191,24 @@ jobs:
                     | join(", ")' 2>/dev/null | tr -d '\r\n' || echo "statuses API unreadable")"
                   if [ -n "$manifest_missing" ]; then
                     manifest_fail="${manifest_fail}manifest rows missing from the dashboard: ${manifest_missing}; "
+                  fi
+                  # Reverse direction (D6 removal drift): a dashboard row in a
+                  # channel's own group that the just-fetched manifest does not
+                  # justify is a stale fragment — a dead puller timer or a
+                  # frozen row set. Only groups whose manifest parsed this run
+                  # are checked (a 404/410 not-published channel keeps
+                  # last-known-good, so its rows must not be flagged).
+                  case " ${manifest_channels} " in *" tenant "*) want_alias=1 ;; *) want_alias=0 ;; esac
+                  case " ${manifest_channels} " in *" platform "*) want_platform=1 ;; *) want_platform=0 ;; esac
+                  manifest_extra="$(jq -rn --arg alias "${TENANT_USER:-}" --argjson want_alias "$want_alias" --argjson want_platform "$want_platform" --slurpfile expected "$work/manifest-expected.json" --slurpfile api "$work/api" '
+                    ($api[0] | if type == "array" then . else [] end | map({name:(.name // ""), group:(.group // "")})) as $have
+                    | [ $have[] | . as $h
+                        | select(((($h.group == $alias) and ($want_alias == 1)) or (($h.group == "platform") and ($want_platform == 1)))
+                                 and (any($expected[0][]; .name == $h.name and .group == $h.group) | not))
+                        | "\($h.group)/\($h.name)" ]
+                    | join(", ")' 2>/dev/null | tr -d '\r\n' || echo "statuses API unreadable")"
+                  if [ -n "$manifest_extra" ]; then
+                    manifest_fail="${manifest_fail}stale dashboard rows not in the manifest: ${manifest_extra}; "
                   fi
                 fi
                 if [ -n "$manifest_fail" ]; then

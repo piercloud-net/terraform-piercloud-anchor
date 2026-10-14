@@ -62,7 +62,7 @@ command -v python3 >/dev/null 2>&1 || { printf 'FAIL python3 is required\n'; exi
 
 pass=0
 fail=0
-MIN_CHECKS=224
+MIN_CHECKS=240
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -401,7 +401,7 @@ has "--state prints the rendered hash" "$(cat "$CASE/stdout.log")$(cat "$CASE/st
 has "--state prints last_success" "$(cat "$CASE/stdout.log")$(cat "$CASE/stderr.log")" "last_success"
 
 # ---- (c) tenant validation red rules --------------------------------------
-TENANT_RED="http-scheme port userinfo foreign-suffix ip-literal dollar control-char space quote backslash query fragment oversize-url too-many reserved-platform reserved-home reserved-slice reserved-host duplicate uppercase-name non-bool-alerts bad-version wrong-tenant future-generated-at bad-generated-at empty-list disabled-with-entries unknown-top-field unknown-entry-field endpoint-not-object endpoints-not-list file-scheme nested-three-labels deep-public missing-type bad-type-value bad-type-case bad-type-bool public-nested private-flat"
+TENANT_RED="http-scheme port userinfo foreign-suffix ip-literal dollar control-char space quote backslash query fragment oversize-url too-many reserved-platform reserved-home reserved-slice reserved-host duplicate uppercase-name non-bool-alerts bad-version wrong-tenant future-generated-at bad-generated-at empty-list disabled-with-entries unknown-top-field unknown-entry-field endpoint-not-object endpoints-not-list file-scheme nested-three-labels deep-public missing-type bad-type-value bad-type-case bad-type-bool bad-type-object bad-type-list leading-hyphen-public leading-hyphen-private public-nested private-flat"
 for rule in $TENANT_RED; do
   new_case "red-${rule}"
   python3 "${HARNESS_DIR}/fixtures.py" tenant "$rule" >"$CASE/tenant.json"
@@ -467,17 +467,19 @@ rc="$(pull_rc)"
 lacks "opt-out did not emit a tenant failure" "$(cat "$CASE/stderr.log")" "tenant manifest failure"
 
 # valid allowlist shapes: the anchor name is inside the tenant allowlist and
-# is exempt from the D13 class cross-check (infrastructure, not a site).
+# is exempt from the D13 class cross-check (infrastructure, not a site). Post-
+# D13 such an entry renders NO app-health row (only `type: public` does).
 new_case allow-anchor
 python3 "${HARNESS_DIR}/fixtures.py" tenant anchor-name >"$CASE/tenant.json"
 seed_once
 rc="$(pull_rc)"
-[ "$rc" = "0" ] && grep -q 'name: blog' "$FRAGMENT" && grep -q 'url: https://anchor-01-pier.piercloud.net/healthz' "$FRAGMENT" \
-  && ok "tenant allowlist accepts the anchor-01 host (class-exempt)" || bad "tenant allowlist accepts the anchor-01 host"
+is "tenant allowlist accepts the anchor-01 host (class-exempt)" "0" "$rc"
+lacks "anchor-host entry renders no app-health row" "$(cat "$FRAGMENT")" "anchor-01-pier.piercloud.net"
+lacks "anchor-host entry renders no row name" "$(cat "$FRAGMENT")" "name: blog"
 
 # D13: a `type: shared` entry derives the shared gate row (class 5, pinned
-# strict login path); the shared site itself renders no per-site app-health row
-# class beyond its class-4 monitor row.
+# strict login path) and renders NO per-site app-health row — an anonymous
+# probe cannot see inside a gate (D4).
 new_case shared-gate
 python3 "${HARNESS_DIR}/fixtures.py" tenant shared-nested >"$CASE/tenant.json"
 set_topic
@@ -489,8 +491,36 @@ has "shared gate: pinned strict login path" "$(cat "$FRAGMENT")" "url: https://i
 has "shared gate: group is the tenant alias" "$(row_block 'shared (gate)')" "    group: pier"
 has "shared gate: class 5 ntfy-JSON bridge" "$(row_block 'shared (gate)')" "- type: custom"
 has "shared gate: resolves at priority 3" "$(row_block 'shared (gate)')" 'RESOLVED: "3"'
-has "shared entry: the site row is rendered class 4" "$(row_block fantasy)" "- type: ntfy"
-lacks "shared entry: no class-5 bridge on the site row" "$(row_block fantasy)" "send-on-resolved"
+lacks "shared entry: no app-health row rendered" "$(cat "$FRAGMENT")" "name: fantasy"
+lacks "shared entry: no app-health row url rendered" "$(cat "$FRAGMENT")" "fantasy.pier.piercloud.net"
+
+# D13: two shared entries derive exactly one `shared (gate)` row (and no rows).
+new_case two-shared
+python3 "${HARNESS_DIR}/fixtures.py" tenant two-shared >"$CASE/tenant.json"
+seed_once
+rc="$(pull_rc)"
+is "two shared: pull exits 0" "0" "$rc"
+is "two shared: exactly one derived gate row" "1" "$(grep -c '^  - name: shared (gate)$' "$FRAGMENT")"
+lacks "two shared: no app-health row (aaa)" "$(cat "$FRAGMENT")" "name: aaa"
+lacks "two shared: no app-health row (bbb)" "$(cat "$FRAGMENT")" "name: bbb"
+
+# D13: a disabled shared entry derives nothing and renders no row.
+new_case disabled-shared
+python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-shared >"$CASE/tenant.json"
+seed_once
+rc="$(pull_rc)"
+is "disabled shared: pull exits 0" "0" "$rc"
+lacks "disabled shared: no derived gate row" "$(cat "$FRAGMENT")" "shared (gate)"
+lacks "disabled shared: no app-health row" "$(cat "$FRAGMENT")" "old-shared"
+
+# D13: a private entry renders no app-health row (the seeded gate row is it).
+new_case private-entry
+python3 "${HARNESS_DIR}/fixtures.py" tenant private-nested >"$CASE/tenant.json"
+seed_once
+rc="$(pull_rc)"
+is "private entry: pull exits 0" "0" "$rc"
+lacks "private entry: no app-health row" "$(cat "$FRAGMENT")" "name: secret"
+lacks "private entry: no shared gate derivation" "$(cat "$FRAGMENT")" "shared (gate)"
 
 # the derived row disappears with the last shared entry (D7 notice names it)
 new_case shared-gate-removal
@@ -788,7 +818,7 @@ is "install: service unit mode 0644" "644" "$(stat -c %a "${WORK}/install/system
 has "install: env carries the tenant manifest URL" "$(cat "${WORK}/install/etc/gatus-pull.env")" "meta-pier.piercloud.site/.well-known/pc-status.json"
 has "install: env carries the platform manifest URL" "$(cat "${WORK}/install/etc/gatus-pull.env")" "platform.piercloud.net/.well-known/pc-status.json"
 has "install: env carries the ntfy topic" "$(cat "${WORK}/install/etc/gatus-pull.env")" "NTFY_TOPIC=pc-test"
-has "install: seeded fragment carries the shared rows" "$(cat "${WORK}/install/etc/gatus/tenant-endpoints.yaml")" "name: your piercloud"
+has "install: seeded fragment carries the seeded rows" "$(cat "${WORK}/install/etc/gatus/tenant-endpoints.yaml")" "name: your piercloud"
 has "install: systemctl daemon-reload called" "$(cat "${WORK}/install/systemctl.log")" "daemon-reload"
 has "install: timer enabled" "$(cat "${WORK}/install/systemctl.log")" "enable piercloud-gatus-pull.timer"
 ( source "${WORK}/stubs.src"; source "${WORK}/span.src"; gatus_puller_disable ) \
