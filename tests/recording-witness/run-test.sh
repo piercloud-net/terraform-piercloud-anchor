@@ -210,7 +210,8 @@ WORK="$(mktemp -d /tmp/recording-witness.XXXXXX)"
 # heredocs below, so a committed pyc is an execution route. Delete any cache
 # before the first python call and never write one back (`-B` on every
 # `python3 -I` call, which ignores the environment; PYTHONDONTWRITEBYTECODE
-# for the rest). The b3b scan treats any in-tree pyc as fail-closed.
+# for the rest). Any in-tree pyc fails the b3b scan (a pyc contains NUL
+# bytes, and the scan has no bytecode exemption).
 rm -rf "${HARNESS_DIR}/__pycache__"
 export PYTHONDONTWRITEBYTECODE=1
 MOCK_PID=""

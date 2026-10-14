@@ -438,6 +438,7 @@ fi
 wf_job_digest=""
 wf_top_digest=""
 wf_on_digest=""
+wf_perm_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
   # The TOP-LEVEL line sequence is pinned on its own: the jobs-last invariant
@@ -447,11 +448,15 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   # hashed RAW: the old token extraction was lossy (a quoted key with an
   # internal colon truncated to the pre-colon word, and a comma-bearing key
   # collided with the comma-joined token string — r21 F1/F2), so a
-  # replacement could keep the digest green. Raw hashing is injective: ANY
-  # column-0 change — a decoy key in any spelling, a quoted/renamed/removed
-  # key, a `---` separator, a flow continuation — changes the pin. Spelling
-  # stability is traded for injectivity: a cosmetic respelling or reorder
-  # also reds (deliberate pin update).
+  # replacement could keep the digest green. Raw hashing is collision-resistant
+  # over the hashed line set: a change to ANY column-0 non-comment line — a
+  # decoy key in any spelling, a quoted/renamed/removed key, a same-line value
+  # rewrite, a `---` separator, a flow continuation — changes the pin. The
+  # pin is a hash of the lines, so it is collision-resistant, not injective in
+  # the mathematical sense; column-0 comment lines and whitespace-indented
+  # lines are not part of the pin (comments are non-executable, indented lines
+  # are not top-level). Spelling stability is traded for that coverage: a
+  # cosmetic respelling or reorder also reds (deliberate pin update).
   wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[^[:space:]#]' "$wf" | sha256sum | cut -d' ' -f1)"
   # The `on:` trigger block is pinned per workflow: the top-level line digest
   # sees only column-0 lines, so an indent-2 trigger added under `on:`
@@ -468,6 +473,21 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     on_end="$(awk -v s="$on_lines" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
     [ -n "$on_end" ] || on_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
     wf_on_digest="$wf_on_digest|$wf:$(sed -n "${on_lines},$((on_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
+  fi
+  # The top-level `permissions:` block is pinned per workflow too: token
+  # scopes are security-relevant and an indented child value rewrite
+  # (`contents: read` -> `write`) is invisible to the raw top-level line
+  # digest and to the count-only censuses (r22 trust MEDIUM / r21 F7). Same
+  # span/locator doctrine as `on:`; every in-tree workflow has exactly one.
+  perm_lines="$(grep -nE '^((&|!)[^[:space:]]+[[:space:]]+)*(["'"'"']?permissions["'"'"']?)[[:space:]]*:' "$wf" | cut -d: -f1 || true)"
+  perm_count="$(printf '%s\n' "$perm_lines" | grep -c . || true)"
+  if [ "$perm_count" != "1" ]; then
+    bad "$wf top-level permissions: key count (expected 1, got $perm_count)"
+    wf_perm_digest="$wf_perm_digest|$wf:AMBIGUOUS"
+  else
+    perm_end="$(awk -v s="$perm_lines" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
+    [ -n "$perm_end" ] || perm_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
+    wf_perm_digest="$wf_perm_digest|$wf:$(sed -n "${perm_lines},$((perm_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
   fi
   jobs_keys="$(grep -cE "^((&|!)[^[:space:]]+[[:space:]]+)*([\"']?jobs[\"']?)[[:space:]]*:[[:space:]]*(#.*)?\$" "$wf" || true)"
   if [ "$jobs_keys" != "1" ]; then
@@ -561,6 +581,11 @@ on_digest_got="$(printf '%s' "$wf_on_digest" | sha256sum | cut -d' ' -f1)"
 is "workflow on: trigger blocks are pinned (pin: update for a deliberate trigger change)" "4e7f26bf4c989cd1329dad27ea393924f24d3ed9842371b61ab5121d8142591f" "$on_digest_got"
 if [ "$on_digest_got" != "4e7f26bf4c989cd1329dad27ea393924f24d3ed9842371b61ab5121d8142591f" ]; then
   printf '   on: parts (to update the pin):\n'; printf '%s' "$wf_on_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
+fi
+perm_digest_got="$(printf '%s' "$wf_perm_digest" | sha256sum | cut -d' ' -f1)"
+is "workflow top-level permissions blocks are pinned (pin: update for a deliberate scope change)" "1988700a260b3e6e87ebfab47f56009ed7a389b831fcea86f172b7a66a11f6eb" "$perm_digest_got"
+if [ "$perm_digest_got" != "1988700a260b3e6e87ebfab47f56009ed7a389b831fcea86f172b7a66a11f6eb" ]; then
+  printf '   permissions: parts (to update the pin):\n'; printf '%s' "$wf_perm_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 # A workflow must not gain (or repoint) an execution of test-tree content:
 # the `tests/*/run-test.sh` pin records are exempt from the retired-name scan,
@@ -908,7 +933,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=201
+CHECK_FLOOR=202
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
