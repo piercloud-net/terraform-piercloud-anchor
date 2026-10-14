@@ -46,15 +46,17 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # indent-2 entry) is one collection to YAML, so a plain "next column-0 line"
 # terminator let an added trigger hide between them (r22 functional LOW).
 # Quote and comment indicators count only at a YAML token start (line start,
-# whitespace, or a flow indicator): a mid-token `'`/`"`/`#` is plain-scalar
-# content (`it's`, `a#b`), and counting a `]`/`}` inside a quoted scalar
-# closed a live flow early — a trigger hidden after the early end reds no pin
-# (r23 HIGH). Quoted contents are not counted at all, so a mis-read can only
-# extend the span. Empty when no terminator is found (EOF).
+# whitespace, a flow indicator, or the explicit-key `?`): a mid-token
+# `'`/`"`/`#` is plain-scalar content (`it's`, `a#b`), and counting a `]`/`}`
+# inside a quoted scalar closed a live flow early — a trigger hidden after
+# the early end reds no pin (r23 HIGH; `?` added by the r23 trust lens:
+# `[?'a]b']` is a quoted explicit key and `[?# ]` a comment). Quoted contents
+# are not counted at all, so a mis-read can only extend the span. Empty when
+# no terminator is found (EOF).
 flow_end() { # $1 file, $2 start line
   awk -v s="$2" '
     function sq() { return sprintf("%c", 39) }
-    function tokstart(p) { return p == "" || p == " " || p == "\t" || p == "[" || p == "{" || p == "," }
+    function tokstart(p) { return p == "" || p == " " || p == "\t" || p == "[" || p == "{" || p == "," || p == "?" }
     function depth(line,   i, c, prev, d) {
       d = 0; prev = ""
       for (i = 1; i <= length(line); i++) {
@@ -101,6 +103,8 @@ fe_case 5 "flow_end: quoted ] inside a flow does not end the span early" $'on: [
 fe_case 4 "flow_end: quoted } inside a flow mapping does not end the span early" $'on: {"a}b": x,\n  pull_request_target,\n}\npermissions:\n'
 fe_case 7 "flow_end: mid-token # is plain content, not a comment" $'on: [a#b, [c,\npush,\n],\npush2,\n  pull_request_target,\n]\npermissions:\n'
 fe_case 3 "flow_end: # after a flow comma is a comment" $'on: [a,# ]\npush]\npermissions:\n'
+fe_case 5 "flow_end: ? explicit-key quoted scalar does not end the span early" $'on: [?\'a]b\',\npush,\n  pull_request_target,\n]\npermissions:\n'
+fe_case 3 "flow_end: # after an explicit-key ? is a comment" $'on: [?# ]\npush]\npermissions:\n'
 fe_case 5 "flow_end: mid-token apostrophe does not open a quote" $'on: [it\'s, [a, b\'s,\n], push,\npull_request_target,\n]\npermissions:\n'
 fe_case 5 "flow_end: mid-token double quote does not open a quote" $'on: [it"s, [a, b"s,\n], push,\npull_request_target,\n]\npermissions:\n'
 fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: [it\'s,\n  push,\n'
@@ -1005,7 +1009,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=210
+CHECK_FLOOR=212
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

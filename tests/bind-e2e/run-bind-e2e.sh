@@ -39,9 +39,10 @@ WORK="$(mktemp -d /tmp/bind-e2e.XXXXXX)"
 # No in-tree bytecode: mock-tang.py imports the in-tree p521 module, and a
 # planted `tests/bind-e2e/__pycache__/p521.cpython-*.pyc` (PEP 552 hash-based
 # or matching mtime/size) would be loaded instead of the source — an
-# execution route in this cred-free job, which runs before the unit-tests
-# scan (r22 functional LOW). Delete any cache before the first python call
-# and never write one back (`-B` on every call; the export covers the rest).
+# execution route in this cred-free job (r22 functional LOW). This job is
+# independent of the unit-tests scan (no `needs:` — parallel), so the fix
+# must hold on its own: delete any cache before the first python call and
+# never write one back (`-B` on every call; the export covers the rest).
 rm -rf "${HARNESS_DIR}/__pycache__"
 export PYTHONDONTWRITEBYTECODE=1
 START="$(date +%s)"
