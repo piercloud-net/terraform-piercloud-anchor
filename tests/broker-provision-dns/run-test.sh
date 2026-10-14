@@ -418,27 +418,36 @@ else
 fi
 # Every workflow's job set is pinned as ONE digest: a job added to any
 # workflow (release.yml carries write permissions) or a new workflow file
-# changes it, and a duplicate top-level `jobs:` key — YAML resolves it to
-# the LAST block, so a flow-form second block would leave a pinned first
-# block green while the effective job set changes — fails the count here.
-# Pin update is deliberate (same PR as the workflow change).
+# (`.yml` or `.yaml`) changes it. The digest pins job NAMES only — the
+# content of jobs outside ci.yml/provision.yml is unpinned (those two have
+# whole-job byte pins). A duplicate top-level `jobs:` key in any spelling
+# the count recognises fails here; quoted/spaced spellings are rejected
+# outright by the Actions parser, so the count is the backstop for the
+# spelling that resolves. Pin update is deliberate (same PR as the workflow
+# change).
 wf_job_digest=""
-for wf in .github/workflows/*.yml; do
-  jobs_keys="$(grep -cE '^jobs:' "$wf" || true)"
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$wf" ] || continue
+  jobs_keys="$(grep -cE "^((&|!)[^[:space:]]+[[:space:]]+)*([\"']?jobs[\"']?)[[:space:]]*:" "$wf" || true)"
   if [ "$jobs_keys" != "1" ]; then
     bad "$wf top-level jobs key count (expected 1, got $jobs_keys)"
     wf_job_digest="$wf_job_digest|$wf:AMBIGUOUS"
     continue
   fi
   jstart="$(grep -nE '^jobs:' "$wf" | head -n1 | cut -d: -f1)"
-  jend="$(awk -v s="$jstart" 'NR > s && /^[^ ]/ {print NR; exit}' "$wf")"
+  if [ -z "$jstart" ]; then
+    bad "$wf has no top-level jobs: key"
+    wf_job_digest="$wf_job_digest|$wf:NOJOBS"
+    continue
+  fi
+  jend="$(awk -v s="$jstart" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
   [ -n "$jend" ] || jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
   names="$(sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
     | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
     | sed -e 's/[[:space:]]*:.*$//' \
-    | sed -E -e 's/^"//' -e 's/"$//' | tr '\n' ',')"
+    | sed -E -e 's/^"//' -e 's/"$//' | tr '\n' ',')" || true
   wf_job_digest="$wf_job_digest|$wf:$names"
 done
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
@@ -495,6 +504,14 @@ done
 # per-key checks above stay as diagnostics.
 is "ci.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$CI")"
 is "provision.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$PROV")"
+# Explicit mapping keys are banned in EVERY workflow: `? jobs` + a following
+# `: {...}` is an alternate spelling for a duplicate top-level key that the
+# raw count cannot see (the Actions parser may reject it, but the ban is the
+# fail-closed backstop). Zero legitimate uses in-tree.
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$wf" ] || continue
+  is "$wf has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$wf")"
+done
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Block, flow and tagged spellings (`<< :`,
@@ -685,7 +702,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=171
+CHECK_FLOOR=178
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
