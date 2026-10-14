@@ -961,7 +961,15 @@ for lbcase in CR NEL LS PS BOM; do
   esac
   is "line-break scan: $lbcase fails closed" "$lbf" "$(line_break_scan "$lbf")"
 done
-rm -f "$lbf"
+# Multi-file arity (r33 red-team LOW): a "$@"->"$1" mutant must not survive.
+lbf2="$(mktemp)"; printf 'name: y\n' > "$lbf2"
+printf 'name: x\r\n' > "$lbf"
+is "line-break scan: every listed file is scanned" "$lbf" "$(line_break_scan "$lbf2" "$lbf")"
+rm -f "$lbf" "$lbf2"
+# The in-tree call site must keep both globs (a dropped .yaml glob is
+# invisible while no .yaml workflow exists — r33 red-team LOW). Anchored on
+# the call line so the check's own pattern text cannot self-match.
+is "line-break scan call site covers .yml and .yaml" "1" "$(grep -cE '^lb_files="\$\(line_break_scan .*\.yml .*\.yaml\)"$' "$0" || true)"
 lb_files="$(line_break_scan .github/workflows/*.yml .github/workflows/*.yaml)"
 if [ -z "$lb_files" ]; then ok "workflows are LF-only and BOM-free (no CR/NEL/LS/PS/U+FEFF — YAML vs grep parity)"; else bad "workflow contains a non-LF line break or a BOM (YAML vs grep differential): $lb_files"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
@@ -1210,7 +1218,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=280
+CHECK_FLOOR=282
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
