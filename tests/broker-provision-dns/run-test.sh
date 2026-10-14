@@ -153,6 +153,10 @@ fe_case 4 "flow_end: bare column-0 block-scalar header is pinned (r27 HIGH)" $'o
 fe_case 4 "flow_end: folded block-scalar header with indicators is pinned (r27 HIGH)" $'on:\n>2-\n  push\npermissions:\n'
 fe_case 4 "flow_end: literal block-scalar entry under a column-0 sequence is pinned (r27 LOW)" $'on:\n- |\n  push\npermissions:\n'
 fe_case 4 "flow_end: bare column-0 sequence entry is pinned (r27 LOW)" $'on:\n-\n  push\npermissions:\n'
+fe_case 4 "flow_end: bare literal header with no indicators is pinned (r28 LOW)" $'on:\n|\n  push\npermissions:\n'
+fe_case 4 "flow_end: bare folded header with no indicators is pinned (r28 LOW)" $'on:\n>\n  push\npermissions:\n'
+fe_case 4 "flow_end: header with indicator and comment is pinned (r28 LOW)" $'on:\n|- # c\n  push\npermissions:\n'
+fe_case 4 "flow_end: header with a trailing space is pinned (r28 LOW)" $'on:\n|- \n  push\npermissions:\n'
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
@@ -196,6 +200,31 @@ rs_case BAD "root shape: --- with an anchor (r25 F2)" $'name: x\n--- &a\non: [pu
 rs_case BAD "root shape: ... marker" $'...\n'
 rs_case BAD "root shape: first content line indented" $'  name: x\n'
 rs_case BAD "root shape: anchor-only first line" $'&a\n  name: x\n'
+
+# YAML anchors relocate bytes: `env:\n  A: &a push` + `on: *a` puts the
+# real trigger value in an unpinned child while the `on:` span pins only
+# `on: *a`; an alias KEY (`run-name: &k "on"` + `*k: |-`) makes the locator
+# pin decoy bytes (r28 red-team HIGH/MEDIUM — actionlint-clean, all four
+# digests byte-identical). An alias cannot resolve without an anchor, so
+# `&name` definitions are banned blanket in every workflow (boundary-
+# anchored; `&&`, `2>&1` and glob stars stay legal). No in-tree use.
+anchor_count() { # $1 file -- anchor-definition tokens (&name)
+  grep -cE '(^|[[:space:]]|\[|\{|\}|,)&[^][:space:],{}&]' "$1" || true
+}
+aa_case() { # $1 expected, $2 label, $3 content
+  local f got
+  f="$(mktemp)"
+  printf '%s' "$3" > "$f"
+  got="$(anchor_count "$f")"
+  rm -f "$f"
+  is "$2" "$1" "$got"
+}
+aa_case 1 "anchor ban: block anchor" $'env:\n  A: &a push\n'
+aa_case 1 "anchor ban: flow anchor" $'x: [&a push]\n'
+aa_case 1 "anchor ban: punctuation-start name (permissive-parser form)" $'x: &.a 1\n'
+aa_case 0 "anchor ban: && is not an anchor" $'run: make && make test\n'
+aa_case 0 "anchor ban: 2>&1 is not an anchor" $'run: cmd 2>&1\n'
+aa_case 0 "anchor ban: branch glob is not an anchor" $'branches: [main, release/*]\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
 [ -f "$CI" ] || { printf 'FAIL ci.yml not found: %s\n' "$CI"; exit 1; }
@@ -906,6 +935,7 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
   is "$wf has no YAML merge keys" "0" "$(grep -cE '<<[[:space:]]*:' "$wf")"
   is "$wf has no YAML merge tags" "0" "$(grep -cE '!!merge|2002:merge' "$wf")"
+  is "$wf has no YAML anchors" "0" "$(anchor_count "$wf")"
 done
 is "ci.yml has no workflow defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
@@ -1139,7 +1169,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=246
+CHECK_FLOOR=263
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
