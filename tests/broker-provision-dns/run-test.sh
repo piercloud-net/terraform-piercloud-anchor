@@ -527,12 +527,12 @@ done
 job_digest_got="$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$job_digest_got"
 if [ "$job_digest_got" != "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" ]; then
-  printf '   job-set parts (to update the pin):\n'; printf '%s' "$wf_job_digest" | tr '|' '\n' | sed 's/^/     /'
+  printf '   job-set parts (to update the pin):\n'; printf '%s' "$wf_job_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 top_digest_got="$(printf '%s' "$wf_top_digest" | sha256sum | cut -d' ' -f1)"
 is "workflow top-level key set is pinned (pin: update for a deliberate top-level key change)" "598e3ea070a86315c6b546fbd67d10070ca83d8e4bfa2fc227168192540b0a23" "$top_digest_got"
 if [ "$top_digest_got" != "598e3ea070a86315c6b546fbd67d10070ca83d8e4bfa2fc227168192540b0a23" ]; then
-  printf '   top-level key parts (to update the pin):\n'; printf '%s' "$wf_top_digest" | tr '|' '\n' | sed 's/^/     /'
+  printf '   top-level key parts (to update the pin):\n'; printf '%s' "$wf_top_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 # A workflow must not gain (or repoint) an execution of test-tree content:
 # the `tests/*/run-test.sh` pin records are exempt from the retired-name scan,
@@ -552,7 +552,7 @@ done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
 is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" "$tests_digest_got"
 if [ "$tests_digest_got" != "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" ]; then
-  printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'
+  printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
