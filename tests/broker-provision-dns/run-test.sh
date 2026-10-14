@@ -50,19 +50,28 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # `'`/`"`/`#` is plain-scalar content (`it's`, `a#b`), and counting a `]`/`}`
 # inside a quoted scalar closed a live flow early — a trigger hidden after
 # the early end reds no pin (r23 HIGH; `?` added by the r23 trust lens:
-# `[?'a]b']` is a quoted explicit key and `[?# ]` a comment). Quoted contents
-# are not counted at all, so a mis-read can only extend the span. Empty when
-# no terminator is found (EOF).
+# `[?'a]b']` is a quoted explicit key and `[?# ]` a comment). A comment also
+# starts right after a COMPLETED token with no whitespace — `"b"# c`,
+# `[a]# c`, `{a: 1}# c` are all comments in YAML — so the comment rule
+# additionally accepts a closing quote or collection (`cmtstart`; a post-
+# close `#` was the r23 red-team HIGH: the `]` inside that comment closed a
+# live flow early). A quoted scalar also starts directly after a `:` in a
+# flow mapping (`{"k":"x]y"}`, r23 functional HIGH) and the terminator
+# additionally requires a CLOSED quote state, so a column-0 continuation of
+# a multi-line quoted scalar is never the span end. Quoted contents are not
+# counted at all, so a mis-read can only extend the span. Empty when no
+# terminator is found (EOF).
 flow_end() { # $1 file, $2 start line
   awk -v s="$2" '
     function sq() { return sprintf("%c", 39) }
-    function tokstart(p) { return p == "" || p == " " || p == "\t" || p == "[" || p == "{" || p == "," || p == "?" }
+    function tokstart(p) { return p == "" || p == " " || p == "\t" || p == "[" || p == "{" || p == "," || p == "?" || p == ":" }
+    function cmtstart(p) { return tokstart(p) || p == "\"" || p == sq() || p == "]" || p == "}" }
     function depth(line,   i, c, prev, d) {
       d = 0; prev = ""
       for (i = 1; i <= length(line); i++) {
         c = substr(line, i, 1)
         if (q == "") {
-          if (c == "#" && tokstart(prev)) break
+          if (c == "#" && cmtstart(prev)) break
           if ((c == "\"" || c == sq()) && tokstart(prev)) { q = c; prev = c; continue }
           if (c == "[" || c == "{") { d++ }
           else if (c == "]" || c == "}") { d-- }
@@ -83,7 +92,7 @@ flow_end() { # $1 file, $2 start line
     NR == s { d = depth($0); next }
     NR > s {
       if ($0 ~ /^[[:space:]]*$/) { next }
-      if (d <= 0 && $0 ~ /^[^[:space:]#]/) { print NR; exit }
+      if (q == "" && d <= 0 && $0 ~ /^[^[:space:]#]/) { print NR; exit }
       d += depth($0)
     }
   ' "$1"
@@ -105,6 +114,10 @@ fe_case 7 "flow_end: mid-token # is plain content, not a comment" $'on: [a#b, [c
 fe_case 3 "flow_end: # after a flow comma is a comment" $'on: [a,# ]\npush]\npermissions:\n'
 fe_case 5 "flow_end: ? explicit-key quoted scalar does not end the span early" $'on: [?\'a]b\',\npush,\n  pull_request_target,\n]\npermissions:\n'
 fe_case 3 "flow_end: # after an explicit-key ? is a comment" $'on: [?# ]\npush]\npermissions:\n'
+fe_case 5 "flow_end: # after a closing quote is a comment" $'on: [a, "b"# ] decoy\n, d,\n  pull_request_target,\n]\npermissions:\n'
+fe_case 5 "flow_end: # after a closing collection is a comment" $'on: {"pull_request": {branches: [main]}# ] decoy\n, workflow_dispatch,\n  pull_request_target,\n}\npermissions:\n'
+fe_case 5 "flow_end: quoted value after : in a flow mapping is not counted" $'on: {"pull_request": {"branches":"x]y"}\n, workflow_dispatch: null,\n  pull_request_target: null,\n}\npermissions:\n'
+fe_case 3 "flow_end: multi-line quoted scalar continuation is not a terminator" $'on: "a\nb"\npermissions:\n'
 fe_case 5 "flow_end: mid-token apostrophe does not open a quote" $'on: [it\'s, [a, b\'s,\n], push,\npull_request_target,\n]\npermissions:\n'
 fe_case 5 "flow_end: mid-token double quote does not open a quote" $'on: [it"s, [a, b"s,\n], push,\npull_request_target,\n]\npermissions:\n'
 fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: [it\'s,\n  push,\n'
@@ -1009,7 +1022,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=212
+CHECK_FLOOR=216
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
