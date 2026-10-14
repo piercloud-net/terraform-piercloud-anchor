@@ -62,7 +62,7 @@ command -v python3 >/dev/null 2>&1 || { printf 'FAIL python3 is required\n'; exi
 
 pass=0
 fail=0
-MIN_CHECKS=178
+MIN_CHECKS=224
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -126,6 +126,10 @@ has "module writes temp files that are not .yaml" "$(cat "${WORK}/module.py")" '
 for flag in '"--proto", "=https"' '"--max-redirs", "0"' '"--max-time", "20"' '"--max-filesize", str(MAX_BODY)' '"--speed-limit", "1000"' '"--speed-time", "10"' '"If-None-Match: " + etag'; do
   has "curl flag pinned: ${flag}" "$(cat "${WORK}/module.py")" "$flag"
 done
+has "module pins the public-edge target" "$(cat "${WORK}/module.py")" "https://edge.piercloud.site/healthz"
+has "module derives the shared gate login path" "$(cat "${WORK}/module.py")" "https://id.%s.piercloud.net/login"
+has "module requires the site class" "$(cat "${WORK}/module.py")" "type must be one of: public, shared, private"
+has "module cross-checks the class namespace" "$(cat "${WORK}/module.py")" "type public requires a <site>-<alias>.piercloud.site url"
 lacks "no --max-redirs value other than 0" "$(cat "${WORK}/module.py")" '"--max-redirs", "10"'
 # systemd hardening (rendered from the real functions)
 render_gatus_puller_service >"${WORK}/puller.service"
@@ -397,7 +401,7 @@ has "--state prints the rendered hash" "$(cat "$CASE/stdout.log")$(cat "$CASE/st
 has "--state prints last_success" "$(cat "$CASE/stdout.log")$(cat "$CASE/stderr.log")" "last_success"
 
 # ---- (c) tenant validation red rules --------------------------------------
-TENANT_RED="http-scheme port userinfo foreign-suffix ip-literal dollar control-char space quote backslash query fragment oversize-url too-many reserved-platform reserved-home reserved-slice reserved-host duplicate uppercase-name non-bool-alerts bad-version wrong-tenant future-generated-at bad-generated-at empty-list disabled-with-entries unknown-top-field unknown-entry-field endpoint-not-object endpoints-not-list file-scheme nested-three-labels deep-public"
+TENANT_RED="http-scheme port userinfo foreign-suffix ip-literal dollar control-char space quote backslash query fragment oversize-url too-many reserved-platform reserved-home reserved-slice reserved-host duplicate uppercase-name non-bool-alerts bad-version wrong-tenant future-generated-at bad-generated-at empty-list disabled-with-entries unknown-top-field unknown-entry-field endpoint-not-object endpoints-not-list file-scheme nested-three-labels deep-public missing-type bad-type-value bad-type-case bad-type-bool public-nested private-flat"
 for rule in $TENANT_RED; do
   new_case "red-${rule}"
   python3 "${HARNESS_DIR}/fixtures.py" tenant "$rule" >"$CASE/tenant.json"
@@ -462,16 +466,59 @@ rc="$(pull_rc)"
   || bad "disabled: true opt-out is accepted (no rows)"
 lacks "opt-out did not emit a tenant failure" "$(cat "$CASE/stderr.log")" "tenant manifest failure"
 
-# valid allowlist shapes: the anchor name is inside the tenant allowlist
+# valid allowlist shapes: the anchor name is inside the tenant allowlist and
+# is exempt from the D13 class cross-check (infrastructure, not a site).
 new_case allow-anchor
 python3 "${HARNESS_DIR}/fixtures.py" tenant anchor-name >"$CASE/tenant.json"
 seed_once
 rc="$(pull_rc)"
 [ "$rc" = "0" ] && grep -q 'name: blog' "$FRAGMENT" && grep -q 'url: https://anchor-01-pier.piercloud.net/healthz' "$FRAGMENT" \
-  && ok "tenant allowlist accepts the anchor-01 host" || bad "tenant allowlist accepts the anchor-01 host"
+  && ok "tenant allowlist accepts the anchor-01 host (class-exempt)" || bad "tenant allowlist accepts the anchor-01 host"
+
+# D13: a `type: shared` entry derives the shared gate row (class 5, pinned
+# strict login path); the shared site itself renders no per-site app-health row
+# class beyond its class-4 monitor row.
+new_case shared-gate
+python3 "${HARNESS_DIR}/fixtures.py" tenant shared-nested >"$CASE/tenant.json"
+set_topic
+seed_once
+rc="$(pull_rc)"
+is "shared gate: pull exits 0" "0" "$rc"
+has "shared gate: derived row rendered" "$(cat "$FRAGMENT")" "  - name: shared (gate)"
+has "shared gate: pinned strict login path" "$(cat "$FRAGMENT")" "url: https://id.pier.piercloud.net/login"
+has "shared gate: group is the tenant alias" "$(row_block 'shared (gate)')" "    group: pier"
+has "shared gate: class 5 ntfy-JSON bridge" "$(row_block 'shared (gate)')" "- type: custom"
+has "shared gate: resolves at priority 3" "$(row_block 'shared (gate)')" 'RESOLVED: "3"'
+has "shared entry: the site row is rendered class 4" "$(row_block fantasy)" "- type: ntfy"
+lacks "shared entry: no class-5 bridge on the site row" "$(row_block fantasy)" "send-on-resolved"
+
+# the derived row disappears with the last shared entry (D7 notice names it)
+new_case shared-gate-removal
+python3 "${HARNESS_DIR}/fixtures.py" tenant shared-nested >"$CASE/tenant.json"
+set_topic
+seed_once
+pull_rc >/dev/null
+python3 "${HARNESS_DIR}/fixtures.py" tenant valid >"$CASE/tenant.json"
+rm -f "${WORK}/notices.log"
+rc="$(pull_rc)"
+is "shared gate removal: pull exits 0" "0" "$rc"
+lacks "shared gate removal: row is gone" "$(cat "$FRAGMENT")" "shared (gate)"
+has "shared gate removal: notice names the derived row" "$(notices)" "shared (gate)"
+is "shared gate removal: last_tenant_names drops it" '["blog"]' "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("last_tenant_names")))' "$STATE")"
+
+# a disabled entry (D3 removal bookkeeping) is accepted and renders no row
+new_case disabled-entry
+python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-entry >"$CASE/tenant.json"
+seed_once
+rc="$(pull_rc)"
+if [ "$rc" = "0" ] && ! grep -q 'old-site' "$FRAGMENT"; then
+  ok "disabled entry: accepted (carries its class), renders no row"
+else
+  bad "disabled entry: accepted (carries its class), renders no row (rc=$rc)"
+fi
 
 # ---- (d) platform schema ---------------------------------------------------
-PLATFORM_RED="alerts-field foreign-host wrong-path name-url-mismatch bad-name platform-name-mismatch too-many two-platform-rows"
+PLATFORM_RED="alerts-field foreign-host wrong-path name-url-mismatch bad-name platform-name-mismatch too-many two-platform-rows edge-nonbool edge-disabled-conflict"
 for rule in $PLATFORM_RED; do
   new_case "pred-${rule}"
   python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
@@ -503,6 +550,42 @@ cp "$FRAGMENT" "$CASE/before.yaml"
 rc="$(pull_rc)"
 [ "$rc" = "0" ] && cmp -s "$FRAGMENT" "$CASE/before.yaml" && ok "platform disabled opt-out is accepted" \
   || bad "platform disabled opt-out is accepted"
+
+# D13: the platform's `edge: true` derives the `public edge` row (target
+# anchor-pinned; operator alerting, monitor-only on tenant anchors).
+new_case platform-edge
+python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
+python3 "${HARNESS_DIR}/fixtures.py" platform edge >"$CASE/platform.json"
+set_topic
+seed_once
+rc="$(pull_rc)"
+is "platform edge: pull exits 0" "0" "$rc"
+has "platform edge: row rendered" "$(cat "$FRAGMENT")" "  - name: public edge"
+has "platform edge: pinned target" "$(cat "$FRAGMENT")" "url: https://edge.piercloud.site/healthz"
+has "platform edge: platform group" "$(row_block 'public edge')" "    group: platform"
+has "platform edge: operator alerting (class 5 bridge)" "$(row_block 'public edge')" "- type: custom"
+
+new_case platform-edge-tenant-role
+python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
+python3 "${HARNESS_DIR}/fixtures.py" platform edge >"$CASE/platform.json"
+set_topic
+sed -i 's/^GATUS_PULL_ROLE=operator$/GATUS_PULL_ROLE=tenant/' "$CASE/env"
+seed_once
+rc="$(pull_rc)"
+is "platform edge (tenant role): pull exits 0" "0" "$rc"
+has "platform edge (tenant role): row stays monitor-only" "$(cat "$FRAGMENT")" "  - name: public edge"
+lacks "platform edge (tenant role): no alert stanza" "$(row_block 'public edge')" "alerts:"
+
+new_case platform-edge-false
+python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
+python3 "${HARNESS_DIR}/fixtures.py" platform edge-false >"$CASE/platform.json"
+seed_once
+rc="$(pull_rc)"
+if [ "$rc" = "0" ] && ! grep -q 'public edge' "$FRAGMENT"; then
+  ok "platform edge-false: no row rendered"
+else
+  bad "platform edge-false: no row rendered (rc=$rc)"
+fi
 
 # ---- (e) 404 not-published vs the 5xx ladder -------------------------------
 new_case not-published

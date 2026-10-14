@@ -161,13 +161,16 @@ jobs:
                   if [ "$manifest_channel" = "tenant" ]; then
                     jq -n --arg alias "${TENANT_USER:-}" --slurpfile doc "$work/manifest-tenant.json" \
                       '[{name:"platform",group:"platform"},{name:"your piercloud",group:$alias},{name:"private (gate)",group:$alias}]
+                       + (if ($doc[0].endpoints // [] | map(select((.disabled // false) == false and .type == "shared")) | length) > 0
+                          then [{name:"shared (gate)",group:$alias}] else [] end)
                        + ($doc[0].endpoints // [] | map(select((.disabled // false) == false) | {name:.name, group:$alias}))' \
                       >"$work/manifest-expected-tenant.json" || manifest_fail="${manifest_fail}tenant manifest parse failed; "
                     manifest_files="${manifest_files} $work/manifest-expected-tenant.json"
                   else
                     jq -n --slurpfile doc "$work/manifest-platform.json" \
                       '($doc[0].platform // [] | map(select((.disabled // false) == false) | {name:.name, group:"platform"}))
-                       + ($doc[0].hosts // [] | map(select((.disabled // false) == false) | {name:.name, group:"platform"}))' \
+                       + ($doc[0].hosts // [] | map(select((.disabled // false) == false) | {name:.name, group:"platform"}))
+                       + (if ($doc[0].edge // false) then [{name:"public edge",group:"platform"}] else [] end)' \
                       >"$work/manifest-expected-platform.json" || manifest_fail="${manifest_fail}platform manifest parse failed; "
                     manifest_files="${manifest_files} $work/manifest-expected-platform.json"
                   fi
