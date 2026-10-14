@@ -7,7 +7,8 @@
 # provision.yml `anchor-dns` job (broker lib call over OIDC, managed-lane
 # guard, tenant environment, resolved IPv4, fail-before-thumbprint ordering),
 # proves the retired provider surface (script, harness, variable and secret
-# names) is gone from every production surface, and cross-checks that the
+# names) is gone from every production surface (test-tree scripts included;
+# the `run-test.sh` pin records excepted), and cross-checks that the
 # committed CI wiring still names every harness (a dropped run-list line
 # cannot silently skip one). All extractions are block-scalar-aware: a decoy
 # `|`/`>` scalar (anchors/tags/quoted keys included) that quotes the job or
@@ -486,13 +487,12 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
 done
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
 # A workflow must not gain (or repoint) an execution of test-tree content:
-# `tests/` is pruned from the retired-name scan (the harnesses are the pin
-# records), so an unpinned job could otherwise `run: bash tests/evil.sh` and
-# a direct provider write inside a test-tree script would be executed by a
-# production job with no harness red. The exact set of workflow lines
-# mentioning the `tests` path token is pinned as one digest (comments
-# included); a new, edited or removed reference fails closed until the pin
-# is deliberately updated.
+# the `tests/*/run-test.sh` pin records are pruned from the retired-name scan,
+# so an unpinned job could otherwise `run: bash tests/broker-provision-dns/run-test.sh`
+# and a harness record would run in a production job. The exact set of
+# workflow lines mentioning the `tests` path token is pinned as one digest
+# (comments included); a new, edited or removed reference fails closed until
+# the pin is deliberately updated.
 wf_tests_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
@@ -623,14 +623,17 @@ else
 fi
 
 # ---- production surfaces carry no retired name ----------------------------
-# Every file in the repo outside tests/, .git/ and the gitignored .local/
-# proof config is a production surface (extensionless and Markdown included),
-# except the two records that name the retired identifiers by design:
-# docs/security-posture.md (the retirement record) and docs/verification.md
-# (the b3b verification row naming the retired harness). A new
-# `tools/evil.sh`, `tools/dns-fallback.env`, `evil.bash`,
-# `.github/workflows/evil.yaml`, `scripts/lib/helper` or sourced
-# `docs/evil.md` must not sit outside the scan. Word
+# Every file in the repo outside .git/ and the gitignored .local/ proof
+# config is a production surface (extensionless and Markdown included),
+# except two record classes that name the retired identifiers by design:
+# the `tests/*/run-test.sh` harness records (the pins themselves) and
+# docs/security-posture.md + docs/verification.md. Scanning the rest of
+# tests/ closes the execute-a-test-script route: an unpinned job could
+# otherwise `run: bash tests/evil.sh` — however the path is spelled, shell
+# assembly included — and a direct provider write inside the script would
+# never be scanned. A new `tools/evil.sh`, `tools/dns-fallback.env`,
+# `evil.bash`, `.github/workflows/evil.yaml`, `scripts/lib/helper` or
+# sourced `docs/evil.md` must not sit outside the scan. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
 # legal while the retired repo variable is caught. Comments are INCLUDED: a
 # stale comment is drift too. The named groups are still checked explicitly
@@ -644,11 +647,11 @@ for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' 'scripts/*.sh'; do
   compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
 done
 surface_files=()
-while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type f ! -path './docs/security-posture.md' ! -path './docs/verification.md' -print | sort)
+while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./.local \) -prune -o -type f ! -path './tests/*/run-test.sh' ! -path './docs/security-posture.md' ! -path './docs/verification.md' -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
 # closed instead (the tree has none).
-symlinks="$(find . \( -path ./.git -o -path ./tests -o -path ./.local \) -prune -o -type l -print | sort)"
+symlinks="$(find . \( -path ./.git -o -path ./.local \) -prune -o -type l ! -path './tests/*/run-test.sh' -print | sort)"
 if [ -z "$symlinks" ]; then ok "no symlinks in the production surface"; else bad "symlink in the production surface: $symlinks"; fi
 for f in "${surface_files[@]}"; do
   [ -f "$f" ] || bad "scanned surface missing: $f"
