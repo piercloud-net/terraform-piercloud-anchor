@@ -215,8 +215,9 @@ anchor_count() { # $1 file -- anchor-definition tokens at a NODE START
   # reject them -- the ban is fail-closed. The prefix is a NODE-START
   # context (`: `/`- ` value starts, flow `[`/`{`/`,`, line start, `? `,
   # a tag), so a mid-scalar shell `&&` (`make && make`, `2>&1 &&`,
-  # `[ -s x ] &&`) stays legal -- the r29/r30 red-team class.
-  grep -cE '(^[[:space:]]*|:[[:space:]]*|-[[:space:]]+|[[:space:]]*[\[{,][[:space:]]*|[?][[:space:]]+|[!][^[:space:]]*[[:space:]]+)&[^][:space:],{}]' "$1" || true
+  # `[ -s x ] &&`) stays legal while the r29-r31 red-team anchor spellings
+  # are caught.
+  grep -cE '(^[[:space:]]*|:[[:space:]]*|-[[:space:]]+|[[:space:]]*[\[{,][[:space:]]*|[?][[:space:]]*|[!][^[:space:]]*[[:space:]]+)&[^][:space:],{}]' "$1" || true
 }
 aa_case() { # $1 expected, $2 label, $3 content
   local f got
@@ -238,6 +239,9 @@ aa_case 1 "anchor ban: triple-ampersand name (go-yaml run)" $'env:\n  A: &&&b pu
 aa_case 1 "anchor ban: bare double-ampersand name (go-yaml anchor &)" $'env:\n  A: && push\n'
 aa_case 1 "anchor ban: tag-prefixed run name" $'x: !!str &&b 1\n'
 aa_case 1 "anchor ban: flow colon with no space (r30 red-team F1)" $'env: {"k":&a push}\n'
+aa_case 1 "anchor ban: flow explicit key with no space (r31 red-team)" $'x: {?&a y: z}\n'
+aa_case 1 "anchor ban: line-start block anchor (r31 functional F2)" $'key:\n  &a value\n'
+aa_case 1 "anchor ban: block sequence anchor (r31 functional F2)" $'- &a value\n'
 aa_case 0 "anchor ban: in-tree shell && continuation is content" $'run: cmd >/dev/null 2>&1 && cmd2\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
@@ -1183,7 +1187,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=270
+CHECK_FLOOR=273
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
