@@ -84,22 +84,43 @@ function qprefix(s,   i, c, q) {
 }'  "$PROV")"
 [ -n "$PROV_STRUCT" ] || { printf 'FAIL structural view of %s is empty\n' "$PROV"; exit 1; }
 prov_raw_live="$(grep -v '^[[:space:]]*#' "$PROV")"
-JOB_START="$(awk -F'\t' '$2 ~ /^  anchor-dns:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
+JOB_START="$(awk -F'\t' '$2 ~ /^  ((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*anchor-dns:[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 [ -n "$JOB_START" ] || { printf 'FAIL anchor-dns job key not found in %s\n' "$PROV"; exit 1; }
-JOB_END="$(awk -F'\t' -v s="$JOB_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
+JOB_END="$(awk -F'\t' -v s="$JOB_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 [ -n "$JOB_END" ] || { printf 'FAIL anchor-dns job end not found in %s\n' "$PROV"; exit 1; }
 JOB_RAW="$(sed -n "$((JOB_START + 1)),$((JOB_END - 1))p" "$PROV")"
 JOB="$(printf '%s\n' "$JOB_RAW" | grep -v '^[[:space:]]*#' || true)"
 [ -n "$JOB" ] || { printf 'FAIL anchor-dns job body not found in %s\n' "$PROV"; exit 1; }
 # Exactly one job key at top level: a decoy scalar the stripper does not
 # recognise would add a second (and the structural view would pick it first).
-is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?(\"anchor-dns\"|'anchor-dns'|anchor-dns)[[:space:]]*:?[[:space:]]*(#.*)?$" "$PROV")"
+is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"anchor-dns\"|'anchor-dns'|anchor-dns)[[:space:]]*:?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$" "$PROV")"
 # Spelling-agnostic structural census: every raw line that starts at indent 2
 # with a non-space, non-comment character is a structural line of the
 # workflow top level (on/concurrency/permissions children plus the eight job
 # keys). A duplicate or decoy job key in ANY spelling (tags, quotes, hex
 # escapes, explicit keys) adds one, so it fails until the pin is deliberately
 # updated.
+# The job SET is pinned by name: the indent-2 census is a count, so a new
+# job added while a default-equivalent indent-2 line is removed (e.g.
+# concurrency `cancel-in-progress: false`) keeps the count green. Any
+# deliberate job addition/rename updates this pin.
+JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
+JOBS_END="$(awk -F'\t' -v s="$JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$PROV_STRUCT")"
+if [ -n "$JOBS_START" ] && [ -z "$JOBS_END" ]; then JOBS_END=$(( $(wc -l < "$PROV") + 1 )); fi
+if [ -n "$JOBS_START" ] && [ -n "$JOBS_END" ]; then
+  actual_jobs="$(sed -n "$((JOBS_START + 1)),$((JOBS_END - 1))p" "$PROV" | grep -E '^  [a-z][a-z0-9-]*:$' | sed -e 's/^  //' -e 's/:$//')"
+  expected_jobs='visibility-banner
+device-flow
+anchor-dns
+apply-placeholder
+check-hygiene
+update-ip-placeholder
+destroy-gate
+thumbprint'
+  is "provision.yml job set is pinned (pin: update for a deliberate job change)" "$expected_jobs" "$actual_jobs"
+else
+  bad "provision.yml jobs span not found"
+fi
 is "provision.yml structural indent-2 line count (pin: update for a new top-level line)" "12" "$(printf '%s\n' "$PROV_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 
 # ---- the broker-dns lib is the one writer --------------------------------
@@ -285,9 +306,11 @@ function qprefix(s,   i, c, q) {
   }
 }'  "$CI")"
 ci_unit_START="$(awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
-ci_unit_END="$(awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+ci_unit_END="$(awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
 ci_unit=""
+ci_unit_raw=""
 [ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
+[ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit_raw="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI")"
 [ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
 # The gate and run-list assertions are scoped to the unit-tests-scripts job
 # block: a mention in another job's run line or a commented-out line cannot
@@ -325,6 +348,11 @@ else
   bad "harness-run step span not found in ci.yml"
 fi
 is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the committed script harnesses \(cheap first\)$' "$CI")"
+# The whole unit-tests-scripts job body is byte-pinned: the step pins cannot
+# see an inserted step in the same job that rewrites a harness on the runner
+# before the pinned run step executes it (the static harnesses read the PR
+# tree, not the runner workspace). Any deliberate job edit updates this pin.
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "d28a8019bf4a441e04e5409c93ab5ec0b4591520ebf0e9adc57ceca9e57076b3" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -332,9 +360,9 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # while the pinned step stays green. Exactly one job key line (any spelling)
 # may exist; the span is located structurally and fails closed when the end
 # is missing.
-SCP_START="$(awk -F'\t' '$2 ~ /^  scp-endpoint-allowlist:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
-SCP_END="$(awk -F'\t' -v s="$SCP_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
-is "exactly one scp-endpoint-allowlist job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"scp-endpoint-allowlist\"|'scp-endpoint-allowlist'|scp-endpoint-allowlist)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
+SCP_START="$(awk -F'\t' '$2 ~ /^  ((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*scp-endpoint-allowlist:[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+SCP_END="$(awk -F'\t' -v s="$SCP_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+is "exactly one scp-endpoint-allowlist job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"scp-endpoint-allowlist\"|'scp-endpoint-allowlist'|scp-endpoint-allowlist)[[:space:]]*:?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$" "$CI")"
 if [ -n "$SCP_START" ] && [ -n "$SCP_END" ]; then
   SCP_JOB_BLOB="$(sed -n "$((SCP_START + 1)),$((SCP_END - 1))p" "$CI")"
   is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "f7d98c0ac8deb7e8ddfc407ee0129492c2858e9d286c7942a41779fce5727827" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
@@ -358,6 +386,10 @@ is "no job-level strategy on the unit-tests job" "0" "$(printf '%s\n' "$ci_unit"
 is "no workflow-level defaults in ci.yml" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 for v in BASH_ENV ENV SHELLOPTS BASHOPTS; do
   lacks_word "ci.yml does not set $v" "$v" "$ci_live"
+done
+for v in LD_PRELOAD LD_LIBRARY_PATH; do
+  lacks_word "ci.yml does not set $v" "$v" "$ci_live"
+  lacks_word "provision.yml does not set $v" "$v" "$prov_raw_live"
 done
 lacks "ci allowlist no longer names the Cloudflare DNS API" 'api.cloudflare.com' "$(cat "$CI")"
 lacks "ci allowlist no longer names the Gcore DNS API" 'api.gcore.com' "$(cat "$CI")"
@@ -424,7 +456,7 @@ done
 allowed_default="$(grep -E '^[[:space:]]*allowed_url=' "$CI" || true)"
 [ -n "$allowed_default" ] || bad "ci.yml allowed_url default not found"
 is "exactly one line-leading allowed_url assignment" "1" "$(grep -cE '^[[:space:]]*allowed_url=' "$CI")"
-is "ci.yml allowed_url default blob hash" "2995ad1ff3581328f07a567d6ffa840d3dad8cc14627869d8dc2288ff7b57617" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
+is "ci.yml allowed_url default blob hash (pin: update after a deliberate edit)" "2995ad1ff3581328f07a567d6ffa840d3dad8cc14627869d8dc2288ff7b57617" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
 lacks "ci.yml does not append to allowed_url" 'allowed_url+=' "$(cat "$CI")"
 lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed_default"
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
@@ -488,26 +520,30 @@ for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKE
     *) bad "grep failed scanning for $v (rc=$rc)" ;;
   esac
 done
-rc=0
-hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surface_files[@]}")" || rc=$?
+writer_rc=0
+writer_hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surface_files[@]}")" || writer_rc=$?
+case "$writer_rc" in
+  0) bad "production surface references the retired writer/harness: $writer_hits" ;;
+  1) ok "no production surface references the retired writer/harness" ;;
+  *) bad "grep failed scanning for the retired writer/harness (rc=$writer_rc)" ;;
+esac
 # The retired provider APIs must not reappear even when URL_EXTRACT cannot
 # see the URL (`${SCHEME}://api.gcore.com`, `HTTPS://...`): the host
-# literals are banned case-insensitively across the whole production
-# surface. A variable-assembled hostname remains a disclosed residual.
-for pat in 'api\.gcore\.com' 'api\.cloudflare\.com'; do
-  rc=0
-  hits="$(grep -liE -- "$pat" "${surface_files[@]}")" || rc=$?
-  case "$rc" in
-    0) bad "production surface names a retired provider host ($pat): $hits" ;;
+# API hostnames are banned case-insensitively across the whole production
+# surface: any subdomain of the retired providers (`api.gcore.com`, the
+# legacy `api.gcorelabs.com`, `api.cloudflare.com`, `dns.gcore.com`),
+# escaped-dot spellings included. A bare provider domain in prose (the
+# Cloudflare edge-ranges comment in main.tf) is not an API host and stays
+# legal; a variable-assembled hostname remains a disclosed residual.
+for pat in '[[:alnum:]_-]+\\*\.gcore\\*\.com' '[[:alnum:]_-]+\\*\.gcorelabs\\*\.com' '[[:alnum:]_-]+\\*\.cloudflare\\*\.com'; do
+  host_rc=0
+  host_hits="$(grep -liE -- "$pat" "${surface_files[@]}")" || host_rc=$?
+  case "$host_rc" in
+    0) bad "production surface names a retired provider host ($pat): $host_hits" ;;
     1) ok "no production surface names a retired provider host ($pat)" ;;
-    *) bad "grep failed scanning for '$pat' (rc=$rc)" ;;
+    *) bad "grep failed scanning for '$pat' (rc=$host_rc)" ;;
   esac
 done
-case "$rc" in
-  0) bad "production surface references the retired writer/harness: $hits" ;;
-  1) ok "no production surface references the retired writer/harness" ;;
-  *) bad "grep failed scanning for the retired writer/harness (rc=$rc)" ;;
-esac
 
 # Composite and local actions execute in the same context: every action
 # manifest anywhere outside tests/ (a `uses: ./actions/foo` local action
@@ -573,10 +609,13 @@ for t in "${harnesses[@]}"; do
   fi
 done
 
-# Exact passing-check floor: deleting or emptying a check (the byte-pin block
-# included) must fail the suite instead of silently reducing coverage. Update
-# deliberately when adding or removing checks.
-CHECK_FLOOR=162
+# Exact passing-check floor (count-only, same class as banner-workflow-diff):
+# deleting or emptying a counted check (the byte-pin block included) fails
+# the suite instead of silently reducing coverage; a same-count gutting —
+# deleting an ok-less guard, or this block itself — is invisible here and
+# relies on review plus the CI run list. Update deliberately when adding or
+# removing checks.
+CHECK_FLOOR=169
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
