@@ -967,16 +967,54 @@ printf 'name: x\r\n' > "$lbf"
 is "line-break scan: every listed file is scanned" "$lbf" "$(line_break_scan "$lbf2" "$lbf")"
 is "line-break scan: dirty first file is scanned" "$lbf" "$(line_break_scan "$lbf" "$lbf2")"
 rm -f "$lbf" "$lbf2"
-# The in-tree call site must be exactly ONE assignment keeping both GLOBS
-# (a dropped .yaml glob is invisible while no .yaml workflow exists — r33
-# red-team LOW; a glob replaced by a plain filename carrying the
-# extension, and a later broken overwrite of the variable, are caught too
-# — r34 functional/red-team LOWs). The pattern is applied to the
-# extracted assignment line, so the check's own text cannot self-match.
-lb_assign="$(grep -E '^lb_files=' "$0" || true)"
-is "line-break scan call site: exactly one assignment" "1" "$(printf '%s\n' "$lb_assign" | grep -c . || true)"
-is "line-break scan call site covers .yml and .yaml globs" "1" "$(printf '%s\n' "$lb_assign" | grep -cE '^lb_files="\$\(line_break_scan .*\*\.yml .*\*\.yaml\)"$' || true)"
+# The in-tree call site is pinned structurally AND at runtime (r35
+# red-team MEDIUM/LOW): the scan result is held in a READONLY variable
+# (any later overwrite — bare, indented, inline-after-`then`, declare/
+# export/eval — is a fatal assignment error in a non-interactive shell,
+# so a hostile tree stays red), and the call line must be the exact
+# readonly globs line. Any other assignment shape anywhere
+# (word-boundary match), any other call text (a swapped directory, a
+# decoy glob, an added flag) and any glob-disable (`set -f`-style)
+# fails closed. The patterns avoid the literal assignment/call tokens so
+# this check's own lines cannot self-match.
+lb_assign_lines() { # $1 file -- any-shape assignment lines
+  grep -nE '(^|[^[:alnum:]_])lb_files(\+)?[[:space:]]*=' "$1" || true
+}
+lb_setf_lines() { # $1 file -- `set -f`-style glob-disable lines
+  grep -nE '(^|[^[:alnum:]_])set[[:space:]]+-[[:alpha:]]*f([[:space:]]|$)' "$1" || true
+}
+lb_call_lines() { # $1 file -- exact scan-call tokens
+  grep -cE '(^|[^[:alnum:]_])line_break_scan \.github/workflows/\*\.yml \.github/workflows/\*\.yaml($|[^[:alnum:]_])' "$1" || true
+}
 lb_files="$(line_break_scan .github/workflows/*.yml .github/workflows/*.yaml)"
+readonly lb_files
+is "line-break scan call site: exactly one assignment (any shape)" "1" "$(lb_assign_lines "$0" | grep -c . || true)"
+is "line-break scan call site: exact scan assignment line" "1" "$(grep -cE '^lb_file[s]="\$\(line_break_scan \.github/workflows/\*\.yml \.github/workflows/\*\.yaml\)"$' "$0" || true)"
+is "line-break scan call site: readonly guard present" "1" "$(grep -cE '^readonly lb_file[s]$' "$0" || true)"
+is "line-break scan call site: no glob disable" "0" "$(lb_setf_lines "$0" | grep -c . || true)"
+# Teeth: every assignment shape counts; the call token must be exact.
+lbfa="$(mktemp)"
+printf 'lb_file%s=""\n' 's' > "$lbfa"
+is "lb assign scan: bare assignment found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
+printf '  lb_file%s=""\n' 's' > "$lbfa"
+is "lb assign scan: indented overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
+printf 'if true; then lb_file%s=""; fi\n' 's' > "$lbfa"
+is "lb assign scan: inline-after-then overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
+printf 'declare lb_file%s=""\n' 's' > "$lbfa"
+is "lb assign scan: declare-prefixed overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
+printf 'eval lb_file%s=""\n' 's' > "$lbfa"
+is "lb assign scan: eval-built overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
+printf 'run: make && make test\n' > "$lbfa"
+is "lb assign scan: shell && is not an assignment" "" "$(lb_assign_lines "$lbfa")"
+printf 'set -%s\n' 'ef' > "$lbfa"
+is "lb setf scan: short-flag glob disable found" "1" "$(lb_setf_lines "$lbfa" | grep -c . || true)"
+printf 'run: set -eu\n' > "$lbfa"
+is "lb setf scan: set -eu is not a glob disable" "" "$(lb_setf_lines "$lbfa")"
+printf 'line_break_scan .github/workflows/%s.yml .github/workflows/%s.yaml\n' '*' '*' > "$lbfa"
+is "lb call scan: exact call token counted" "1" "$(lb_call_lines "$lbfa")"
+printf 'line_break_scan docs/%s.yml docs/%s.yaml\n' '*' '*' > "$lbfa"
+is "lb call scan: swapped directory not counted" "0" "$(lb_call_lines "$lbfa")"
+rm -f "$lbfa"
 if [ -z "$lb_files" ]; then ok "workflows are LF-only and BOM-free (no CR/NEL/LS/PS/U+FEFF — YAML vs grep parity)"; else bad "workflow contains a non-LF line break or a BOM (YAML vs grep differential): $lb_files"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
@@ -1224,7 +1262,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=284
+CHECK_FLOOR=296
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
