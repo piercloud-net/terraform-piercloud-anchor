@@ -108,7 +108,17 @@ JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<
 JOBS_END="$(awk -F'\t' -v s="$JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$PROV_STRUCT")"
 if [ -n "$JOBS_START" ] && [ -z "$JOBS_END" ]; then JOBS_END=$(( $(wc -l < "$PROV") + 1 )); fi
 if [ -n "$JOBS_START" ] && [ -n "$JOBS_END" ]; then
-  actual_jobs="$(sed -n "$((JOBS_START + 1)),$((JOBS_END - 1))p" "$PROV" | grep -E '^  [a-z][a-z0-9-]*:$' | sed -e 's/^  //' -e 's/:$//')"
+  # Every indent-2 non-comment line of the jobs block is a job key: normalise
+  # the spelling (leading node properties, trailing comment, `: <value>`,
+  # surrounding quotes) and compare the whole set, so a hostile key in ANY
+  # spelling is either normalised into the set check (and reds as an unknown
+  # name) or reds by not normalising to a known name.
+  actual_jobs="$(sed -n "$((JOBS_START + 1)),$((JOBS_END - 1))p" "$PROV" \
+    | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
+    | sed -e 's/[[:space:]]*#.*$//' -e 's/^  //' \
+    | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
+    | sed -e 's/[[:space:]]*:.*$//' \
+    | sed -E -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
   expected_jobs='visibility-banner
 device-flow
 anchor-dns
@@ -376,6 +386,36 @@ is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (
 # keys). A
 # duplicate or decoy job key in ANY spelling adds one.
 is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
+# The job SET is pinned by name too: the census is a count, so a new job
+# added while a semantic-neutral indent-2 line is removed (`permissions:
+# { contents: read }` replacing the block form) keeps the count green — and
+# a new job runs with repo secrets and can shadow a required check by name.
+# Every indent-2 non-comment line of the jobs block is normalised and
+# compared; any deliberate job addition/rename updates this pin.
+CI_JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+CI_JOBS_END="$(awk -F'\t' -v s="$CI_JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$CI_STRUCT")"
+if [ -n "$CI_JOBS_START" ] && [ -z "$CI_JOBS_END" ]; then CI_JOBS_END=$(( $(wc -l < "$CI") + 1 )); fi
+if [ -n "$CI_JOBS_START" ] && [ -n "$CI_JOBS_END" ]; then
+  actual_ci_jobs="$(sed -n "$((CI_JOBS_START + 1)),$((CI_JOBS_END - 1))p" "$CI" \
+    | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
+    | sed -e 's/[[:space:]]*#.*$//' -e 's/^  //' \
+    | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
+    | sed -e 's/[[:space:]]*:.*$//' \
+    | sed -E -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+  expected_ci_jobs='fmt
+validate
+key-material-grep
+scp-endpoint-allowlist
+pat-print-grep
+shared-origin-grep
+unit-tests-scripts
+bind-e2e
+jq-boolean-guard
+scrub-canary'
+  is "ci.yml job set is pinned (pin: update for a deliberate job change)" "$expected_ci_jobs" "$actual_ci_jobs"
+else
+  bad "ci.yml jobs span not found"
+fi
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
 # variables anywhere in ci.yml, and the allowlist must no longer name the
@@ -528,8 +568,8 @@ case "$writer_rc" in
   *) bad "grep failed scanning for the retired writer/harness (rc=$writer_rc)" ;;
 esac
 # The retired provider APIs must not reappear even when URL_EXTRACT cannot
-# see the URL (`${SCHEME}://api.gcore.com`, `HTTPS://...`): the host
-# API hostnames are banned case-insensitively across the whole production
+# see the URL (`${SCHEME}://api.gcore.com`, `HTTPS://...`): the API
+# hostnames are banned case-insensitively across the whole production
 # surface: any subdomain of the retired providers (`api.gcore.com`, the
 # legacy `api.gcorelabs.com`, `api.cloudflare.com`, `dns.gcore.com`),
 # escaped-dot spellings included. A bare provider domain in prose (the
@@ -595,6 +635,10 @@ done
 # A dropped run-list line silently skips a harness and no harness can catch
 # its own absence — the cross-check lives here, in managed-inputs and in
 # edge-origin-auth, so removing one checker's line still leaves two failing.
+# Deleting the harness FILE is caught at CI runtime (the run step's `bash`
+# exits 127) unless its run-list line is removed in the same PR; that joint
+# removal is a disclosed review-only residual (the unit-tests-scripts
+# whole-job pin catches a runner-side overwrite, not an absent file).
 shopt -s nullglob
 harnesses=(tests/*/run-test.sh)
 [ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
@@ -615,7 +659,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=169
+CHECK_FLOOR=170
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
