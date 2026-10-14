@@ -8,7 +8,8 @@
 # guard, tenant environment, resolved IPv4, fail-before-thumbprint ordering),
 # proves the retired provider surface (script, harness, variable and secret
 # names) is gone from every production surface (test-tree scripts included;
-# the `run-test.sh` pin records excepted), and cross-checks that the
+# the `run-test.sh` pin records and the two by-design retirement records
+# docs/security-posture.md / docs/verification.md excepted), and cross-checks that the
 # committed CI wiring still names every harness (a dropped run-list line
 # cannot silently skip one). All extractions are block-scalar-aware: a decoy
 # `|`/`>` scalar (anchors/tags/quoted keys included) that quotes the job or
@@ -106,8 +107,12 @@ is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\
 # concurrency `cancel-in-progress: false`) keeps the count green. Any
 # deliberate job addition/rename updates this pin.
 JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
-JOBS_END="$(awk -F'\t' -v s="$JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$PROV_STRUCT")"
-if [ -n "$JOBS_START" ] && [ -z "$JOBS_END" ]; then JOBS_END=$(( $(awk 'END{print NR}' "$PROV") + 1 )); fi
+# Parsed to end-of-file: ending the span at the first column-0 line let a
+# flow-collection continuation at column 0 truncate it and hide every job
+# key after it (r17 F1). A top-level key after jobs (unsupported layout;
+# jobs is last in-tree) contributes its indent-2 lines to the set check, so
+# the set changes and the pin must be deliberately updated.
+JOBS_END=$(( $(awk 'END{print NR}' "$PROV") + 1 ))
 if [ -n "$JOBS_START" ] && [ -n "$JOBS_END" ]; then
   # Every indent-2 non-comment line of the jobs block is a job key: normalise
   # the spelling (leading node properties, trailing comment, `: <value>`,
@@ -394,8 +399,9 @@ is "ci.yml structural indent-2 line count (pin: update for a new top-level line)
 # Every indent-2 non-comment line of the jobs block is normalised and
 # compared; any deliberate job addition/rename updates this pin.
 CI_JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
-CI_JOBS_END="$(awk -F'\t' -v s="$CI_JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$CI_STRUCT")"
-if [ -n "$CI_JOBS_START" ] && [ -z "$CI_JOBS_END" ]; then CI_JOBS_END=$(( $(awk 'END{print NR}' "$CI") + 1 )); fi
+# Parsed to end-of-file (a column-0 flow continuation must not truncate the
+# span; see the provision job-set comment).
+CI_JOBS_END=$(( $(awk 'END{print NR}' "$CI") + 1 ))
 if [ -n "$CI_JOBS_START" ] && [ -n "$CI_JOBS_END" ]; then
   actual_ci_jobs="$(sed -n "$((CI_JOBS_START + 1)),$((CI_JOBS_END - 1))p" "$CI" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
@@ -424,7 +430,8 @@ fi
 # `scp-endpoint-allowlist`), external-watch.yml and broker-report-selftest.yml
 # wiring is pinned by their own harnesses, and the remaining job bodies
 # (incl. release.yml, validate-package-version.yml, validate-release-pr.yml)
-# are names-only. A duplicate top-level `jobs:` key in any spelling
+# get only name pins here (other harnesses pin parts of some bodies, e.g.
+# the banner and device-flow jobs). A duplicate top-level `jobs:` key in any spelling
 # the count recognises fails here; the escaped spelling
 # (`"j\u006fbs":`) is caught by the all-workflow hex/octal-escape ban
 # below. Pin update is deliberate (same PR as the workflow change).
@@ -443,8 +450,13 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     wf_job_digest="$wf_job_digest|$wf:NOJOBS"
     continue
   fi
-  jend="$(awk -v s="$jstart" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
-  [ -n "$jend" ] || jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
+  # The jobs block is parsed to end-of-file: ending the span at the first
+  # column-0 line let a flow-collection continuation at column 0 truncate it
+  # and hide every job key after it (r17 F1). A top-level key after jobs
+  # (unsupported layout; jobs is last in-tree) contributes its indent-2 lines
+  # to the name extraction, so the digest changes and the pin must be
+  # deliberately updated.
+  jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
   # A quoted job key can hide a colon (`"release: evil":`), which the
   # first-colon strip would truncate to the plain name and hide the rename.
   # Quoted keys are not needed in-tree; fail closed on any. The quote may
@@ -458,22 +470,24 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   fi
   raw_keys="$(sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
-    | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
+    | sed -E -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//')" || true
   # The digest truncates each key at its first colon, so a rename to
   # `<known>:evil:` (plain YAML) or `&a "release:evil":` would yield the
-  # known name. Every raw key must be exactly a valid GitHub job id
-  # (alphanumerics, `-`, `_`, starting with a letter or `_`) followed by its
-  # colon: anything else is a hidden rename or an unrecognised spelling
-  # (extra colon, comma, tab, quote truncation) and fails closed.
-  if grep -qvE '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*:[[:space:]]*$' <<<"$raw_keys"; then
+  # known name. Every raw key must start with a valid GitHub job id
+  # (alphanumerics, `-`, `_`, starting with a letter or `_`) whose colon is a
+  # real mapping separator (followed by whitespace or end of line — in YAML a
+  # colon inside a plain key is not followed by whitespace). Anything after
+  # the separator is the job's value and is left to the body pins (a
+  # value-side anchor/tag, e.g. `release: &a`, is legal YAML).
+  if grep -qvE '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*:([[:space:]].*)?$' <<<"$raw_keys"; then
     bad "$wf job key fails the GitHub job-id grammar (rename/truncation guard)"
     wf_job_digest="$wf_job_digest|$wf:BADNAME"
     continue
   fi
   names="$(sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
-    | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
+    | sed -E -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
     | sed -e 's/[[:space:]]*:.*$//' \
     | sed -E -e 's/^"//' -e 's/"$//')" || true
@@ -487,16 +501,19 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
 done
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
 # A workflow must not gain (or repoint) an execution of test-tree content:
-# the `tests/*/run-test.sh` pin records are pruned from the retired-name scan,
+# the `tests/*/run-test.sh` pin records are exempt from the retired-name scan,
 # so an unpinned job could otherwise `run: bash tests/broker-provision-dns/run-test.sh`
 # and a harness record would run in a production job. The exact set of
-# workflow lines mentioning the `tests` path token is pinned as one digest
-# (comments included); a new, edited or removed reference fails closed until
-# the pin is deliberately updated.
+# workflow lines mentioning the `tests` path token OR `run-test.sh` is pinned
+# as one digest (comments included); a new, edited or removed reference fails
+# closed until the pin is deliberately updated. The pin is literal-token-only:
+# a shell-assembled `tests` token still fires the pin while `run-test.sh` is
+# literal; a fully-assembled path (both tokens) fires no pin (disclosed
+# residual).
 wf_tests_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
-  wf_tests_digest="$wf_tests_digest|$wf:$(grep -E '(^|[^[:alnum:]_-])tests([^[:alnum:]_-]|$)' "$wf" | sha256sum | cut -d' ' -f1 || true)"
+  wf_tests_digest="$wf_tests_digest|$wf:$(grep -E '(^|[^[:alnum:]_-])tests([^[:alnum:]_-]|$)|run-test\.sh' "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" "$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
 # The unit-tests job itself must stay live and shell-predictable: no
@@ -623,10 +640,12 @@ else
 fi
 
 # ---- production surfaces carry no retired name ----------------------------
-# Every file in the repo outside .git/ and the gitignored .local/ proof
-# config is a production surface (extensionless and Markdown included),
+# Every file in the repo outside .git/, the gitignored .local/ proof config
+# and gitignored build artifacts (`__pycache__/`) is a production surface
+# (extensionless and Markdown included),
 # except two record classes that name the retired identifiers by design:
-# the `tests/*/run-test.sh` harness records (the pins themselves) and
+# the `tests/*/run-test.sh` harness records (exactly one level — the pins
+# themselves; a nested `run-test.sh` is scanned like any other file) and
 # docs/security-posture.md + docs/verification.md. Scanning the rest of
 # tests/ closes the execute-a-test-script route: an unpinned job could
 # otherwise `run: bash tests/evil.sh` — however the path is spelled, shell
@@ -647,18 +666,34 @@ for pat in '.github/workflows/*.yml' '.github/scripts/*.sh' 'scripts/*.sh'; do
   compgen -G "$pat" >/dev/null || bad "surface group matched nothing: $pat"
 done
 surface_files=()
-while IFS= read -r f; do surface_files+=("$f"); done < <(find . \( -path ./.git -o -path ./.local \) -prune -o -type f ! -path './tests/*/run-test.sh' ! -path './docs/security-posture.md' ! -path './docs/verification.md' -print | sort)
+while IFS= read -r f; do
+  # bash regex, not `find -path`: `*` in a find path pattern crosses `/`,
+  # which would over-exclude a nested `tests/a/b/run-test.sh` from the scan.
+  if [[ "$f" =~ ^\./tests/[^/]+/run-test\.sh$ ]]; then continue; fi
+  if [[ "$f" == "./docs/security-posture.md" || "$f" == "./docs/verification.md" ]]; then continue; fi
+  surface_files+=("$f")
+done < <(find . \( -path ./.git -o -path ./.local -o -path '*/__pycache__' \) -prune -o -type f -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
-# closed instead (the tree has none).
-symlinks="$(find . \( -path ./.git -o -path ./.local \) -prune -o -type l ! -path './tests/*/run-test.sh' -print | sort)"
+# closed instead (the tree has none). This check is unconditional — a
+# `tests/*/run-test.sh` record replaced by a symlink would otherwise run the
+# wrong file in CI with every other pin green.
+symlinks="$(find . \( -path ./.git -o -path ./.local -o -path '*/__pycache__' \) -prune -o -type l -print | sort)"
 if [ -z "$symlinks" ]; then ok "no symlinks in the production surface"; else bad "symlink in the production surface: $symlinks"; fi
+# A binary or encoded payload (e.g. UTF-16LE) in the production surface can
+# carry a retired identifier that no text grep sees; fail closed on any NUL
+# byte. The tree has none.
+nul_files=""
+for f in "${surface_files[@]}"; do
+  if ! cmp -s <(LC_ALL=C tr -d '\0' < "$f") "$f"; then nul_files="$nul_files $f"; fi
+done
+if [ -z "$nul_files" ]; then ok "no production surface file contains a NUL byte"; else bad "production surface files contain NUL bytes (binary/encoded):$nul_files"; fi
 for f in "${surface_files[@]}"; do
   [ -f "$f" ] || bad "scanned surface missing: $f"
 done
 for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKEN; do
   rc=0
-  hits="$(grep -lnwE -- "$v" "${surface_files[@]}")" || rc=$?
+  hits="$(grep -linwE -- "$v" "${surface_files[@]}")" || rc=$?
   case "$rc" in
     0) bad "production surface uses $v: $hits" ;;
     1) ok "no production surface uses $v" ;;
@@ -764,7 +799,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=186
+CHECK_FLOOR=187
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
