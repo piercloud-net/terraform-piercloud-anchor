@@ -106,7 +106,7 @@ is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\
 # deliberate job addition/rename updates this pin.
 JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 JOBS_END="$(awk -F'\t' -v s="$JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$PROV_STRUCT")"
-if [ -n "$JOBS_START" ] && [ -z "$JOBS_END" ]; then JOBS_END=$(( $(wc -l < "$PROV") + 1 )); fi
+if [ -n "$JOBS_START" ] && [ -z "$JOBS_END" ]; then JOBS_END=$(( $(awk 'END{print NR}' "$PROV") + 1 )); fi
 if [ -n "$JOBS_START" ] && [ -n "$JOBS_END" ]; then
   # Every indent-2 non-comment line of the jobs block is a job key: normalise
   # the spelling (leading node properties, trailing comment, `: <value>`,
@@ -115,10 +115,10 @@ if [ -n "$JOBS_START" ] && [ -n "$JOBS_END" ]; then
   # name) or reds by not normalising to a known name.
   actual_jobs="$(sed -n "$((JOBS_START + 1)),$((JOBS_END - 1))p" "$PROV" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
-    | sed -e 's/[[:space:]]*#.*$//' -e 's/^  //' \
+    | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
     | sed -e 's/[[:space:]]*:.*$//' \
-    | sed -E -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+    | sed -E -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")" || true
   expected_jobs='visibility-banner
 device-flow
 anchor-dns
@@ -394,14 +394,14 @@ is "ci.yml structural indent-2 line count (pin: update for a new top-level line)
 # compared; any deliberate job addition/rename updates this pin.
 CI_JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
 CI_JOBS_END="$(awk -F'\t' -v s="$CI_JOBS_START" '$1 > s && $2 ~ /^[^ #]/ {print $1; exit}' <<<"$CI_STRUCT")"
-if [ -n "$CI_JOBS_START" ] && [ -z "$CI_JOBS_END" ]; then CI_JOBS_END=$(( $(wc -l < "$CI") + 1 )); fi
+if [ -n "$CI_JOBS_START" ] && [ -z "$CI_JOBS_END" ]; then CI_JOBS_END=$(( $(awk 'END{print NR}' "$CI") + 1 )); fi
 if [ -n "$CI_JOBS_START" ] && [ -n "$CI_JOBS_END" ]; then
   actual_ci_jobs="$(sed -n "$((CI_JOBS_START + 1)),$((CI_JOBS_END - 1))p" "$CI" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
-    | sed -e 's/[[:space:]]*#.*$//' -e 's/^  //' \
+    | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
     | sed -e 's/[[:space:]]*:.*$//' \
-    | sed -E -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+    | sed -E -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")" || true
   expected_ci_jobs='fmt
 validate
 key-material-grep
@@ -416,6 +416,32 @@ scrub-canary'
 else
   bad "ci.yml jobs span not found"
 fi
+# Every workflow's job set is pinned as ONE digest: a job added to any
+# workflow (release.yml carries write permissions) or a new workflow file
+# changes it, and a duplicate top-level `jobs:` key — YAML resolves it to
+# the LAST block, so a flow-form second block would leave a pinned first
+# block green while the effective job set changes — fails the count here.
+# Pin update is deliberate (same PR as the workflow change).
+wf_job_digest=""
+for wf in .github/workflows/*.yml; do
+  jobs_keys="$(grep -cE '^jobs:' "$wf" || true)"
+  if [ "$jobs_keys" != "1" ]; then
+    bad "$wf top-level jobs key count (expected 1, got $jobs_keys)"
+    wf_job_digest="$wf_job_digest|$wf:AMBIGUOUS"
+    continue
+  fi
+  jstart="$(grep -nE '^jobs:' "$wf" | head -n1 | cut -d: -f1)"
+  jend="$(awk -v s="$jstart" 'NR > s && /^[^ ]/ {print NR; exit}' "$wf")"
+  [ -n "$jend" ] || jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
+  names="$(sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" \
+    | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
+    | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
+    | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
+    | sed -e 's/[[:space:]]*:.*$//' \
+    | sed -E -e 's/^"//' -e 's/"$//' | tr '\n' ',')"
+  wf_job_digest="$wf_job_digest|$wf:$names"
+done
+is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
 # variables anywhere in ci.yml, and the allowlist must no longer name the
@@ -659,7 +685,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=170
+CHECK_FLOOR=171
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
