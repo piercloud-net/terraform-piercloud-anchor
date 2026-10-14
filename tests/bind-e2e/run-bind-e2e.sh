@@ -36,6 +36,8 @@ CADDY_URL="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSI
 CADDY_SHA512="8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9"
 
 WORK="$(mktemp -d /tmp/bind-e2e.XXXXXX)"
+log() { printf '\n==> %s\n' "$*"; }
+die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 # No in-tree bytecode: mock-tang.py imports the in-tree p521 module, and a
 # planted `tests/bind-e2e/__pycache__/p521.cpython-*.pyc` (PEP 552 hash-based
 # or matching mtime/size) would be loaded instead of the source — an
@@ -49,15 +51,18 @@ rm -rf "${HARNESS_DIR}/__pycache__"
 rm -f "${HARNESS_DIR}"/*.pyc
 # A planted package directory (`p521/__init__.pyc`, `cryptography/__init__.pyc`)
 # is a sourceless module that shadows the in-tree/stdlib module and survives
-# both removals (r24 functional/red-team LOW). The harness directory has no
-# legitimate subdirectories: fail closed on any.
-if [ -n "$(find "${HARNESS_DIR}" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]; then
-  die "unexpected subdirectory in ${HARNESS_DIR} (bytecode-shadowing fail-closed)"
+# both removals (r24 functional/red-team LOW). A SYMLINKED directory is not
+# listed by `find -type d` (lstat) but shadows the module the same way (r25
+# functional/red-team LOW), so symlinks fail closed too. The harness
+# directory has no legitimate subdirectories or symlinks.
+harness_dir_untidy() { # $1 dir -- first subdirectory/symlink, empty when clean
+  find "$1" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) -print -quit 2>/dev/null || true
+}
+if [ -n "$(harness_dir_untidy "${HARNESS_DIR}")" ]; then
+  die "unexpected subdirectory or symlink in ${HARNESS_DIR} (bytecode-shadowing fail-closed)"
 fi
 export PYTHONDONTWRITEBYTECODE=1
 START="$(date +%s)"
-log() { printf '\n==> %s\n' "$*"; }
-die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
   # Best-effort teardown in reverse bring-up order; never masks the failure.

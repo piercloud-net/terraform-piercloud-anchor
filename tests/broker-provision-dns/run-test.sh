@@ -23,6 +23,7 @@ PROV=".github/workflows/provision.yml"
 CI=".github/workflows/ci.yml"
 LIB=".github/scripts/lib/broker-dns.sh"
 REPORT_LIB=".github/scripts/lib/broker-report.sh"
+BIND_E2E="tests/bind-e2e/run-bind-e2e.sh"
 
 pass=0
 fail=0
@@ -56,8 +57,11 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # every pin — the r23/r24 HIGH class across a `]`/`}` inside quotes, a
 # mid-token `#`, the explicit-key `?`, a post-close `#`, a `:` before a flow
 # value, and mid-plain quote chars (r23 red-team/functional, r24
-# trust/functional). Quoted contents are not counted at all, so a mis-read
-# can only extend the span. Empty when no terminator is found (EOF).
+# trust/functional). A double-quoted scalar's escape state is LINE-LOCAL:
+# a `\` at EOL escapes the break itself, so it must not consume the next
+# line's first character (r25 HIGH). Quoted contents are not counted at
+# all, so a mis-read can only extend the span. Empty when no terminator is
+# found (EOF).
 flow_end() { # $1 file, $2 start line
   awk -v s="$2" '
     function sq() { return sprintf("%c", 39) }
@@ -85,6 +89,13 @@ flow_end() { # $1 file, $2 start line
           } else { tokend = 0 }
         }
       }
+      # A trailing backslash inside a double-quoted scalar escapes the
+      # LINE BREAK itself (YAML), so the escape is consumed by the newline
+      # and must not leak into the next line: the continuation line has a
+      # fresh first character. Carrying `esc` across lines let a `\`-at-EOL
+      # + `\"` continuation close the scalar early, ending the `on:` span
+      # at a column-0 line YAML still parses inside the open flow (r25 HIGH).
+      if (q == "\"" && esc) esc = 0
       return d
     }
     NR == s { d = depth($0); next }
@@ -121,6 +132,52 @@ fe_case 5 "flow_end: mid-token double quote does not open a quote" $'on: [it"s, 
 fe_case 6 "flow_end: mid-plain apostrophe + # is content, not a comment" $'on: {"a": dogs\'# , "b": [c,\n]\n, workflow_dispatch,\n    pull_request_target,\n}\npermissions:\n'
 fe_case 7 "flow_end: mid-plain : + # is content, not a comment" $'on: {push: {branches: [main, a:#], schedule: [{cron: \'0 0 * * *\',\n}],\n}\n,\n  pull_request_target: null,\n}\npermissions:\n'
 fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: [it\'s,\n  push,\n'
+fe_case 5 "flow_end: escaped line break keeps the quoted scalar open (r25 F1)" $'on: {push: {branches: ["x\\\n\\"]y", main, \'release/*\']},\nworkflow_dispatch: null,\n}\npermissions:\n'
+fe_case 3 "flow_end: escaped line break then a real close ends at the terminator (r25 F1)" $'on: ["a\\\n" , b]\npermissions:\n'
+fe_case 5 "flow_end: single-quoted close then # is a comment" $'on: [a, \'b\'# ] decoy\n, d,\n  pull_request_target,\n]\npermissions:\n'
+
+# Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
+# matches COLUMN-0 lines, but YAML allows the root mapping itself to be
+# indented while a column-0 multi-line quoted scalar carries decoy `on:`/
+# `permissions:`/`jobs:` lines -- the pins would then hash decoy bytes and
+# a real trigger/job added under the indented root changes nothing.
+# Require no BOM, no column-0 `---`/`...`-prefixed line (ANY suffix:
+# `--- &a` anchors an indented root, r25 F2), and a first content line
+# that is a plain column-0 `key:` (an anchor/property-only first line
+# leaves the root mapping indented under it). In-tree all seven start at
+# column 0 with `name:`. Prints the reason, empty when the shape is OK.
+root_shape_bad() { # $1 file
+  local bom first bad=""
+  bom="$(head -c3 "$1" | od -An -tx1 | tr -d ' \n' || true)"
+  first="$(grep -m1 -E '^[[:space:]]*[^#[:space:]]' "$1" || true)"
+  [ "$bom" = "efbbbf" ] && bad="BOM"
+  if grep -qE '^(---|\.\.\.)' "$1"; then bad="${bad:+$bad, }document marker"; fi
+  if [ -z "$first" ]; then
+    bad="${bad:+$bad, }first content line indented or missing"
+  elif ! grep -qE '^[A-Za-z_][A-Za-z0-9_-]*:' <<<"$first"; then
+    bad="${bad:+$bad, }first content line is not a plain column-0 key"
+  fi
+  printf '%s' "$bad"
+}
+rs_case() { # $1 expected (OK/BAD), $2 label, $3 content
+  local f got
+  f="$(mktemp)"
+  printf '%s' "$3" > "$f"
+  got="$(root_shape_bad "$f")"
+  rm -f "$f"
+  if [ "$1" = "OK" ]; then is "$2" "" "$got"; else
+    if [ -n "$got" ]; then ok "$2"; else bad "$2 (expected fail-closed)"; fi
+  fi
+}
+rs_case OK  "root shape: plain name: first line" $'name: x\non: [push]\njobs: {}\n'
+bomf="$(mktemp)"; printf '\xef\xbb\xbfname: x\n' > "$bomf"
+contains "root shape: BOM fails closed" "BOM" "$(root_shape_bad "$bomf")"
+rm -f "$bomf"
+rs_case BAD "root shape: bare --- marker" $'---\nname: x\n'
+rs_case BAD "root shape: --- with an anchor (r25 F2)" $'name: x\n--- &a\non: [push]\njobs: {}\n'
+rs_case BAD "root shape: ... marker" $'...\n'
+rs_case BAD "root shape: first content line indented" $'  name: x\n'
+rs_case BAD "root shape: anchor-only first line" $'&a\n  name: x\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
 [ -f "$CI" ] || { printf 'FAIL ci.yml not found: %s\n' "$CI"; exit 1; }
@@ -230,6 +287,27 @@ contains "broker mint pins the broker audience" '"piercloud-broker"' "$(cat "$RE
 # never carry a standing secret.
 is "broker-dns lib blob hash (pin: update after a deliberate edit)" "c668738f19c28344ac0f591d4cc283e36d761a1292afc789ea897399f53f8862" "$(sha256sum "$LIB" | cut -d' ' -f1)"
 is "broker-report lib blob hash (pin: update after a deliberate edit)" "0cd7b5bb73ecd115bb1478776365a2ee6b0d3c739f45f466f5513acda1718533" "$(sha256sum "$REPORT_LIB" | cut -d' ' -f1)"
+is "bind-e2e script blob hash (pin: update after a deliberate edit)" "a817fef8dcb94a15d992c32af97c2d7d9462ce1c0245824c9506de06811be366" "$(sha256sum "$BIND_E2E" | cut -d' ' -f1)"
+
+# bind-e2e harness-dir teeth (r25 F3): a symlinked package directory is
+# not listed by `find -type d` but shadows the in-tree p521 module exactly
+# like a real subdirectory. The check is extracted from the script (its
+# call site is pinned by the blob hash above) and exercised on synthetic
+# trees: clean passes; a real subdirectory AND a lone symlink each fail
+# closed.
+harness_dir_src="$(sed -n '/^harness_dir_untidy()/,/^}/p' "$BIND_E2E" || true)"
+if [ -z "$harness_dir_src" ]; then
+  bad "bind-e2e harness_dir_untidy() not found"
+else
+  eval "$harness_dir_src"
+  bdir="$(mktemp -d)"
+  mkdir -p "$bdir/clean" "$bdir/dironly/pkg" "$bdir/symonly"
+  ln -s "$bdir/dironly/pkg" "$bdir/symonly/link"
+  is "bind-e2e dir check: clean harness dir passes" "" "$(harness_dir_untidy "$bdir/clean")"
+  if [ -n "$(harness_dir_untidy "$bdir/dironly")" ]; then ok "bind-e2e dir check: subdirectory fails closed"; else bad "bind-e2e dir check: subdirectory fails closed"; fi
+  if [ -n "$(harness_dir_untidy "$bdir/symonly")" ]; then ok "bind-e2e dir check: symlink fails closed"; else bad "bind-e2e dir check: symlink fails closed"; fi
+  rm -rf "$bdir"
+fi
 lacks "anchor-dns job uses no standing secret" 'secrets.' "$JOB"
 
 # ---- job shape: broker call, managed lane, OIDC ---------------------------
@@ -527,17 +605,13 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   # while a column-0 multi-line quoted scalar carries decoy `on:`/
   # `permissions:`/`jobs:` lines — the pins would then hash decoy bytes and
   # a real trigger/job added under the indented root changes nothing. Require
-  # no BOM, no document marker, and the first non-blank/non-comment line at
-  # column 0, so the root mapping is exactly the column-0 line set the
-  # locators read. (In-tree all seven start at column 0 with `name:`.)
-  wf_bom="$(head -c3 "$wf" | od -An -tx1 | tr -d ' \n' || true)"
-  wf_first="$(grep -m1 -E '^[[:space:]]*[^#[:space:]]' "$wf" || true)"
-  wf_root_bad=""
-  [ "$wf_bom" = "efbbbf" ] && wf_root_bad="BOM"
-  if grep -qE '^(---|\.\.\.)[[:space:]]*(#.*)?$' "$wf"; then wf_root_bad="${wf_root_bad:+$wf_root_bad, }document marker"; fi
-  case "$wf_first" in
-    ""|" "*|"	"*) wf_root_bad="${wf_root_bad:+$wf_root_bad, }first content line indented or missing" ;;
-  esac
+  # no BOM, no column-0 `---`/`...`-prefixed line, and a plain column-0
+  # `key:` as the first content line, so the root mapping is exactly the
+  # column-0 line set the
+  # locators read. `--- &a` (any `---`/`...` suffix) and an anchor-only
+  # first line are rejected too (r25 F2). (In-tree all seven start at
+  # column 0 with `name:`.)
+  wf_root_bad="$(root_shape_bad "$wf")"
   if [ -n "$wf_root_bad" ]; then
     bad "$wf root shape: $wf_root_bad (fail closed)"
     wf_top_digest="$wf_top_digest|$wf:BADROOT"
@@ -1047,7 +1121,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=225
+CHECK_FLOOR=239
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
