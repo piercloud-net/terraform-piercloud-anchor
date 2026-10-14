@@ -208,8 +208,12 @@ rs_case BAD "root shape: anchor-only first line" $'&a\n  name: x\n'
 # digests byte-identical). An alias cannot resolve without an anchor, so
 # `&name` definitions are banned blanket in every workflow (boundary-
 # anchored; `&&`, `2>&1` and glob stars stay legal). No in-tree use.
-anchor_count() { # $1 file -- anchor-definition tokens (&name)
-  grep -cE '(^|[[:space:]]|\[|\{|\}|,)&[^][:space:],{}&]' "$1" || true
+anchor_count() { # $1 file -- anchor-definition tokens (&name, permissive &&name)
+  # The second alternative covers the spec-permissive double-ampersand name
+  # (`&&b` = anchor `&b` under go-yaml/actionlint; PyYAML and Psych reject it,
+  # but the ban is fail-closed, r29 red-team). A spaced shell `&&` stays
+  # legal; `&&name` in a run scalar is an accepted over-approximation.
+  grep -cE '(^|[[:space:]]|\[|\{|\}|,)(&[^][:space:],{}&]|&&[^][:space:],{}&])' "$1" || true
 }
 aa_case() { # $1 expected, $2 label, $3 content
   local f got
@@ -225,6 +229,8 @@ aa_case 1 "anchor ban: punctuation-start name (permissive-parser form)" $'x: &.a
 aa_case 0 "anchor ban: && is not an anchor" $'run: make && make test\n'
 aa_case 0 "anchor ban: 2>&1 is not an anchor" $'run: cmd 2>&1\n'
 aa_case 0 "anchor ban: branch glob is not an anchor" $'branches: [main, release/*]\n'
+aa_case 1 "anchor ban: double-ampersand name (spec-permissive form)" $'x: &&b 1\n'
+aa_case 1 "anchor ban: &&name in a run scalar (accepted over-approximation)" $'run: make &&test\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
 [ -f "$CI" ] || { printf 'FAIL ci.yml not found: %s\n' "$CI"; exit 1; }
@@ -1169,7 +1175,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=263
+CHECK_FLOOR=265
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
