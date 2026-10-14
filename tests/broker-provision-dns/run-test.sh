@@ -206,14 +206,17 @@ rs_case BAD "root shape: anchor-only first line" $'&a\n  name: x\n'
 # `on: *a`; an alias KEY (`run-name: &k "on"` + `*k: |-`) makes the locator
 # pin decoy bytes (r28 red-team HIGH/MEDIUM — actionlint-clean, all four
 # digests byte-identical). An alias cannot resolve without an anchor, so
-# `&name` definitions are banned blanket in every workflow (boundary-
-# anchored; `&&`, `2>&1` and glob stars stay legal). No in-tree use.
-anchor_count() { # $1 file -- anchor-definition tokens (&name, permissive &&name)
-  # The second alternative covers the spec-permissive double-ampersand name
-  # (`&&b` = anchor `&b` under go-yaml/actionlint; PyYAML and Psych reject it,
-  # but the ban is fail-closed, r29 red-team). A spaced shell `&&` stays
-  # legal; `&&name` in a run scalar is an accepted over-approximation.
-  grep -cE '(^|[[:space:]]|\[|\{|\}|,)(&[^][:space:],{}&]|&&[^][:space:],{}&])' "$1" || true
+# `&name` definitions are banned blanket in every workflow (node-start
+# anchored; a mid-scalar `&&`, `2>&1` and glob stars stay legal). No in-tree use.
+anchor_count() { # $1 file -- anchor-definition tokens at a NODE START
+  # The name tail admits `&`, so any ampersand run (`&a`, `&&b`, `&&&b`, and
+  # a bare `&&` = anchor `&`) is caught: go-yaml v4 (actionlint's parser,
+  # the r29/r30 oracle) scans every `&` run as the name, while PyYAML/Psych
+  # reject them -- the ban is fail-closed. The prefix is a NODE-START
+  # context (`: `/`- ` value starts, flow `[`/`{`/`,`, line start, `? `,
+  # a tag), so a mid-scalar shell `&&` (`make && make`, `2>&1 &&`,
+  # `[ -s x ] &&`) stays legal -- the r29/r30 red-team class.
+  grep -cE '(^[[:space:]]*|:[[:space:]]*|-[[:space:]]+|[[:space:]]*[\[{,][[:space:]]*|[?][[:space:]]+|[!][^[:space:]]*[[:space:]]+)&[^][:space:],{}]' "$1" || true
 }
 aa_case() { # $1 expected, $2 label, $3 content
   local f got
@@ -230,7 +233,12 @@ aa_case 0 "anchor ban: && is not an anchor" $'run: make && make test\n'
 aa_case 0 "anchor ban: 2>&1 is not an anchor" $'run: cmd 2>&1\n'
 aa_case 0 "anchor ban: branch glob is not an anchor" $'branches: [main, release/*]\n'
 aa_case 1 "anchor ban: double-ampersand name (spec-permissive form)" $'x: &&b 1\n'
-aa_case 1 "anchor ban: &&name in a run scalar (accepted over-approximation)" $'run: make &&test\n'
+aa_case 0 "anchor ban: mid-scalar && is plain content" $'run: make &&test\n'
+aa_case 1 "anchor ban: triple-ampersand name (go-yaml run)" $'env:\n  A: &&&b push\n'
+aa_case 1 "anchor ban: bare double-ampersand name (go-yaml anchor &)" $'env:\n  A: && push\n'
+aa_case 1 "anchor ban: tag-prefixed run name" $'x: !!str &&b 1\n'
+aa_case 1 "anchor ban: flow colon with no space (r30 red-team F1)" $'env: {"k":&a push}\n'
+aa_case 0 "anchor ban: in-tree shell && continuation is content" $'run: cmd >/dev/null 2>&1 && cmd2\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
 [ -f "$CI" ] || { printf 'FAIL ci.yml not found: %s\n' "$CI"; exit 1; }
@@ -1175,7 +1183,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=265
+CHECK_FLOOR=270
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
