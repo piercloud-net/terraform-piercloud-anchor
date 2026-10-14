@@ -436,15 +436,21 @@ fi
 # (`"j\u006fbs":`) is caught by the all-workflow hex/octal-escape ban
 # below. Pin update is deliberate (same PR as the workflow change).
 wf_job_digest=""
+wf_top_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
-  jobs_keys="$(grep -cE "^((&|!)[^[:space:]]+[[:space:]]+)*([\"']?jobs[\"']?)[[:space:]]*:" "$wf" || true)"
+  # The TOP-LEVEL key set is pinned on its own: the jobs-last invariant and
+  # every job-set span read content from `jobs:` down, so a decoy key placed
+  # BEFORE `jobs:` (with indent-2 children, compensated in the census) would
+  # be invisible to every job pin. Any new/renamed/removed top-level key reds.
+  wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*:' "$wf" | sed -E 's/^((&|!)[^[:space:]]+[[:space:]]+)?([A-Za-z_][A-Za-z0-9_-]*)[[:space:]]*:.*/\3/' | tr '\n' ',')"
+  jobs_keys="$(grep -cE "^((&|!)[^[:space:]]+[[:space:]]+)*([\"']?jobs[\"']?)[[:space:]]*:[[:space:]]*(#.*)?\$" "$wf" || true)"
   if [ "$jobs_keys" != "1" ]; then
     bad "$wf top-level jobs key count (expected 1, got $jobs_keys)"
     wf_job_digest="$wf_job_digest|$wf:AMBIGUOUS"
     continue
   fi
-  jstart="$(grep -nE '^jobs:' "$wf" | head -n1 | cut -d: -f1 || true)"
+  jstart="$(grep -nE '^jobs:[[:space:]]*(#.*)?$' "$wf" | head -n1 | cut -d: -f1 || true)"
   if [ -z "$jstart" ]; then
     bad "$wf has no top-level jobs: key"
     wf_job_digest="$wf_job_digest|$wf:NOJOBS"
@@ -511,6 +517,7 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_job_digest="$wf_job_digest|$wf:$names"
 done
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
+is "workflow top-level key set is pinned (pin: update for a deliberate top-level key change)" "598e3ea070a86315c6b546fbd67d10070ca83d8e4bfa2fc227168192540b0a23" "$(printf '%s' "$wf_top_digest" | sha256sum | cut -d' ' -f1)"
 # A workflow must not gain (or repoint) an execution of test-tree content:
 # the `tests/*/run-test.sh` pin records are exempt from the retired-name scan,
 # so an unpinned job could otherwise `run: bash tests/broker-provision-dns/run-test.sh`
@@ -592,14 +599,15 @@ done
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Block, flow and tagged spellings (`<< :`,
 # `&m <<:`, `- <<: *evil`, `{ <<: *evil }`, `!!merge '<<': *evil`) all
-# resolve as merges under YAML, so the `<<:` token is banned anywhere in the
-# workflow files (heredocs/herestrings use `<<NAME`/`<<<`, never a colon),
-# and the `!!merge` / verbose `2002:merge` tags are banned outright. Zero
-# legitimate uses in-tree.
-is "ci.yml has no YAML merge keys" "0" "$(grep -cE '<<[[:space:]]*:' "$CI")"
-is "provision.yml has no YAML merge keys" "0" "$(grep -cE '<<[[:space:]]*:' "$PROV")"
-is "ci.yml has no YAML merge tags" "0" "$(grep -cE '!!merge|2002:merge' "$CI")"
-is "provision.yml has no YAML merge tags" "0" "$(grep -cE '!!merge|2002:merge' "$PROV")"
+# resolve as merges under YAML, so the `<<:` token is banned in EVERY workflow
+# file (heredocs/herestrings use `<<NAME`/`<<<`, never a colon), and the
+# `!!merge` / verbose `2002:merge` tags are banned outright. Zero legitimate
+# uses in-tree.
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$wf" ] || continue
+  is "$wf has no YAML merge keys" "0" "$(grep -cE '<<[[:space:]]*:' "$wf")"
+  is "$wf has no YAML merge tags" "0" "$(grep -cE '!!merge|2002:merge' "$wf")"
+done
 is "ci.yml has no workflow defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
@@ -651,21 +659,23 @@ else
 fi
 
 # ---- production surfaces carry no retired name ----------------------------
-# Every file in the repo outside .git/, the gitignored .local/ proof config
-# and two build-artifact exclusions — the gitignored provider downloads
-# `.terraform/` and the recording-witness bytecode cache
-# `tests/recording-witness/__pycache__/` — is a production surface
-# (extensionless and Markdown included),
+# Every file in the repo outside .git/ and the gitignored .local/ proof
+# config is a production surface (extensionless and Markdown included),
 # except two record classes that name the retired identifiers by design:
 # the `tests/*/run-test.sh` harness records (exactly one level — the pins
 # themselves; a nested `run-test.sh` is scanned like any other file) and
-# docs/security-posture.md + docs/verification.md. Scanning the rest of
-# tests/ closes the execute-a-test-script route: an unpinned job could
+# docs/security-posture.md + docs/verification.md. Recording the whole tree
+# closes the execute-a-test-script route: an unpinned job could
 # otherwise `run: bash tests/evil.sh` — however the path is spelled, shell
 # assembly included — and a direct provider write inside the script would
 # never be scanned. A new `tools/evil.sh`, `tools/dns-fallback.env`,
-# `evil.bash`, `.github/workflows/evil.yaml`, `scripts/lib/helper` or
-# sourced `docs/evil.md` must not sit outside the scan. Word
+# `evil.bash`, `.github/workflows/evil.yaml`, `scripts/lib/helper`,
+# `.terraform/payload.sh` or sourced
+# `docs/evil.md` must not sit outside the scan. The only exempt build
+# artifact is the recording-witness suite's bytecode cache —
+# `tests/recording-witness/__pycache__/*.pyc` exactly (anything else in that
+# directory is scanned), and a `terraform-provider-*`/`tofu-provider-*`
+# provider binary is only exempt from the NUL check below. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
 # legal while the retired repo variable is caught. Comments are INCLUDED: a
 # stale comment is drift too. The named groups are still checked explicitly
@@ -684,20 +694,28 @@ while IFS= read -r f; do
   # which would over-exclude a nested `tests/a/b/run-test.sh` from the scan.
   if [[ "$f" =~ ^\./tests/[^/]+/run-test\.sh$ ]]; then continue; fi
   if [[ "$f" == "./docs/security-posture.md" || "$f" == "./docs/verification.md" ]]; then continue; fi
+  # The recording-witness suite's bytecode cache is the only in-tree build
+  # artifact (gitignored); the exemption is exact path + extension, so a
+  # committed `evil.py` inside that directory is still scanned.
+  if [[ "$f" == "./tests/recording-witness/__pycache__/"*.pyc ]]; then continue; fi
   surface_files+=("$f")
-done < <(find . \( -path ./.git -o -path ./.local -o -type d -path '*/.terraform' -o -type d -path './tests/recording-witness/__pycache__' \) -prune -o -type f -print | sort)
+done < <(find . \( -path ./.git -o -path ./.local \) -prune -o -type f -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
 # closed instead (the tree has none). This check is unconditional — a
 # `tests/*/run-test.sh` record replaced by a symlink would otherwise run the
 # wrong file in CI with every other pin green.
-symlinks="$(find . \( -path ./.git -o -path ./.local -o -type d -path '*/.terraform' -o -type d -path './tests/recording-witness/__pycache__' \) -prune -o -type l -print | sort)"
+symlinks="$(find . \( -path ./.git -o -path ./.local \) -prune -o -type l -print | sort)"
 if [ -z "$symlinks" ]; then ok "no symlinks in the production surface"; else bad "symlink in the production surface: $symlinks"; fi
 # A binary or encoded payload (e.g. UTF-16LE) in the production surface can
 # carry a retired identifier that no text grep sees; fail closed on any NUL
 # byte. The tree has none.
 nul_files=""
 for f in "${surface_files[@]}"; do
+  # A tofu provider binary carries NUL bytes by design: only the NUL check
+  # tolerates it, and the name/host scan still covers it. Everything else in
+  # the surface must be text (a UTF-16/other encoding payload fails closed).
+  case "${f##*/}" in terraform-provider-*|tofu-provider-*) continue ;; esac
   if ! cmp -s <(LC_ALL=C tr -d '\0' < "$f") "$f"; then nul_files="$nul_files $f"; fi
 done
 if [ -z "$nul_files" ]; then ok "no production surface file contains a NUL byte"; else bad "production surface files contain NUL bytes (binary/encoded):$nul_files"; fi
@@ -812,7 +830,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=187
+CHECK_FLOOR=198
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
