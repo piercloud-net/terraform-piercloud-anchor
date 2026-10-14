@@ -213,10 +213,10 @@ anchor_count() { # $1 file -- anchor-definition tokens at a NODE START
   # a bare `&&` = anchor `&`) is caught: go-yaml v4 (actionlint's parser,
   # the r29/r30 oracle) scans every `&` run as the name, while PyYAML/Psych
   # reject them -- the ban is fail-closed. The prefix is a NODE-START
-  # context (`: `/`- ` value starts, flow `[`/`{`/`,`, line start, `? `,
-  # a tag), so a mid-scalar shell `&&` (`make && make`, `2>&1 &&`,
-  # `[ -s x ] &&`) stays legal while the r29-r31 red-team anchor spellings
-  # are caught.
+  # context (`: `/`- ` value starts, flow `[`/`{`/`,`, line start, `?` (no
+  # space required in flow), a tag), so a mid-scalar shell `&&`
+  # (`make && make`, `2>&1 &&`, `[ -s x ] &&`) stays legal while the
+  # r29-r32 lens anchor spellings are caught.
   grep -cE '(^[[:space:]]*|:[[:space:]]*|-[[:space:]]+|[[:space:]]*[\[{,][[:space:]]*|[?][[:space:]]*|[!][^[:space:]]*[[:space:]]+)&[^][:space:],{}]' "$1" || true
 }
 aa_case() { # $1 expected, $2 label, $3 content
@@ -240,6 +240,7 @@ aa_case 1 "anchor ban: bare double-ampersand name (go-yaml anchor &)" $'env:\n  
 aa_case 1 "anchor ban: tag-prefixed run name" $'x: !!str &&b 1\n'
 aa_case 1 "anchor ban: flow colon with no space (r30 red-team F1)" $'env: {"k":&a push}\n'
 aa_case 1 "anchor ban: flow explicit key with no space (r31 red-team)" $'x: {?&a y: z}\n'
+aa_case 1 "anchor ban: explicit key with space (r32 red-team F2)" $'? &a x: y\n'
 aa_case 1 "anchor ban: line-start block anchor (r31 functional F2)" $'key:\n  &a value\n'
 aa_case 1 "anchor ban: block sequence anchor (r31 functional F2)" $'- &a value\n'
 aa_case 0 "anchor ban: in-tree shell && continuation is content" $'run: cmd >/dev/null 2>&1 && cmd2\n'
@@ -937,10 +938,32 @@ if [ -z "$local_refs" ]; then ok "no workflow references .local (outside the sca
 # proxy — accept as line breaks) as a new line, but grep splits on LF only:
 # a "\r"-prefixed line is a real YAML line at column 0 that every grep-based
 # pin and census skips (r22 red-team HIGH: a hidden job and duplicate
-# top-level keys passed all 21 harnesses). The in-tree workflows are LF-only,
-# so fail closed on any non-LF line break and keep the line models aligned.
-lb_files="$(LC_ALL=C grep -lE $'(\r|\xc2\x85|\xe2\x80\xa8|\xe2\x80\xa9)' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null || true)"
-if [ -z "$lb_files" ]; then ok "workflows are LF-only (no CR/NEL/LS/PS — YAML vs grep line-break parity)"; else bad "workflow contains a non-LF line break (YAML vs grep line-break differential): $lb_files"; fi
+# top-level keys passed all 21 harnesses). Psych also treats a U+FEFF BOM
+# as ignorable anywhere, so `env: [\n\uFEFF&a push\n]` + `on: *a` resolves
+# while every byte-oriented prefix misses the anchor (r32 red-team F1).
+# The in-tree workflows are LF-only and BOM-free, so fail closed on any
+# non-LF line break OR a BOM byte sequence and keep the line models aligned.
+line_break_scan() { # $1.. files -- prints files with a non-LF break or a BOM byte
+  LC_ALL=C grep -lE $'(\r|\xc2\x85|\xe2\x80\xa8|\xe2\x80\xa9|\xef\xbb\xbf)' "$@" 2>/dev/null || true
+}
+# The scan's teeth (r32 red-team F1 mutation gap): a clean LF file passes;
+# every hostile byte sequence fails closed. Extracted so a drop of any
+# alternative is caught here, not only on a hostile in-tree tree.
+lbf="$(mktemp)"
+is "line-break scan: clean file passes" "" "$(line_break_scan "$lbf")"
+for lbcase in CR NEL LS PS BOM; do
+  case "$lbcase" in
+    CR)  printf 'name: x\r\n' > "$lbf" ;;
+    NEL) printf 'name: x\xc2\x85\n' > "$lbf" ;;
+    LS)  printf 'name: x\xe2\x80\xa8\n' > "$lbf" ;;
+    PS)  printf 'name: x\xe2\x80\xa9\n' > "$lbf" ;;
+    BOM) printf 'env: [\n\xef\xbb\xbf&a push\n]\n' > "$lbf" ;;
+  esac
+  is "line-break scan: $lbcase fails closed" "$lbf" "$(line_break_scan "$lbf")"
+done
+rm -f "$lbf"
+lb_files="$(line_break_scan .github/workflows/*.yml .github/workflows/*.yaml)"
+if [ -z "$lb_files" ]; then ok "workflows are LF-only and BOM-free (no CR/NEL/LS/PS/U+FEFF — YAML vs grep parity)"; else bad "workflow contains a non-LF line break or a BOM (YAML vs grep differential): $lb_files"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Block, flow and tagged spellings (`<< :`,
@@ -1187,7 +1210,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=273
+CHECK_FLOOR=280
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
