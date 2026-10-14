@@ -101,7 +101,12 @@ flow_end() { # $1 file, $2 start line
     NR == s { d = depth($0); next }
     NR > s {
       if ($0 ~ /^[[:space:]]*$/) { next }
-      if (q == "" && d <= 0 && $0 ~ /^[^[:space:]#]/) { print NR; exit }
+      # A column-0 BLOCK SEQUENCE entry (`- x`, `-`, `- |`) continues the
+      # current key value: YAML lets a block sequence sit at the same
+      # indent as its parent key (`on:` then `- push`), and a block-scalar
+      # entry hides indented content that no other pin sees. It is never a
+      # top-level key, so it must not terminate the span (r26 HIGH).
+      if (q == "" && d <= 0 && $0 ~ /^[^[:space:]#]/ && $0 !~ /^-([[:space:]]|$)/) { print NR; exit }
       d += depth($0)
     }
   ' "$1"
@@ -135,6 +140,9 @@ fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: 
 fe_case 5 "flow_end: escaped line break keeps the quoted scalar open (r25 F1)" $'on: {push: {branches: ["x\\\n\\"]y", main, \'release/*\']},\nworkflow_dispatch: null,\n}\npermissions:\n'
 fe_case 3 "flow_end: escaped line break then a real close ends at the terminator (r25 F1)" $'on: ["a\\\n" , b]\npermissions:\n'
 fe_case 5 "flow_end: single-quoted close then # is a comment" $'on: [a, \'b\'# ] decoy\n, d,\n  pull_request_target,\n]\npermissions:\n'
+fe_case 4 "flow_end: block-scalar entry under a column-0 sequence is pinned (r26 HIGH)" $'on:\n- >-\n  push\npermissions:\n'
+fe_case 4 "flow_end: mapping entry under a column-0 sequence is pinned (r26 HIGH)" $'on:\n- push: null\n  pull_request_target: null\npermissions:\n'
+fe_case 4 "flow_end: plain column-0 sequence entries are pinned (r26 HIGH)" $'on:\n- push\n- pull_request_target\npermissions:\n'
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
@@ -1121,7 +1129,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=239
+CHECK_FLOOR=242
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
