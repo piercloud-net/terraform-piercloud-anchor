@@ -17,14 +17,14 @@ def base(**over):
         "generated_at": "2026-10-12T07:00:00Z",
         "tenant": ALIAS,
         "note": "example fixture",
-        "endpoints": [{"name": "blog", "url": "https://blog-pier.piercloud.site", "alerts": True}],
+        "endpoints": [{"name": "blog", "url": "https://blog-pier.piercloud.site", "alerts": True, "type": "public"}],
     }
     doc.update(over)
     return doc
 
 
 def entry(**over):
-    doc = {"name": "blog", "url": "https://blog-pier.piercloud.site", "alerts": True}
+    doc = {"name": "blog", "url": "https://blog-pier.piercloud.site", "alerts": True, "type": "public"}
     doc.update(over)
     return doc
 
@@ -56,9 +56,9 @@ TENANT_RULES = {
     "oversize-url": base(endpoints=[entry(url="https://blog-pier.piercloud.site/" + "a" * 220)]),
     "too-many": base(endpoints=[entry(name="s%02d" % i) for i in range(33)]),
     "reserved-platform": base(endpoints=[entry(name="platform")]),
-    "reserved-home": base(endpoints=[entry(name="home", url="https://home-pier.piercloud.net")]),
+    "reserved-home": base(endpoints=[entry(name="home", type="private", url="https://home-pier.piercloud.net")]),
     "reserved-slice": base(endpoints=[entry(name="slice", url="https://slice-pier.piercloud.site")]),
-    "reserved-host": base(endpoints=[entry(name="host-01", url="https://host-01.piercloud.net/healthz")]),
+    "reserved-host": base(endpoints=[entry(name="host-01", type="private", url="https://host-01.piercloud.net/healthz")]),
     "duplicate": base(endpoints=[entry(), entry()]),
     "uppercase-name": base(endpoints=[entry(name="Blog")]),
     "non-bool-alerts": base(endpoints=[entry(alerts="yes")]),
@@ -74,9 +74,27 @@ TENANT_RULES = {
     "endpoint-not-object": base(endpoints=["blog"]),
     "endpoints-not-list": base(endpoints={"name": "blog"}),
     "file-scheme": base(endpoints=[entry(url="file:///etc/passwd")]),
-    "nested-three-labels": base(endpoints=[entry(url="https://a.b.c.pier.piercloud.net")]),
+    "nested-three-labels": base(endpoints=[entry(type="private", url="https://a.b.c.pier.piercloud.net")]),
     "deep-public": base(endpoints=[entry(url="https://a.b.piercloud.site")]),
-    "anchor-name": base(endpoints=[entry(url="https://anchor-01-pier.piercloud.net/healthz")]),
+    "anchor-name": base(endpoints=[entry(type="private", url="https://anchor-01-pier.piercloud.net/healthz")]),
+    "private-nested": base(endpoints=[entry(name="secret", type="private", url="https://secret.pier.piercloud.net")]),
+    "disabled-shared": base(endpoints=[entry(name="old-shared", type="shared",
+                                              url="https://old-shared.pier.piercloud.net", disabled=True)]),
+    "two-shared": base(endpoints=[entry(name="aaa", type="shared", url="https://aaa.pier.piercloud.net"),
+                                    entry(name="bbb", type="shared", url="https://bbb.pier.piercloud.net")]),
+    "missing-type": base(endpoints=[{key: value for key, value in entry().items() if key != "type"}]),
+    "bad-type-value": base(endpoints=[entry(type="internal")]),
+    "bad-type-case": base(endpoints=[entry(type="Public")]),
+    "bad-type-bool": base(endpoints=[entry(type=True)]),
+    "public-nested": base(endpoints=[entry(type="public", url="https://blog.pier.piercloud.net")]),
+    "private-flat": base(endpoints=[entry(type="private", url="https://blog-pier.piercloud.site")]),
+    "shared-nested": base(endpoints=[entry(name="fantasy", type="shared", url="https://fantasy.pier.piercloud.net")]),
+    "leading-hyphen-public": base(endpoints=[entry(type="public", url="https://-pier.piercloud.site")]),
+    "leading-hyphen-private": base(endpoints=[entry(type="private", url="https://-x.pier.piercloud.net")]),
+    "bad-type-object": base(endpoints=[entry(type={})]),
+    "bad-type-list": base(endpoints=[entry(type=[])]),
+    "disabled-entry": base(endpoints=[entry(name="old-site", type="private",
+                                            url="https://old.pier.piercloud.net", disabled=True)]),
 }
 
 PLATFORM_RULES = {
@@ -85,6 +103,31 @@ PLATFORM_RULES = {
         "generated_at": "2026-10-12T07:00:00Z",
         "platform": [{"name": "platform", "url": "https://platform.piercloud.net/healthz"}],
         "hosts": [host_entry()],
+    },
+    "edge": {
+        "version": 1,
+        "generated_at": "2026-10-12T07:00:00Z",
+        "platform": [{"name": "platform", "url": "https://platform.piercloud.net/healthz"}],
+        "hosts": [host_entry()],
+        "edge": True,
+    },
+    "edge-false": {
+        "version": 1,
+        "generated_at": "2026-10-12T07:00:00Z",
+        "hosts": [host_entry()],
+        "edge": False,
+    },
+    "edge-nonbool": {
+        "version": 1,
+        "generated_at": "2026-10-12T07:00:00Z",
+        "hosts": [host_entry()],
+        "edge": "yes",
+    },
+    "edge-disabled-conflict": {
+        "version": 1,
+        "generated_at": "2026-10-12T07:00:00Z",
+        "disabled": True,
+        "edge": True,
     },
     "hosts-only": {
         "version": 1,
