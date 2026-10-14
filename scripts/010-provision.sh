@@ -1281,7 +1281,7 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "skip-invalid-config-update: true   # keep the old config when a pulled fragment still slips through (the puller validates its candidate first)"
   printf '%s\n' ""
   printf '%s\n' "ui:"
-  printf '%s\n' "  default-sort-by: group   # platform / <alias> groups (the fragment owns the grouped rows)"
+  printf '%s\n' "  default-sort-by: group   # anchor / platform / <alias> groups (anchor-local rows here; platform/alias rows in the fragment)"
   printf '%s\n' ""
   printf '%s\n' "endpoints:"
   printf '%s\n' "  # The anchor through Caddy's :80 (proves the proxy path clevis"
@@ -1290,7 +1290,13 @@ TMP_CFG="${GATUS_CONFIG}.new"
   printf '%s\n' "  # here: tangd binds 127.0.0.1 only, which a bridge-network container can never"
   printf '%s\n' "  # dial; instead every run proves tang direct with a host-level curl to :8081/adv"
   printf '%s\n' "  # (see the proxy proofs at the end)."
+  printf '%s\n' "  # group: anchor — the anchor-local infrastructure rows (owner 2026-10-13):"
+  printf '%s\n' "  # grouped so a puller-anchor dashboard has no \"No Group\" section (the"
+  printf '%s\n' "  # legacy shape keeps its ungrouped main/platform/pair rows); the fragment"
+  printf '%s\n' "  # rows use \`platform\` / \`<alias>\`. Group is part of the endpoint key ->"
+  printf '%s\n' "  # both rows' stored history restarts on the next dispatch (both shapes)."
   printf '%s\n' "  - name: tang (via Caddy)"
+  printf '%s\n' "    group: anchor"
   printf '%s\n' "    url: http://hostanchor/adv"
   printf '%s\n' "    interval: 60s"
   printf '%s\n' "    conditions:"
@@ -1305,6 +1311,7 @@ TMP_CFG="${GATUS_CONFIG}.new"
     printf '%s\n' "  # origin TLS and warns while the cert is still fresh (stale-cert"
     printf '%s\n' "  # failure is dashboard-only — tang answers plain HTTP on its own port)."
     printf '%s\n' "  - name: dashboard TLS (via edge)"
+    printf '%s\n' "    group: anchor"
     printf '%s\n' "    url: https://${STATUS_HOST}"
     printf '%s\n' "    interval: 300s"
     printf '%s\n' "    conditions:"
@@ -1512,8 +1519,17 @@ ALERT_STANZA_CLASS4 = (
     "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)\n"
 )
 TENANT_TOP_KEYS = frozenset(("version", "generated_at", "tenant", "note", "endpoints", "disabled"))
-PLATFORM_TOP_KEYS = frozenset(("version", "generated_at", "note", "platform", "hosts", "disabled"))
+PLATFORM_TOP_KEYS = frozenset(("version", "generated_at", "note", "platform", "hosts", "disabled", "edge"))
 ENTRY_KEYS = frozenset(("name", "url", "alerts", "disabled"))
+# Tenant entries carry a site class (D13): the manifest publishes the contract
+# fact (S5 makes the class a contract + registry entry); shared/private sites
+# get no per-site app-health row, only the derived gate rows below.
+TENANT_ENTRY_KEYS = frozenset(("name", "url", "alerts", "disabled", "type"))
+SITE_TYPES = frozenset(("public", "shared", "private"))
+# `public edge` (D13): the row target is anchor-pinned (never manifest-
+# controlled); the platform enables it with `edge: true` once it serves this
+# path through the public edge (a platform-side follow-up).
+PUBLIC_EDGE_URL = "https://edge.piercloud.site/healthz"
 
 
 class PullError(Exception):
@@ -1865,7 +1881,7 @@ def validate_tenant(doc, alias, resolver):
     for entry in entries:
         if not isinstance(entry, dict):
             raise ManifestError("each endpoint must be an object")
-        extra = sorted(set(entry) - ENTRY_KEYS)
+        extra = sorted(set(entry) - TENANT_ENTRY_KEYS)
         if extra:
             raise ManifestError("unknown endpoint field(s): %s" % ", ".join(extra))
         name = _validate_tenant_name(entry.get("name"))
@@ -1873,32 +1889,64 @@ def validate_tenant(doc, alias, resolver):
         if folded in seen:
             raise ManifestError("duplicate endpoint name %r (case-folded)" % name)
         seen.add(folded)
+        site_type = entry.get("type")
+        if not isinstance(site_type, str) or site_type not in SITE_TYPES:
+            raise ManifestError("type must be one of: public, shared, private")
         if _validate_disabled(entry):
-            out.append({"name": name, "disabled": True, "url": None, "alerts": False})
+            out.append({"name": name, "disabled": True, "url": None, "alerts": False,
+                        "type": site_type})
             continue
         host, _path = _validate_url(entry.get("url"), _tenant_host_allowed(alias))
+        if site_type == "public" and not _public_site_host_allowed(host, alias):
+            raise ManifestError("type public requires a <site>-<alias>.piercloud.site url")
+        if site_type in ("shared", "private") and not (
+                _private_site_host_allowed(host, alias) or _anchor_host_allowed(host, alias)):
+            raise ManifestError("type %s requires a site under <alias>.piercloud.net" % site_type)
         resolver.check(host)
         out.append({"name": name, "disabled": False, "url": entry.get("url"),
-                    "alerts": _validate_alerts(entry)})
+                    "alerts": _validate_alerts(entry), "type": site_type})
     return out
 
 
+def _dns_label_ok(label):
+    # One host label (RFC 1123 LDH): alphanumeric edges, hyphens allowed inside.
+    return re.match(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?\Z", label) is not None
+
+
+def _anchor_host_allowed(host, alias):
+    # The anchor's own hostname is infrastructure, not a tenant site: it stays
+    # inside the URL allowlist and is exempt from the D13 class cross-check.
+    # Post-D13 an entry pointing at it renders no app-health row (only
+    # `type: public` entries do), so the exemption merely keeps an existing
+    # manifest parseable; `type: public` + the anchor host stays rejected.
+    return host == "anchor-01-%s.piercloud.net" % alias
+
+
+def _private_site_host_allowed(host, alias):
+    # `shared`/`private` sites live in the nested private namespace.
+    suffix = ".%s.piercloud.net" % alias
+    if not host.endswith(suffix):
+        return False
+    prefix = host[: -len(suffix)]
+    labels = prefix.split(".")
+    return 1 <= len(labels) <= 2 and all(_dns_label_ok(label) for label in labels)
+
+
+def _public_site_host_allowed(host, alias):
+    # `public` sites live in the flat public namespace (S).
+    suffix = "-%s.piercloud.site" % alias
+    if not host.endswith(suffix) or host.count(".") != 2:
+        return False
+    return _dns_label_ok(host[: -len(suffix)])
+
+
 def _tenant_host_allowed(alias):
-    exact = "anchor-01-%s.piercloud.net" % alias
     home = "home.%s.piercloud.net" % alias
-    nested_suffix = ".%s.piercloud.net" % alias
-    public_suffix = "-%s.piercloud.site" % alias
 
     def allowed(host):
-        if host in (home, exact):
-            return True
-        if host.endswith(nested_suffix):
-            prefix = host[: -len(nested_suffix)]
-            labels = prefix.split(".")
-            return 1 <= len(labels) <= 2 and all(labels) and all(label == label.lower() for label in labels)
-        if host.endswith(public_suffix) and host.count(".") == 2:
-            return True
-        return False
+        return (host == home or _anchor_host_allowed(host, alias)
+                or _private_site_host_allowed(host, alias)
+                or _public_site_host_allowed(host, alias))
 
     return allowed
 
@@ -1912,6 +1960,9 @@ def validate_platform(doc, resolver):
     top_disabled = doc.get("disabled", False)
     if not isinstance(top_disabled, bool):
         raise ManifestError("disabled must be a boolean")
+    edge = doc.get("edge", False)
+    if not isinstance(edge, bool):
+        raise ManifestError("edge must be a boolean")
     platform = doc.get("platform", [])
     hosts = doc.get("hosts", [])
     if not isinstance(platform, list) or not isinstance(hosts, list):
@@ -1920,7 +1971,7 @@ def validate_platform(doc, resolver):
         raise ManifestError("the platform list carries at most one row")
     if len(hosts) > MAX_PLATFORM_HOSTS:
         raise ManifestError("more than %d platform host rows" % MAX_PLATFORM_HOSTS)
-    if top_disabled and (platform or hosts):
+    if top_disabled and (platform or hosts or edge):
         raise ManifestError("disabled: true must not carry rows")
     out = []
     seen = set()
@@ -1952,6 +2003,11 @@ def validate_platform(doc, resolver):
         resolver.check(host)
         out.append({"name": name, "disabled": False, "url": entry.get("url"),
                     "is_platform_row": is_platform_row})
+    if edge:
+        # D13: the platform declares the public edge is in use; the anchor
+        # derives the row (target pinned above, never manifest-controlled).
+        out.append({"name": "public edge", "disabled": False, "url": PUBLIC_EDGE_URL,
+                    "is_platform_row": False, "edge": True})
     return out
 
 
@@ -1979,26 +2035,45 @@ def render_fragment(alias, role, alerting, platform_entries, tenant_entries):
     rows = []
     platform_url = "https://platform.piercloud.net/healthz"
     host_rows = []
+    edge_rows = []
     for entry in platform_entries or []:
         if entry.get("disabled"):
             continue
         if entry.get("is_platform_row"):
             platform_url = entry["url"]
+        elif entry.get("edge"):
+            edge_rows.append(entry)
         else:
             host_rows.append(entry)
     rows.append(render_row("platform", "platform", platform_url,
                            alerting and role == "operator"))
+    # D13 `public edge`: the platform declares the row in use; the target is
+    # anchor-pinned, so a platform-side change cannot redirect the probe.
+    for entry in edge_rows:
+        rows.append(render_row("public edge", "platform", entry["url"],
+                               alerting and role == "operator"))
     rows.append(render_row("your piercloud", alias,
                            "https://meta-%s.piercloud.site/healthz" % alias, alerting))
     rows.append(render_row("private (gate)", alias,
                            "https://teleport.%s.piercloud.net/web/login" % alias, alerting))
-    # `shared (gate)` is intentionally not seeded: no install-time signal that
-    # the shared class is in use (sites/federation S5/S6/S7).
+    # D13 `shared (gate)`: derived from the manifest's `type` field — one gate
+    # row per class in use, never a declared entry. It disappears (with the D7
+    # notice) when the last `type: shared` entry leaves.
+    if any(not entry.get("disabled") and entry.get("type") == "shared"
+           for entry in tenant_entries or []):
+        rows.append(render_row("shared (gate)", alias,
+                               "https://id.%s.piercloud.net/login" % alias, alerting))
     for entry in host_rows:
         rows.append(render_row(entry["name"], "platform", entry["url"],
                                alerting and role == "operator"))
     for entry in tenant_entries or []:
         if entry.get("disabled"):
+            continue
+        if entry.get("type") != "public":
+            # D13/D4: `shared`/`private` entries carry the class contract (they
+            # drive the gate-row derivation above), never an app-health row —
+            # an anonymous probe cannot see inside a gate, so the row could
+            # only ever be red.
             continue
         # Public tenant rows are class 4 (D5): native ntfy, no resolve.
         rows.append(render_row(entry["name"], alias, entry["url"],
@@ -2453,7 +2528,14 @@ def run_pull(cfg):
         save_state(cfg.state, state)
         return 1
     old_names = set(state.get("last_tenant_names") or [])
-    new_names = {entry["name"] for entry in outcome["tenant"]["entries"] if not entry.get("disabled")}
+    # D13: the tenant-side row set = public entries only (shared/private entries
+    # render no row) plus the derived `shared (gate)` row when present — the
+    # notice below names exactly the rows that disappeared.
+    new_names = {entry["name"] for entry in outcome["tenant"]["entries"]
+                 if not entry.get("disabled") and entry.get("type") == "public"}
+    if any(not entry.get("disabled") and entry.get("type") == "shared"
+           for entry in outcome["tenant"]["entries"]):
+        new_names.add("shared (gate)")
     removed = sorted(old_names - new_names)
     if removed and outcome["tenant"]["fresh"]:
         notify(cfg, "gatus puller: tenant monitor rows removed",
