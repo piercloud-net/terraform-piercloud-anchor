@@ -106,6 +106,13 @@ is "provision.yml structural indent-2 line count (pin: update for a new top-leve
 contains "broker-dns lib defines write_anchor_dns" 'write_anchor_dns()' "$(cat "$LIB")"
 contains "dns lib reuses the shared broker helpers" 'broker-report.sh' "$(cat "$LIB")"
 contains "broker mint pins the broker audience" '"piercloud-broker"' "$(cat "$REPORT_LIB")"
+# The sourced libs are the effective writer: pin their bytes, so an
+# env-gated direct provider call added inside one cannot hide behind the
+# write step's green pin. The job authenticates per-run via OIDC and must
+# never carry a standing secret.
+is "broker-dns lib blob hash (pin: update after a deliberate edit)" "c668738f19c28344ac0f591d4cc283e36d761a1292afc789ea897399f53f8862" "$(sha256sum "$LIB" | cut -d' ' -f1)"
+is "broker-report lib blob hash (pin: update after a deliberate edit)" "0cd7b5bb73ecd115bb1478776365a2ee6b0d3c739f45f466f5513acda1718533" "$(sha256sum "$REPORT_LIB" | cut -d' ' -f1)"
+lacks "anchor-dns job uses no standing secret" 'secrets.' "$JOB"
 
 # ---- job shape: broker call, managed lane, OIDC ---------------------------
 contains "job routes through the broker" 'Anchor DNS upsert + verify through the pc-control broker (fail-closed)' "$JOB"
@@ -188,7 +195,7 @@ STEP_BLOB="$(awk '
   f && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ {exit}
   f {print}
 ' <<<"$JOB_RAW")"
-is "write step blob hash" "5293b16c734b119a757a0653e8824f44b224910d9909bc5f18f4b8bef9c5f806" "$(printf '%s\n' "$STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+is "write step blob hash (pin: update after a deliberate edit)" "5293b16c734b119a757a0653e8824f44b224910d9909bc5f18f4b8bef9c5f806" "$(printf '%s\n' "$STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 # The guard step is byte-pinned too: its body decides whether a ref-less
 # apply can reach the write (a prefix such as
 # `ANCHOR_REF="${ANCHOR_REF:-anchor-01}"` inside the run block would neuter
@@ -199,13 +206,21 @@ GUARD_BLOB="$(awk '
   f && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ {exit}
   f {print}
 ' <<<"$JOB_RAW")"
-is "guard step blob hash" "ef59e00c3696d06e3b3c2ed4fe2e9d20ab317fa110a619613fd13b1c86a46fe7" "$(printf '%s\n' "$GUARD_BLOB" | sha256sum | cut -d' ' -f1)"
+is "guard step blob hash (pin: update after a deliberate edit)" "ef59e00c3696d06e3b3c2ed4fe2e9d20ab317fa110a619613fd13b1c86a46fe7" "$(printf '%s\n' "$GUARD_BLOB" | sha256sum | cut -d' ' -f1)"
 # Exactly one guard step and one write step anywhere in the workflow, and
 # exactly one write_anchor_dns token in the job: a second (unpinned) writer
 # step that runs `... || true`, or a relocated copy, is caught here.
 is "exactly one guard-step header in the workflow" "1" "$(grep -cE '^      - name: Managed-lane guard \(b3b #189 retired the direct-token writer\)$' "$PROV")"
 is "exactly one write-step header in the workflow" "1" "$(grep -cE '^      - name: Upsert anchor A \+ dashboard CNAME through the broker$' "$PROV")"
 is "exactly one write_anchor_dns token in the job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -c 'write_anchor_dns')"
+# The whole job body is byte-pinned: the step pins above cannot see the
+# checkout identity (`repository:`/`ref:` under `with:` would source an
+# attacker's broker-dns.sh), a job-env injection (LD_PRELOAD), or any other
+# added/edited line in the job. Any deliberate job edit updates this pin.
+is "anchor-dns job blob hash (pin: update after a deliberate edit)" "a6334e45c3a174abd93ff125f34b71a39d6e353263a7d330d450ae2f6834e45d" "$(printf '%s\n' "$JOB_RAW" | sha256sum | cut -d' ' -f1)"
+for v in LD_PRELOAD LD_LIBRARY_PATH; do
+  lacks_word "job does not set $v" "$v" "$JOB"
+done
 # The writer may live only here: a second call in another job, or an
 # obfuscated same-job call (`write_anchor_""dns`), adds a token.
 is "exactly one write_anchor mention in the job" "1" "$(printf '%s\n' "$JOB_LINES" | grep -c 'write_anchor')"
@@ -304,12 +319,28 @@ RUN_START="$(awk -F'\t' '$2 == "      - name: Run the committed script harnesses
 RUN_END="$(awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
   RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
-  is "harness-run step blob hash" "286baff6b596031b9d0faaa716dac758b1515251ee3fafa2454d639184991182" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "harness-run step blob hash (pin: update after a deliberate edit)" "286baff6b596031b9d0faaa716dac758b1515251ee3fafa2454d639184991182" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
   is "harness-run step keeps the gate expression" "1" "$(printf '%s\n' "$RUN_STEP_BLOB" | grep -cE '^        if: steps\.gate\.outputs\.run == .yes.$')"
 else
   bad "harness-run step span not found in ci.yml"
 fi
 is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the committed script harnesses \(cheap first\)$' "$CI")"
+# The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
+# step pin hashes the consumer, not the producer of its contract source
+# (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
+# a rewrite inserted into another step would re-admit a retired provider
+# while the pinned step stays green. Exactly one job key line (any spelling)
+# may exist; the span is located structurally and fails closed when the end
+# is missing.
+SCP_START="$(awk -F'\t' '$2 ~ /^  scp-endpoint-allowlist:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+SCP_END="$(awk -F'\t' -v s="$SCP_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+is "exactly one scp-endpoint-allowlist job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"scp-endpoint-allowlist\"|'scp-endpoint-allowlist'|scp-endpoint-allowlist)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
+if [ -n "$SCP_START" ] && [ -n "$SCP_END" ]; then
+  SCP_JOB_BLOB="$(sed -n "$((SCP_START + 1)),$((SCP_END - 1))p" "$CI")"
+  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "f7d98c0ac8deb7e8ddfc407ee0129492c2858e9d286c7942a41779fce5727827" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
+else
+  bad "scp-endpoint-allowlist job span not found in ci.yml"
+fi
 is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"unit-tests-scripts\"|'unit-tests-scripts'|unit-tests-scripts)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
 # Spelling-agnostic census for ci.yml (same doctrine as provision.yml):
 # every indent-2 non-space/non-comment line of the stripped view is a
@@ -348,7 +379,7 @@ GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts
 GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
-  is "gate step blob hash" "0f85dbbe46c2abad81a846cc32397163ec1a3cb9a50afe5c674849b1ebcd18e9" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "gate step blob hash (pin: update after a deliberate edit)" "0f85dbbe46c2abad81a846cc32397163ec1a3cb9a50afe5c674849b1ebcd18e9" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "gate step span not found in ci.yml"
 fi
@@ -368,10 +399,16 @@ is "ci.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|
 is "provision.yml has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$PROV")"
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
-# invisible to every key regex. Neither workflow uses merge keys, so they are
-# banned blanket.
-is "ci.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}((&|!)[^[:space:]]+[[:space:]]+)*<<[[:space:]]*:' "$CI")"
-is "provision.yml has no YAML merge keys" "0" "$(grep -cE '^ {0,8}((&|!)[^[:space:]]+[[:space:]]+)*<<[[:space:]]*:' "$PROV")"
+# invisible to every key regex. Block, flow and tagged spellings (`<< :`,
+# `&m <<:`, `- <<: *evil`, `{ <<: *evil }`, `!!merge '<<': *evil`) all
+# resolve as merges under YAML, so the `<<:` token is banned anywhere in the
+# workflow files (heredocs/herestrings use `<<NAME`/`<<<`, never a colon),
+# and the `!!merge` / verbose `2002:merge` tags are banned outright. Zero
+# legitimate uses in-tree.
+is "ci.yml has no YAML merge keys" "0" "$(grep -cE '<<[[:space:]]*:' "$CI")"
+is "provision.yml has no YAML merge keys" "0" "$(grep -cE '<<[[:space:]]*:' "$PROV")"
+is "ci.yml has no YAML merge tags" "0" "$(grep -cE '!!merge|2002:merge' "$CI")"
+is "provision.yml has no YAML merge tags" "0" "$(grep -cE '!!merge|2002:merge' "$PROV")"
 is "ci.yml has no workflow defaults" "0" "$(grep -cE "^(&[^[:space:]]+[[:space:]]+|![^[:space:]]+[[:space:]]+)*[\"']?defaults[\"']?[[:space:]]*:" "$CI")"
 lacks_word "unit-tests job does not set BASH_ENV" BASH_ENV "$ci_unit"
 lacks_word "ci.yml does not set BASH_ENV" BASH_ENV "$ci_live"
@@ -393,12 +430,20 @@ lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
 # The whole allowlist step is byte-pinned: the default-line pin above cannot
 # see a later re-assignment (`declare allowed_url=...`) that re-admits the
-# retired provider APIs without touching the pinned line.
+# retired provider APIs without touching the pinned line. Exactly one raw
+# step header may exist, or a byte-identical copy earlier in the file (even
+# inside a scalar the structural stripper does not honour) would satisfy the
+# hash while the real step is weakened. A step at end-of-file has no
+# following sibling/job line and fails closed as "span not found": a move to
+# EOF changes the step's job membership, so it must update this guard
+# deliberately (over-approximation accepted; trailing comments after the step
+# also join the pin).
+is "exactly one allowlist-step header in ci.yml" "1" "$(grep -cE '^      - name: Fail on anything netcup-shaped outside the allowlist$' "$CI")"
 ALLOW_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Fail on anything netcup-shaped outside the allowlist" {print $1; exit}')"
 ALLOW_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ALLOW_START" '$1 > s && ($2 ~ /^      - / || $2 ~ /^  [^ #]/) {print $1; exit}')"
 if [ -n "$ALLOW_START" ] && [ -n "$ALLOW_END" ]; then
   ALLOW_STEP_BLOB="$(sed -n "${ALLOW_START},$((ALLOW_END - 1))p" "$CI")"
-  is "allowlist step blob hash" "9af2491dbc47cd000e75bfb7b682891c25d710ec6f0552837c5e426c60bcdc57" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "allowlist step blob hash (pin: update after a deliberate edit)" "9af2491dbc47cd000e75bfb7b682891c25d710ec6f0552837c5e426c60bcdc57" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "allowlist step span not found in ci.yml"
 fi
@@ -445,6 +490,19 @@ for v in NET_DNS_PROVIDER STATUS_EDGE_DOMAIN CLOUDFLARE_DNS_TOKEN GCORE_DNS_TOKE
 done
 rc=0
 hits="$(grep -lnE '030-anchor-dns|tests/anchor-dns' "${surface_files[@]}")" || rc=$?
+# The retired provider APIs must not reappear even when URL_EXTRACT cannot
+# see the URL (`${SCHEME}://api.gcore.com`, `HTTPS://...`): the host
+# literals are banned case-insensitively across the whole production
+# surface. A variable-assembled hostname remains a disclosed residual.
+for pat in 'api\.gcore\.com' 'api\.cloudflare\.com'; do
+  rc=0
+  hits="$(grep -liE -- "$pat" "${surface_files[@]}")" || rc=$?
+  case "$rc" in
+    0) bad "production surface names a retired provider host ($pat): $hits" ;;
+    1) ok "no production surface names a retired provider host ($pat)" ;;
+    *) bad "grep failed scanning for '$pat' (rc=$rc)" ;;
+  esac
+done
 case "$rc" in
   0) bad "production surface references the retired writer/harness: $hits" ;;
   1) ok "no production surface references the retired writer/harness" ;;
@@ -514,6 +572,12 @@ for t in "${harnesses[@]}"; do
     bad "ci.yml run list includes $t"
   fi
 done
+
+# Exact passing-check floor: deleting or emptying a check (the byte-pin block
+# included) must fail the suite instead of silently reducing coverage. Update
+# deliberately when adding or removing checks.
+CHECK_FLOOR=162
+if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
