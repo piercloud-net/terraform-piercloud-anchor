@@ -109,8 +109,8 @@ is "exactly one anchor-dns job key line in provision.yml" "1" "$(grep -cE "^  (\
 JOBS_START="$(awk -F'\t' '$2 ~ /^jobs:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 # Parsed to end-of-file: ending the span at the first column-0 line let a
 # flow-collection continuation at column 0 truncate it and hide every job
-# key after it (r17 F1). A top-level key after jobs (unsupported layout;
-# jobs is last in-tree) contributes its indent-2 lines to the set check, so
+# key after it (r17 F1). A top-level key after jobs (none in-tree, and not
+# specially handled here) contributes its indent-2 lines to the set check, so
 # the set changes and the pin must be deliberately updated.
 JOBS_END=$(( $(awk 'END{print NR}' "$PROV") + 1 ))
 if [ -n "$JOBS_START" ] && [ -n "$JOBS_END" ]; then
@@ -452,10 +452,19 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   fi
   # The jobs block is parsed to end-of-file: ending the span at the first
   # column-0 line let a flow-collection continuation at column 0 truncate it
-  # and hide every job key after it (r17 F1). A top-level key after jobs
-  # (unsupported layout; jobs is last in-tree) contributes its indent-2 lines
-  # to the name extraction, so the digest changes and the pin must be
-  # deliberately updated.
+  # and hide every job key after it (r17 F1). But an end-of-file span also
+  # sweeps in the indent-2 children of any top-level key placed AFTER jobs,
+  # so jobs is required to be the LAST top-level key: no column-0
+  # non-comment, non-blank line may follow it. In all seven workflows jobs is
+  # last; a genuine top-level key after jobs, a `---` document separator, or
+  # a column-0 flow-collection continuation (r17 F1) each land here and fail
+  # closed, instead of letting a re-indented jobs block + a decoy key
+  # spelling out the pinned names keep the digest green (r18 F1/F2).
+  if sed -n "$((jstart + 1)),\$p" "$wf" | grep -qE '^[^[:space:]#]'; then
+    bad "$wf has a column-0 non-comment line after jobs: (jobs must be the last top-level key)"
+    wf_job_digest="$wf_job_digest|$wf:AMBIGUOUS"
+    continue
+  fi
   jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
   # A quoted job key can hide a colon (`"release: evil":`), which the
   # first-colon strip would truncate to the plain name and hide the rename.
@@ -478,8 +487,10 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   # (alphanumerics, `-`, `_`, starting with a letter or `_`) whose colon is a
   # real mapping separator (followed by whitespace or end of line — in YAML a
   # colon inside a plain key is not followed by whitespace). Anything after
-  # the separator is the job's value and is left to the body pins (a
-  # value-side anchor/tag, e.g. `release: &a`, is legal YAML).
+  # the separator is the job's value and is left to that job's own pins where
+  # they exist — this digest pins names only (three bodies are whole-job
+  # byte-pinned elsewhere in this harness); a value-side anchor/tag, e.g.
+  # `release: &a`, is legal YAML.
   if grep -qvE '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*:([[:space:]].*)?$' <<<"$raw_keys"; then
     bad "$wf job key fails the GitHub job-id grammar (rename/truncation guard)"
     wf_job_digest="$wf_job_digest|$wf:BADNAME"
@@ -641,7 +652,9 @@ fi
 
 # ---- production surfaces carry no retired name ----------------------------
 # Every file in the repo outside .git/, the gitignored .local/ proof config
-# and gitignored build artifacts (`__pycache__/`) is a production surface
+# and two build-artifact exclusions — the gitignored provider downloads
+# `.terraform/` and the recording-witness bytecode cache
+# `tests/recording-witness/__pycache__/` — is a production surface
 # (extensionless and Markdown included),
 # except two record classes that name the retired identifiers by design:
 # the `tests/*/run-test.sh` harness records (exactly one level — the pins
@@ -672,13 +685,13 @@ while IFS= read -r f; do
   if [[ "$f" =~ ^\./tests/[^/]+/run-test\.sh$ ]]; then continue; fi
   if [[ "$f" == "./docs/security-posture.md" || "$f" == "./docs/verification.md" ]]; then continue; fi
   surface_files+=("$f")
-done < <(find . \( -path ./.git -o -path ./.local -o -path '*/__pycache__' \) -prune -o -type f -print | sort)
+done < <(find . \( -path ./.git -o -path ./.local -o -type d -path '*/.terraform' -o -type d -path './tests/recording-witness/__pycache__' \) -prune -o -type f -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
 # A symlink in the production surface would dodge the scan entirely: fail
 # closed instead (the tree has none). This check is unconditional — a
 # `tests/*/run-test.sh` record replaced by a symlink would otherwise run the
 # wrong file in CI with every other pin green.
-symlinks="$(find . \( -path ./.git -o -path ./.local -o -path '*/__pycache__' \) -prune -o -type l -print | sort)"
+symlinks="$(find . \( -path ./.git -o -path ./.local -o -type d -path '*/.terraform' -o -type d -path './tests/recording-witness/__pycache__' \) -prune -o -type l -print | sort)"
 if [ -z "$symlinks" ]; then ok "no symlinks in the production surface"; else bad "symlink in the production surface: $symlinks"; fi
 # A binary or encoded payload (e.g. UTF-16LE) in the production surface can
 # carry a retired identifier that no text grep sees; fail closed on any NUL
