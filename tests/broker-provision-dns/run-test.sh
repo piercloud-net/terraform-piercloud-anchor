@@ -437,21 +437,38 @@ fi
 # below. Pin update is deliberate (same PR as the workflow change).
 wf_job_digest=""
 wf_top_digest=""
+wf_on_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
-  # The TOP-LEVEL key set is pinned on its own: the jobs-last invariant and
-  # every job-set span read content from `jobs:` down, so a decoy key placed
-  # BEFORE `jobs:` (with indent-2 children, compensated in the census) would
-  # be invisible to every job pin. Every column-0 non-comment line
-  # contributes its first colon-delimited token (node properties and one
-  # surrounding quote stripped), so a decoy key in ANY spelling — plain,
-  # quoted, single-quoted, anchored, tagged, dotted or spaced — changes the
-  # pin. The sequence is ORDERED: a cosmetic reorder also reds (deliberate
-  # pin update). A column-0 non-key line (a `---` separator, a multi-line
-  # quoted-scalar continuation) contributes its text and reds too
-  # (over-approximation, accepted).
-  wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[^[:space:]#]' "$wf" \
-    | sed -E -e 's/[[:space:]]*:.*$//' -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr '\n' ',')"
+  # The TOP-LEVEL line sequence is pinned on its own: the jobs-last invariant
+  # and every job-set span read content from `jobs:` down, so a decoy key
+  # placed BEFORE `jobs:` (with indent-2 children, compensated in the census)
+  # would be invisible to every job pin. Every column-0 non-comment line is
+  # hashed RAW: the old token extraction was lossy (a quoted key with an
+  # internal colon truncated to the pre-colon word, and a comma-bearing key
+  # collided with the comma-joined token string — r21 F1/F2), so a
+  # replacement could keep the digest green. Raw hashing is injective: ANY
+  # column-0 change — a decoy key in any spelling, a quoted/renamed/removed
+  # key, a `---` separator, a flow continuation — changes the pin. Spelling
+  # stability is traded for injectivity: a cosmetic respelling or reorder
+  # also reds (deliberate pin update).
+  wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[^[:space:]#]' "$wf" | sha256sum | cut -d' ' -f1)"
+  # The `on:` trigger block is pinned per workflow: the top-level line digest
+  # sees only column-0 lines, so an indent-2 trigger added under `on:`
+  # (e.g. `pull_request_target:`) was invisible to every other pin (r21 F4).
+  # The span is hashed raw from the `on:` key line to the next column-0
+  # non-comment line; flow continuations at column 0 are already in the
+  # top-level digest, and a missing or ambiguous `on:` key fails closed.
+  on_lines="$(grep -nE '^((&|!)[^[:space:]]+[[:space:]]+)*(["'"'"']?on["'"'"']?)[[:space:]]*:' "$wf" | cut -d: -f1 || true)"
+  on_count="$(printf '%s\n' "$on_lines" | grep -c . || true)"
+  if [ "$on_count" != "1" ]; then
+    bad "$wf top-level on: key count (expected 1, got $on_count)"
+    wf_on_digest="$wf_on_digest|$wf:AMBIGUOUS"
+  else
+    on_end="$(awk -v s="$on_lines" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
+    [ -n "$on_end" ] || on_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
+    wf_on_digest="$wf_on_digest|$wf:$(sed -n "${on_lines},$((on_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
+  fi
   jobs_keys="$(grep -cE "^((&|!)[^[:space:]]+[[:space:]]+)*([\"']?jobs[\"']?)[[:space:]]*:[[:space:]]*(#.*)?\$" "$wf" || true)"
   if [ "$jobs_keys" != "1" ]; then
     bad "$wf top-level jobs key count (expected 1, got $jobs_keys)"
@@ -530,9 +547,20 @@ if [ "$job_digest_got" != "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c
   printf '   job-set parts (to update the pin):\n'; printf '%s' "$wf_job_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 top_digest_got="$(printf '%s' "$wf_top_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow top-level key set is pinned (pin: update for a deliberate top-level key change)" "598e3ea070a86315c6b546fbd67d10070ca83d8e4bfa2fc227168192540b0a23" "$top_digest_got"
-if [ "$top_digest_got" != "598e3ea070a86315c6b546fbd67d10070ca83d8e4bfa2fc227168192540b0a23" ]; then
+is "workflow top-level key sequence is pinned (pin: update for a deliberate top-level key change)" "79697d40de1560fdff6c3c014c5f023e93fde0425295d70438f98baa985b4618" "$top_digest_got"
+if [ "$top_digest_got" != "79697d40de1560fdff6c3c014c5f023e93fde0425295d70438f98baa985b4618" ]; then
   printf '   top-level key parts (to update the pin):\n'; printf '%s' "$wf_top_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
+  printf '   top-level line content (each workflow, hashed as-is; strip the "     | " prefix):\n'
+  for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$wf" ] || continue
+    printf '     %s:\n' "$wf"
+    grep -E '^[^[:space:]#]' "$wf" | sed 's/^/     | /' || true
+  done
+fi
+on_digest_got="$(printf '%s' "$wf_on_digest" | sha256sum | cut -d' ' -f1)"
+is "workflow on: trigger blocks are pinned (pin: update for a deliberate trigger change)" "4e7f26bf4c989cd1329dad27ea393924f24d3ed9842371b61ab5121d8142591f" "$on_digest_got"
+if [ "$on_digest_got" != "4e7f26bf4c989cd1329dad27ea393924f24d3ed9842371b61ab5121d8142591f" ]; then
+  printf '   on: parts (to update the pin):\n'; printf '%s' "$wf_on_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 # A workflow must not gain (or repoint) an execution of test-tree content:
 # the `tests/*/run-test.sh` pin records are exempt from the retired-name scan,
@@ -544,15 +572,22 @@ fi
 # a shell-assembled `tests` token still fires the pin while `run-test.sh` is
 # literal; a fully-assembled path (both tokens) fires no pin (disclosed
 # residual).
+TESTS_REF_RE='(^|[^[:alnum:]_-])tests([^[:alnum:]_-]|$)|run-test\.sh'
 wf_tests_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
-  wf_tests_digest="$wf_tests_digest|$wf:$(grep -E '(^|[^[:alnum:]_-])tests([^[:alnum:]_-]|$)|run-test\.sh' "$wf" | sha256sum | cut -d' ' -f1 || true)"
+  wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
 is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" "$tests_digest_got"
 if [ "$tests_digest_got" != "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
+  printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
+  for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$wf" ] || continue
+    printf '     %s:\n' "$wf"
+    grep -E "$TESTS_REF_RE" "$wf" | sed 's/^/     | /' || true
+  done
 fi
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
@@ -616,13 +651,18 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   is "$wf has no explicit mapping keys" "0" "$(grep -cE '^ {0,8}\?([[:space:]]|$)' "$wf")"
 done
 # A dotfile workflow (`.github/workflows/.evil.yml`) is invisible to every
-# glob below and to GitHub's own path filters; there is none in-tree and the
-# digests would not see one, so fail closed.
+# glob in this harness and to GitHub's own path filters; there is none
+# in-tree and the digests would not see one, so fail closed.
 if compgen -G '.github/workflows/.*.yml' >/dev/null || compgen -G '.github/workflows/.*.yaml' >/dev/null; then
   bad "dotfile workflow present under .github/workflows/ (invisible to every glob and digest)"
 else
   ok "no dotfile workflows under .github/workflows/"
 fi
+# No workflow may reference `.local` (gitignored local configuration): a
+# force-added `.local` payload executed by a committed step would sit
+# outside the scan surface (r21 F5). Zero legitimate uses in-tree.
+local_refs="$(grep -lE '(^|[^[:alnum:]_-])\.local([^[:alnum:]_-]|$)' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$local_refs" ]; then ok "no workflow references .local (outside the scan surface)"; else bad "workflow references .local (outside the scan surface): $local_refs"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Block, flow and tagged spellings (`<< :`,
@@ -699,11 +739,14 @@ fi
 # never be scanned. A new `tools/evil.sh`, `tools/dns-fallback.env`,
 # `evil.bash`, `.github/workflows/evil.yaml`, `scripts/lib/helper`,
 # `.terraform/payload.sh` or sourced
-# `docs/evil.md` must not sit outside the scan. The only exempt build
-# artifact is the recording-witness suite's bytecode cache —
-# `tests/recording-witness/__pycache__/*.pyc` exactly (anything else in that
-# directory is scanned), and a `terraform-provider-*`/`tofu-provider-*`
-# provider binary is only exempt from the NUL check below. Word
+# `docs/evil.md` must not sit outside the scan. There is no bytecode-cache
+# exemption: a planted `.pyc` is an execution route (the recording-witness
+# harness deletes its cache before its first python call and writes none
+# back, so any in-tree `__pycache__`/`.pyc` is scanned — a binary pyc fails
+# the NUL check below) — r21 F3. A
+# `terraform-provider-*`/`tofu-provider-*`
+# provider binary is only exempt from the NUL check below (exact path shape;
+# a descendant of a provider-shaped directory is scanned) — r21 F6. Word
 # boundaries keep the live broker config name (`PC_BROKER_STATUS_EDGE_DOMAIN`)
 # legal while the retired repo variable is caught. Comments are INCLUDED: a
 # stale comment is drift too. The named groups are still checked explicitly
@@ -722,12 +765,11 @@ while IFS= read -r f; do
   # which would over-exclude a nested `tests/a/b/run-test.sh` from the scan.
   if [[ "$f" =~ ^\./tests/[^/]+/run-test\.sh$ ]]; then continue; fi
   if [[ "$f" == "./docs/security-posture.md" || "$f" == "./docs/verification.md" ]]; then continue; fi
-  # The recording-witness suite's bytecode cache is the only in-tree build
-  # artifact this scan exempts (it is also the only one present during this
-  # harness's CI run); the exemption is exact path + a single extension
-  # component, so a committed `evil.py`, a nested `sub/evil.pyc` or a cache
-  # in any other directory is still scanned.
-  if [[ "$f" =~ ^\./tests/recording-witness/__pycache__/[^/]+\.pyc$ ]]; then continue; fi
+  # No bytecode-cache exemption: a planted `.pyc` is an execution route
+  # (Python loads a PEP 552 hash-based pyc instead of the source) and the
+  # recording-witness harness deletes its cache before the first python call
+  # and writes none back, so any in-tree `__pycache__`/`.pyc` is scanned like
+  # any other file (a binary pyc fails the NUL check) — r21 F3.
   surface_files+=("$f")
 done < <(find . \( -path ./.git -o -path ./.local \) -prune -o -type f -print | sort)
 [ "${#surface_files[@]}" -gt 0 ] || bad "no production surfaces matched"
@@ -747,9 +789,11 @@ for f in "${surface_files[@]}"; do
   # covers it. Everywhere else a provider-shaped name is scanned like any
   # other file, and everything else must be text (a UTF-16/other encoding
   # payload fails closed).
-  case "$f" in
-    ./.terraform/providers/*/terraform-provider-*|./.terraform/providers/*/tofu-provider-*) continue ;;
-  esac
+  # Exact shape, not a `case` glob: a `case` pattern's `*` crosses `/`, so
+  # `.../terraform-provider-aws/inner.sh` was exempt too (r21 F6). The regex
+  # requires exactly one non-slash directory component and a non-slash
+  # basename.
+  if [[ "$f" =~ ^\./\.terraform/providers/[^/]+/(terraform|tofu)-provider-[^/]+$ ]]; then continue; fi
   if ! cmp -s <(LC_ALL=C tr -d '\0' < "$f") "$f"; then nul_files="$nul_files $f"; fi
 done
 if [ -z "$nul_files" ]; then ok "no production surface file contains a NUL byte"; else bad "production surface files contain NUL bytes (binary/encoded):$nul_files"; fi
@@ -864,7 +908,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=199
+CHECK_FLOOR=201
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
