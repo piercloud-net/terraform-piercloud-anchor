@@ -36,6 +36,14 @@ CADDY_URL="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSI
 CADDY_SHA512="8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9"
 
 WORK="$(mktemp -d /tmp/bind-e2e.XXXXXX)"
+# No in-tree bytecode: mock-tang.py imports the in-tree p521 module, and a
+# planted `tests/bind-e2e/__pycache__/p521.cpython-*.pyc` (PEP 552 hash-based
+# or matching mtime/size) would be loaded instead of the source — an
+# execution route in this cred-free job, which runs before the unit-tests
+# scan (r22 functional LOW). Delete any cache before the first python call
+# and never write one back (`-B` on every call; the export covers the rest).
+rm -rf "${HARNESS_DIR}/__pycache__"
+export PYTHONDONTWRITEBYTECODE=1
 START="$(date +%s)"
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
@@ -68,7 +76,7 @@ apt-get install -y -qq clevis clevis-luks cryptsetup jose curl jq python3 python
 command -v clevis >/dev/null || die "clevis missing after apt"
 command -v jq >/dev/null || die "jq missing after apt (the collapse proof and the provision probe need it)"
 command -v cryptsetup >/dev/null || die "cryptsetup missing after apt"
-python3 -c "import cryptography" 2>/dev/null || die "python3-cryptography missing after apt"
+python3 -B -c "import cryptography" 2>/dev/null || die "python3-cryptography missing after apt"
 # Drift canary: the runner's jose must still speak the mock's curve. If a
 # future jose changes ECMR generation, this fails LOUDLY here instead of
 # mid-bind with a cryptic clevis error.
@@ -221,7 +229,7 @@ awk 'NR == 1 { print; next } /^\{$/ { print; print "\tauto_https disable_redirec
 HOME="${WORK}" "${CADDY_BIN}" adapt --config "${WORK}/Caddyfile.gate" --adapter caddyfile --pretty > "${WORK}/Caddyfile.gate.json" \
   || die "gate render does not adapt"
 assert_gate_order() { # $1 = adapted config json, $2 = site host
-python3 - "$1" "$2" <<'PY' || die "adapted route order puts the origin gate behind the catch-all handle (dead code)"
+python3 -B - "$1" "$2" <<'PY' || die "adapted route order puts the origin gate behind the catch-all handle (dead code)"
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 host = sys.argv[2]
@@ -271,7 +279,7 @@ assert_gate_order "${WORK}/Caddyfile.gate.prod.json" "${GATE_HOST%:*}"
 grep -q '130.176.88.0/21' "${WORK}/Caddyfile.gate.prod" || die "production-shape gate render does not carry the production ranges"
 if grep -q '127.0.0.3/32' "${WORK}/Caddyfile.gate.prod"; then die "production-shape gate render carries the test range"; fi
 mkdir -p "${WORK}/gate-stub" && printf 'STUBOK' > "${WORK}/gate-stub/index.html"
-python3 -m http.server "${GATE_STUB_PORT}" --bind 127.0.0.1 --directory "${WORK}/gate-stub" >"${WORK}/gate-stub.log" 2>&1 &
+python3 -B -m http.server "${GATE_STUB_PORT}" --bind 127.0.0.1 --directory "${WORK}/gate-stub" >"${WORK}/gate-stub.log" 2>&1 &
 GATE_STUB_PID=$!
 HOME="${WORK}" "${CADDY_BIN}" run --config "${WORK}/Caddyfile.gate.serve" --adapter caddyfile >"${WORK}/caddy-gate.log" 2>&1 &
 GATE_PID=$!
@@ -310,9 +318,9 @@ log "Gate matrix passed (adapted order + 8 request cases)"
 # ---------------------------------------------------------------- 4. serve
 log "Starting mock tang + stub + caddy"
 export TENANT_USER=citest TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
-python3 "${HARNESS_DIR}/mock-tang.py" --port "${MOCK_PORT}" --thp-file "${WORK}/thp.txt" >"${WORK}/mock.log" 2>&1 &
+python3 -B "${HARNESS_DIR}/mock-tang.py" --port "${MOCK_PORT}" --thp-file "${WORK}/thp.txt" >"${WORK}/mock.log" 2>&1 &
 MOCK_PID=$!
-python3 "${HARNESS_DIR}/mock-tang.py" --stub --port "${STUB_PORT}" --stub-body "gatus-stub-ok" >"${WORK}/stub.log" 2>&1 &
+python3 -B "${HARNESS_DIR}/mock-tang.py" --stub --port "${STUB_PORT}" --stub-body "gatus-stub-ok" >"${WORK}/stub.log" 2>&1 &
 STUB_PID=$!
 for i in $(seq 1 30); do [ -f "${WORK}/thp.txt" ] && break; sleep 1; done
 THP="$(cat "${WORK}/thp.txt" 2>/dev/null || true)"

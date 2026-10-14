@@ -40,6 +40,70 @@ lacks() { # $1 label, $2 needle, $3 haystack -- ok when the needle is ABSENT
 lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
   if grep -qwE -- "$2" <<<"$3"; then bad "$1 (found '$2')"; else ok "$1"; fi
 }
+# End line of a key's span, flow-aware: the span runs from the key's line
+# ($2) to the first column-0 non-comment line seen while the flow depth is
+# zero. A mixed-indent flow collection (`on: [` + column-0 entries + a later
+# indent-2 entry) is one collection to YAML, so a plain "next column-0 line"
+# terminator let an added trigger hide between them (r22 functional LOW).
+# Quote and comment indicators count only at a YAML token start (line start,
+# whitespace, or a flow indicator): a mid-token `'`/`"`/`#` is plain-scalar
+# content (`it's`, `a#b`), and counting a `]`/`}` inside a quoted scalar
+# closed a live flow early — a trigger hidden after the early end reds no pin
+# (r23 HIGH). Quoted contents are not counted at all, so a mis-read can only
+# extend the span. Empty when no terminator is found (EOF).
+flow_end() { # $1 file, $2 start line
+  awk -v s="$2" '
+    function sq() { return sprintf("%c", 39) }
+    function tokstart(p) { return p == "" || p == " " || p == "\t" || p == "[" || p == "{" || p == "," }
+    function depth(line,   i, c, prev, d) {
+      d = 0; prev = ""
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (q == "") {
+          if (c == "#" && tokstart(prev)) break
+          if ((c == "\"" || c == sq()) && tokstart(prev)) { q = c; prev = c; continue }
+          if (c == "[" || c == "{") { d++ }
+          else if (c == "]" || c == "}") { d-- }
+        } else if (q == "\"") {
+          if (esc) { esc = 0 }
+          else if (c == "\\") { esc = 1 }
+          else if (c == "\"") { q = "" }
+        } else {
+          if (c == sq()) {
+            if (substr(line, i + 1, 1) == sq()) { i++ }
+            else { q = "" }
+          }
+        }
+        prev = c
+      }
+      return d
+    }
+    NR == s { d = depth($0); next }
+    NR > s {
+      if ($0 ~ /^[[:space:]]*$/) { next }
+      if (d <= 0 && $0 ~ /^[^[:space:]#]/) { print NR; exit }
+      d += depth($0)
+    }
+  ' "$1"
+}
+# flow_end unit fixtures: the span end must never move EARLIER than the real
+# YAML block (r23 HIGH regression). Each case pins the exact end line; a
+# fixture with no terminator prints nothing (EOF extension).
+fe_case() { # $1 expected end ("EOF" = no terminator), $2 label, $3 content
+  local f got
+  f="$(mktemp)"
+  printf '%s' "$3" > "$f"
+  got="$(flow_end "$f" 1)"
+  rm -f "$f"
+  if [ "$1" = "EOF" ]; then is "$2" "" "$got"; else is "$2" "$1" "$got"; fi
+}
+fe_case 5 "flow_end: quoted ] inside a flow does not end the span early" $'on: ["a]b",\npush,\n  pull_request_target,\n]\npermissions:\n'
+fe_case 4 "flow_end: quoted } inside a flow mapping does not end the span early" $'on: {"a}b": x,\n  pull_request_target,\n}\npermissions:\n'
+fe_case 7 "flow_end: mid-token # is plain content, not a comment" $'on: [a#b, [c,\npush,\n],\npush2,\n  pull_request_target,\n]\npermissions:\n'
+fe_case 3 "flow_end: # after a flow comma is a comment" $'on: [a,# ]\npush]\npermissions:\n'
+fe_case 5 "flow_end: mid-token apostrophe does not open a quote" $'on: [it\'s, [a, b\'s,\n], push,\npull_request_target,\n]\npermissions:\n'
+fe_case 5 "flow_end: mid-token double quote does not open a quote" $'on: [it"s, [a, b"s,\n], push,\npull_request_target,\n]\npermissions:\n'
+fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: [it\'s,\n  push,\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
 [ -f "$CI" ] || { printf 'FAIL ci.yml not found: %s\n' "$CI"; exit 1; }
@@ -457,7 +521,7 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   # lines are not part of the pin (comments are non-executable, indented lines
   # are not top-level). Spelling stability is traded for that coverage: a
   # cosmetic respelling or reorder also reds (deliberate pin update).
-  wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[^[:space:]#]' "$wf" | sha256sum | cut -d' ' -f1)"
+  wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[^[:space:]#]' "$wf" | sha256sum | cut -d' ' -f1 || true)"
   # The `on:` trigger block is pinned per workflow: the top-level line digest
   # sees only column-0 lines, so an indent-2 trigger added under `on:`
   # (e.g. `pull_request_target:`) was invisible to every other pin (r21 F4).
@@ -470,7 +534,7 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     bad "$wf top-level on: key count (expected 1, got $on_count)"
     wf_on_digest="$wf_on_digest|$wf:AMBIGUOUS"
   else
-    on_end="$(awk -v s="$on_lines" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
+    on_end="$(flow_end "$wf" "$on_lines")"
     [ -n "$on_end" ] || on_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
     wf_on_digest="$wf_on_digest|$wf:$(sed -n "${on_lines},$((on_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
   fi
@@ -485,7 +549,7 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     bad "$wf top-level permissions: key count (expected 1, got $perm_count)"
     wf_perm_digest="$wf_perm_digest|$wf:AMBIGUOUS"
   else
-    perm_end="$(awk -v s="$perm_lines" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
+    perm_end="$(flow_end "$wf" "$perm_lines")"
     [ -n "$perm_end" ] || perm_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
     wf_perm_digest="$wf_perm_digest|$wf:$(sed -n "${perm_lines},$((perm_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
   fi
@@ -688,6 +752,14 @@ fi
 # outside the scan surface (r21 F5). Zero legitimate uses in-tree.
 local_refs="$(grep -lE '(^|[^[:alnum:]_-])\.local([^[:alnum:]_-]|$)' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null || true)"
 if [ -z "$local_refs" ]; then ok "no workflow references .local (outside the scan surface)"; else bad "workflow references .local (outside the scan surface): $local_refs"; fi
+# YAML treats bare CR (and NEL/LS/PS, which libyaml/Psych — the CI's parser
+# proxy — accept as line breaks) as a new line, but grep splits on LF only:
+# a "\r"-prefixed line is a real YAML line at column 0 that every grep-based
+# pin and census skips (r22 red-team HIGH: a hidden job and duplicate
+# top-level keys passed all 21 harnesses). The in-tree workflows are LF-only,
+# so fail closed on any non-LF line break and keep the line models aligned.
+lb_files="$(LC_ALL=C grep -lE $'(\r|\xc2\x85|\xe2\x80\xa8|\xe2\x80\xa9)' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null || true)"
+if [ -z "$lb_files" ]; then ok "workflows are LF-only (no CR/NEL/LS/PS — YAML vs grep line-break parity)"; else bad "workflow contains a non-LF line break (YAML vs grep line-break differential): $lb_files"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Block, flow and tagged spellings (`<< :`,
@@ -933,7 +1005,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=202
+CHECK_FLOOR=210
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
