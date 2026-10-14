@@ -42,50 +42,48 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 }
 # End line of a key's span, flow-aware: the span runs from the key's line
 # ($2) to the first column-0 non-comment line seen while the flow depth is
-# zero. A mixed-indent flow collection (`on: [` + column-0 entries + a later
-# indent-2 entry) is one collection to YAML, so a plain "next column-0 line"
-# terminator let an added trigger hide between them (r22 functional LOW).
-# Quote and comment indicators count only at a YAML token start (line start,
-# whitespace, a flow indicator, or the explicit-key `?`): a mid-token
-# `'`/`"`/`#` is plain-scalar content (`it's`, `a#b`), and counting a `]`/`}`
-# inside a quoted scalar closed a live flow early — a trigger hidden after
-# the early end reds no pin (r23 HIGH; `?` added by the r23 trust lens:
-# `[?'a]b']` is a quoted explicit key and `[?# ]` a comment). A comment also
-# starts right after a COMPLETED token with no whitespace — `"b"# c`,
-# `[a]# c`, `{a: 1}# c` are all comments in YAML — so the comment rule
-# additionally accepts a closing quote or collection (`cmtstart`; a post-
-# close `#` was the r23 red-team HIGH: the `]` inside that comment closed a
-# live flow early). A quoted scalar also starts directly after a `:` in a
-# flow mapping (`{"k":"x]y"}`, r23 functional HIGH) and the terminator
-# additionally requires a CLOSED quote state, so a column-0 continuation of
-# a multi-line quoted scalar is never the span end. Quoted contents are not
-# counted at all, so a mis-read can only extend the span. Empty when no
-# terminator is found (EOF).
+# zero AND no quoted scalar is open. A mixed-indent flow collection (`on: [`
+# + column-0 entries + a later indent-2 entry) is one collection to YAML, so
+# a plain "next column-0 line" terminator let an added trigger hide between
+# them (r22 functional LOW).
+#
+# Comment and quote indicators are recognised at a YAML TOKEN BOUNDARY only,
+# tracked as `tokend` (line start, whitespace, a flow indicator, or a REAL
+# quote/collection close; `:` and `?` preserve the boundary state they are
+# in). A mid-token `'`/`"`/`#`/`:`/`?` is plain-scalar content (`it's`,
+# `a#b`, `a:#`, `a?#b`, `dogs'#`): treating one as an opener/comment dropped
+# the rest of the line and closed a live flow early, hiding a trigger from
+# every pin — the r23/r24 HIGH class across a `]`/`}` inside quotes, a
+# mid-token `#`, the explicit-key `?`, a post-close `#`, a `:` before a flow
+# value, and mid-plain quote chars (r23 red-team/functional, r24
+# trust/functional). Quoted contents are not counted at all, so a mis-read
+# can only extend the span. Empty when no terminator is found (EOF).
 flow_end() { # $1 file, $2 start line
   awk -v s="$2" '
     function sq() { return sprintf("%c", 39) }
-    function tokstart(p) { return p == "" || p == " " || p == "\t" || p == "[" || p == "{" || p == "," || p == "?" || p == ":" }
-    function cmtstart(p) { return tokstart(p) || p == "\"" || p == sq() || p == "]" || p == "}" }
-    function depth(line,   i, c, prev, d) {
-      d = 0; prev = ""
+    function depth(line,   i, c, d, tokend) {
+      d = 0; tokend = 1
       for (i = 1; i <= length(line); i++) {
         c = substr(line, i, 1)
         if (q == "") {
-          if (c == "#" && cmtstart(prev)) break
-          if ((c == "\"" || c == sq()) && tokstart(prev)) { q = c; prev = c; continue }
-          if (c == "[" || c == "{") { d++ }
-          else if (c == "]" || c == "}") { d-- }
+          if (c == "#") { if (tokend) break; tokend = 0 }
+          else if (c == "\"" || c == sq()) { if (tokend) { q = c }; tokend = 0 }
+          else if (c == "[" || c == "{") { d++; tokend = 1 }
+          else if (c == "]" || c == "}") { d--; tokend = 1 }
+          else if (c == ",") { tokend = 1 }
+          else if (c == " " || c == "\t") { tokend = 1 }
+          else if (c != ":" && c != "?") { tokend = 0 }
         } else if (q == "\"") {
           if (esc) { esc = 0 }
           else if (c == "\\") { esc = 1 }
-          else if (c == "\"") { q = "" }
+          else if (c == "\"") { q = ""; tokend = 1 }
+          else { tokend = 0 }
         } else {
           if (c == sq()) {
             if (substr(line, i + 1, 1) == sq()) { i++ }
-            else { q = "" }
-          }
+            else { q = ""; tokend = 1 }
+          } else { tokend = 0 }
         }
-        prev = c
       }
       return d
     }
@@ -120,6 +118,8 @@ fe_case 5 "flow_end: quoted value after : in a flow mapping is not counted" $'on
 fe_case 3 "flow_end: multi-line quoted scalar continuation is not a terminator" $'on: "a\nb"\npermissions:\n'
 fe_case 5 "flow_end: mid-token apostrophe does not open a quote" $'on: [it\'s, [a, b\'s,\n], push,\npull_request_target,\n]\npermissions:\n'
 fe_case 5 "flow_end: mid-token double quote does not open a quote" $'on: [it"s, [a, b"s,\n], push,\npull_request_target,\n]\npermissions:\n'
+fe_case 6 "flow_end: mid-plain apostrophe + # is content, not a comment" $'on: {"a": dogs\'# , "b": [c,\n]\n, workflow_dispatch,\n    pull_request_target,\n}\npermissions:\n'
+fe_case 7 "flow_end: mid-plain : + # is content, not a comment" $'on: {push: {branches: [main, a:#], schedule: [{cron: \'0 0 * * *\',\n}],\n}\n,\n  pull_request_target: null,\n}\npermissions:\n'
 fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: [it\'s,\n  push,\n'
 
 [ -f "$PROV" ] || { printf 'FAIL provision.yml not found: %s\n' "$PROV"; exit 1; }
@@ -522,6 +522,31 @@ wf_on_digest=""
 wf_perm_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
+  # Root-shape fail-closed (r24 red-team HIGH): every locator below matches
+  # COLUMN-0 lines, but YAML allows the root mapping itself to be indented
+  # while a column-0 multi-line quoted scalar carries decoy `on:`/
+  # `permissions:`/`jobs:` lines — the pins would then hash decoy bytes and
+  # a real trigger/job added under the indented root changes nothing. Require
+  # no BOM, no document marker, and the first non-blank/non-comment line at
+  # column 0, so the root mapping is exactly the column-0 line set the
+  # locators read. (In-tree all seven start at column 0 with `name:`.)
+  wf_bom="$(head -c3 "$wf" | od -An -tx1 | tr -d ' \n' || true)"
+  wf_first="$(grep -m1 -E '^[[:space:]]*[^#[:space:]]' "$wf" || true)"
+  wf_root_bad=""
+  [ "$wf_bom" = "efbbbf" ] && wf_root_bad="BOM"
+  if grep -qE '^(---|\.\.\.)[[:space:]]*(#.*)?$' "$wf"; then wf_root_bad="${wf_root_bad:+$wf_root_bad, }document marker"; fi
+  case "$wf_first" in
+    ""|" "*|"	"*) wf_root_bad="${wf_root_bad:+$wf_root_bad, }first content line indented or missing" ;;
+  esac
+  if [ -n "$wf_root_bad" ]; then
+    bad "$wf root shape: $wf_root_bad (fail closed)"
+    wf_top_digest="$wf_top_digest|$wf:BADROOT"
+    wf_on_digest="$wf_on_digest|$wf:BADROOT"
+    wf_perm_digest="$wf_perm_digest|$wf:BADROOT"
+    wf_job_digest="$wf_job_digest|$wf:BADROOT"
+    continue
+  fi
+  ok "$wf root shape (no BOM/document marker, first content line at column 0)"
   # The TOP-LEVEL line sequence is pinned on its own: the jobs-last invariant
   # and every job-set span read content from `jobs:` down, so a decoy key
   # placed BEFORE `jobs:` (with indent-2 children, compensated in the census)
@@ -1022,7 +1047,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=216
+CHECK_FLOOR=225
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

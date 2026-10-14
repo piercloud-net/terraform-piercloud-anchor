@@ -47,6 +47,13 @@ WORK="$(mktemp -d /tmp/bind-e2e.XXXXXX)"
 # back (`-B` on every call; the export covers the rest).
 rm -rf "${HARNESS_DIR}/__pycache__"
 rm -f "${HARNESS_DIR}"/*.pyc
+# A planted package directory (`p521/__init__.pyc`, `cryptography/__init__.pyc`)
+# is a sourceless module that shadows the in-tree/stdlib module and survives
+# both removals (r24 functional/red-team LOW). The harness directory has no
+# legitimate subdirectories: fail closed on any.
+if [ -n "$(find "${HARNESS_DIR}" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]; then
+  die "unexpected subdirectory in ${HARNESS_DIR} (bytecode-shadowing fail-closed)"
+fi
 export PYTHONDONTWRITEBYTECODE=1
 START="$(date +%s)"
 log() { printf '\n==> %s\n' "$*"; }
