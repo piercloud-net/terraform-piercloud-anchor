@@ -418,13 +418,14 @@ else
 fi
 # Every workflow's job set is pinned as ONE digest: a job added to any
 # workflow (release.yml carries write permissions) or a new workflow file
-# (`.yml` or `.yaml`) changes it. The digest pins job NAMES only — the
-# content of jobs outside ci.yml/provision.yml is unpinned (those two have
-# whole-job byte pins). A duplicate top-level `jobs:` key in any spelling
-# the count recognises fails here; quoted/spaced spellings are rejected
-# outright by the Actions parser, so the count is the backstop for the
-# spelling that resolves. Pin update is deliberate (same PR as the workflow
-# change).
+# (`.yml` or `.yaml`) changes it. The digest pins job NAMES only: ci.yml
+# and provision.yml job bodies are whole-job byte-pinned, external-watch.yml
+# and broker-report-selftest.yml wiring is pinned by their own harnesses,
+# and release.yml job bodies are names-only. A duplicate top-level `jobs:`
+# key in any spelling
+# the count recognises fails here; the escaped spelling
+# (`"j\u006fbs":`) is caught by the all-workflow hex/octal-escape ban
+# above. Pin update is deliberate (same PR as the workflow change).
 wf_job_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
@@ -434,7 +435,7 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     wf_job_digest="$wf_job_digest|$wf:AMBIGUOUS"
     continue
   fi
-  jstart="$(grep -nE '^jobs:' "$wf" | head -n1 | cut -d: -f1)"
+  jstart="$(grep -nE '^jobs:' "$wf" | head -n1 | cut -d: -f1 || true)"
   if [ -z "$jstart" ]; then
     bad "$wf has no top-level jobs: key"
     wf_job_digest="$wf_job_digest|$wf:NOJOBS"
@@ -442,12 +443,25 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   fi
   jend="$(awk -v s="$jstart" 'NR > s && /^[^[:space:]#]/ {print NR; exit}' "$wf")"
   [ -n "$jend" ] || jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
+  # A quoted job key can hide a colon (`"release: evil":`), which the
+  # first-colon strip would truncate to the plain name and hide the rename.
+  # Quoted keys are not needed in-tree; fail closed on any.
+  if sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" | grep -qE '^  ["'"'"']'; then
+    bad "$wf job key is quoted (unexpected spelling)"
+    wf_job_digest="$wf_job_digest|$wf:BADNAME"
+    continue
+  fi
   names="$(sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" \
     | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
     | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
     | sed -e 's/[[:space:]]*:.*$//' \
     | sed -E -e 's/^"//' -e 's/"$//' | tr '\n' ',')" || true
+  if [ -z "$names" ]; then
+    bad "$wf jobs block yielded no job names (flow-form or non-standard indent)"
+    wf_job_digest="$wf_job_digest|$wf:NONAMES"
+    continue
+  fi
   wf_job_digest="$wf_job_digest|$wf:$names"
 done
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
@@ -532,6 +546,17 @@ for f in "$CI" "$PROV"; do
     bad "$(basename "$f") contains a hex/octal escape (name-assembly route, banned blanket)"
   else
     ok "$(basename "$f") has no hex/octal escape"
+  fi
+done
+# Escapes are banned in EVERY workflow: `"j\u006fbs":` decodes to a
+# duplicate top-level key that defeats the raw count, the span terminator
+# and the explicit-key ban (actionlint flags it; PyYAML resolves it).
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$wf" ] || continue
+  if grep -qE '\\[uUxX][0-9a-fA-F]|\\[0-7]' <<<"$(grep -v '^[[:space:]]*#' "$wf")"; then
+    bad "$wf contains a hex/octal escape (name-assembly route, banned blanket)"
+  else
+    ok "$wf has no hex/octal escape"
   fi
 done
 # The in-tree allowlist default must not admit the retired provider APIs
@@ -702,7 +727,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=178
+CHECK_FLOOR=185
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
