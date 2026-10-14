@@ -418,14 +418,15 @@ else
 fi
 # Every workflow's job set is pinned as ONE digest: a job added to any
 # workflow (release.yml carries write permissions) or a new workflow file
-# (`.yml` or `.yaml`) changes it. The digest pins job NAMES only: ci.yml
-# and provision.yml job bodies are whole-job byte-pinned, external-watch.yml
-# and broker-report-selftest.yml wiring is pinned by their own harnesses,
-# and release.yml job bodies are names-only. A duplicate top-level `jobs:`
-# key in any spelling
+# (`.yml` or `.yaml`) changes it. The digest pins job NAMES only: three job
+# bodies are whole-job byte-pinned (`anchor-dns`, `unit-tests-scripts`,
+# `scp-endpoint-allowlist`), external-watch.yml and broker-report-selftest.yml
+# wiring is pinned by their own harnesses, and the remaining job bodies
+# (incl. release.yml, validate-package-version.yml, validate-release-pr.yml)
+# are names-only. A duplicate top-level `jobs:` key in any spelling
 # the count recognises fails here; the escaped spelling
 # (`"j\u006fbs":`) is caught by the all-workflow hex/octal-escape ban
-# above. Pin update is deliberate (same PR as the workflow change).
+# below. Pin update is deliberate (same PR as the workflow change).
 wf_job_digest=""
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
@@ -445,9 +446,27 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -n "$jend" ] || jend=$(( $(awk 'END{print NR}' "$wf") + 1 ))
   # A quoted job key can hide a colon (`"release: evil":`), which the
   # first-colon strip would truncate to the plain name and hide the rename.
-  # Quoted keys are not needed in-tree; fail closed on any.
-  if sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" | grep -qE '^  ["'"'"']'; then
+  # Quoted keys are not needed in-tree; fail closed on any. The quote may
+  # be preceded by YAML node properties (`&x "release: evil":`,
+  # `!!str "release: evil":`), so strip the same property prefix the
+  # name extraction strips before looking for the quote.
+  if sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" | grep -qE '^  ((&|!)[^[:space:]]+[[:space:]]+)*["'"'"']'; then
     bad "$wf job key is quoted (unexpected spelling)"
+    wf_job_digest="$wf_job_digest|$wf:BADNAME"
+    continue
+  fi
+  raw_keys="$(sed -n "$((jstart + 1)),$((jend - 1))p" "$wf" \
+    | grep -E '^  [^[:space:]]' | grep -vE '^  #' \
+    | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
+    | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//')" || true
+  # The digest truncates each key at its first colon, so a rename to
+  # `<known>:evil:` (plain YAML) or `&a "release:evil":` would yield the
+  # known name. Every raw key must be exactly a valid GitHub job id
+  # (alphanumerics, `-`, `_`, starting with a letter or `_`) followed by its
+  # colon: anything else is a hidden rename or an unrecognised spelling
+  # (extra colon, comma, tab, quote truncation) and fails closed.
+  if grep -qvE '^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*:[[:space:]]*$' <<<"$raw_keys"; then
+    bad "$wf job key fails the GitHub job-id grammar (rename/truncation guard)"
     wf_job_digest="$wf_job_digest|$wf:BADNAME"
     continue
   fi
@@ -456,15 +475,30 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     | sed -e 's/[[:space:]]+#.*$//' -e 's/^  //' \
     | sed -E -e 's/^((&|!)[^[:space:]]+[[:space:]]+)+//' \
     | sed -e 's/[[:space:]]*:.*$//' \
-    | sed -E -e 's/^"//' -e 's/"$//' | tr '\n' ',')" || true
+    | sed -E -e 's/^"//' -e 's/"$//')" || true
   if [ -z "$names" ]; then
     bad "$wf jobs block yielded no job names (flow-form or non-standard indent)"
     wf_job_digest="$wf_job_digest|$wf:NONAMES"
     continue
   fi
+  names="$(tr '\n' ',' <<<"$names")"
   wf_job_digest="$wf_job_digest|$wf:$names"
 done
 is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
+# A workflow must not gain (or repoint) an execution of test-tree content:
+# `tests/` is pruned from the retired-name scan (the harnesses are the pin
+# records), so an unpinned job could otherwise `run: bash tests/evil.sh` and
+# a direct provider write inside a test-tree script would be executed by a
+# production job with no harness red. The exact set of workflow lines
+# mentioning the `tests` path token is pinned as one digest (comments
+# included); a new, edited or removed reference fails closed until the pin
+# is deliberately updated.
+wf_tests_digest=""
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$wf" ] || continue
+  wf_tests_digest="$wf_tests_digest|$wf:$(grep -E '(^|[^[:alnum:]_-])tests([^[:alnum:]_-]|$)' "$wf" | sha256sum | cut -d' ' -f1 || true)"
+done
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" "$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
 # The unit-tests job itself must stay live and shell-predictable: no
 # job-level if/defaults/strategy, no workflow defaults, no bash startup-file
 # variables anywhere in ci.yml, and the allowlist must no longer name the
@@ -550,7 +584,7 @@ for f in "$CI" "$PROV"; do
 done
 # Escapes are banned in EVERY workflow: `"j\u006fbs":` decodes to a
 # duplicate top-level key that defeats the raw count, the span terminator
-# and the explicit-key ban (actionlint flags it; PyYAML resolves it).
+# and the explicit-key ban (PyYAML resolves it).
 for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$wf" ] || continue
   if grep -qE '\\[uUxX][0-9a-fA-F]|\\[0-7]' <<<"$(grep -v '^[[:space:]]*#' "$wf")"; then
@@ -727,7 +761,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=185
+CHECK_FLOOR=186
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
