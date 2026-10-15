@@ -200,12 +200,65 @@ has "${CI}" 'tests/edge-origin-auth/run-test.sh' "ci.yml runs this harness"
 has "${CI}" 'edge-origin-auth|origin-ca|recording-witness|broker-report)/' "ci.yml path gate includes edge-origin-auth (witness pin intact)"
 # The extraction is anchored on the unit-tests gate's own prefix (not the
 # first `elif grep -qE` in the file) so reordering jobs cannot silently move
-# the case onto another gate (functional/red-team #170 LOW).
-gate_line_ci="$(grep -m1 -F "elif grep -qE '^(\\.github/scripts/" "${CI}" || true)"
+# the case onto another gate (functional/red-team #170 LOW), and it runs on
+# a block-scalar-stripped structural view so a decoy scalar cannot spoof it.
+EDGE_CI_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+function qprefix(s,   i, c, q) {
+  q = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { q = 1 - q }
+    else if (c == "#" && q == 0) { return substr(s, 1, i - 1) }
+  }
+  return s
+}
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) {
+      if (i <= ihdr) { skip = 0 } else { sind = i; next }
+    } else if (i >= sind) { next } else { skip = 0 }
+  }
+  printf "%d\t%s\n", NR, $0
+  if (($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) && qprefix($0) ~ /[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*$/) {
+    ihdr = indent($0)
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$CI")"
+EDGE_CI_UNIT_START="$(awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$EDGE_CI_STRUCT")"
+EDGE_CI_UNIT_END="$(awk -F'\t' -v s="$EDGE_CI_UNIT_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$EDGE_CI_STRUCT")"
+EDGE_CI_UNIT=""
+[ -n "$EDGE_CI_UNIT_START" ] && [ -n "$EDGE_CI_UNIT_END" ] && EDGE_CI_UNIT="$(sed -n "$((EDGE_CI_UNIT_START + 1)),$((EDGE_CI_UNIT_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
+is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE '^  unit-tests-scripts:' "$CI")"
+gate_line_ci="$(grep -m1 -F "elif grep -qE '^(\\.github/scripts/" <<<"$EDGE_CI_UNIT" || true)"
 case "${gate_line_ci}" in
   *'.*\.tf$'*) ok "ci.yml unit-tests gate runs on .tf-only changes" ;;
   *) bad "ci.yml unit-tests gate skips .tf-only changes (the sync tooth would not run)" ;;
 esac
+
+# Third independent wiring-completeness checker (b3b #189): every committed
+# harness must be named in the ci.yml run list; no harness can catch its own
+# removal. Three checkers in three harnesses mean dropping one still leaves
+# two failing. The match is scoped to the unit-tests-scripts job block of
+# the block-scalar-stripped structural view and is whole-line/
+# indentation-tolerant, so a decoy `echo skipped # bash ...`, a
+# commented-out line, a decoy scalar or a run line in another job fails
+# here.
+[ -n "${EDGE_CI_UNIT:-}" ] || bad "ci.yml unit-tests-scripts job not found"
+shopt -s nullglob
+edge_harnesses=(tests/*/run-test.sh)
+[ ${#edge_harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
+for t in "${edge_harnesses[@]}"; do
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" <<<"$EDGE_CI_UNIT"; then
+    ok "ci.yml run list includes $t"
+  else
+    bad "ci.yml run list includes $t"
+  fi
+done
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

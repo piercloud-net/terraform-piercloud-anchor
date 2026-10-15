@@ -204,6 +204,16 @@ PROVISION="${ROOT}/scripts/010-provision.sh"
 MOCK_S3="${HARNESS_DIR}/mock_s3.py"
 
 WORK="$(mktemp -d /tmp/recording-witness.XXXXXX)"
+# No in-tree bytecode: a planted `__pycache__` entry (PEP 552 hash-based pyc
+# or a matching mtime/size header) is loaded instead of the source by the
+# normal imports, the `spec_from_file_location` loaders and the `python3 -I`
+# heredocs below, so a committed pyc is an execution route. Delete any cache
+# before the first python call and never write one back (`-B` on every
+# `python3 -I` call, which ignores the environment; PYTHONDONTWRITEBYTECODE
+# for the rest). Any in-tree pyc fails the b3b scan (a pyc contains NUL
+# bytes, and the scan has no bytecode exemption).
+rm -rf "${HARNESS_DIR}/__pycache__"
+export PYTHONDONTWRITEBYTECODE=1
 MOCK_PID=""
 cleanup() {
   if [ -n "${MOCK_PID}" ]; then
@@ -570,7 +580,7 @@ replica_refuses "range end beyond the 18-digit grammar" "seq_end must be" --flat
 # LOW; trust round-12 INFO). Keep the wrapped heredoc bodies backtick-free:
 # bash 3.2's `$()` scanner miscounts them and fails to parse (functional
 # round-12 LOW).
-if teeth_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+if teeth_out="$(python3 -I -B - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
 import sys
@@ -619,7 +629,7 @@ fi
 # The bash layer asserts the exact printed sentinel line (counts + pinned
 # source), so neither a skipped checker nor an appended extra line can read as
 # a pass.
-if matrix_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+if matrix_out="$(python3 -I -B - "${HARNESS_DIR}" <<'PY'
 import hashlib
 import importlib.util
 import json
@@ -820,7 +830,7 @@ printf 'PINNED = 1\n' > "${f1_repo}/scripts/lib/b2_client.py"
 git -C "${f1_repo}" add scripts/lib/b2_client.py
 git -C "${f1_repo}" -c commit.gpgsign=false commit -q -m "pinned bytes"
 f1_helper() {
-  python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import generate_shipper_vectors as g; print(g.blob_matches_head(sys.argv[2], "scripts/lib/b2_client.py"))' "${HARNESS_DIR}" "$1"
+  python3 -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import generate_shipper_vectors as g; print(g.blob_matches_head(sys.argv[2], "scripts/lib/b2_client.py"))' "${HARNESS_DIR}" "$1"
 }
 f1_pristine="$(f1_helper "${f1_repo}")"
 printf 'MUTATED = 1\n' > "${f1_repo}/scripts/lib/b2_client.py"
@@ -853,7 +863,7 @@ fi
 f1_pyc_dir="${WORK}/f1-pyc"
 mkdir -p "${f1_pyc_dir}"
 printf 'PINNED = 1\n' > "${f1_pyc_dir}/b2_client.py"
-if python3 -I - "${HARNESS_DIR}" "${f1_pyc_dir}" "${WORK}/f1-pyc-marker" <<'PY'
+if python3 -I -B - "${HARNESS_DIR}" "${f1_pyc_dir}" "${WORK}/f1-pyc-marker" <<'PY'
 import importlib.util
 import marshal
 import os
@@ -912,7 +922,7 @@ fi
 # floors with substituted content is the documented deliberate-tamper
 # residue).
 oracle_rc=0
-oracle_out="$(python3 -I - "${HARNESS_DIR}" <<'PY'
+oracle_out="$(python3 -I -B - "${HARNESS_DIR}" <<'PY'
 import importlib.util
 import os
 import re
@@ -1458,7 +1468,7 @@ case "${CASE_DETAIL}" in *open-upload-stale*) ok "open-upload detail names open-
 # tautological because state.json is clipped server-side; this checks the
 # bounded renderer itself. Keys come from the shipper grammar (the
 # replica-importing heredocs run `python3 -I`: cwd off sys.path).
-python3 -I - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+python3 -I -B - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
 import json
 import sys
 
@@ -1509,7 +1519,7 @@ sig_capped_a="$(state_field signature)"
 # missing ranges (an identical detail render) and a different 21st+ remainder
 # -> the signature must move. Pre-fix both hashed the capped render, so the
 # tooth fails on the old code.
-python3 -I - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
+python3 -I -B - "${HARNESS_DIR}" "$SID" <<'PY' | fixture
 import json
 import sys
 
@@ -5578,7 +5588,7 @@ is "delta age: the run really took the delta path" "delta" "$(state_field observ
 # sweep of the same bucket.
 range_dir="${WORK}/state-range"
 serial_dir="${WORK}/state-range-serial"
-python3 -I - "${HARNESS_DIR}" "${SID}" <<'PY' | fixture
+python3 -I -B - "${HARNESS_DIR}" "${SID}" <<'PY' | fixture
 import json
 import sys
 
@@ -5666,7 +5676,7 @@ run_delta "${pag_dir}"
 is "delta pagination: the warm sweep is green" "ok" "${CASE_STATE}"
 PAG_HEARTBEAT_TS="$(audit_stamp -120)"
 PAG_START_TS="$(audit_stamp -290)"
-python3 -I - "${HARNESS_DIR}" "${SID2}" "${PAG_HEARTBEAT_TS}" "${PAG_START_TS}" <<'PY' | fixture
+python3 -I -B - "${HARNESS_DIR}" "${SID2}" "${PAG_HEARTBEAT_TS}" "${PAG_START_TS}" <<'PY' | fixture
 import json
 import sys
 

@@ -57,7 +57,7 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- BEGIN CADDY RENDER (tests/bind-e2e/run-bind-e2e.sh extracts this span; keep markers) ---
 # Tenant naming is canonical in scripts/lib/naming.sh (the workflow resolve
-# step and .github/scripts/030-anchor-dns.sh source it). Inside the nested
+# step sources it). Inside the nested
 # NAMING markers below sits the embedded fallback for console hand runs
 # (dispatched runs receive STATUS_HOST as the dashboard FQDN via 020's
 # ENV_PREFIX; ANCHOR_HOSTNAME stays the zone-less SCP hostname);

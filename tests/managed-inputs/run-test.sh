@@ -19,7 +19,12 @@
 #     uses the MANAGED_TENANT marker.
 #   - BEHAVIORAL: the REAL preflight and binding step bodies (extracted,
 #     never copies) run under `env -i`; refusals must fail closed and valid
-#     shapes must pass (incl. the ref-less mutating-run warning).
+#     shapes must pass (incl. the b3b managed-apply refusal and the
+#     ref-less update-ip/destroy warning — those modes do not touch DNS).
+#   - WIRING COMPLETENESS: every committed `tests/*/run-test.sh` is named in
+#     the ci.yml run list and its directory is in the unit-tests path gate;
+#     a dropped line would silently skip that harness (no harness can catch
+#     its own absence — broker-provision-dns carries the same cross-check).
 #
 # Cred-free, offline: no network, no credentials.
 set -euo pipefail
@@ -27,6 +32,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PROV="$ROOT/.github/workflows/provision.yml"
+CI="$ROOT/.github/workflows/ci.yml"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -45,6 +51,40 @@ contains() { # $1 label, $2 needle, $3 haystack
 
 DYN_ENV="\${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}"
 
+# Block-scalar-stripped structural view (NR + text): every extraction below
+# reads THIS, so a decoy `|`/`>` scalar quoting the job (a `run-name: |2`
+# copy, anchors/tags/quoted keys included) can never satisfy a pin meant for
+# the real job; the raw exactly-one job-key count backstops a form the
+# stripper does not recognise.
+PROV_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+function qprefix(s,   i, c, q) {
+  q = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { q = 1 - q }
+    else if (c == "#" && q == 0) { return substr(s, 1, i - 1) }
+  }
+  return s
+}
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) {
+      if (i <= ihdr) { skip = 0 } else { sind = i; next }
+    } else if (i >= sind) { next } else { skip = 0 }
+  }
+  printf "%d\t%s\n", NR, $0
+  if (($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) && qprefix($0) ~ /[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*$/) {
+    ihdr = indent($0)
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$PROV")"
+[ -n "$PROV_STRUCT" ] || { printf 'FAIL structural view of %s is empty\n' "$PROV"; exit 1; }
+
 # ---- static wiring over provision.yml ------------------------------------
 # The lane must be a STABLE function of anchor_ref alone: pin the exact
 # group value (a run-id suffix or any other variable would split the lane).
@@ -55,10 +95,10 @@ is "lane group is the pinned anchor_ref expression" \
 case "$LANE" in *github.*|*needs.*|*strategy.*|*matrix.*) bad "lane references a non-input context";; *) ok "lane references no non-input context";; esac
 
 # Per-job environment extraction: every job's own `environment:` line.
-ENV_LINES="$(awk '
-  /^  [A-Za-z0-9_.-]+:$/ { job=$1; sub(/:$/, "", job) }
-  /^    environment:/ { line=$0; sub(/^    environment: /, "", line); gsub(/^['"'"'"]|['"'"'"]$/, "", line); print job "|" line }
-' "$PROV")"
+ENV_LINES="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' '
+  $2 ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*(#.*)?$/ { job=$2; sub(/:[[:space:]]*(#.*)?$/, "", job); sub(/^  /, "", job) }
+  $2 ~ /^    environment:/ { line=$2; sub(/^    environment: /, "", line); gsub(/^['"'"'"]|['"'"'"]$/, "", line); print job "|" line }
+')"
 is "exactly two jobs carry an environment" "2" "$(printf '%s\n' "$ENV_LINES" | grep -c '|')"
 is "device-flow binds the dynamic environment" "device-flow|$DYN_ENV" "$(printf '%s\n' "$ENV_LINES" | grep '^device-flow|')"
 is "anchor-dns binds the dynamic environment" "anchor-dns|$DYN_ENV" "$(printf '%s\n' "$ENV_LINES" | grep '^anchor-dns|')"
@@ -70,15 +110,15 @@ is "anchor_ref input declared" "1" "$(grep -c '^      anchor_ref:$' "$PROV")"
 # Preflight placement: the preflight must be the FIRST step of the ungated job
 # that owns it, and device-flow must `needs:` that job — a new ungated job
 # owning the preflight between banner and device-flow must not stay green.
-PREFLIGHT_LINE="$(grep -n '^      - name: Managed-input preflight' "$PROV" | head -1 | cut -d: -f1)"
-DEVFLOW_LINE="$(grep -n '^  device-flow:' "$PROV" | cut -d: -f1)"
+PREFLIGHT_LINE="$(awk -F'\t' '$2 ~ /^      - name: Managed-input preflight/ {print $1; exit}' <<<"$PROV_STRUCT")"
+DEVFLOW_LINE="$(awk -F'\t' '$2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$PROV_STRUCT")"
 [ -n "$PREFLIGHT_LINE" ] && ok "preflight step present" || bad "preflight step missing"
 # The owning job = nearest 2-space job header at/before the preflight line.
-OWNER_JOB="$(awk -v n="$PREFLIGHT_LINE" 'NR<=n && /^  [A-Za-z0-9_.-]+:$/ { job=$1; sub(/:$/, "", job) } END { print job }' "$PROV")"
+OWNER_JOB="$(printf '%s\n' "$PROV_STRUCT" | awk -F'\t' -v n="$PREFLIGHT_LINE" '$1<=n && $2 ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*(#.*)?$/ { job=$2; sub(/:[[:space:]]*(#.*)?$/, "", job); sub(/^  /, "", job) } END { print job }')"
 OWNER_HEADER_LINE=""
-[ -n "$OWNER_JOB" ] && OWNER_HEADER_LINE="$(grep -n "^  ${OWNER_JOB}:" "$PROV" | head -1 | cut -d: -f1)"
+[ -n "$OWNER_JOB" ] && OWNER_JOB_RE="${OWNER_JOB//./[.]}" && OWNER_HEADER_LINE="$(awk -F'\t' -v j="$OWNER_JOB_RE" '$2 ~ ("^  " j ":[[:space:]]*(#.*)?$") {print $1; exit}' <<<"$PROV_STRUCT")"
 FIRST_STEP_LINE=""
-[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(awk -v n="$OWNER_HEADER_LINE" 'NR>n && /^      - name: / { print NR; exit }' "$PROV")"
+[ -n "$OWNER_HEADER_LINE" ] && FIRST_STEP_LINE="$(awk -F'\t' -v n="$OWNER_HEADER_LINE" '$1>n && $2 ~ /^      - name: / {print $1; exit}' <<<"$PROV_STRUCT")"
 is "preflight is the first step of its own job" "$PREFLIGHT_LINE" "$FIRST_STEP_LINE"
 # …and it must still precede the device-flow job in the file (the banner job
 # is scheduled before device-flow).
@@ -88,12 +128,16 @@ else
   bad "preflight does not precede device-flow ($PREFLIGHT_LINE / $DEVFLOW_LINE)"
 fi
 # device-flow must `needs:` the owning job (dependency, not line proximity).
-DEVFLOW_NEEDS="$(awk '/^  device-flow:/{f=1; next} f && /^    needs:/{line=$0; sub(/^    needs: */, "", line); print line; exit} f && /^  [A-Za-z0-9_.-]+:$/{exit}' "$PROV")"
+DEVFLOW_NEEDS="$(awk -F'\t' '
+  $2 ~ /^  device-flow:[[:space:]]*(#.*)?$/ {f=1; next}
+  f && $2 ~ /^  [A-Za-z0-9_.-]+:$/ {exit}
+  f && $2 ~ /^    needs:/ {line=$2; sub(/^    needs: */, "", line); print line; exit}
+' <<<"$PROV_STRUCT")"
 case "$DEVFLOW_NEEDS" in *"$OWNER_JOB"*) ok "device-flow needs the preflight's job ($OWNER_JOB)";; *) bad "device-flow does not need $OWNER_JOB (needs: $DEVFLOW_NEEDS)";; esac
 # Step header (name .. run:) must carry no `if:` — a disabled preflight is a
-# silent bypass.
+# silent bypass (quoted keys and space-before-colon included).
 awk -v n="$PREFLIGHT_LINE" 'NR>=n && /^      - name:/ && NR>n { exit } NR>=n { print }' "$PROV" > "$WORK/preflight-header.txt"
-is "preflight step has no if: guard" "0" "$(grep -c '^        if:' "$WORK/preflight-header.txt")"
+is "preflight step has no if: guard" "0" "$(grep -cE "^        [\"']?if[\"']?[[:space:]]*:" "$WORK/preflight-header.txt")"
 # The owning job must be ungated (no `environment:` for it in the per-job extraction).
 OWNER_ENV="$(printf '%s\n' "$ENV_LINES" | grep "^${OWNER_JOB}|" || true)"
 is "preflight's job is ungated" "" "$OWNER_ENV"
@@ -104,12 +148,16 @@ contains "binding check compares marker to input" 'if [ -n "$TENANT_INPUT" ] && 
 
 # ---- behavior helpers ------------------------------------------------------
 extract_step() { # $1 = step name needle, $2 = out file
-  awk -v needle="$1" '
-    index($0, "- name: " needle) { inblock=1; next }
-    inblock && $0 == "        run: |" { inrun=1; next }
+  local start end
+  start="$(awk -F'\t' -v needle="$1" 'index($2, "- name: " needle) {print $1; exit}' <<<"$PROV_STRUCT")"
+  [ -n "$start" ] || return 1
+  end="$(awk -F'\t' -v s="$start" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$PROV_STRUCT")"
+  [ -n "$end" ] || end=$(( $(wc -l < "$PROV") + 1 ))
+  awk -v s="$start" -v e="$end" 'NR>s && NR<e' "$PROV" | awk '
+    /^        run: \|$/ { inrun=1; next }
     inrun && /^      - name: / { exit }
     inrun { line=$0; sub(/^          /, "", line); print line }
-  ' "$PROV" > "$2"
+  ' > "$2"
 }
 PREFLIGHT_BODY="$WORK/preflight-body.sh"
 BINDING_BODY="$WORK/binding-body.sh"
@@ -138,8 +186,14 @@ is "p0 empty inputs rc" "0" "$rc"
 contains "p0 preflight ok" "Managed-input preflight ok." "$(OUT p0)"
 
 rc="$(RUN_BODY p0b "$PREFLIGHT_BODY" MODE=apply)"
-is "p0b ref-less apply rc" "0" "$rc"
-contains "p0b ref-less apply warns" "::warning::no anchor_ref" "$(OUT p0b)"
+is "p0b ref-less apply rc" "1" "$rc"
+contains "p0b ref-less apply names the managed requirement" "apply now requires a managed dispatch" "$(OUT p0b)"
+contains "p0b ref-less apply names the broker" "anchor DNS writes through the pc-control broker (b3b, #189)" "$(OUT p0b)"
+contains "p0b ref-less apply names the early refusal" "Refusing before any provisioning" "$(OUT p0b)"
+
+rc="$(RUN_BODY p0d "$PREFLIGHT_BODY" MODE=update-ip)"
+is "p0d ref-less update-ip rc" "0" "$rc"
+contains "p0d ref-less update-ip warns" "::warning::no anchor_ref" "$(OUT p0d)"
 
 rc="$(RUN_BODY p0c "$PREFLIGHT_BODY" MODE=check)"
 case "$(OUT p0c)" in *"::warning::"*) bad "p0c check mode must not warn";; *) ok "p0c check mode emits no warning";; esac
@@ -150,6 +204,14 @@ contains "p1 names the lane requirement" "must carry anchor_ref" "$(OUT p1)"
 
 rc="$(RUN_BODY p1b "$PREFLIGHT_BODY" ANCHOR_REF=ok MODE=check)"
 is "p1b ref without tenant rc" "0" "$rc"
+
+rc="$(RUN_BODY p1c "$PREFLIGHT_BODY" ANCHOR_REF=ok MODE=apply)"
+is "p1c tenant-less apply rc" "1" "$rc"
+contains "p1c names the managed-apply requirement" "apply now requires a managed dispatch" "$(OUT p1c)"
+
+rc="$(RUN_BODY p1d "$PREFLIGHT_BODY" TENANT_INPUT=foo MODE=update-ip)"
+is "p1d ref-less managed update-ip rc" "1" "$rc"
+contains "p1d names the lane requirement" "must carry anchor_ref" "$(OUT p1d)"
 
 rc="$(RUN_BODY p2 "$PREFLIGHT_BODY" TENANT_INPUT=Foo ANCHOR_REF=ok MODE=check)"
 is "p2 bad tenant charset rc" "1" "$rc"
@@ -201,6 +263,90 @@ is "b2 matching marker rc" "0" "$rc"
 
 rc="$(RUN_BODY b3 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=bar)"
 is "b3 mismatching marker rc" "1" "$rc"
+
+# ---- wiring completeness: no harness can be silently un-wired ------------
+# The unit-tests gate line (anchored on its own prefix) must name every
+# committed harness directory, and the run list must name every harness
+# script. Removing a single token or line then fails HERE — broker-provision-dns
+# and edge-origin-auth carry the same cross-check, so dropping one checker's
+# own line still leaves two failing. (Removing all three checkers is a
+# three-line, review-visible edit and remains the disclosed drift-guard
+# residual.) The gate and run-list assertions are scoped to the
+# unit-tests-scripts job block of a block-scalar-stripped structural view: a
+# mention in another job's run line, a decoy `echo skipped # bash ...`, a
+# commented-out line or a decoy scalar cannot satisfy them.
+CI_STRUCT="$(awk '
+function indent(s,   m) { match(s, /^ */); return RLENGTH }
+function qprefix(s,   i, c, q) {
+  q = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { q = 1 - q }
+    else if (c == "#" && q == 0) { return substr(s, 1, i - 1) }
+  }
+  return s
+}
+{
+  if (skip) {
+    if ($0 ~ /^[[:space:]]*$/) next
+    i = indent($0)
+    if (sind < 0) {
+      if (i <= ihdr) { skip = 0 } else { sind = i; next }
+    } else if (i >= sind) { next } else { skip = 0 }
+  }
+  printf "%d\t%s\n", NR, $0
+  if (($0 ~ /^[[:space:]]*[^#[:space:]].*:[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/ || $0 ~ /^[[:space:]]*\?[[:space:]]*((&[^[:space:]#]+|![^[:space:]#]+)[[:space:]]+)*[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*(#.*)?$/) && qprefix($0) ~ /[|>]([0-9][-+]?|[-+][0-9]?)?[[:space:]]*$/) {
+    ihdr = indent($0)
+    if (match($0, /[|>][-+]?[0-9]/)) { sind = ihdr + substr($0, RSTART + RLENGTH - 1, 1) + 0 }
+    else { sind = -1 }
+    skip = 1
+  }
+}'  "$CI")"
+ci_unit_START="$(awk -F'\t' '$2 ~ /^  unit-tests-scripts:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+ci_unit_END="$(awk -F'\t' -v s="$ci_unit_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*(#.*)?$/ {print $1; exit}' <<<"$CI_STRUCT")"
+ci_unit=""
+[ -n "$ci_unit_START" ] && [ -n "$ci_unit_END" ] && ci_unit="$(sed -n "$((ci_unit_START + 1)),$((ci_unit_END - 1))p" "$CI" | grep -v '^[[:space:]]*#' || true)"
+[ -n "$ci_unit" ] || bad "ci.yml unit-tests-scripts job not found"
+is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"unit-tests-scripts\"|'unit-tests-scripts'|unit-tests-scripts)[[:space:]]*:?[[:space:]]*(#.*)?$" "$CI")"
+# Spelling-agnostic census for ci.yml (same doctrine as provision.yml):
+# every indent-2 non-space/non-comment line of the stripped view is a
+# structural line of the top level (on/env/permissions children plus the job
+# keys). A
+# duplicate or decoy job key in ANY spelling adds one.
+is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
+gate_line="$(grep -m1 -F "elif grep -qE '^(\.github/scripts/" <<<"$ci_unit" || true)"
+[ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
+is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"
+# Extract the regex from the gate LINE itself, exactly one match: a decoy
+# `grep -qE` elsewhere in the job cannot satisfy the functional check.
+gate_raw="$(printf '%s\n' "$gate_line" | grep -oE "grep -qE '[^']*'" || true)"
+is "exactly one gate regex on the gate line" "1" "$(printf '%s\n' "$gate_raw" | grep -c . || true)"
+gate_pattern="$(head -n1 <<<"$gate_raw" | sed -e "s/^grep -qE '//" -e "s/'$//")"
+[ -n "$gate_pattern" ] || bad "could not extract the unit-tests gate regex"
+gate_ln="$(printf '%s\n' "$ci_unit" | grep -nE 'elif grep -qE' | head -n1 | cut -d: -f1 || true)"
+if [ -n "$gate_ln" ]; then
+  gate_next="$(printf '%s\n' "$ci_unit" | sed -n "$((gate_ln + 1)),\$p" | awk '/^[[:space:]]*(elif|else|fi)([[:space:]]|$)/ {exit} {print}' | grep -vE '^[[:space:]]*(#|$)' | head -n1 || true)"
+  is "gate branch sets run=yes" '              echo "run=yes" >> "$GITHUB_OUTPUT"' "$gate_next"
+else
+  bad "gate elif line not found in the unit-tests job"
+fi
+shopt -s nullglob
+harnesses=(tests/*/run-test.sh)
+[ ${#harnesses[@]} -gt 0 ] || bad "no tests/*/run-test.sh harnesses found"
+for t in "${harnesses[@]}"; do
+  dir="$(basename "$(dirname "$t")")"
+  contains "unit-tests gate covers tests/$dir" "$dir" "$gate_line"
+  if [ -n "$gate_pattern" ] && grep -qE "$gate_pattern" <<<"$t"; then
+    ok "unit-tests gate regex matches $t"
+  else
+    bad "unit-tests gate regex does not match $t"
+  fi
+  if grep -qE "^[[:space:]]+bash ${t//./\\.}[[:space:]]*$" <<<"$ci_unit"; then
+    ok "ci.yml run list includes $t"
+  else
+    bad "ci.yml run list includes $t"
+  fi
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

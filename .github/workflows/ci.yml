@@ -338,16 +338,17 @@ jobs:
           # and fail on anything else netcup-shaped in the CI-called surface
           # (provision.yml + .github/scripts). Permitted today:
           #   URLs: the SCP REST base, the two A1 egress-IP endpoints, ntfy,
-          #   the Cloudflare DNS API (anchor A-record upsert + verify), the
-          #   Gcore DNS API (A2 writer; the `.net` provider switch is B), and
-          #   the pc-control broker report endpoint (`broker.piercloud.net`,
-          #   M1 broker leg (b) b2 — the managed-run anchor-IPv4 push; the
-          #   caller authenticates with a per-run GitHub OIDC token, never a
-          #   standing credential).
+          #   and the pc-control broker endpoints (`broker.piercloud.net`,
+          #   M1 broker leg (b) b2/b3a — the managed-run anchor-IPv4 push and
+          #   the broker-owned DNS writes; the caller authenticates with a
+          #   per-run GitHub OIDC token, never a standing credential). The
+          #   direct Cloudflare/Gcore DNS APIs are retired (b3b #189): once
+          #   this lands, a re-appearance fails this gate (PR runs use the
+          #   pattern fetched from origin/main).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|api\.cloudflare\.com|api\.gcore\.com|broker\.piercloud\.net)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|broker\.piercloud\.net)(/|$)'
           # Passwordless bootstrap (issue #50) extends the surface with task
           # polling (/tasks) and the approver guard (/users/{id}); the
           # provisioning-only stems above stay intact (sanity check enforces).
@@ -647,7 +648,7 @@ jobs:
             # cloudfront_ranges.tf sync tooth and the firewall-wiring
             # assertions live in tests/edge-origin-auth, so a ranges
             # refresh or rule edit must not skip them.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|anchor-dns|gatus-render|gatus-pull|external-watch|managed-inputs|broker-dns|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|gatus-pull|external-watch|managed-inputs|broker-dns|broker-provision-dns|edge-origin-auth|origin-ca|recording-witness|broker-report)/|.*\.tf$)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -670,7 +671,6 @@ jobs:
           bash tests/sweep-pre-classify/run-test.sh
           bash tests/sweep-post-shapes/run-test.sh
           bash tests/naming-scheme/run-test.sh
-          bash tests/anchor-dns/run-test.sh
           bash tests/ntfy-token-handrun/run-test.sh
           bash tests/retention-cap/run-test.sh
           bash tests/policy-naming/run-test.sh
@@ -684,6 +684,7 @@ jobs:
           bash tests/recording-witness/run-test.sh
           bash tests/broker-report/run-test.sh
           bash tests/broker-dns/run-test.sh
+          bash tests/broker-provision-dns/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |

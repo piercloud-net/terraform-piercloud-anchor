@@ -67,9 +67,12 @@ writes `config.yaml`), the systemd unit's `ReadWritePaths`, and
 > must not overlap. A **manual** run that omits `anchor_ref` uses the static
 > fallback lane `piercloud-netcup-policy`; on a managed account that is a
 > *different* lane from `anchor-<ref>`, so it can overlap a live managed run
-> — the operator passes the account's ref (a ref-less mutating run emits a
-> loud `::warning::`; a managed `tenant` dispatch without a ref fails
-> closed).
+> — the operator passes the account's ref. Since b3b (#189) `mode=apply` is
+> managed-dispatch-only: a ref-less or tenant-less apply fails closed at the
+> preflight before any provisioning; a **tenant-less**, ref-less
+> `update-ip`/`destroy` (neither touches anchor DNS) emits a loud
+> `::warning::`, and a managed `tenant` dispatch without a ref still fails
+> closed.
 
 **Rationale.** The pre-sweep (`020-provision-anchor.sh` `cmd_sweep_pre`)
 retires every foreign `piercloud-tmp-*` firewall policy on the account, and
@@ -86,7 +89,9 @@ Making the account the single-writer unit keeps the sweep truthful.
   fallback; the lane is assigned when the run is created, before input
   validation — a bad dispatch with a valid ref still occupies the lane and
   can cancel its single pending run, which is why the backend ledger, not
-  GitHub, is the queue);
+  GitHub, is the queue; the ref is matched verbatim, so two spellings of one
+  account's ref (e.g. `acct` vs `acct.`) occupy different lanes — the
+  registry mints one canonical ref per account);
 - the managed-input preflight (ungated `visibility-banner` job): a `tenant`
   dispatch without `anchor_ref`, or with a malformed, uppercase or
   over-long value, fails before the environment gate and the device card;
