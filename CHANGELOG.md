@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - *(provision)* Run-name + dispatch_intent input for control-plane run discovery (closes #176)
 - *(broker)* Report the anchor IPv4 to the pc-control broker (closes #183)
 - *(broker)* Write anchor DNS records + DNS-01 challenges through the pc-control broker (closes #185)
+- *(dns)* Anchor DNS goes through the pc-control broker; retire the direct-token writer (closes #189)
 
 ### 🐛 Bug Fixes
 
