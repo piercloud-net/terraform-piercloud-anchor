@@ -281,18 +281,20 @@ echo "TRIPWIRE curl called" >&2
 exit 97
 TRIP
 chmod +x "$WORK/tripwire/curl"
+# E2E sets the global rc (not printed): it is called in the main shell so
+# the tripwire assertion's pass/fail counters are not lost in a subshell.
 E2E() { # $1 label, $2 command, then VAR=value env assignments
-  local l="$1" cmd="$2" rc=0
+  local l="$1" cmd="$2"
   shift 2
+  rc=0
   env -i PATH="$WORK/tripwire:$PATH" HOME="$WORK" RUN_ID=999 MODE=check "$@" \
     bash "$SCRIPT" "$cmd" > "$WORK/e2e.$l" 2>&1 || rc=$?
-  is "$l no network (curl tripwire untouched)" "0" "$(grep -c 'TRIPWIRE' "$WORK/e2e.$l" || true)" >&2
-  printf '%s' "$rc"
+  is "$l no network (curl tripwire untouched)" "0" "$(grep -c 'TRIPWIRE' "$WORK/e2e.$l" || true)"
 }
 noop_case() { # $1 label, then env assignments: must be the clean no-op
-  local l="$1" rc
+  local l="$1"
   shift
-  rc="$(E2E "$l" sweep-post "$@")"
+  E2E "$l" sweep-post "$@"
   is "$l rc 0 (clean no-op)" "0" "$rc"
   is "$l no-op logged" "1" "$(grep -c '^A1: post-sweep: no token held' "$WORK/e2e.$l" || true)"
   is "$l no FAIL line" "0" "$(grep -c 'A1 FAIL' "$WORK/e2e.$l" || true)"
@@ -302,14 +304,14 @@ noop_case e2                                                   # token + ids uns
 noop_case e3 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID='1;x' SCP_USER_ID=  # malformed id never interpolated
 noop_case e3b NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID='1;x' # malformed user id too
 # With a token held the guards are unchanged: empty / non-digit ids still fail closed.
-rc="$(E2E e4 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID= SCP_USER_ID=1)"
+E2E e4 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID= SCP_USER_ID=1
 is "e4 token + empty SERVER_ID rc 1" "1" "$rc"
 is "e4 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e4" || true)"
-rc="$(E2E e5 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID='1;x' SCP_USER_ID=1)"
+E2E e5 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID='1;x' SCP_USER_ID=1
 is "e5 token + non-digit SERVER_ID rc 1" "1" "$rc"
 is "e5 injection guard" "1" "$(grep -c 'SERVER_ID is not all-digits' "$WORK/e2e.e5" || true)"
 # Other commands with no token are unchanged (the short-circuit is sweep-post only).
-rc="$(E2E e6 sweep-pre NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=)"
+E2E e6 sweep-pre NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
 is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"
 is "e6 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e6" || true)"
 
