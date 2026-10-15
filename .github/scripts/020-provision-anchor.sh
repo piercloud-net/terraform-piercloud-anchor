@@ -236,16 +236,20 @@ SCP_USER_ID="${SCP_USER_ID:-}"
 RUN_ID="${RUN_ID:-}"
 MODE="${MODE:-}"
 # sweep-post without a token is the documented clean no-op (approval never
-# completed -> nothing created): it runs in an `always()` step, usually on a
-# run that failed before resolve produced any ids, so it must short-circuit
-# BEFORE the id guards or every early failure grows a second red step
-# (#196). With a token held, the guards below apply unchanged.
+# completed -> nothing created): it runs in an `always()` step, and a run
+# that failed before the device-flow token was exported holds no ids either,
+# so it must short-circuit BEFORE the id guards or each such no-token early
+# failure grows a second red step (#196). With a token held, the guards below
+# apply unchanged: a run that holds a token but failed before resolve wrote
+# SERVER_ID still fails `SERVER_ID is required` (fail closed, deliberate).
+# cmd_sweep_post keeps its own no-token branch as defense in depth.
 if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
-  log "post-sweep: no token held (approval never completed) — nothing created, nothing to sweep"
+  log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired by the next token-bearing run)"
   exit 0
 fi
 # lock-password is the SSH-only finally-path (no API use): it must run even
-# when resolve never produced ids, so it is exempt from the id guards.
+# when resolve never produced ids, so it is exempt from the id guards (as is
+# the no-token sweep-post above, which exits before reaching them).
 case "$CMD" in
   lock-password) ;;
   *)
@@ -1333,13 +1337,15 @@ cmd_close() {
 # ---------------------------------------------------------------------------
 # sweep-post: delete own-run any-age + tmp >2h + orphans. Fails loudly if any
 # delete fails (an orphan window must never pass silently). No token (auth
-# never completed) = clean no-op so `always()` keeps the original verdict.
+# never completed) = clean no-op so `always()` keeps the original verdict;
+# the entrypoint short-circuits that case before the id guards (#196), so the
+# branch below is defense in depth for direct calls of this function.
 # Destructive ONLY in apply mode (sweep_destructive): the other modes report
 # what would be swept + append it to the step summary, and delete nothing.
 # ---------------------------------------------------------------------------
 cmd_sweep_post() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
-    log "post-sweep: no token held (approval never completed) — nothing created, nothing to sweep"
+    log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired by the next token-bearing run)"
     return 0
   fi
   # The steady-state family is anchored on the canonical hostname; an empty

@@ -45,6 +45,12 @@
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
+#
+# Issue #196 (entrypoint cases e1-e6, at the end): these run the WHOLE
+# script as a subprocess (`env -i`, nothing stubbed) so the ordering of the
+# no-token sweep-post short-circuit against the global id guards is pinned.
+# They never reach an API helper; a `curl` tripwire on PATH enforces that
+# (any curl call fails the case).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -268,11 +274,19 @@ is "c9d actions (live kept)" "" "$(ACTIONS c9d)"
 # failure grew a second red step. Drive the whole script (not the extracted
 # function) so the guard ordering itself is pinned. No network: every case
 # exits before any API helper.
+mkdir -p "$WORK/tripwire"
+cat > "$WORK/tripwire/curl" <<'TRIP'
+#!/usr/bin/env bash
+echo "TRIPWIRE curl called" >&2
+exit 97
+TRIP
+chmod +x "$WORK/tripwire/curl"
 E2E() { # $1 label, $2 command, then VAR=value env assignments
   local l="$1" cmd="$2" rc=0
   shift 2
-  env -i PATH="$PATH" HOME="$WORK" RUN_ID=999 MODE=check "$@" \
+  env -i PATH="$WORK/tripwire:$PATH" HOME="$WORK" RUN_ID=999 MODE=check "$@" \
     bash "$SCRIPT" "$cmd" > "$WORK/e2e.$l" 2>&1 || rc=$?
+  is "$l no network (curl tripwire untouched)" "0" "$(grep -c 'TRIPWIRE' "$WORK/e2e.$l" || true)" >&2
   printf '%s' "$rc"
 }
 noop_case() { # $1 label, then env assignments: must be the clean no-op
@@ -286,6 +300,7 @@ noop_case() { # $1 label, then env assignments: must be the clean no-op
 noop_case e1 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=   # the run-38823575615 shape
 noop_case e2                                                   # token + ids unset entirely
 noop_case e3 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID='1;x' SCP_USER_ID=  # malformed id never interpolated
+noop_case e3b NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID='1;x' # malformed user id too
 # With a token held the guards are unchanged: empty / non-digit ids still fail closed.
 rc="$(E2E e4 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID= SCP_USER_ID=1)"
 is "e4 token + empty SERVER_ID rc 1" "1" "$rc"
