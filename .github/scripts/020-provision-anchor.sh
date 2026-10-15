@@ -235,6 +235,15 @@ SERVER_ID="${SERVER_ID:-}"
 SCP_USER_ID="${SCP_USER_ID:-}"
 RUN_ID="${RUN_ID:-}"
 MODE="${MODE:-}"
+# sweep-post without a token is the documented clean no-op (approval never
+# completed -> nothing created): it runs in an `always()` step, usually on a
+# run that failed before resolve produced any ids, so it must short-circuit
+# BEFORE the id guards or every early failure grows a second red step
+# (#196). With a token held, the guards below apply unchanged.
+if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
+  log "post-sweep: no token held (approval never completed) — nothing created, nothing to sweep"
+  exit 0
+fi
 # lock-password is the SSH-only finally-path (no API use): it must run even
 # when resolve never produced ids, so it is exempt from the id guards.
 case "$CMD" in

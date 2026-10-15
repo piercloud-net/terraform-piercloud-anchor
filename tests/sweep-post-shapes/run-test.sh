@@ -261,5 +261,42 @@ rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anch
 is "c9d rc" "0" "$rc"
 is "c9d actions (live kept)" "" "$(ACTIONS c9d)"
 
+# ---- #196: the no-token no-op holds through the REAL entrypoint ----------
+# The always() post-sweep usually runs on a run that failed before resolve
+# (binding refusal, approval timeout): no token AND no ids. The global id
+# guards used to run first and fail `SERVER_ID is required`, so every early
+# failure grew a second red step. Drive the whole script (not the extracted
+# function) so the guard ordering itself is pinned. No network: every case
+# exits before any API helper.
+E2E() { # $1 label, $2 command, then VAR=value env assignments
+  local l="$1" cmd="$2" rc=0
+  shift 2
+  env -i PATH="$PATH" HOME="$WORK" RUN_ID=999 MODE=check "$@" \
+    bash "$SCRIPT" "$cmd" > "$WORK/e2e.$l" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+noop_case() { # $1 label, then env assignments: must be the clean no-op
+  local l="$1" rc
+  shift
+  rc="$(E2E "$l" sweep-post "$@")"
+  is "$l rc 0 (clean no-op)" "0" "$rc"
+  is "$l no-op logged" "1" "$(grep -c '^A1: post-sweep: no token held' "$WORK/e2e.$l" || true)"
+  is "$l no FAIL line" "0" "$(grep -c 'A1 FAIL' "$WORK/e2e.$l" || true)"
+}
+noop_case e1 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=   # the run-38823575615 shape
+noop_case e2                                                   # token + ids unset entirely
+noop_case e3 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID='1;x' SCP_USER_ID=  # malformed id never interpolated
+# With a token held the guards are unchanged: empty / non-digit ids still fail closed.
+rc="$(E2E e4 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID= SCP_USER_ID=1)"
+is "e4 token + empty SERVER_ID rc 1" "1" "$rc"
+is "e4 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e4" || true)"
+rc="$(E2E e5 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID='1;x' SCP_USER_ID=1)"
+is "e5 token + non-digit SERVER_ID rc 1" "1" "$rc"
+is "e5 injection guard" "1" "$(grep -c 'SERVER_ID is not all-digits' "$WORK/e2e.e5" || true)"
+# Other commands with no token are unchanged (the short-circuit is sweep-post only).
+rc="$(E2E e6 sweep-pre NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=)"
+is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"
+is "e6 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e6" || true)"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
