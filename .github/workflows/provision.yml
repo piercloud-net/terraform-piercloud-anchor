@@ -142,11 +142,21 @@ jobs:
           # hand-extracted step bodies may not).
           TENANT_INPUT="${TENANT_INPUT:-}"
           ANCHOR_REF="${ANCHOR_REF:-}"
+          # The tenant input is the GitHub environment name AND (#198) the
+          # managed alias, so it must satisfy both grammars here, before any
+          # gate: pc-control's environment/alias grammar ^[a-z0-9]{3,15}$
+          # (registry.ValidateEnvName) and the anchor's tenant-name rule
+          # (scripts/lib/naming.sh validate_tenant_username: reserved
+          # anchor/status/pcu/platform prefixes). The binding step re-runs
+          # the canonical validator before the device card.
           case "$TENANT_INPUT" in
             '') ;;
-            [!a-z0-9]* | *- | *[!a-z0-9_-]*) echo "::error::tenant input must match [a-z0-9][a-z0-9_-]{0,39} (must start alphanumeric; no trailing hyphen) — refusing."; exit 1 ;;
+            *[!a-z0-9]*) echo "::error::tenant input must match ^[a-z0-9]{3,15}$ (the pc-control environment/alias grammar) — refusing."; exit 1 ;;
+            anchor* | status* | pcu* | platform*) echo "::error::tenant input starts with a reserved prefix (anchor/status/pcu/platform) — refusing."; exit 1 ;;
           esac
-          [ "${#TENANT_INPUT}" -le 40 ] || { echo "::error::tenant input exceeds 40 characters — refusing."; exit 1; }
+          if [ -n "$TENANT_INPUT" ] && { [ "${#TENANT_INPUT}" -lt 3 ] || [ "${#TENANT_INPUT}" -gt 15 ]; }; then
+            echo "::error::tenant input must be 3-15 characters (the pc-control environment/alias grammar) — refusing."; exit 1
+          fi
           # Lowercase-only: the concurrency lane is evaluated before any step
           # runs and GitHub expressions cannot fold case, so an uppercase ref
           # could occupy a different lane than its lowercase spelling.
@@ -375,12 +385,24 @@ jobs:
           # card. In-workflow half of the "platform lifecycle is the
           # control" claim; the lane key itself was already evaluated when
           # the run was created.
+          # The tenant input is the managed alias (#198): run the canonical
+          # tenant-name validator before the device card, not only in the
+          # resolve step after it.
+          if [ -n "$TENANT_INPUT" ]; then
+            # shellcheck source=scripts/lib/naming.sh
+            . scripts/lib/naming.sh
+            if ! validate_tenant_username "$TENANT_INPUT"; then
+              echo "::error::tenant input '$TENANT_INPUT' is not a valid tenant name — refusing before the device card."
+              exit 1
+            fi
+          fi
           if [ -n "$TENANT_INPUT" ] && [ "$MANAGED_TENANT" != "$TENANT_INPUT" ]; then
             echo "::error::environment '$TENANT_INPUT' does not carry MANAGED_TENANT='$TENANT_INPUT' — refusing (a typo'd/partial environment would silently read repo-level values). Provisioned tenant environments set the marker; see docs/invariants.md invariant 3."
             exit 1
           fi
-          # Operator-plane isolation (#198): a managed run never reads the
-          # operator's repo-level values. Every operator-plane reference in
+          # Operator-plane isolation (#198): a managed run reads none of the
+          # operator's repo-level values except the platform-plane
+          # CLOUDFRONT_ORIGIN_SECRET and MAIN_BOX_IPV4. Every operator-plane reference in
           # this workflow is gated on `inputs.tenant == ''` (pinned by
           # tests/managed-operator-plane), and the managed customer number
           # comes from the tenant-only TENANT_CUSTOMER_NUMBER, which is never

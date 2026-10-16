@@ -84,20 +84,41 @@ mutant "new ungated name" provision.yml "s.replace('          MODE: \${{ inputs.
 mutant "duplicate env key" provision.yml "s.replace('      - name: Tenant-environment binding check (environment marker == tenant input)\n        env:\n', '      - name: Tenant-environment binding check (environment marker == tenant input)\n        env:\n          NTFY_TOPIC: \${{ secrets.NTFY_TOPIC }}\n        env:\n', 1)"
 mutant "aliased scalar" provision.yml "s.replace('          MODE: \${{ inputs.mode }}\n', '          MODE: \${{ inputs.mode }}\n          A: &leak \"\${{ secrets.RECORDING_WITNESS_KEY }}\"\n          B: *leak\n', 1)"
 mutant "environment added to an operator-only workflow" external-watch.yml "s.replace('    runs-on: ubuntu-latest\n', '    runs-on: ubuntu-latest\n    environment: \${{ inputs.probe_url }}\n', 1)"
+mutant "environment added to visibility-banner" provision.yml "s.replace('  visibility-banner:\n', '  visibility-banner:\n    environment: anchor\n', 1)"
+mutant "local reusable-workflow call" provision.yml "s.replace('  visibility-banner:\n', '  callee:\n    needs: [visibility-banner]\n    uses: ./.github/workflows/release.yml\n  visibility-banner:\n', 1)"
+mutant "binary-tagged expression" provision.yml "s.replace('          MODE: \${{ inputs.mode }}\n', '          MODE: \${{ inputs.mode }}\n          X: !!binary JHt7IHNlY3JldHMuTlRGWV9UT1BJQyB9fQ==\n', 1)"
+mutant "local composite action" provision.yml "s.replace('      - name: Checkout (no credentials persisted)\n', '      - uses: ./.github/actions/leak\n      - name: Checkout (no credentials persisted)\n', 1)"
+mutant "repository_dispatch trigger on a checked file" release.yml "s.replace('on:\n', 'on:\n  repository_dispatch:\n', 1)"
+mutant "workflow_call trigger on a checked file" release.yml "s.replace('on:\n', 'on:\n  workflow_call:\n', 1)"
 
-# --- operator-only predicate is structural, not a filename list -----------
+# --- operator-only is an explicit named list, checked structurally too ----
+# r1 red-team F1: a structural guess exempted a reusable callee with no
+# environment/tenant text. Only OPERATOR_ONLY files may read operator values
+# bare; any new file is checked in full.
 mkdir -p "$WORK/op"
-cat > "$WORK/op/op.yml" <<'YML'
+cat > "$WORK/op/callee.yml" <<'YML'
 on: workflow_dispatch
 jobs:
   a:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "${{ secrets.NTFY_TOPIC }}"
+      - run: echo "${{ vars.ANCHOR_ROLE }}"
 YML
-if python3 -I -B "$CHECK" "$WORK/op" >/dev/null 2>&1; then ok "a workflow no managed run can select may read operator values"; else bad "operator-only workflow wrongly red"; fi
-sed 's/on: workflow_dispatch/on:\n  workflow_dispatch:\n    inputs:\n      tenant:\n        type: string/' "$WORK/op/op.yml" > "$WORK/op/op2.yml"
-if python3 -I -B "$CHECK" "$WORK/op" >/dev/null 2>&1; then bad "a tenant input does not make the workflow tenant-reachable"; else ok "a tenant input makes the workflow tenant-reachable"; fi
+if python3 -I -B "$CHECK" "$WORK/op" >/dev/null 2>&1; then bad "an unlisted workflow reads operator values bare"; else ok "an unlisted workflow is checked in full"; fi
+mkdir -p "$WORK/op2"
+cp "$WORK/op/callee.yml" "$WORK/op2/external-watch.yml"
+if python3 -I -B "$CHECK" "$WORK/op2" >/dev/null 2>&1; then ok "a listed operator-only workflow may read operator values"; else bad "listed operator-only workflow wrongly red"; fi
+sed 's/on: workflow_dispatch/on:\n  workflow_dispatch:\n    inputs:\n      tenant:\n        type: string/' "$WORK/op/callee.yml" > "$WORK/op2/external-watch.yml"
+if python3 -I -B "$CHECK" "$WORK/op2" >/dev/null 2>&1; then bad "a listed file naming a tenant stays exempt"; else ok "a listed file naming a tenant loses the exemption"; fi
+sed 's/on: workflow_dispatch/on: workflow_run/' "$WORK/op/callee.yml" > "$WORK/op2/external-watch.yml"
+if python3 -I -B "$CHECK" "$WORK/op2" >/dev/null 2>&1; then bad "workflow_run on a listed file stays green"; else ok "workflow_run fails closed even on a listed file"; fi
+sed 's/run: echo/run: echo "${{ github.event.client_payload.tenant }}" \&\& echo/' "$WORK/op/callee.yml" > "$WORK/op2/external-watch.yml"
+if python3 -I -B "$CHECK" "$WORK/op2" >/dev/null 2>&1; then bad "a listed file reading client_payload stays exempt"; else ok "a listed file reading client_payload loses the exemption"; fi
+# r1 red-team F2: the extension match is case-insensitive.
+mkdir -p "$WORK/op3"
+cp "$WFDIR/release.yml" "$WORK/op3/release.yml"
+cp "$WORK/op/callee.yml" "$WORK/op3/PROVISION.YML"
+if python3 -I -B "$CHECK" "$WORK/op3" >/dev/null 2>&1; then bad "upper-case extension skipped"; else ok "upper-case extension is checked"; fi
 
 # --- behavior: the real binding step -------------------------------------
 python3 -I -B - "$PROV" "$WORK/binding.sh" <<'PY'
