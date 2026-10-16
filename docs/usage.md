@@ -64,7 +64,7 @@ Managed-run residuals (disclosed):
 - Tenant boxes hold the shared `CLOUDFRONT_ORIGIN_SECRET` (rendered into the root-only Caddyfile, and a tenant has root on its box). With its own CloudFront distribution, a tenant can reach any anchor's dashboard origin directly. That reach is status-page content only; tang and API paths abort. This is reasoned from the Caddy gate and the CloudFront ranges, not live-tested (security-posture row 3; per-anchor origin secret: #202).
 - `MAIN_BOX_IPV4` tells each tenant the pc-host address (its firewall admits it). It is informational only: spoofing a TCP source from a tenant box is not practical.
 - The repo-scope check sees repository and organization scope through presence probes in a job with no environment; it is a refusal, not a sandbox. A value added at repository level after the banner job ran is read by that run (a race the operator controls; the next dispatch refuses).
-- Deployment-branch policy: a tenant environment's `v*` tag policy is set by `pc-control admin env harden`, not by this repository; the `anchor` environment has none. Neither is verified by the workflow or the pin.
+- Deployment-branch policy: the proof environments carry a `v*` tag policy and `anchor` has none; `pc-control admin env harden` is expected to set tenant policies (not verified here — neither the workflow nor the pin checks it).
 - The pin (`tests/managed-operator-plane`) scans workflow text only: scripts are not scanned (reading repo variables through the API needs `actions: read`, which no job grants), and the allowed forms are literals not bound per name.
 
 ## 3. Dispatch and approve (S1)

@@ -162,6 +162,24 @@ mutant_why "step inserted before the preflight" provision.yml 's.replace("      
 mutant_why "later banner step shell: override" provision.yml 's.replace("      - name: Record head SHA for the backend approval pin\n", "      - name: Record head SHA for the backend approval pin\n        shell: sh\n", 1)' "keys must be within"
 mutant_why "bare MANAGED_TENANT in a job with no environment" provision.yml 's.replace("  apply-placeholder:\n", "  apply-placeholder:\n    env:\n      M: ${{ vars.MANAGED_TENANT }}\n", 1)' "ungated 'vars' reference"
 
+# --- PR #205 round 2 (red-team lead): the customer-number form reads
+# TENANT_CUSTOMER_NUMBER for a managed run, so it is allowed only inside a
+# tenant-environment job. A new job outside the banner's needs closure (a
+# static environment, a mapping-form environment, or none) must not read it.
+# The device-flow rewrites (mapping form, whitespace variant) and a second
+# `run:` key on the repo-scope step fail closed and stay pinned here.
+CUSTF="\${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}"
+TENV="\${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}"
+newjob() { # $1 job id, $2 extra job keys (python-escaped) -> append a job reading CUSTF
+  printf 's + "\\n  %s:\\n    runs-on: ubuntu-latest\\n%s    steps:\\n      - run: echo \\"%s\\" >/dev/null\\n"' "$1" "$2" "$CUSTF"
+}
+mutant_why "customer-number form in a static environment: anchor job" provision.yml "$(newjob c20 '    environment: anchor\n')" "ungated 'secrets' reference"
+mutant_why "customer-number form in a mapping-form tenant environment, needs: []" provision.yml "$(newjob c22 "    needs: []\\n    environment:\\n      name: $TENV\\n")" "ungated 'secrets' reference"
+mutant_why "customer-number form in a job with no environment" provision.yml "$(newjob c25 '')" "ungated 'secrets' reference"
+mutant_why "device-flow environment in mapping form" provision.yml "s.replace(\"    environment: $TENV\\n    outputs:\\n      thumbprint:\", \"    environment:\\n      name: $TENV\\n    outputs:\\n      thumbprint:\", 1)" "ungated"
+mutant_why "device-flow environment, whitespace variant" provision.yml "s.replace(\"    environment: $TENV\\n    outputs:\\n      thumbprint:\", \"    environment: \${{  inputs.tenant != '' && inputs.tenant || 'anchor' }}\\n    outputs:\\n      thumbprint:\", 1)" "ungated"
+mutant_why "repo-scope step: a second run: key" provision.yml 's.replace("      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n", "      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n        run: exit 0\n", 1)' "duplicate mapping key"
+
 # --- operator-only is an explicit named list, checked structurally too ----
 # r1 red-team F1: a structural guess exempted a reusable callee with no
 # environment/tenant text. Only OPERATOR_ONLY files may read operator values

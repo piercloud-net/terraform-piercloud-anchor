@@ -5,8 +5,10 @@ repository-level values for every name the environment does not define. So
 every `secrets` / `vars` reference in a workflow that a managed run can reach
 must be one of the exact allowed forms below: a shared platform-plane name, a
 gated form that resolves empty whenever `inputs.tenant` is set (operator-only
-names), or (#204, below) a bare read inside a tenant-environment job of a
-name the banner proves absent at repository level.
+names), the TENANT_USER form (the tenant input for a managed run), or (#204,
+below) inside a tenant-environment job only, a bare read of a name the banner
+proves absent at repository level, `vars.MANAGED_TENANT`, or the
+customer-number form.
 
 Default-deny, no hand-rolled parsing: PyYAML composes the node graph (every
 key and value scalar, duplicate keys and alias targets included), the allowed
@@ -45,7 +47,8 @@ managed dispatch on any `true`. The step may carry no `if:` and no
 may carry a status-function `if:` (always/failure/cancelled/success in any
 form: an explicit `success() || x` replaces the implicit one) that would run
 it after the banner refused. Probe forms are allowed only inside that step;
-bare forms (and `vars.MANAGED_TENANT`) only inside a TENANT_ENV job. YAML
+bare forms, `vars.MANAGED_TENANT` and the customer-number form (which reads
+TENANT_CUSTOMER_NUMBER for a managed run) only inside a TENANT_ENV job. YAML
 anchors and aliases are refused (a node shared across jobs would carry one
 job's allowance into another).
 
@@ -65,9 +68,12 @@ broker-provision-dns blob-hash pins in the same PR (a review control).
 Residuals: the allowed forms are a set of literals, not bound per name (a
 gated name may use another name's gated form; a managed run still resolves
 empty); scripts are not scanned (reading repo variables through the API needs
-`actions: read`, which no job grants); a new job with a static
-`environment:` is judged by the same literal set only. PyYAML (YAML 1.1) is not GitHub's parser; a parse difference that splits
-an expression leaves the context word in place and fails closed.
+`actions: read`, which no job grants); a job outside TENANT_ENV (a static
+`environment:` or none) may use only the global forms: the shared names, the
+gated forms (empty for a managed run) and the TENANT_USER form (the tenant
+input for a managed run). PyYAML (YAML 1.1) is not GitHub's parser; a parse
+difference that splits an expression leaves the context word in place and
+fails closed.
 
 Usage: check.py WORKFLOW_DIR   (exit 0 = pin holds; findings on stdout)
 """
@@ -185,13 +191,15 @@ PINNED_STEPS = [
     (PREFLIGHT_STEP, "a458a87c5a790ee8a3e160dec75d6dc8dda09075d542f6f762fff7de42e7e46a"),
     (SCOPE_STEP, "5a3698d442a0ec392848ff8185a099d394a32c8d2c6b0fe281ceaaa33ba7caed"),
 ]
-# Managed alias = the validated tenant input; managed customer number = the
-# tenant-only environment secret (never defined at repo level).
-TENANT_FORMS = [
-    "${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}",
-    "${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}",
-]
-ALLOWED = SHARED + GATED + TENANT_FORMS
+# Managed alias = the validated tenant input: a managed run never reaches the
+# TENANT_USER read, so the form is allowed in any job.
+TENANT_USER_FORM = "${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}"
+# Managed customer number = the tenant-only TENANT_CUSTOMER_NUMBER, which a
+# managed run resolves environment first, then repository level. Allowed only
+# inside a TENANT_ENV job (node_allowance): a job outside the banner's needs
+# closure would read a repository-level copy before the refusal (round 2).
+TENANT_CUSTOMER_FORM = "${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}"
+ALLOWED = SHARED + GATED + [TENANT_USER_FORM]
 
 # Any mention of either context as a word, in any case. Over-approximates on
 # prose by design: a comment inside a run: block that names the context fails
@@ -417,7 +425,7 @@ def node_allowance(doc):
     for name, job in jobs_of(doc):
         if is_tenant_env_job(job):
             for n in scalars(job, set()):
-                extra[id(n)] = DIRECT + TENANT_ONLY
+                extra[id(n)] = DIRECT + TENANT_ONLY + [TENANT_CUSTOMER_FORM]
         if name == "visibility-banner":
             for seq in mget(job, "steps"):
                 if not isinstance(seq, yaml.SequenceNode):
