@@ -258,8 +258,14 @@ rc="$(RUN_BODY b1 "$BINDING_BODY" TENANT_INPUT=foo)"
 is "b1 tenant without marker rc" "1" "$rc"
 contains "b1 names the marker" "does not carry MANAGED_TENANT" "$(OUT b1)"
 
-rc="$(RUN_BODY b2 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=foo)"
+# #198: a managed run also needs its tenant-only customer number (the job
+# env resolves TENANT_CUSTOMER_NUMBER into CUSTOMER_NUMBER on a managed run).
+rc="$(RUN_BODY b2 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=foo CUSTOMER_NUMBER=123456)"
 is "b2 matching marker rc" "0" "$rc"
+
+rc="$(RUN_BODY b2n "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=foo)"
+is "b2n matching marker, no tenant customer number rc" "1" "$rc"
+contains "b2n names the tenant-only secret" "TENANT_CUSTOMER_NUMBER" "$(OUT b2n)"
 
 rc="$(RUN_BODY b3 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=bar)"
 is "b3 mismatching marker rc" "1" "$rc"
