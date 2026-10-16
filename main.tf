@@ -158,7 +158,7 @@ locals {
   # Policy key: the canonical hostname (operator-readable, public). The
   # server id deliberately left the name (issue #121): it is the alias →
   # netcup-account join key and policy names land in public logs/summaries.
-  # 020's sweep-post retires any unattached policy in the
+  # 020's sweep-post (apply mode) retires any unattached policy in the
   # piercloud-anchor- family in the same run — including the pre-change
   # <hostname>-<server_id> shape (one-time migration), while the attached
   # live policy is never touched (D3, issues #101/#121).

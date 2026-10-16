@@ -14,7 +14,9 @@
 #              fail-closed on orphan (no parseable created_at) BEFORE any
 #              mutation -> retire EVERY non-own tmp (aged >2h or leaked
 #              fresh: the workflow-wide mutex means no foreign run can be
-#              live) -> drop this run's own leftovers.
+#              live) -> drop this run's own leftovers. Deletions happen in
+#              apply mode only (sweep_destructive); other modes report, but
+#              the orphan fail-closed refusal applies in every mode.
 #   open       dual-endpoint egress-IP fetch (exact match or fail) -> create
 #              TTL-tagged tmp policy (idempotent on run_id: retry reuses the
 #              existing policy, never duplicates) -> attach to the server NIC.
@@ -46,7 +48,8 @@
 #              order; missing policy is a success no-op (idempotent).
 #   sweep-post delete this run's policy at any age + every tmp older than 2h
 #              (+ orphans: no valid created_at) + UNATTACHED steady-state
-#              orphans (issue #101 — the create-per-run leak). Tolerates a
+#              orphans (issue #101 — the create-per-run leak); apply mode
+#              only — other modes report what would go. Tolerates a
 #              missing token
 #              (auth never completed -> nothing created -> clean no-op) so the
 #              workflow `always()` post step never masks the real failure.
@@ -243,8 +246,13 @@ MODE="${MODE:-}"
 # apply unchanged: a run that holds a token but failed before resolve wrote
 # SERVER_ID still fails `SERVER_ID is required` (fail closed, deliberate).
 # cmd_sweep_post keeps its own no-token branch as defense in depth.
-if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
-  log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired by the next token-bearing run)"
+# "No token" means neither the step env nor a $GITHUB_ENV handoff line (the
+# source scp_token_refresh adopts) holds one; a handoff token falls through
+# to the guards (fail closed, even though each step's $GITHUB_ENV starts empty).
+if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ] \
+  && ! { [ -n "${GITHUB_ENV:-}" ] && [ -f "$GITHUB_ENV" ] \
+         && grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV"; }; then
+  log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that gets past resolve; report-only modes do not delete)"
   exit 0
 fi
 # lock-password is the SSH-only finally-path (no API use): it must run even
@@ -1345,7 +1353,7 @@ cmd_close() {
 # ---------------------------------------------------------------------------
 cmd_sweep_post() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
-    log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired by the next token-bearing run)"
+    log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that gets past resolve; report-only modes do not delete)"
     return 0
   fi
   # The steady-state family is anchored on the canonical hostname; an empty
