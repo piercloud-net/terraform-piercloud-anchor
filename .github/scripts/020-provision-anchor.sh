@@ -110,7 +110,7 @@
 #                            lock-password (finally-path). Same-runner
 #                            handoff only — dies with the runner.
 #   GATUS_ENDPOINTS          comma-separated name=url pairs (http(s), v1) for the
-#                            dispatch-managed monitor config (repo secret — tenant
+#                            dispatch-managed monitor config (environment or repo secret — tenant
 #                            service map stays write-only). NTFY_TOPIC/NTFY_TOKEN
 #                            arrive the same way (empty = checks without push).
 #   RECORDING_WITNESS_*      optional recording-completeness witness (repo
@@ -124,7 +124,7 @@
 #                            env prefix below — never argv, never logged.
 #                            Docs: docs/recording-witness.md.
 #   ORIGIN_CA_CERT_PEM      operator-planted per-anchor public certificate
-#                            chain, leaf first (repo VARIABLE, cert-only
+#                            chain, leaf first (env or repo VARIABLE, cert-only
 #                            public material — the chain is required and
 #                            enforced (leaf-only/unlinked values fail the
 #                            install gate); CloudFront 502s without the
@@ -933,7 +933,7 @@ cmd_provision() {
   EFFECTIVE_PASSWORD=""
   log "running on-box provision (plain ssh, no ansible)"
   # Monitor config rides in as env (single-quote escaped): the tenant converges
-  # monitors from a phone via repo secret + re-dispatch — no key, no console.
+  # monitors from a phone via an environment or repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
   ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_ROLE='$(q "${ANCHOR_ROLE:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' STATUS_PULLER='$(q "${STATUS_PULLER:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")' CLOUDFRONT_ORIGIN_SECRET='$(q "${CLOUDFRONT_ORIGIN_SECRET:-}")' MAIN_BOX_IPV4='$(q "${MAIN_BOX_IPV4:-}")' RECORDING_WITNESS_ENDPOINT='$(q "${RECORDING_WITNESS_ENDPOINT:-}")' RECORDING_WITNESS_BUCKET='$(q "${RECORDING_WITNESS_BUCKET:-}")' RECORDING_WITNESS_AUDIT_PREFIX='$(q "${RECORDING_WITNESS_AUDIT_PREFIX:-}")' RECORDING_WITNESS_RECORDINGS_PREFIX='$(q "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}")' RECORDING_WITNESS_KEY_ID='$(q "${RECORDING_WITNESS_KEY_ID:-}")' RECORDING_WITNESS_KEY='$(q "${RECORDING_WITNESS_KEY:-}")' RECORDING_WITNESS_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_SIGNATURE='$(q "${RECORDING_WITNESS_QUIET_SIGNATURE:-}")' RECORDING_WITNESS_COLD_START_SECONDS='$(q "${RECORDING_WITNESS_COLD_START_SECONDS:-}")' RECORDING_WITNESS_SWEEP_SECONDS='$(q "${RECORDING_WITNESS_SWEEP_SECONDS:-}")';";
   if [ "$ROTATE" -eq 1 ]; then

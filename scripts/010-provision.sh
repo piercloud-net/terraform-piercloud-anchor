@@ -376,7 +376,7 @@ gen_keys() { # append a fresh key set on this box (never deletes)
 # Per-anchor cert material (issue #123; A2 2026-09-30): the private key is
 # generated ON this box and never leaves it; the CSR is public material
 # published in the run artifact for operator/broker-side signing; the signed
-# cert returns via the ORIGIN_CA_CERT_PEM env (cert-only repo variable) and
+# cert returns via the ORIGIN_CA_CERT_PEM env (cert-only environment or repo variable) and
 # is validated fail-closed (leaf + linked chain) before Caddy may serve it. A2: the dashboard sits
 # behind CloudFront, which trusts Mozilla-store CAs only — so the cert is a
 # PUBLIC single-SAN cert for the nested `<tenant>.status.piercloud.net`
@@ -671,7 +671,7 @@ origin_ca_install_from_env() { # install ORIGIN_CA_CERT_PEM (cert-only public ma
     || die "ORIGIN_CA_CERT_PEM is set but STATUS_HOST is unset — cannot verify the cert SAN; refusing to install"
   [ -s "${ORIGIN_CA_KEY}" ] \
     || die "ORIGIN_CA_CERT_PEM is set but ${ORIGIN_CA_KEY} is missing — restore the key first (the cert must match it)"
-  # Cert-only, like CF_AOP_CA_PEM: this value is a public repo variable and the
+  # Cert-only, like CF_AOP_CA_PEM: this value is a public (environment or repo) variable and the
   # file lands in a bind mount — a private key must never travel here.
   case "$pem" in *"PRIVATE KEY"*) die "ORIGIN_CA_CERT_PEM must be certificate-only (public material; the private key is generated on this box and never travels) — strip the private key";; esac
   origin_ca_cert_pem_ok "$pem" \
@@ -736,7 +736,7 @@ origin_ca_select_pair() { # choose the served pair; a per-anchor pair is VALIDAT
       if ! origin_ca_aop_deployed; then
         blocks="$(origin_ca_chain_blocks "${ORIGIN_CA_CRT}")"
         [ "${blocks:-0}" -ge 2 ] \
-          || die "on-box per-anchor pair for ${STATUS_HOST} is leaf-only; the A2 CloudFront origin leg REQUIRES the leaf-first chain (CloudFront answers 502 without the intermediate) — set the ORIGIN_CA_CERT_PEM repo variable to the issued chain and re-dispatch"
+          || die "on-box per-anchor pair for ${STATUS_HOST} is leaf-only; the A2 CloudFront origin leg REQUIRES the leaf-first chain (CloudFront answers 502 without the intermediate) — set the ORIGIN_CA_CERT_PEM variable (the anchor's environment, or repository level) to the issued chain and re-dispatch"
       fi
     else
       warn "STATUS_HOST unset — per-anchor pair validation skipped (no :443 vhost is rendered; re-dispatch with TENANT_USER)"
@@ -1054,7 +1054,7 @@ assert_no_key_leak
 # ---------------------------------------------------------------------------
 # c) Gatus config — DISPATCH-MANAGED (2026-09-08: no standing SSH keys, no
 #    console edits; a phone tenant converges monitors via the GATUS_ENDPOINTS
-#    repo secret + re-dispatch). Rendered on EVERY run; hand edits die
+#    secret (environment or repo) + re-dispatch). Rendered on EVERY run; hand edits die
 #    (one-time backup below). Env in: GATUS_ENDPOINTS (comma-separated
 #    name=url pairs, http(s) only, v1), NTFY_TOPIC / NTFY_TOKEN (empty =
 #    checks without push + warn), ANCHOR_ROLE (empty/tenant = the platform
@@ -1262,7 +1262,7 @@ TMP_CFG="${GATUS_CONFIG}.new"
 {
   printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
   printf '%s\n' "# DO NOT EDIT BY HAND — re-rendered on every provision run. Change monitors"
-  printf '%s\n' "# via the GATUS_ENDPOINTS repo secret (+ NTFY_TOPIC secret for push) and"
+  printf '%s\n' "# via the GATUS_ENDPOINTS secret, environment or repo (+ NTFY_TOPIC secret for push) and"
   printf '%s\n' "# re-dispatch mode=apply. Docs: https://gatus.io/docs"
   printf '%s\n' "#"
   printf '%s\n' "# Probe targets by DNS NAME, not IP: Gatus never caches DNS, so when you"
@@ -6552,7 +6552,7 @@ case "$(recording_witness_state)" in
     ;;
   partial)
     witness_problem="$(recording_witness_config_problem)"
-    die "recording-witness env is partial: ${witness_problem:-unknown problem}. Set every RECORDING_WITNESS_* repo secret or none at all (docs/recording-witness.md)."
+    die "recording-witness env is partial: ${witness_problem:-unknown problem}. Set every RECORDING_WITNESS_* secret (the anchor's environment, or repository level) or none at all (docs/recording-witness.md)."
     ;;
   off)
     recording_witness_disable

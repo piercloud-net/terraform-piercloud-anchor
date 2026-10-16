@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# tests/managed-operator-plane/run-test.sh — issue #198 operator-plane pin.
+# tests/managed-operator-plane/run-test.sh — issues #198 + #204 operator-plane pin.
 #
 # A managed tenant run selects its own environment, and GitHub falls back to
 # repository-level values for every name that environment does not define.
-# The operator's values (ANCHOR_ROLE, TENANT_USER, NTFY_*, the B2 witness key,
-# CUSTOMER_NUMBER, the pier.status chain) live at repository level, so every
-# reference a managed run can reach must be gated on `inputs.tenant`.
+# A managed run reads its operator-plane values (ANCHOR_ROLE, NTFY_*, the B2
+# witness key, the TLS chain, ...) from its own environment (#204): bare reads
+# are allowed only inside tenant-environment jobs, and the ungated banner
+# job's repo-scope step probes every such name and refuses a managed dispatch
+# while a repository- or organization-level copy exists. The operator-only
+# values (TENANT_USER, CUSTOMER_NUMBER) stay gated on `inputs.tenant`.
+#
+# Structural pins (#204 round 1): workflow/banner job/banner step keys are
+# allowlisted (no `defaults:`, `shell:`, BASH_ENV-style env), the preflight
+# and repo-scope steps are banner steps 1-2 pinned by digest, and any status
+# function in a tenant-environment job's needs closure is refused.
 #
 # This harness binds:
 #   - the PIN (check.py, PyYAML node walk, exact-literal allowlist, default
@@ -117,6 +125,42 @@ mutant "device-flow if: always()" provision.yml "s.replace('    needs: [visibili
 mutant "device-flow if: !success()" provision.yml "s.replace('    needs: [visibility-banner]\n', \"    needs: [visibility-banner]\\n    if: \${{ !success() }}\\n\", 1)"
 mutant "anchor-dns if: always()" provision.yml "s.replace(\"    if: inputs.mode == 'apply'\\n    # Same gate as device-flow\", \"    if: always() && inputs.mode == 'apply'\\n    # Same gate as device-flow\", 1)"
 mutant "anchor on a scope-step node" provision.yml "s.replace('          TENANT_INPUT: \${{ inputs.tenant }}\n          REPO_SCOPE_', '          TENANT_INPUT: &t \${{ inputs.tenant }}\n          REPO_SCOPE_', 1)"
+
+# --- PR #205 round 1 (red-team F1-F5, functional F3): each mutant must be red
+# for its own rule, not incidentally. mutant_why LABEL FILE EXPR NEEDLE.
+mutant_why() {
+  local label="$1" file="$2" expr="$3" needle="$4" dir="$WORK/m$((pass + fail))" out
+  mkdir -p "$dir"
+  cp "$WFDIR"/*.yml "$dir"/
+  python3 -I -B - "$dir/$file" "$expr" <<'PY'
+import sys
+p, expr = sys.argv[1], sys.argv[2]
+s = open(p).read()
+t = eval(expr, {"s": s})
+assert t != s, "mutation did not change the file"
+open(p, "w").write(t)
+PY
+  if out="$(python3 -I -B "$CHECK" "$dir" 2>&1)"; then
+    bad "mutant stays green: $label"
+  elif printf '%s' "$out" | grep -qF -- "$needle"; then
+    ok "mutant red for its rule: $label"
+  else
+    bad "mutant red for another reason: $label (want '$needle'; got: $(printf '%s' "$out" | head -n1))"
+  fi
+}
+mutant_why "device-flow if: success() || ..." provision.yml 's.replace("    needs: [visibility-banner]\n", "    needs: [visibility-banner]\n    if: ${{ success() || needs.visibility-banner.result == \"failure\" }}\n", 1)' "status-function"
+mutant_why "repo-scope body: TENANT_INPUT blanked" provision.yml 's.replace("TENANT_INPUT=\"${TENANT_INPUT:-}\"\n          if [ -z \"$TENANT_INPUT\" ]; then\n            echo \"Operator run", "TENANT_INPUT=\"${TENANT_INPUT:-}\"\n          TENANT_INPUT=\"\"\n          if [ -z \"$TENANT_INPUT\" ]; then\n            echo \"Operator run", 1)' "step 2"
+mutant_why "repo-scope body: comment-spoofed loop" provision.yml 's.replace("          for v in ${!REPO_SCOPE_@}; do\n", "          # for v in ${!REPO_SCOPE_@}; do\n          for v in ${!NOPE_@}; do\n", 1)' "step 2"
+mutant_why "repo-scope step shell: override" provision.yml 's.replace("      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n", "      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n        shell: \"true {0}\"\n", 1)' "step 2 keys must be within"
+mutant_why "banner job defaults: shell" provision.yml 's.replace("  visibility-banner:\n", "  visibility-banner:\n    defaults:\n      run:\n        shell: \"true {0}\"\n", 1)' "visibility-banner keys must be within"
+mutant_why "banner job env: BASH_ENV" provision.yml 's.replace("  visibility-banner:\n", "  visibility-banner:\n    env:\n      BASH_ENV: /tmp/x\n", 1)' "visibility-banner keys must be within"
+mutant_why "workflow-level defaults: shell" provision.yml 's.replace("\njobs:\n", "\ndefaults:\n  run:\n    shell: \"true {0}\"\njobs:\n", 1)' "workflow top-level keys must be within"
+mutant_why "workflow-level env: BASH_ENV" provision.yml 's.replace("\njobs:\n", "\nenv:\n  BASH_ENV: /tmp/x\njobs:\n", 1)' "workflow top-level keys must be within"
+mutant_why "preflight step if: false" provision.yml 's.replace("      - name: Managed-input preflight", "      - if: false\n        name: Managed-input preflight", 1)' "step 1 keys must be within"
+mutant_why "preflight body edited" provision.yml 's.replace("          MODE: ${{ inputs.mode }}\n        run: |\n          set -euo pipefail\n", "          MODE: ${{ inputs.mode }}\n        run: |\n          set -euo pipefail\n          exit 0\n", 1)' "step 1"
+mutant_why "step inserted before the preflight" provision.yml 's.replace("      - name: Managed-input preflight", "      - name: Early\n        run: echo BASH_ENV=/tmp/x >> \"$GITHUB_ENV\"\n      - name: Managed-input preflight", 1)' "step 1 must be"
+mutant_why "later banner step shell: override" provision.yml 's.replace("      - name: Record head SHA for the backend approval pin\n", "      - name: Record head SHA for the backend approval pin\n        shell: sh\n", 1)' "keys must be within"
+mutant_why "bare MANAGED_TENANT in a job with no environment" provision.yml 's.replace("  apply-placeholder:\n", "  apply-placeholder:\n    env:\n      M: ${{ vars.MANAGED_TENANT }}\n", 1)' "ungated 'vars' reference"
 
 # --- operator-only is an explicit named list, checked structurally too ----
 # r1 red-team F1: a structural guess exempted a reusable callee with no

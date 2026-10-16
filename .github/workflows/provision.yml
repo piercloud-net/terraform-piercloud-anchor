@@ -407,8 +407,10 @@ jobs:
       anchor_hostname: ${{ steps.resolve.outputs.anchor_hostname }}
       tenant_user: ${{ steps.resolve.outputs.tenant_user }}
     env:
-      # Identifiers resolve from REPO-level secret values inside runs (C-E) —
-      # never dispatch inputs, never logs (values are write-only, log-masked).
+      # Identifiers resolve from stored secret values inside runs (C-E): the
+      # selected environment's value first, then repository level for names
+      # it does not define — never dispatch inputs, never logs (values are
+      # write-only, log-masked).
       # Operator-plane and per-anchor values (#204) are read directly here:
       # this job selects the tenant environment, so GitHub resolves the
       # environment's value first. The ungated visibility-banner job refuses
