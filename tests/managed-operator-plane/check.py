@@ -1,11 +1,14 @@
-"""tests/managed-operator-plane/check.py: issue #198 operator-plane pin.
+"""tests/managed-operator-plane/check.py: issues #198 + #204 operator-plane pin.
 
 A managed tenant run selects its own environment, but GitHub falls back to
-repository-level values for every name the environment does not define, and
-the operator's values live at repository level. So every `secrets` / `vars`
-reference in a workflow that a managed run can reach must be one of the exact
-gated forms below, which resolve empty (or to a tenant-only name) whenever
-`inputs.tenant` is set.
+repository-level values for every name the environment does not define. So
+every `secrets` / `vars` reference in a workflow that a managed run can reach
+must be one of the exact allowed forms below: a shared platform-plane name, a
+gated form that resolves empty whenever `inputs.tenant` is set (operator-only
+names), the TENANT_USER form (the tenant input for a managed run), or (#204,
+below) inside a tenant-environment job only, a bare read of a name the banner
+proves absent at repository level, `vars.MANAGED_TENANT`, or the
+customer-number form.
 
 Default-deny, no hand-rolled parsing: PyYAML composes the node graph (every
 key and value scalar, duplicate keys and alias targets included), the allowed
@@ -29,6 +32,34 @@ expression text from the scan). provision.yml must define the
 workflow may carry an `environment` key (the approval card is reviewed before
 the environment gate; a renamed or duplicated banner job fails too).
 
+Issue #204 (environment-scoped operator values): inside a job whose
+`environment:` is exactly the tenant expression (TENANT_ENV), the DIRECT_NAMES
+may be read bare (`${{ secrets.X }}` / `${{ vars.X }}`): GitHub resolves the
+environment's value first. The #198 leak (a repo-level value falling through
+to a tenant) is closed by refusal instead: provision.yml's ungated
+`visibility-banner` job carries exactly one step named SCOPE_STEP whose env
+holds exactly one presence probe `REPO_SCOPE_<N>: ${{ ctx.N != '' }}` per name
+in DIRECT_NAMES plus ENV_ONLY_NAMES (that job selects no environment, so the
+probe sees repository/organization scope only), and its body refuses a
+managed dispatch on any `true`. The step may carry no `if:` and no
+`continue-on-error`; every job that selects TENANT_ENV must reach
+`visibility-banner` through its `needs:` closure, and no job in that closure
+may carry a status-function `if:` (always/failure/cancelled/success in any
+form: an explicit `success() || x` replaces the implicit one) that would run
+it after the banner refused. Probe forms are allowed only inside that step;
+bare forms, `vars.MANAGED_TENANT` and the customer-number form (which reads
+TENANT_CUSTOMER_NUMBER for a managed run) only inside a TENANT_ENV job. YAML
+anchors and aliases are refused (a node shared across jobs would carry one
+job's allowance into another).
+
+The banner's execution context is pinned too (PR #205 round 1): the
+workflow's top-level keys, the banner job's keys and every banner step's
+keys are exact allowlists (no `defaults:`, `env:`, `shell:`, `if:`,
+`continue-on-error:`, `working-directory:`), and the first two banner steps
+are the preflight and the repo-scope check, each pinned whole by a sha256
+over [name, sorted env pairs, run] (PINNED_STEPS). A deliberate edit to
+either step updates its digest in the same reviewed change.
+
 This is a drift guard over the committed workflow text, not a boundary: the
 isolation is GitHub's environment / secret scoping plus the workflow text on
 the executed ref. A change that edits both the workflow and this pin passes
@@ -37,13 +68,18 @@ broker-provision-dns blob-hash pins in the same PR (a review control).
 Residuals: the allowed forms are a set of literals, not bound per name (a
 gated name may use another name's gated form; a managed run still resolves
 empty); scripts are not scanned (reading repo variables through the API needs
-`actions: read`, which no job grants); a new job with a static
-`environment:` is judged by the same literal set only. PyYAML (YAML 1.1) is not GitHub's parser; a parse difference that splits
-an expression leaves the context word in place and fails closed.
+`actions: read`, which no job grants); a job outside TENANT_ENV (a static
+`environment:` or none) may use only the global forms: the shared names, the
+gated forms (empty for a managed run) and the TENANT_USER form (the tenant
+input for a managed run). PyYAML (YAML 1.1) is not GitHub's parser; a parse
+difference that splits an expression leaves the context word in place and
+fails closed.
 
 Usage: check.py WORKFLOW_DIR   (exit 0 = pin holds; findings on stdout)
 """
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -63,12 +99,11 @@ SHARED = [
 ]
 
 # Tenant-environment-only name: the lifecycle writes it on the tenant
-# environment, and it is reserved at repo level (by convention, not enforced) (a repo-level value would
-# become the per-name fallback for a typo'd environment; disclosed in
-# docs/usage.md section 2). Read bare.
+# environment. A repo-level value would become the per-name fallback for a
+# typo'd environment, so the repo-scope step refuses one (#204). Read bare.
 TENANT_ONLY = [
     "${{ vars.MANAGED_TENANT }}",
-]
+]  # allowed only inside a TENANT_ENV job (node_allowance)
 
 # Workflows no managed run can select and that read operator values bare.
 # Explicit list, not a structural guess: a new file is checked in full.
@@ -118,13 +153,53 @@ GATED = [
     for ctx, names in GATED_NAMES.items()
     for name in names
 ]
-# Managed alias = the validated tenant input; managed customer number = the
-# tenant-only environment secret (never defined at repo level).
-TENANT_FORMS = [
-    "${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}",
-    "${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}",
+
+# Issue #204: the gated names are read bare inside a TENANT_ENV job; the
+# banner job probes each one (plus the environment-only names) at repo scope.
+TENANT_ENV = "${{ inputs.tenant != '' && inputs.tenant || 'anchor' }}"
+DIRECT_NAMES = GATED_NAMES
+DIRECT = [
+    "${{ %s.%s }}" % (ctx, name)
+    for ctx, names in DIRECT_NAMES.items()
+    for name in names
 ]
-ALLOWED = SHARED + TENANT_ONLY + GATED + TENANT_FORMS
+ENV_ONLY_NAMES = {"secrets": ["TENANT_CUSTOMER_NUMBER"], "vars": ["MANAGED_TENANT"]}
+SCOPE_STEP = "Repo-scope check (managed runs read operator-plane values from their environment only)"
+PROBES = {
+    "REPO_SCOPE_%s" % name: "${{ %s.%s != '' }}" % (ctx, name)
+    for table in (DIRECT_NAMES, ENV_ONLY_NAMES)
+    for ctx, names in table.items()
+    for name in names
+}
+# Any status function: an explicit `success()` also replaces GitHub's implicit
+# one, so `success() || <anything>` runs after the banner refused.
+STATUS_IF = re.compile(r"(?i)\b(always|failure|cancelled|success)\s*\(")
+PREFLIGHT_STEP = "Managed-input preflight (tenant/anchor_ref — fail closed before any gate)"
+# The banner job and its steps: exact key sets. No `defaults:`/`env:` on the
+# job (a `shell:` default or BASH_ENV would neuter every step), no `shell:`,
+# `if:`, `continue-on-error:` or `working-directory:` on any step.
+BANNER_JOB_KEYS = {"name", "runs-on", "outputs", "steps"}
+BANNER_STEP_KEYS = {"name", "id", "run", "env", "uses", "with"}
+# provision.yml top level: no workflow-wide `defaults:` or `env:`.
+WORKFLOW_KEYS = {"name", "run-name", "on", "concurrency", "permissions", "jobs"}
+# The first two banner steps (the preflight, then the repo-scope check) are
+# pinned whole: sha256 over [name, sorted env pairs, run]. A deliberate edit
+# updates the digest here in the same reviewed change (the mismatch message
+# prints the new value). Position matters too: no earlier step can write
+# GITHUB_ENV / GITHUB_PATH ahead of them.
+PINNED_STEPS = [
+    (PREFLIGHT_STEP, "a458a87c5a790ee8a3e160dec75d6dc8dda09075d542f6f762fff7de42e7e46a"),
+    (SCOPE_STEP, "5a3698d442a0ec392848ff8185a099d394a32c8d2c6b0fe281ceaaa33ba7caed"),
+]
+# Managed alias = the validated tenant input: a managed run never reaches the
+# TENANT_USER read, so the form is allowed in any job.
+TENANT_USER_FORM = "${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}"
+# Managed customer number = the tenant-only TENANT_CUSTOMER_NUMBER, which a
+# managed run resolves environment first, then repository level. Allowed only
+# inside a TENANT_ENV job (node_allowance): a job outside the banner's needs
+# closure would read a repository-level copy before the refusal (round 2).
+TENANT_CUSTOMER_FORM = "${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}"
+ALLOWED = SHARED + GATED + [TENANT_USER_FORM]
 
 # Any mention of either context as a word, in any case. Over-approximates on
 # prose by design: a comment inside a run: block that names the context fails
@@ -189,6 +264,180 @@ def all_nodes(node, seen):
             yield from all_nodes(value, seen)
 
 
+def mget(node, key):
+    """Every value node under an exact scalar `key` of a mapping node."""
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    return [v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == key]
+
+
+def jobs_of(doc):
+    """[(name, job node)] for every `jobs` mapping of the document."""
+    out = []
+    for jobs in mget(doc, "jobs"):
+        if isinstance(jobs, yaml.MappingNode):
+            out.extend((k.value, v) for k, v in jobs.value if isinstance(k, yaml.ScalarNode))
+    return out
+
+
+def scalar_list(node):
+    if isinstance(node, yaml.ScalarNode):
+        return [node.value]
+    if isinstance(node, yaml.SequenceNode):
+        return [c.value for c in node.value if isinstance(c, yaml.ScalarNode)]
+    return None
+
+
+def is_tenant_env_job(job):
+    envs = mget(job, "environment")
+    return len(envs) == 1 and isinstance(envs[0], yaml.ScalarNode) and envs[0].value == TENANT_ENV
+
+
+def scope_findings(path, doc):
+    """Issue #204 structure: the banner probe step and the needs closure."""
+    findings = []
+    jobs = jobs_of(doc)
+    by_name = {}
+    for name, job in jobs:
+        by_name.setdefault(name, []).append(job)
+    banner = by_name.get("visibility-banner", [])
+    if len(banner) != 1:
+        return findings  # reported by the banner-count check
+    banner = banner[0]
+    for key in ("if", "continue-on-error"):
+        if mget(banner, key):
+            findings.append("%s: visibility-banner must not carry `%s:`" % (path, key))
+    wkeys = key_names(doc)
+    if wkeys is None or not wkeys <= WORKFLOW_KEYS:
+        findings.append("%s: workflow top-level keys must be within %s (got %s)" % (path, sorted(WORKFLOW_KEYS), sorted(wkeys or [])))
+    bkeys = key_names(banner)
+    if bkeys is None or not bkeys <= BANNER_JOB_KEYS:
+        findings.append("%s: visibility-banner keys must be within %s (got %s)" % (path, sorted(BANNER_JOB_KEYS), sorted(bkeys or [])))
+    steps = [st for seq in mget(banner, "steps") if isinstance(seq, yaml.SequenceNode) for st in seq.value]
+    for i, st in enumerate(steps):
+        skeys = key_names(st)
+        if skeys is None or not skeys <= BANNER_STEP_KEYS:
+            findings.append("%s: visibility-banner step %d keys must be within %s (got %s)" % (path, i + 1, sorted(BANNER_STEP_KEYS), sorted(skeys or [])))
+    for i, (want_name, want_digest) in enumerate(PINNED_STEPS):
+        got_name = step_name(steps[i]) if i < len(steps) else None
+        if got_name != want_name:
+            findings.append("%s: visibility-banner step %d must be %r (got %r)" % (path, i + 1, want_name, got_name))
+            continue
+        got_digest = step_digest(steps[i])
+        if got_digest != want_digest:
+            findings.append("%s: visibility-banner step %d (%r) changed: digest %s, pinned %s" % (path, i + 1, want_name, got_digest, want_digest))
+    scope = [st for st in steps if any(isinstance(n, yaml.ScalarNode) and n.value == SCOPE_STEP for n in mget(st, "name"))]
+    if len(scope) != 1:
+        findings.append("%s: visibility-banner must carry the repo-scope step exactly once (found %d)" % (path, len(scope)))
+    else:
+        st = scope[0]
+        for key in ("if", "continue-on-error"):
+            if mget(st, key):
+                findings.append("%s: the repo-scope step must not carry `%s:`" % (path, key))
+        envs = mget(st, "env")
+        got = {}
+        if len(envs) == 1 and isinstance(envs[0], yaml.MappingNode):
+            for k, v in envs[0].value:
+                if not isinstance(k, yaml.ScalarNode) or not isinstance(v, yaml.ScalarNode) or k.value in got:
+                    findings.append("%s: repo-scope env must be unique scalar pairs" % path)
+                    continue
+                got[k.value] = v.value
+        want = dict(PROBES, TENANT_INPUT="${{ inputs.tenant }}")
+        if got != want:
+            missing = sorted(set(want) - set(got))
+            extra = sorted(set(got) - set(want))
+            wrong = sorted(k for k in set(got) & set(want) if got[k] != want[k])
+            findings.append("%s: repo-scope probes must equal the pinned set (missing %s, extra %s, wrong %s)" % (path, missing, extra, wrong))
+        runs = mget(st, "run")
+        body = runs[0].value if len(runs) == 1 and isinstance(runs[0], yaml.ScalarNode) else ""
+        for needle in ('for v in ${!REPO_SCOPE_@}; do', 'true) found="$found ${v#REPO_SCOPE_}" ;;', 'if [ -n "$found" ]; then'):
+            if needle not in body:
+                findings.append("%s: repo-scope step body lost %r" % (path, needle))
+    # Every TENANT_ENV job reaches the banner through `needs:`, and nothing on
+    # that path runs after a failure.
+    def needs(job):
+        out = []
+        for v in mget(job, "needs"):
+            lst = scalar_list(v)
+            out.extend(lst if lst is not None else ["<non-scalar>"])
+        return out
+    for name, job in jobs:
+        if not is_tenant_env_job(job):
+            continue
+        seen, todo, reaches = set(), [name], False
+        while todo:
+            cur = todo.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur == "visibility-banner":
+                reaches = True
+                continue
+            cands = by_name.get(cur, [])
+            if len(cands) != 1:
+                findings.append("%s: job %r in the needs closure of %r is not defined exactly once" % (path, cur, name))
+                continue
+            for cond in mget(cands[0], "if"):
+                if not isinstance(cond, yaml.ScalarNode) or STATUS_IF.search(cond.value):
+                    findings.append("%s: job %r (needs closure of %r) carries a status-function `if:`" % (path, cur, name))
+            todo.extend(needs(cands[0]))
+        if not reaches:
+            findings.append("%s: job %r selects the tenant environment but does not need visibility-banner" % (path, name))
+    return findings
+
+
+def key_names(node):
+    """Set of scalar mapping keys, or None when not a mapping / a key is not scalar."""
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    keys = set()
+    for k, _ in node.value:
+        if not isinstance(k, yaml.ScalarNode):
+            return None
+        keys.add(k.value)
+    return keys
+
+
+def step_name(st):
+    names = mget(st, "name")
+    return names[0].value if len(names) == 1 and isinstance(names[0], yaml.ScalarNode) else None
+
+
+def step_digest(st):
+    """sha256 over [name, sorted env pairs, run]; None when not plain scalars."""
+    if key_names(st) != {"name", "env", "run"}:
+        return None
+    envs, runs = mget(st, "env"), mget(st, "run")
+    if len(envs) != 1 or not isinstance(envs[0], yaml.MappingNode) or len(runs) != 1 or not isinstance(runs[0], yaml.ScalarNode):
+        return None
+    pairs = []
+    for k, v in envs[0].value:
+        if not isinstance(k, yaml.ScalarNode) or not isinstance(v, yaml.ScalarNode):
+            return None
+        pairs.append([k.value, v.value])
+    blob = json.dumps([step_name(st), sorted(pairs), runs[0].value], ensure_ascii=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def node_allowance(doc):
+    """id(scalar) -> extra allowed forms by region (no aliases: one path)."""
+    extra = {}
+    for name, job in jobs_of(doc):
+        if is_tenant_env_job(job):
+            for n in scalars(job, set()):
+                extra[id(n)] = DIRECT + TENANT_ONLY + [TENANT_CUSTOMER_FORM]
+        if name == "visibility-banner":
+            for seq in mget(job, "steps"):
+                if not isinstance(seq, yaml.SequenceNode):
+                    continue
+                for st in seq.value:
+                    if any(isinstance(n, yaml.ScalarNode) and n.value == SCOPE_STEP for n in mget(st, "name")):
+                        for env in mget(st, "env"):
+                            for n in scalars(env, set()):
+                                extra[id(n)] = list(PROBES.values())
+    return extra
+
+
 def check_file(path):
     findings = []
     with open(path, "rb") as fh:
@@ -198,11 +447,28 @@ def check_file(path):
     except (UnicodeDecodeError, yaml.YAMLError) as exc:
         return ["%s: does not parse (%s)" % (path, exc.__class__.__name__)]
     nodes = []
+    extra = {}
+    try:
+        events = list(yaml.parse(raw.decode("utf-8"), Loader=yaml.SafeLoader))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        return ["%s: does not parse (%s)" % (path, exc.__class__.__name__)]
+    for ev in events:
+        if isinstance(ev, yaml.AliasEvent) or getattr(ev, "anchor", None) is not None:
+            findings.append("%s:%d: YAML anchor/alias (refused: a shared node crosses job allowances)" % (path, ev.start_mark.line + 1))
     for doc in docs:
         if doc is None:
             continue
         nodes.extend(scalars(doc, set()))
+        # Only provision.yml carries the banner repo-scope check, so only it
+        # may read the direct names bare.
+        if os.path.basename(path) == "provision.yml":
+            extra.update(node_allowance(doc))
+            findings.extend(scope_findings(path, doc))
         for n in all_nodes(doc, set()):
+            if isinstance(n, yaml.MappingNode):
+                keys = [k.value for k, _ in n.value if isinstance(k, yaml.ScalarNode)]
+                for dup in sorted({k for k in keys if keys.count(k) > 1}):
+                    findings.append("%s:%d: duplicate mapping key %r (parsers disagree on which wins)" % (path, n.start_mark.line + 1, dup))
             if n.tag not in CORE_TAGS:
                 findings.append("%s:%d: non-core YAML tag %s" % (path, n.start_mark.line + 1, n.tag))
         banners = banner_jobs(doc)
@@ -232,7 +498,8 @@ def check_file(path):
         return findings
     for node in nodes:
         rest = node.value
-        for form in ALLOWED:
+        # Longest first: the probe and gated forms embed the bare form.
+        for form in sorted(set(ALLOWED + extra.get(id(node), [])), key=len, reverse=True):
             rest = rest.replace(form, "")
         for m in CONTEXT.finditer(rest):
             line = node.start_mark.line + 1
