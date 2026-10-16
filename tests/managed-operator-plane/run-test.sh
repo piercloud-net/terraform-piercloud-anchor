@@ -97,6 +97,27 @@ mutant "local composite action" provision.yml "s.replace('      - name: Checkout
 mutant "repository_dispatch trigger on a checked file" release.yml "s.replace('on:\n', 'on:\n  repository_dispatch:\n', 1)"
 mutant "workflow_call trigger on a checked file" release.yml "s.replace('on:\n', 'on:\n  workflow_call:\n', 1)"
 
+# --- issue #204: bare reads only in environment jobs, probes only in the
+# repo-scope step, the step is unconditional, every environment job is
+# reached through the banner ------------------------------------------------
+SCOPE="      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n        env:\n"
+LASTP="          REPO_SCOPE_MANAGED_TENANT: \${{ vars.MANAGED_TENANT != '' }}\n"
+mutant "bare read in the banner job" provision.yml "s.replace(\"$LASTP\", \"$LASTP          LEAK: \${{ secrets.NTFY_TOPIC }}\\n\", 1)"
+mutant "bare read in a job with no environment" provision.yml "s.replace('  apply-placeholder:\n', '  apply-placeholder:\n    env:\n      LEAK: \${{ secrets.NTFY_TOPIC }}\n', 1)"
+mutant "missing probe" provision.yml "s.replace(\"          REPO_SCOPE_STATUS_PULLER: \${{ vars.STATUS_PULLER != '' }}\\n\", '', 1)"
+mutant "extra probe" provision.yml "s.replace(\"$LASTP\", \"$LASTP          REPO_SCOPE_FOO: \${{ vars.FOO != '' }}\\n\", 1)"
+mutant "probe on the wrong context" provision.yml "s.replace(\"\${{ vars.STATUS_PULLER != '' }}\", \"\${{ secrets.STATUS_PULLER != '' }}\", 1)"
+mutant "probe outside the repo-scope step" provision.yml "s.replace('          MANAGED_TENANT: \${{ vars.MANAGED_TENANT }}\n', \"          MANAGED_TENANT: \${{ vars.MANAGED_TENANT }}\\n          P: \${{ vars.ANCHOR_ROLE != '' }}\\n\", 1)"
+mutant "repo-scope step renamed" provision.yml "s.replace('Repo-scope check (managed runs', 'Repo scope check (managed runs', 1)"
+mutant "repo-scope step if:" provision.yml "s.replace(\"$SCOPE\", \"$SCOPE\".replace('        env:', \"        if: inputs.tenant == 'x'\\n        env:\"), 1)"
+mutant "repo-scope step continue-on-error" provision.yml "s.replace(\"$SCOPE\", \"$SCOPE\".replace('        env:', '        continue-on-error: true\\n        env:'), 1)"
+mutant "banner job continue-on-error" provision.yml "s.replace('  visibility-banner:\n', '  visibility-banner:\n    continue-on-error: true\n', 1)"
+mutant "device-flow needs removed" provision.yml "s.replace('    needs: [visibility-banner]\n', '', 1)"
+mutant "device-flow if: always()" provision.yml "s.replace('    needs: [visibility-banner]\n', '    needs: [visibility-banner]\n    if: always()\n', 1)"
+mutant "device-flow if: !success()" provision.yml "s.replace('    needs: [visibility-banner]\n', \"    needs: [visibility-banner]\\n    if: \${{ !success() }}\\n\", 1)"
+mutant "anchor-dns if: always()" provision.yml "s.replace(\"    if: inputs.mode == 'apply'\\n    # Same gate as device-flow\", \"    if: always() && inputs.mode == 'apply'\\n    # Same gate as device-flow\", 1)"
+mutant "anchor on a scope-step node" provision.yml "s.replace('          TENANT_INPUT: \${{ inputs.tenant }}\n          REPO_SCOPE_', '          TENANT_INPUT: &t \${{ inputs.tenant }}\n          REPO_SCOPE_', 1)"
+
 # --- operator-only is an explicit named list, checked structurally too ----
 # r1 red-team F1: a structural guess exempted a reusable callee with no
 # environment/tenant text. Only OPERATOR_ONLY files may read operator values
@@ -149,6 +170,43 @@ fi
 if out="$(run_binding envproof envproof 123456)"; then ok "provisioned managed run passes"; else bad "provisioned managed run refused: $out"; fi
 if out="$(run_binding '' '' '')"; then ok "operator run unaffected by the managed check"; else bad "operator run refused: $out"; fi
 if out="$(run_binding envproof other 123456)"; then bad "marker mismatch passes"; else ok "marker mismatch still refused"; fi
+
+# --- behavior: the real repo-scope step (issue #204) ----------------------
+python3 -I -B - "$PROV" "$WORK/scope.sh" "$WORK/probes.txt" <<'PY'
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+steps = [s for s in wf["jobs"]["visibility-banner"]["steps"]
+         if s.get("name") == "Repo-scope check (managed runs read operator-plane values from their environment only)"]
+assert len(steps) == 1, len(steps)
+open(sys.argv[2], "w").write(steps[0]["run"])
+open(sys.argv[3], "w").write("\n".join(k for k in steps[0]["env"] if k.startswith("REPO_SCOPE_")) + "\n")
+PY
+mapfile -t PROBES < "$WORK/probes.txt"
+# run_scope TENANT [NAME=VALUE ...]: every probe false unless overridden.
+run_scope() {
+  local t="$1"; shift
+  local args=() p
+  for p in "${PROBES[@]}"; do args+=("$p=false"); done
+  env -i PATH="$PATH" TENANT_INPUT="$t" "${args[@]}" "$@" bash "$WORK/scope.sh" 2>&1
+}
+if [ "${#PROBES[@]}" -ge 20 ]; then ok "repo-scope step carries ${#PROBES[@]} probes"; else bad "repo-scope step carries only ${#PROBES[@]} probes"; fi
+if out="$(run_scope envproof REPO_SCOPE_NTFY_TOPIC=true)"; then
+  bad "managed run with a repo-level NTFY_TOPIC passes"
+else
+  ok "managed run with a repo-level copy refused"
+  contains "refusal names the repo-level name" "NTFY_TOPIC" "$out"
+  contains "refusal happens before any gate" "before any gate or device card" "$out"
+fi
+if out="$(run_scope envproof REPO_SCOPE_MANAGED_TENANT=true)"; then bad "repo-level MANAGED_TENANT passes"; else ok "repo-level MANAGED_TENANT refused"; fi
+if out="$(run_scope envproof)"; then ok "managed run with no repo-level copies passes"; else bad "clean managed run refused: $out"; fi
+if out="$(run_scope '' REPO_SCOPE_NTFY_TOPIC=true REPO_SCOPE_ANCHOR_ROLE=true)"; then ok "operator run keeps its repo-level values"; else bad "operator run refused: $out"; fi
+if out="$(env -i PATH="$PATH" TENANT_INPUT=envproof bash "$WORK/scope.sh" 2>&1)"; then
+  bad "managed run with no probes passes"
+else
+  contains "no probes fails closed" "fail closed" "$out"
+fi
+if out="$(run_scope envproof REPO_SCOPE_NTFY_TOPIC=)"; then bad "empty probe value passes"; else ok "empty probe value refused"; fi
+if out="$(run_scope envproof REPO_SCOPE_NTFY_TOPIC=TRUE)"; then bad "non-boolean probe value passes"; else ok "non-boolean probe value refused"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

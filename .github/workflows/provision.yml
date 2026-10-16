@@ -207,7 +207,7 @@ jobs:
       # dispatch, before any gate or device card, naming the names (never
       # the values; a probe is a boolean). The probe set is pinned to the
       # set of names read directly in the environment jobs
-      # (tests/managed-operator-plane). MANAGED_TENANT and
+      # (the managed-operator-plane harness). MANAGED_TENANT and
       # TENANT_CUSTOMER_NUMBER are environment-only by contract.
       - name: Repo-scope check (managed runs read operator-plane values from their environment only)
         env:

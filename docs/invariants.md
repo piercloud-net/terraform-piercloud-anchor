@@ -108,6 +108,18 @@ runner-side account↔anchor inventory check (R8 M7 workstream) — until then
 the 1:1 relation rests on provisioning discipline, with the lane + preflight
 as the repo-side controls.
 
+## Invariant 4 — a managed run reads only its own anchor's values (issue #204)
+
+> A managed dispatch (`tenant` set) reads its operator-plane and per-anchor
+> values (role, ntfy, witness key, TLS chain, status puller, extra monitors,
+> root password, anchor address, SCP user) from its own GitHub environment.
+> No such value may exist at repository or organization level while managed
+> dispatches run: GitHub falls back from an environment to the repository per
+> name, so a repository-level copy would reach every managed anchor whose
+> environment lacks it.
+
+**Rationale.** Issue #198 closed the fall-through by blanking these values on every managed run, which also made a managed operator anchor impossible (no role, no witness, no alerts). Environment-scoped values give each anchor its own set; the refusal keeps the fall-through closed. Enforced by: the ungated banner job's repo-scope step (one presence probe per name, refuses a managed dispatch on any repository- or organization-level copy, before any gate or device card), and the `tests/managed-operator-plane` pin (bare reads only inside tenant-environment jobs, the probe set equal to the bare-read set, every tenant-environment job behind the banner). `TENANT_USER` and `CUSTOMER_NUMBER` stay operator-only and are never read by a managed run; the platform-plane `CLOUDFRONT_ORIGIN_SECRET` and `MAIN_BOX_IPV4` are shared by design. **Residual:** a repository-level value created after a run's banner job passed is read by that run's later jobs (an operator-controlled race; the next dispatch refuses).
+
 ## S1 — every netcup use human-approved per run
 
 > No stored tokens, no crons. Each run authenticates via the tenant's

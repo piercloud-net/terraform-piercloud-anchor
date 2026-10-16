@@ -81,9 +81,8 @@ SHARED = [
 ]
 
 # Tenant-environment-only name: the lifecycle writes it on the tenant
-# environment, and it is reserved at repo level (by convention, not enforced) (a repo-level value would
-# become the per-name fallback for a typo'd environment; disclosed in
-# docs/usage.md section 2). Read bare.
+# environment. A repo-level value would become the per-name fallback for a
+# typo'd environment, so the repo-scope step refuses one (#204). Read bare.
 TENANT_ONLY = [
     "${{ vars.MANAGED_TENANT }}",
 ]
