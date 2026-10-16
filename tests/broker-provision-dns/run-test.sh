@@ -583,7 +583,7 @@ RUN_START="$(awk -F'\t' '$2 == "      - name: Run the committed script harnesses
 RUN_END="$(awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
   RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
-  is "harness-run step blob hash (pin: update after a deliberate edit)" "286baff6b596031b9d0faaa716dac758b1515251ee3fafa2454d639184991182" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "harness-run step blob hash (pin: update after a deliberate edit)" "ce1055bc7e53a814ddc4c9a3ef55f5d88034c0f1c91b17449536a75cc579f0f5" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
   is "harness-run step keeps the gate expression" "1" "$(printf '%s\n' "$RUN_STEP_BLOB" | grep -cE '^        if: steps\.gate\.outputs\.run == .yes.$')"
 else
   bad "harness-run step span not found in ci.yml"
@@ -593,7 +593,7 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # see an inserted step in the same job that rewrites a harness on the runner
 # before the pinned run step executes it (the static harnesses read the PR
 # tree, not the runner workspace). Any deliberate job edit updates this pin.
-is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "d28a8019bf4a441e04e5409c93ab5ec0b4591520ebf0e9adc57ceca9e57076b3" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "08c1324f6545b0627e543cbd014c7544a6598ee36e70da7e3aba22c9431efbe8" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -824,8 +824,8 @@ if [ "$top_digest_got" != "79697d40de1560fdff6c3c014c5f023e93fde0425295d70438f98
   done
 fi
 on_digest_got="$(printf '%s' "$wf_on_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow on: trigger blocks are pinned (pin: update for a deliberate trigger change)" "4e7f26bf4c989cd1329dad27ea393924f24d3ed9842371b61ab5121d8142591f" "$on_digest_got"
-if [ "$on_digest_got" != "4e7f26bf4c989cd1329dad27ea393924f24d3ed9842371b61ab5121d8142591f" ]; then
+is "workflow on: trigger blocks are pinned (pin: update for a deliberate trigger change)" "9f3211d610ef69fa59c9ecc3bc89b94813c4de5dcd433e93522d9db99b752a72" "$on_digest_got"
+if [ "$on_digest_got" != "9f3211d610ef69fa59c9ecc3bc89b94813c4de5dcd433e93522d9db99b752a72" ]; then
   printf '   on: parts (to update the pin):\n'; printf '%s' "$wf_on_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 perm_digest_got="$(printf '%s' "$wf_perm_digest" | sha256sum | cut -d' ' -f1)"
@@ -850,8 +850,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" "$tests_digest_got"
-if [ "$tests_digest_got" != "dae05af53c379e28936506e5a7aa0448b94aa4036bad5f78a48654969aca1b2a" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "9aeb9f01b11eb71a9f82e96b18854805c1242a7f4ac3ec0a25b4ec13f1fb15e1" "$tests_digest_got"
+if [ "$tests_digest_got" != "9aeb9f01b11eb71a9f82e96b18854805c1242a7f4ac3ec0a25b4ec13f1fb15e1" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
@@ -895,7 +895,7 @@ GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts
 GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
-  is "gate step blob hash (pin: update after a deliberate edit)" "0f85dbbe46c2abad81a846cc32397163ec1a3cb9a50afe5c674849b1ebcd18e9" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "gate step blob hash (pin: update after a deliberate edit)" "e64511b2a02fc2ecc0b9f57d17a3dbc4eac1f4e08ecfe3c5432cdd8bbc0f37b4" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "gate step span not found in ci.yml"
 fi
@@ -1262,7 +1262,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=296
+CHECK_FLOOR=297
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

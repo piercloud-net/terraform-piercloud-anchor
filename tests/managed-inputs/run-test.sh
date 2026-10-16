@@ -221,10 +221,11 @@ rc="$(RUN_BODY p2b "$PREFLIGHT_BODY" TENANT_INPUT=_foo ANCHOR_REF=ok MODE=check)
 is "p2b leading underscore rc" "1" "$rc"
 rc="$(RUN_BODY p2c "$PREFLIGHT_BODY" TENANT_INPUT=_ ANCHOR_REF=ok MODE=check)"
 is "p2c lone underscore rc" "1" "$rc"
-# Trailing underscore is inside the allowed charset (N3: the message must not
-# claim otherwise).
+# #198: the tenant input is the managed alias, so the preflight enforces the
+# pc-control environment/alias grammar ^[a-z0-9]{3,15}$ plus the anchor's
+# reserved prefixes (underscores and hyphens are refused now).
 rc="$(RUN_BODY p2d "$PREFLIGHT_BODY" TENANT_INPUT=foo_ ANCHOR_REF=ok MODE=check)"
-is "p2d trailing underscore allowed rc" "0" "$rc"
+is "p2d trailing underscore refused rc" "1" "$rc"
 
 rc="$(RUN_BODY p3 "$PREFLIGHT_BODY" TENANT_INPUT=-foo ANCHOR_REF=ok MODE=check)"
 is "p3 leading hyphen rc" "1" "$rc"
@@ -233,7 +234,39 @@ is "p3b trailing hyphen rc" "1" "$rc"
 
 rc="$(RUN_BODY p4 "$PREFLIGHT_BODY" "TENANT_INPUT=$LONG41" ANCHOR_REF=ok MODE=check)"
 is "p4 long tenant rc" "1" "$rc"
-contains "p4 names the tenant length" "tenant input exceeds 40 characters" "$(OUT p4)"
+contains "p4 names the tenant length" "tenant input must be 3-15 characters" "$(OUT p4)"
+
+# p8 (#198 differential): the preflight must never admit a name the canonical
+# validator (scripts/lib/naming.sh validate_tenant_username) refuses, or the
+# refusal would land after the device card. Accepted names must also fit the
+# pc-control environment grammar ^[a-z0-9]{3,15}$.
+LONG16="$(printf 'a%.0s' {1..16})"
+LONG21="$(printf 'a%.0s' {1..21})"
+. "$ROOT/scripts/lib/naming.sh"
+for name in envproof foo abc 123 abc123def456ghi pier-2 my_tenant ab a \
+    "$LONG16" "$LONG21" status1 statusx anchor1 pcuabc12345 pcu platform1 \
+    Pier pier. "pier x" envtagproof mail www edge broker mailbox; do
+  rc="$(RUN_BODY p8 "$PREFLIGHT_BODY" "TENANT_INPUT=$name" ANCHOR_REF=ok MODE=check)"
+  if [ "$rc" = 0 ]; then
+    if validate_tenant_username "$name" 2>/dev/null && [[ "$name" =~ ^[a-z0-9]{3,15}$ ]]; then
+      ok "p8 preflight-accepted '$name' passes the canonical validator and the env grammar"
+    else
+      bad "p8 preflight accepts '$name' but the canonical validator / env grammar refuses it"
+    fi
+  else
+    ok "p8 preflight refuses '$name' before any gate"
+  fi
+done
+for name in pier-2 my_tenant ab "$LONG16" status1 anchor1 pcuabc12345 platform1 edge console ops keys unlock bounce mail broker www; do
+  rc="$(RUN_BODY p8r "$PREFLIGHT_BODY" "TENANT_INPUT=$name" ANCHOR_REF=ok MODE=check)"
+  is "p8 '$name' refused by the preflight rc" "1" "$rc"
+done
+
+# b4 (#198): the binding step runs the canonical validator before the device
+# card (defense in depth behind the preflight).
+rc="$( cd "$ROOT" && RUN_BODY b4 "$BINDING_BODY" TENANT_INPUT=pier-2 MANAGED_TENANT=pier-2 CUSTOMER_NUMBER=123456)"
+is "b4 binding step refuses an invalid tenant name rc" "1" "$rc"
+contains "b4 names the refusal before the device card" "not a valid tenant name" "$(OUT b4)"
 
 rc="$(RUN_BODY p5 "$PREFLIGHT_BODY" TENANT_INPUT=foo "ANCHOR_REF=bad ref" MODE=check)"
 is "p5 bad anchor_ref charset rc" "1" "$rc"
@@ -258,8 +291,14 @@ rc="$(RUN_BODY b1 "$BINDING_BODY" TENANT_INPUT=foo)"
 is "b1 tenant without marker rc" "1" "$rc"
 contains "b1 names the marker" "does not carry MANAGED_TENANT" "$(OUT b1)"
 
-rc="$(RUN_BODY b2 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=foo)"
+# #198: a managed run also needs its tenant-only customer number (the job
+# env resolves TENANT_CUSTOMER_NUMBER into CUSTOMER_NUMBER on a managed run).
+rc="$(RUN_BODY b2 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=foo CUSTOMER_NUMBER=123456)"
 is "b2 matching marker rc" "0" "$rc"
+
+rc="$(RUN_BODY b2n "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=foo)"
+is "b2n matching marker, no tenant customer number rc" "1" "$rc"
+contains "b2n names the tenant-only secret" "TENANT_CUSTOMER_NUMBER" "$(OUT b2n)"
 
 rc="$(RUN_BODY b3 "$BINDING_BODY" TENANT_INPUT=foo MANAGED_TENANT=bar)"
 is "b3 mismatching marker rc" "1" "$rc"
