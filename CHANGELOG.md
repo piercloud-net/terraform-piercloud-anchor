@@ -71,6 +71,7 @@ All notable changes to this project will be documented in this file.
 - *(anchor-dns)* Explicit per-tenant dashboard CNAME (wildcard-ENT immunity) (closes #178)
 - *(banner)* Count workflows against the full base ref + fail loud (closes #130)
 - *(a1)* Post-sweep no-token no-op short-circuits before the id guards (closes #196)
+- *(managed)* A managed tenant run never reads the operator-plane repo values (closes #198)
 
 ### 💼 Other
 
