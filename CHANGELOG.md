@@ -70,6 +70,7 @@ All notable changes to this project will be documented in this file.
 - *(010)* Enforce the ORIGIN_CA_CERT_PEM chain + prove the A2 edge (closes #172)
 - *(anchor-dns)* Explicit per-tenant dashboard CNAME (wildcard-ENT immunity) (closes #178)
 - *(banner)* Count workflows against the full base ref + fail loud (closes #130)
+- *(a1)* Post-sweep no-token no-op short-circuits before the id guards (closes #196)
 
 ### 💼 Other
 
