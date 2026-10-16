@@ -46,7 +46,7 @@
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
 #
-# Issue #196 (entrypoint cases e1-e11, at the end): these run the WHOLE
+# Issue #196 (entrypoint cases e1-e12, at the end): these run the WHOLE
 # script as a subprocess (`env -i`, nothing stubbed) so the ordering of the
 # no-token sweep-post short-circuit against the global id guards is pinned.
 # A `curl` tripwire on PATH records every PATH-resolved curl call in a hit
@@ -341,6 +341,9 @@ is "e8 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e
 E2E_NET=present E2E e9 sweep-post MODE=apply NETCUP_SCP_ACCESS_TOKEN=AT ANCHOR_HOSTNAME=anchor.example.net SERVER_ID=1 SCP_USER_ID=1
 is "e9 apply + token + valid ids reaches the API (rc != 0)" "nonzero" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)"
 is "e9 no no-op line" "0" "$(grep -c 'no token held' "$WORK/e2e.e9" || true)"
+# e12: the no-token no-op holds in apply mode too (the destructive mode): a
+# no-op gated to report-only modes would regrow #196 there (r4 functional).
+noop_case e12 MODE=apply NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
 # e10: an EMPTY handoff value is not a token -> still the clean no-op.
 printf 'NETCUP_SCP_ACCESS_TOKEN=\n' > "$WORK/github_env.e10"
 noop_case e10 GITHUB_ENV="$WORK/github_env.e10" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=

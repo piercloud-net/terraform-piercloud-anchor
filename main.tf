@@ -159,9 +159,10 @@ locals {
   # server id deliberately left the name (issue #121): it is the alias →
   # netcup-account join key and policy names land in public logs/summaries.
   # 020's sweep-post (apply mode) retires, in the same run, any unattached
-  # piercloud-anchor- policy for THIS server: names ending -<hostname> or the
-  # pre-change -<server_id> shape (one-time migration); policies under a
-  # previous hostname are not matched (not swept). The attached
+  # piercloud-anchor- policy whose name ENDS with -<hostname> or with the
+  # pre-change -<server_id> (one-time migration) — a suffix match, so a
+  # longer hostname sharing the suffix also matches (tracked separately).
+  # The attached
   # live policy is never touched (D3, issues #101/#121).
   policy_name = "piercloud-anchor-${var.hostname}"
 

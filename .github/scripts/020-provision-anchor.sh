@@ -249,7 +249,9 @@ MODE="${MODE:-}"
 # "No token" means neither the step env nor a non-empty $GITHUB_ENV handoff
 # line (the source scp_token_refresh adopts) holds one; a handoff token falls
 # through to the guards (fail closed), and so does a $GITHUB_ENV that exists
-# but cannot be read or searched (grep rc != 1). Defense in depth: each step
+# but cannot be read or searched (grep rc != 1). A path that cannot even be
+# stat'ed (a parent denies search) reads as absent -> no-op; unreachable on
+# runners, where the runner user owns the per-step file. Defense in depth: each step
 # gets a fresh empty $GITHUB_ENV from the runner, so at entry this clause is
 # not expected to match in production. The refresh-token file is not consulted: the
 # workflow writes the access-token line before it exports the refresh file
@@ -506,10 +508,11 @@ policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
 list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
   # Family scope (issue #121): the piercloud-anchor- prefix AND either the
   # new hostname anchor (endswith -<hostname>) or the pre-change id anchor
-  # (endswith -<server id>, migration only). A hostname renamed to ANOTHER
-  # hostname, or another server's legacy name, matches neither — never
-  # swept, never logged. The attached-policy compare in cmd_sweep_post
-  # still protects the live policy.
+  # (endswith -<server id>, migration only). This is a SUFFIX match: a name
+  # under another (e.g. previous or longer) hostname that ends with
+  # -<hostname> also matches and, if unattached here, is swept in apply mode
+  # (tracked as its own issue). The attached-policy compare in
+  # cmd_sweep_post still protects the live policy.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
