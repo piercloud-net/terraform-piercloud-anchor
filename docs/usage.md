@@ -61,9 +61,10 @@ Managed-run residuals (disclosed):
 - No per-anchor TLS chain and no status puller: the dashboard certificate and the dynamic status page are operator-only until the broker DNS-01 path ships for tenants.
 - The device code appears only in the public run log: managed tenants have no private device-code channel yet (pc-control #145).
 - `TENANT_CUSTOMER_NUMBER` must be created on the tenant environment by hand: nothing writes it yet.
-- Tenant boxes hold the shared `CLOUDFRONT_ORIGIN_SECRET` (rendered into the root-only Caddyfile, and a tenant has root on its box). With its own CloudFront distribution, a tenant can reach any anchor's dashboard origin directly. That reach is status-page content only; tang and API paths abort (security-posture row 3; per-anchor origin secret tracked as a follow-up).
+- Tenant boxes hold the shared `CLOUDFRONT_ORIGIN_SECRET` (rendered into the root-only Caddyfile, and a tenant has root on its box). With its own CloudFront distribution, a tenant can reach any anchor's dashboard origin directly. That reach is status-page content only; tang and API paths abort. This is reasoned from the Caddy gate and the CloudFront ranges, not live-tested (security-posture row 3; per-anchor origin secret: #202).
 - `MAIN_BOX_IPV4` tells each tenant the pc-host address (its firewall admits it). It is informational only: spoofing a TCP source from a tenant box is not practical.
-- `MANAGED_TENANT` and `TENANT_CUSTOMER_NUMBER` are reserved: never define them at repo level. GitHub falls back to repo-level values per name, so a repo-level value would satisfy the marker or the customer-number check for a typo'd environment.
+- `MANAGED_TENANT` and `TENANT_CUSTOMER_NUMBER` are reserved: never define them at repo level. GitHub falls back to repo-level values per name, so a repo-level value would satisfy the marker or the customer-number check for a typo'd environment. This is a convention; neither the pin nor the workflow enforces it.
+- The pin (`tests/managed-operator-plane`) scans workflow text only: scripts are not scanned (reading repo variables through the API needs `actions: read`, which no job grants), and the allowed forms are literals not bound per name.
 
 ## 3. Dispatch and approve (S1)
 

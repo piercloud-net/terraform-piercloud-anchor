@@ -245,7 +245,7 @@ LONG21="$(printf 'a%.0s' {1..21})"
 . "$ROOT/scripts/lib/naming.sh"
 for name in envproof foo abc 123 abc123def456ghi pier-2 my_tenant ab a \
     "$LONG16" "$LONG21" status1 statusx anchor1 pcuabc12345 pcu platform1 \
-    Pier pier. "pier x" envtagproof; do
+    Pier pier. "pier x" envtagproof mail www edge broker mailbox; do
   rc="$(RUN_BODY p8 "$PREFLIGHT_BODY" "TENANT_INPUT=$name" ANCHOR_REF=ok MODE=check)"
   if [ "$rc" = 0 ]; then
     if validate_tenant_username "$name" 2>/dev/null && [[ "$name" =~ ^[a-z0-9]{3,15}$ ]]; then
@@ -257,7 +257,7 @@ for name in envproof foo abc 123 abc123def456ghi pier-2 my_tenant ab a \
     ok "p8 preflight refuses '$name' before any gate"
   fi
 done
-for name in pier-2 my_tenant ab "$LONG16" status1 anchor1 pcuabc12345 platform1; do
+for name in pier-2 my_tenant ab "$LONG16" status1 anchor1 pcuabc12345 platform1 edge console ops keys unlock bounce mail broker www; do
   rc="$(RUN_BODY p8r "$PREFLIGHT_BODY" "TENANT_INPUT=$name" ANCHOR_REF=ok MODE=check)"
   is "p8 '$name' refused by the preflight rc" "1" "$rc"
 done

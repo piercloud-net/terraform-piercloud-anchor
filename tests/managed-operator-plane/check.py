@@ -15,18 +15,27 @@ expressions are removed as exact literals, and any remaining mention of the
 A workflow may read the operator's values bare only if it is NAMED in
 OPERATOR_ONLY and its node graph still has no `environment` key, no `tenant`
 key and no `inputs.tenant` reference (any case). Any other file is checked in
-full. Any local `uses: ./...` (a reusable workflow or a composite action,
-which this pin does not scan) and a `workflow_call` / `workflow_run` /
+full. Every `uses:` value must be one of the exact USES_ALLOWED strings: a
+composite action or reusable workflow runs with the calling job's `vars` and
+this pin never scans its file, so a new one is a deliberate pin update. Any
+local `uses: ./...` also fails, and a `workflow_call` / `workflow_run` /
 `repository_dispatch` trigger fail closed anywhere: they let a managed run
 execute, or feed, a file the environment checks never see.
 Every node must carry a core YAML tag (a `!!binary` or custom tag would hide
-expression text from the scan), and `visibility-banner` must have no
-`environment` key (the approval card is reviewed before the environment gate).
+expression text from the scan), and provision.yml's `visibility-banner` job
+must exist and have no `environment` key (the approval card is reviewed before
+the environment gate; a renamed banner job fails too).
 
 This is a drift guard over the committed workflow text, not a boundary: the
 isolation is GitHub's environment / secret scoping plus the workflow text on
-the executed ref, and a change that edits both the workflow and this pin passes
-it. PyYAML (YAML 1.1) is not GitHub's parser; a parse difference that splits
+the executed ref. A change that edits both the workflow and this pin passes
+it, and so does one that drops the ci.yml run step and updates the
+broker-provision-dns blob-hash pins in the same PR (a review control).
+Residuals: the allowed forms are a set of literals, not bound per name (a
+gated name may use another name's gated form; a managed run still resolves
+empty); scripts are not scanned (reading repo variables through the API needs
+`actions: read`, which no job grants); a new job with a static
+`environment:` is judged by the same literal set only. PyYAML (YAML 1.1) is not GitHub's parser; a parse difference that splits
 an expression leaves the context word in place and fails closed.
 
 Usage: check.py WORKFLOW_DIR   (exit 0 = pin holds; findings on stdout)
@@ -50,8 +59,8 @@ SHARED = [
     "${{ secrets.MAIN_BOX_IPV4 }}",
 ]
 
-# Tenant-environment-only names: the lifecycle writes them on the tenant
-# environment and they are reserved at repo level (a repo-level value would
+# Tenant-environment-only name: the lifecycle writes it on the tenant
+# environment, and it is reserved at repo level (by convention, not enforced) (a repo-level value would
 # become the per-name fallback for a typo'd environment; disclosed in
 # docs/usage.md section 2). Read bare.
 TENANT_ONLY = [
@@ -61,6 +70,18 @@ TENANT_ONLY = [
 # Workflows no managed run can select and that read operator values bare.
 # Explicit list, not a structural guess: a new file is checked in full.
 OPERATOR_ONLY = {"ci.yml", "external-watch.yml"}
+
+# Every `uses:` value in the tree, exactly (SHA-pinned or the owner's own
+# release actions). A composite action reads the calling job's `vars`, and
+# this pin does not scan action files, so any other value fails closed.
+USES_ALLOWED = {
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+    "opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4",
+    "cad0p/semver-calver-release/release@v1",
+    "cad0p/semver-calver-release/validate-package-version@v1",
+    "cad0p/semver-calver-release/validate-release-pr@v1",
+}
 
 CORE_TAGS = {
     "tag:yaml.org,2002:" + t
@@ -118,17 +139,26 @@ def scalars(node, seen):
             yield from scalars(value, seen)
 
 
-def banner_environment(doc):
-    """True when jobs.visibility-banner has an `environment` key."""
-    if not isinstance(doc, yaml.MappingNode):
-        return False
-    for key, value in doc.value:
-        if key.value == "jobs" and isinstance(value, yaml.MappingNode):
-            for jkey, job in value.value:
-                if jkey.value == "visibility-banner" and isinstance(job, yaml.MappingNode):
-                    if any(k.value.lower() == "environment" for k, _ in job.value):
-                        return True
-    return False
+def banner_problem(doc):
+    """None when jobs.visibility-banner exists and selects no environment."""
+    if isinstance(doc, yaml.MappingNode):
+        for key, value in doc.value:
+            if key.value == "jobs" and isinstance(value, yaml.MappingNode):
+                for jkey, job in value.value:
+                    if jkey.value == "visibility-banner" and isinstance(job, yaml.MappingNode):
+                        if any(k.value.lower() == "environment" for k, _ in job.value):
+                            return "visibility-banner must not select an environment"
+                        return None
+    return "visibility-banner job not found"
+
+
+def uses_values(node, seen):
+    """Value nodes of every mapping key spelled `uses` (any case)."""
+    for n in all_nodes(node, seen):
+        if isinstance(n, yaml.MappingNode):
+            for k, v in n.value:
+                if isinstance(k, yaml.ScalarNode) and k.value.strip().lower() == "uses":
+                    yield v
 
 
 def all_nodes(node, seen):
@@ -161,8 +191,13 @@ def check_file(path):
         for n in all_nodes(doc, set()):
             if n.tag not in CORE_TAGS:
                 findings.append("%s:%d: non-core YAML tag %s" % (path, n.start_mark.line + 1, n.tag))
-        if banner_environment(doc):
-            findings.append("%s: visibility-banner must not select an environment" % path)
+        if os.path.basename(path) == "provision.yml":
+            problem = banner_problem(doc)
+            if problem:
+                findings.append("%s: %s" % (path, problem))
+        for v in uses_values(doc, set()):
+            if not isinstance(v, yaml.ScalarNode) or v.value not in USES_ALLOWED:
+                findings.append("%s:%d: `uses:` value not in USES_ALLOWED: %r" % (path, v.start_mark.line + 1, getattr(v, "value", v)))
     texts = [n.value.lower() for n in nodes]
     for n in nodes:
         t = n.value.strip().lower()

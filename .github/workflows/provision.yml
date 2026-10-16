@@ -153,6 +153,7 @@ jobs:
             '') ;;
             *[!a-z0-9]*) echo "::error::tenant input must match ^[a-z0-9]{3,15}$ (the pc-control environment/alias grammar) — refusing."; exit 1 ;;
             anchor* | status* | pcu* | platform*) echo "::error::tenant input starts with a reserved prefix (anchor/status/pcu/platform) — refusing."; exit 1 ;;
+            edge | console | ops | keys | unlock | bounce | mail | broker | www) echo "::error::tenant input is a reserved platform name (pc-control registry reserved set) — refusing."; exit 1 ;;
           esac
           if [ -n "$TENANT_INPUT" ] && { [ "${#TENANT_INPUT}" -lt 3 ] || [ "${#TENANT_INPUT}" -gt 15 ]; }; then
             echo "::error::tenant input must be 3-15 characters (the pc-control environment/alias grammar) — refusing."; exit 1
