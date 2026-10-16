@@ -46,13 +46,14 @@
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
 #
-# Issue #196 (entrypoint cases e1-e8, at the end): these run the WHOLE
+# Issue #196 (entrypoint cases e1-e11, at the end): these run the WHOLE
 # script as a subprocess (`env -i`, nothing stubbed) so the ordering of the
 # no-token sweep-post short-circuit against the global id guards is pinned.
-# They never reach an API helper: a `curl` tripwire on PATH records every
-# PATH-resolved curl call in a hit file (so redirected stderr cannot hide it)
-# and any hit fails the case; curl is the only API transport (_api_curl +
-# token endpoint). A PATH shim does not catch an absolute-path binary or ssh.
+# A `curl` tripwire on PATH records every PATH-resolved curl call in a hit
+# file (so redirected stderr cannot hide it); curl is the only API transport
+# (_api_curl + token endpoint). Every case except the positive controls e7/e9
+# must leave it untouched (never reach an API helper); e7/e9 (token + valid
+# ids) must hit it. A PATH shim does not catch an absolute-path binary or ssh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -335,6 +336,20 @@ printf 'NETCUP_SCP_ACCESS_TOKEN=AT\n' > "$WORK/github_env.e8"
 E2E e8 sweep-post GITHUB_ENV="$WORK/github_env.e8" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
 is "e8 handoff token + empty SERVER_ID rc 1" "1" "$rc"
 is "e8 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e8" || true)"
+# e9: same in apply mode (the destructive mode) — the no-op must never be
+# mode-gated; a token-bearing apply sweep-post reaches the API (r3 red-team).
+E2E_NET=present E2E e9 sweep-post MODE=apply NETCUP_SCP_ACCESS_TOKEN=AT ANCHOR_HOSTNAME=anchor.example.net SERVER_ID=1 SCP_USER_ID=1
+is "e9 apply + token + valid ids reaches the API (rc != 0)" "nonzero" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)"
+is "e9 no no-op line" "0" "$(grep -c 'no token held' "$WORK/e2e.e9" || true)"
+# e10: an EMPTY handoff value is not a token -> still the clean no-op.
+printf 'NETCUP_SCP_ACCESS_TOKEN=\n' > "$WORK/github_env.e10"
+noop_case e10 GITHUB_ENV="$WORK/github_env.e10" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+# e11: a $GITHUB_ENV that cannot be searched (a directory: grep rc 2) counts
+# as held -> guards apply (fail closed; root bypasses chmod 000, a dir does not).
+mkdir -p "$WORK/github_env.e11"
+E2E e11 sweep-post GITHUB_ENV="$WORK/github_env.e11" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e11 unsearchable GITHUB_ENV + empty SERVER_ID rc 1" "1" "$rc"
+is "e11 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e11" || true)"
 # Other commands with no token are unchanged (the short-circuit is sweep-post only).
 E2E e6 sweep-pre NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
 is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"

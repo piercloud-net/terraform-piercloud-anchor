@@ -246,13 +246,23 @@ MODE="${MODE:-}"
 # apply unchanged: a run that holds a token but failed before resolve wrote
 # SERVER_ID still fails `SERVER_ID is required` (fail closed, deliberate).
 # cmd_sweep_post keeps its own no-token branch as defense in depth.
-# "No token" means neither the step env nor a $GITHUB_ENV handoff line (the
-# source scp_token_refresh adopts) holds one; a handoff token falls through
-# to the guards (fail closed, even though each step's $GITHUB_ENV starts empty).
+# "No token" means neither the step env nor a non-empty $GITHUB_ENV handoff
+# line (the source scp_token_refresh adopts) holds one; a handoff token falls
+# through to the guards (fail closed), and so does a $GITHUB_ENV that exists
+# but cannot be read or searched (grep rc != 1). Defense in depth: each step
+# gets a fresh empty $GITHUB_ENV from the runner, so at entry this clause is
+# not expected to match in production. The refresh-token file is not consulted: the
+# workflow writes the access-token line before it exports the refresh file
+# (provision.yml device-flow poll), so a refresh file never exists alone.
+handoff_token_held=0
+if [ -n "${GITHUB_ENV:-}" ] && [ -e "$GITHUB_ENV" ]; then
+  handoff_rc=0
+  grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV" 2>/dev/null || handoff_rc=$?
+  [ "$handoff_rc" -eq 1 ] || handoff_token_held=1
+fi
 if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ] \
-  && ! { [ -n "${GITHUB_ENV:-}" ] && [ -f "$GITHUB_ENV" ] \
-         && grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV"; }; then
-  log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that gets past resolve; report-only modes do not delete)"
+  && [ "$handoff_token_held" -eq 0 ]; then
+  log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that holds a token and resolves SERVER_ID; report-only modes do not delete)"
   exit 0
 fi
 # lock-password is the SSH-only finally-path (no API use): it must run even
@@ -1353,7 +1363,7 @@ cmd_close() {
 # ---------------------------------------------------------------------------
 cmd_sweep_post() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
-    log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that gets past resolve; report-only modes do not delete)"
+    log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that holds a token and resolves SERVER_ID; report-only modes do not delete)"
     return 0
   fi
   # The steady-state family is anchored on the canonical hostname; an empty
