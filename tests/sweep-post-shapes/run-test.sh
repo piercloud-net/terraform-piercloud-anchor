@@ -45,6 +45,15 @@
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
+#
+# Issue #196 (entrypoint cases e1-e12, at the end): these run the WHOLE
+# script as a subprocess (`env -i`, nothing stubbed) so the ordering of the
+# no-token sweep-post short-circuit against the global id guards is pinned.
+# A `curl` tripwire on PATH records every PATH-resolved curl call in a hit
+# file (so redirected stderr cannot hide it); curl is the only API transport
+# (_api_curl + token endpoint). Every case except the positive controls e7/e9
+# must leave it untouched (never reach an API helper); e7/e9 (token + valid
+# ids) must hit it. A PATH shim does not catch an absolute-path binary or ssh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -116,14 +125,14 @@ STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-01-pier","description":""
 # input; the real filter recognizes it once (tests/policy-naming).
 STEADY_LEGACY='[{"id":43,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'
 
-RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]
+RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]; RC_TOKEN overrides the token (default AT)
   local l="$1" rc=0
   : > "$WORK/actions.$l"
   STUB_LIST_TMP="$2" STUB_IFACE="$3" STUB_STEADY="${4:-[]}" \
   PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" \
   GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE=apply \
   SERVER_ID=933556 SCP_USER_ID=1 RUN_ID=999 ANCHOR_HOSTNAME=anchor-01-pier \
-  OWN_NAME="piercloud-tmp-999" NETCUP_SCP_ACCESS_TOKEN=AT TMP_TTL_SECONDS=7200 \
+  OWN_NAME="piercloud-tmp-999" NETCUP_SCP_ACCESS_TOKEN="${RC_TOKEN-AT}" TMP_TTL_SECONDS=7200 \
   bash -c 'set -euo pipefail; source "$1"; cmd_sweep_post' _ "$WORK/functions.sh" \
     > "$WORK/out.$l" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -260,6 +269,94 @@ steady_case c9c '[{"id":"","name":"piercloud-anchor-anchor-01-pier","description
 rc="$(RC_OF c9d "[]" '{"userPolicies":[42]}' '[{"id":"42","name":"piercloud-anchor-anchor-01-pier","description":""}]')"
 is "c9d rc" "0" "$rc"
 is "c9d actions (live kept)" "" "$(ACTIONS c9d)"
+
+# ---- #196 defense in depth: cmd_sweep_post's own no-token branch ---------
+# Called directly (bypassing the entrypoint short-circuit): with no token it
+# must not touch the API even when an orphan tmp and a live steady policy are
+# listed — rc 0, zero actions, the no-op line.
+rc="$(RC_TOKEN='' RC_OF c0n "[$(tmp_entry 7 1 orphan)]" '' "$STEADY_LIVE")"
+is "c0n no-token rc" "0" "$rc"
+is "c0n no-token actions (none)" "" "$(ACTIONS c0n)"
+is "c0n no-token no-op logged" "1" "$(grep -c '^A1: post-sweep: no token held' "$WORK/out.c0n" || true)"
+
+# ---- #196: the no-token no-op holds through the REAL entrypoint ----------
+# The always() post-sweep usually runs on a run that failed before resolve
+# (binding refusal, approval timeout): no token AND no ids. The global id
+# guards used to run first and fail `SERVER_ID is required`, so every early
+# failure grew a second red step. Drive the whole script (not the extracted
+# function) so the guard ordering itself is pinned. No network: every case
+# exits before any API helper.
+mkdir -p "$WORK/tripwire"
+cat > "$WORK/tripwire/curl" <<TRIP
+#!/usr/bin/env bash
+echo "curl \$*" >> "$WORK/tripwire.hits"
+exit 97
+TRIP
+chmod +x "$WORK/tripwire/curl"
+# E2E sets the global rc (not printed): it is called in the main shell so
+# the tripwire assertion's pass/fail counters are not lost in a subshell.
+E2E() { # $1 label, $2 command, then VAR=value env assignments
+  local l="$1" cmd="$2"
+  shift 2
+  rc=0
+  rm -f "$WORK/tripwire.hits"
+  local want_net="${E2E_NET:-absent}"
+  env -i PATH="$WORK/tripwire:$PATH" HOME="$WORK" RUN_ID=999 MODE=check "$@" \
+    bash "$SCRIPT" "$cmd" > "$WORK/e2e.$l" 2>&1 || rc=$?
+  is "$l network tripwire $want_net" "$want_net" "$([ -e "$WORK/tripwire.hits" ] && echo present || echo absent)"
+}
+noop_case() { # $1 label, then env assignments: must be the clean no-op
+  local l="$1"
+  shift
+  E2E "$l" sweep-post "$@"
+  is "$l rc 0 (clean no-op)" "0" "$rc"
+  is "$l no-op logged" "1" "$(grep -c '^A1: post-sweep: no token held' "$WORK/e2e.$l" || true)"
+  is "$l no FAIL line" "0" "$(grep -c 'A1 FAIL' "$WORK/e2e.$l" || true)"
+}
+noop_case e1 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=   # the run-38823575615 shape
+noop_case e2                                                   # token + ids unset entirely
+noop_case e3 NETCUP_SCP_ACCESS_TOKEN= SERVER_ID='1;x' SCP_USER_ID=  # malformed id never interpolated
+noop_case e3b NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID='1;x' # malformed user id too
+# With a token held the guards are unchanged: empty / non-digit ids still fail closed.
+E2E e4 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID= SCP_USER_ID=1
+is "e4 token + empty SERVER_ID rc 1" "1" "$rc"
+is "e4 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e4" || true)"
+E2E e5 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT SERVER_ID='1;x' SCP_USER_ID=1
+is "e5 token + non-digit SERVER_ID rc 1" "1" "$rc"
+is "e5 injection guard" "1" "$(grep -c 'SERVER_ID is not all-digits' "$WORK/e2e.e5" || true)"
+# A token-bearing sweep-post with valid ids is NOT short-circuited: it reaches
+# the API boundary (the tripwire curl fails it -> rc != 0). Pins that the
+# no-op is gated on the token, not on the command alone (r2 red-team).
+E2E_NET=present E2E e7 sweep-post NETCUP_SCP_ACCESS_TOKEN=AT ANCHOR_HOSTNAME=anchor.example.net SERVER_ID=1 SCP_USER_ID=1
+is "e7 token + valid ids reaches the API (rc != 0)" "nonzero" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)"
+is "e7 no no-op line" "0" "$(grep -c 'no token held' "$WORK/e2e.e7" || true)"
+# A token only in a $GITHUB_ENV handoff line is still "held": no short-circuit,
+# the id guards apply (fail closed).
+printf 'NETCUP_SCP_ACCESS_TOKEN=AT\n' > "$WORK/github_env.e8"
+E2E e8 sweep-post GITHUB_ENV="$WORK/github_env.e8" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e8 handoff token + empty SERVER_ID rc 1" "1" "$rc"
+is "e8 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e8" || true)"
+# e9: same in apply mode (the destructive mode) — the no-op must never be
+# mode-gated; a token-bearing apply sweep-post reaches the API (r3 red-team).
+E2E_NET=present E2E e9 sweep-post MODE=apply NETCUP_SCP_ACCESS_TOKEN=AT ANCHOR_HOSTNAME=anchor.example.net SERVER_ID=1 SCP_USER_ID=1
+is "e9 apply + token + valid ids reaches the API (rc != 0)" "nonzero" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)"
+is "e9 no no-op line" "0" "$(grep -c 'no token held' "$WORK/e2e.e9" || true)"
+# e12: the no-token no-op holds in apply mode too (the destructive mode): a
+# no-op gated to report-only modes would regrow #196 there (r4 functional).
+noop_case e12 MODE=apply NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+# e10: an EMPTY handoff value is not a token -> still the clean no-op.
+printf 'NETCUP_SCP_ACCESS_TOKEN=\n' > "$WORK/github_env.e10"
+noop_case e10 GITHUB_ENV="$WORK/github_env.e10" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+# e11: a $GITHUB_ENV that cannot be searched (a directory: grep rc 2) counts
+# as held -> guards apply (fail closed; root bypasses chmod 000, a dir does not).
+mkdir -p "$WORK/github_env.e11"
+E2E e11 sweep-post GITHUB_ENV="$WORK/github_env.e11" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e11 unsearchable GITHUB_ENV + empty SERVER_ID rc 1" "1" "$rc"
+is "e11 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e11" || true)"
+# Other commands with no token are unchanged (the short-circuit is sweep-post only).
+E2E e6 sweep-pre NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"
+is "e6 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e6" || true)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

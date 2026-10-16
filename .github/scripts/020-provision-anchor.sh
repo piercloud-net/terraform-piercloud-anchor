@@ -14,7 +14,9 @@
 #              fail-closed on orphan (no parseable created_at) BEFORE any
 #              mutation -> retire EVERY non-own tmp (aged >2h or leaked
 #              fresh: the workflow-wide mutex means no foreign run can be
-#              live) -> drop this run's own leftovers.
+#              live) -> drop this run's own leftovers. Deletions happen in
+#              apply mode only (sweep_destructive); other modes report, but
+#              the orphan fail-closed refusal applies in every mode.
 #   open       dual-endpoint egress-IP fetch (exact match or fail) -> create
 #              TTL-tagged tmp policy (idempotent on run_id: retry reuses the
 #              existing policy, never duplicates) -> attach to the server NIC.
@@ -46,7 +48,8 @@
 #              order; missing policy is a success no-op (idempotent).
 #   sweep-post delete this run's policy at any age + every tmp older than 2h
 #              (+ orphans: no valid created_at) + UNATTACHED steady-state
-#              orphans (issue #101 — the create-per-run leak). Tolerates a
+#              orphans (issue #101 — the create-per-run leak); apply mode
+#              only — other modes report what would go. Tolerates a
 #              missing token
 #              (auth never completed -> nothing created -> clean no-op) so the
 #              workflow `always()` post step never masks the real failure.
@@ -235,8 +238,38 @@ SERVER_ID="${SERVER_ID:-}"
 SCP_USER_ID="${SCP_USER_ID:-}"
 RUN_ID="${RUN_ID:-}"
 MODE="${MODE:-}"
+# sweep-post without a token is the documented clean no-op (approval never
+# completed -> nothing created): it runs in an `always()` step, and a run
+# that failed before the device-flow token was exported holds no ids either,
+# so it must short-circuit BEFORE the id guards or each such no-token early
+# failure grows a second red step (#196). With a token held, the guards below
+# apply unchanged: a run that holds a token but failed before resolve wrote
+# SERVER_ID still fails `SERVER_ID is required` (fail closed, deliberate).
+# cmd_sweep_post keeps its own no-token branch as defense in depth.
+# "No token" means neither the step env nor a non-empty $GITHUB_ENV handoff
+# line (the source scp_token_refresh adopts) holds one; a handoff token falls
+# through to the guards (fail closed), and so does a $GITHUB_ENV that exists
+# but cannot be read or searched (grep rc != 1). A path that cannot even be
+# stat'ed (a parent denies search) reads as absent -> no-op; unreachable on
+# runners, where the runner user owns the per-step file. Defense in depth: each step
+# gets a fresh empty $GITHUB_ENV from the runner, so at entry this clause is
+# not expected to match in production. The refresh-token file is not consulted: the
+# workflow writes the access-token line before it exports the refresh file
+# (provision.yml device-flow poll), so a refresh file never exists alone.
+handoff_token_held=0
+if [ -n "${GITHUB_ENV:-}" ] && [ -e "$GITHUB_ENV" ]; then
+  handoff_rc=0
+  grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV" 2>/dev/null || handoff_rc=$?
+  [ "$handoff_rc" -eq 1 ] || handoff_token_held=1
+fi
+if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ] \
+  && [ "$handoff_token_held" -eq 0 ]; then
+  log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that holds a token and resolves SERVER_ID; report-only modes do not delete)"
+  exit 0
+fi
 # lock-password is the SSH-only finally-path (no API use): it must run even
-# when resolve never produced ids, so it is exempt from the id guards.
+# when resolve never produced ids, so it is exempt from the id guards (as is
+# the no-token sweep-post above, which exits before reaching them).
 case "$CMD" in
   lock-password) ;;
   *)
@@ -475,10 +508,11 @@ policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
 list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
   # Family scope (issue #121): the piercloud-anchor- prefix AND either the
   # new hostname anchor (endswith -<hostname>) or the pre-change id anchor
-  # (endswith -<server id>, migration only). A hostname renamed to ANOTHER
-  # hostname, or another server's legacy name, matches neither — never
-  # swept, never logged. The attached-policy compare in cmd_sweep_post
-  # still protects the live policy.
+  # (endswith -<server id>, migration only). This is a SUFFIX match: a name
+  # under another (e.g. previous or longer) hostname that ends with
+  # -<hostname> also matches and, if unattached here, is swept in apply mode
+  # (tracked as its own issue). The attached-policy compare in
+  # cmd_sweep_post still protects the live policy.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -1324,13 +1358,15 @@ cmd_close() {
 # ---------------------------------------------------------------------------
 # sweep-post: delete own-run any-age + tmp >2h + orphans. Fails loudly if any
 # delete fails (an orphan window must never pass silently). No token (auth
-# never completed) = clean no-op so `always()` keeps the original verdict.
+# never completed) = clean no-op so `always()` keeps the original verdict;
+# the entrypoint short-circuits that case before the id guards (#196), so the
+# branch below is defense in depth for direct calls of this function.
 # Destructive ONLY in apply mode (sweep_destructive): the other modes report
 # what would be swept + append it to the step summary, and delete nothing.
 # ---------------------------------------------------------------------------
 cmd_sweep_post() {
   if [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ]; then
-    log "post-sweep: no token held (approval never completed) — nothing created, nothing to sweep"
+    log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that holds a token and resolves SERVER_ID; report-only modes do not delete)"
     return 0
   fi
   # The steady-state family is anchored on the canonical hostname; an empty
