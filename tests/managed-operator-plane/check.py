@@ -15,16 +15,19 @@ expressions are removed as exact literals, and any remaining mention of the
 A workflow may read the operator's values bare only if it is NAMED in
 OPERATOR_ONLY and its node graph still has no `environment` key, no `tenant`
 key and no `inputs.tenant` reference (any case). Any other file is checked in
-full. Every `uses:` value must be one of the exact USES_ALLOWED strings: a
+full. Every `uses:` value must be one of the exact USES_ALLOWED strings for
+its own file (a per-file map, so a mutable-tag action allowed in a release
+workflow cannot be added to provision.yml): a
 composite action or reusable workflow runs with the calling job's `vars` and
 this pin never scans its file, so a new one is a deliberate pin update. Any
 local `uses: ./...` also fails, and a `workflow_call` / `workflow_run` /
 `repository_dispatch` trigger fail closed anywhere: they let a managed run
 execute, or feed, a file the environment checks never see.
 Every node must carry a core YAML tag (a `!!binary` or custom tag would hide
-expression text from the scan), and provision.yml's `visibility-banner` job
-must exist and have no `environment` key (the approval card is reviewed before
-the environment gate; a renamed banner job fails too).
+expression text from the scan). provision.yml must define the
+`visibility-banner` job exactly once, and no `visibility-banner` key in any
+workflow may carry an `environment` key (the approval card is reviewed before
+the environment gate; a renamed or duplicated banner job fails too).
 
 This is a drift guard over the committed workflow text, not a boundary: the
 isolation is GitHub's environment / secret scoping plus the workflow text on
@@ -71,16 +74,22 @@ TENANT_ONLY = [
 # Explicit list, not a structural guess: a new file is checked in full.
 OPERATOR_ONLY = {"ci.yml", "external-watch.yml"}
 
-# Every `uses:` value in the tree, exactly (SHA-pinned or the owner's own
-# release actions). A composite action reads the calling job's `vars`, and
-# this pin does not scan action files, so any other value fails closed.
+# Every `uses:` value per workflow file, exactly. A composite action reads the
+# calling job's `vars`, and this pin does not scan action files, so any other
+# value fails closed. Tenant-reachable files use SHA-pinned actions only; the
+# owner's tag-pinned release actions are allowed only in the release workflows
+# (which no managed run can select). An unlisted file may use nothing.
+CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+UPLOAD = "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"
+TOFU = "opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4"
 USES_ALLOWED = {
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
-    "opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4",
-    "cad0p/semver-calver-release/release@v1",
-    "cad0p/semver-calver-release/validate-package-version@v1",
-    "cad0p/semver-calver-release/validate-release-pr@v1",
+    "provision.yml": {CHECKOUT, UPLOAD, TOFU},
+    "broker-report-selftest.yml": {CHECKOUT},
+    "ci.yml": {CHECKOUT, TOFU},
+    "external-watch.yml": {CHECKOUT},
+    "release.yml": {"cad0p/semver-calver-release/release@v1"},
+    "validate-package-version.yml": {"cad0p/semver-calver-release/validate-package-version@v1"},
+    "validate-release-pr.yml": {"cad0p/semver-calver-release/validate-release-pr@v1"},
 }
 
 CORE_TAGS = {
@@ -139,17 +148,22 @@ def scalars(node, seen):
             yield from scalars(value, seen)
 
 
-def banner_problem(doc):
-    """None when jobs.visibility-banner exists and selects no environment."""
+def banner_jobs(doc):
+    """Every value under a `visibility-banner` key of every `jobs` mapping."""
+    out = []
     if isinstance(doc, yaml.MappingNode):
         for key, value in doc.value:
-            if key.value == "jobs" and isinstance(value, yaml.MappingNode):
+            if isinstance(key, yaml.ScalarNode) and key.value == "jobs" and isinstance(value, yaml.MappingNode):
                 for jkey, job in value.value:
-                    if jkey.value == "visibility-banner" and isinstance(job, yaml.MappingNode):
-                        if any(k.value.lower() == "environment" for k, _ in job.value):
-                            return "visibility-banner must not select an environment"
-                        return None
-    return "visibility-banner job not found"
+                    if isinstance(jkey, yaml.ScalarNode) and jkey.value == "visibility-banner":
+                        out.append(job)
+    return out
+
+
+def banner_has_environment(job):
+    if not isinstance(job, yaml.MappingNode):
+        return True  # not a job mapping: fail closed
+    return any(isinstance(k, yaml.ScalarNode) and k.value.strip().lower() == "environment" for k, _ in job.value)
 
 
 def uses_values(node, seen):
@@ -191,12 +205,14 @@ def check_file(path):
         for n in all_nodes(doc, set()):
             if n.tag not in CORE_TAGS:
                 findings.append("%s:%d: non-core YAML tag %s" % (path, n.start_mark.line + 1, n.tag))
-        if os.path.basename(path) == "provision.yml":
-            problem = banner_problem(doc)
-            if problem:
-                findings.append("%s: %s" % (path, problem))
+        banners = banner_jobs(doc)
+        if any(banner_has_environment(j) for j in banners):
+            findings.append("%s: visibility-banner must not select an environment" % path)
+        if os.path.basename(path) == "provision.yml" and len(banners) != 1:
+            findings.append("%s: visibility-banner job must be defined exactly once (found %d)" % (path, len(banners)))
+        allowed_uses = USES_ALLOWED.get(os.path.basename(path), set())
         for v in uses_values(doc, set()):
-            if not isinstance(v, yaml.ScalarNode) or v.value not in USES_ALLOWED:
+            if not isinstance(v, yaml.ScalarNode) or v.value not in allowed_uses:
                 findings.append("%s:%d: `uses:` value not in USES_ALLOWED: %r" % (path, v.start_mark.line + 1, getattr(v, "value", v)))
     texts = [n.value.lower() for n in nodes]
     for n in nodes:
