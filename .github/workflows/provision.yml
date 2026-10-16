@@ -400,7 +400,7 @@ jobs:
             echo "::error::environment '$TENANT_INPUT' does not carry MANAGED_TENANT='$TENANT_INPUT' — refusing (a typo'd/partial environment would silently read repo-level values). Provisioned tenant environments set the marker; see docs/invariants.md invariant 3."
             exit 1
           fi
-          # Operator-plane isolation (#198): a managed run reads none of the
+          # Operator-plane separation (#198): a managed run reads none of the
           # operator's repo-level values except the platform-plane
           # CLOUDFRONT_ORIGIN_SECRET and MAIN_BOX_IPV4. Every operator-plane reference in
           # this workflow is gated on `inputs.tenant == ''` (pinned by
