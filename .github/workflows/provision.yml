@@ -198,6 +198,70 @@ jobs:
           fi
           echo "Managed-input preflight ok."
 
+      # Repo-scope check (issue #204). A managed run reads its operator-plane
+      # and per-anchor values from its own environment, and GitHub falls
+      # back from the environment to the repository (and organization) per
+      # name. This job selects NO environment, so each probe below sees
+      # repository/organization scope only: a `true` means a managed run
+      # would inherit that value (the #198 leak class). Refuse the managed
+      # dispatch, before any gate or device card, naming the names (never
+      # the values; a probe is a boolean). The probe set is pinned to the
+      # set of names read directly in the environment jobs
+      # (tests/managed-operator-plane). MANAGED_TENANT and
+      # TENANT_CUSTOMER_NUMBER are environment-only by contract.
+      - name: Repo-scope check (managed runs read operator-plane values from their environment only)
+        env:
+          TENANT_INPUT: ${{ inputs.tenant }}
+          REPO_SCOPE_ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 != '' }}
+          REPO_SCOPE_SCP_USER_ID: ${{ secrets.SCP_USER_ID != '' }}
+          REPO_SCOPE_ANCHOR_ROOT_PASSWORD: ${{ secrets.ANCHOR_ROOT_PASSWORD != '' }}
+          REPO_SCOPE_GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS != '' }}
+          REPO_SCOPE_NTFY_TOPIC: ${{ secrets.NTFY_TOPIC != '' }}
+          REPO_SCOPE_NTFY_TOKEN: ${{ secrets.NTFY_TOKEN != '' }}
+          REPO_SCOPE_CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_ENDPOINT: ${{ secrets.RECORDING_WITNESS_ENDPOINT != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_BUCKET: ${{ secrets.RECORDING_WITNESS_BUCKET != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_AUDIT_PREFIX: ${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_RECORDINGS_PREFIX: ${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_KEY_ID: ${{ secrets.RECORDING_WITNESS_KEY_ID != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_KEY: ${{ secrets.RECORDING_WITNESS_KEY != '' }}
+          REPO_SCOPE_TENANT_CUSTOMER_NUMBER: ${{ secrets.TENANT_CUSTOMER_NUMBER != '' }}
+          REPO_SCOPE_ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE != '' }}
+          REPO_SCOPE_STATUS_PULLER: ${{ vars.STATUS_PULLER != '' }}
+          REPO_SCOPE_ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_RENOTIFY_SECONDS != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_QUIET_SIGNATURE: ${{ vars.RECORDING_WITNESS_QUIET_SIGNATURE != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_COLD_START_SECONDS: ${{ vars.RECORDING_WITNESS_COLD_START_SECONDS != '' }}
+          REPO_SCOPE_RECORDING_WITNESS_SWEEP_SECONDS: ${{ vars.RECORDING_WITNESS_SWEEP_SECONDS != '' }}
+          REPO_SCOPE_MANAGED_TENANT: ${{ vars.MANAGED_TENANT != '' }}
+        run: |
+          set -euo pipefail
+          TENANT_INPUT="${TENANT_INPUT:-}"
+          if [ -z "$TENANT_INPUT" ]; then
+            echo "Operator run (no tenant): repository-level values are this run's own; repo-scope check not applicable."
+            exit 0
+          fi
+          probes=0
+          found=""
+          for v in ${!REPO_SCOPE_@}; do
+            probes=$((probes + 1))
+            case "${!v}" in
+              true) found="$found ${v#REPO_SCOPE_}" ;;
+              false) ;;
+              *) echo "::error::repo-scope probe $v is not true/false; refusing."; exit 1 ;;
+            esac
+          done
+          if [ "$probes" -eq 0 ]; then
+            echo "::error::no repo-scope probes reached this step; refusing (fail closed)."
+            exit 1
+          fi
+          if [ -n "$found" ]; then
+            echo "::error::defined at repository or organization level:$found. A managed run would inherit these from there (issue #198). Move each into the anchor's environment and delete the repository-level copy; refusing before any gate or device card."
+            exit 1
+          fi
+          echo "Repo-scope check ok ($probes names, none at repository or organization level)."
+
       - name: Checkout (no credentials persisted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
         with:
@@ -286,8 +350,10 @@ jobs:
         run: |
           set -euo pipefail
           # Secret names chosen in M1 (design Q5): NTFY_TOPIC + NTFY_TOKEN
-          # (publish-scoped). Values live in repo-level secret storage; nothing is committed.
-          # Managed runs (#198) resolve both empty: no ntfy at all.
+          # (publish-scoped). Nothing is committed. This job selects no
+          # environment, so it sees repository-level values only: the
+          # operator run's topic. Managed runs (#198) resolve both empty: no
+          # card ntfy (the topic lives in the tenant environment, #204).
           if [ -z "$NTFY_TOPIC" ]; then
             echo "NTFY_TOPIC unset — verdict stays in the run summary (OK for skeleton)."
             exit 0
@@ -343,9 +409,13 @@ jobs:
     env:
       # Identifiers resolve from REPO-level secret values inside runs (C-E) —
       # never dispatch inputs, never logs (values are write-only, log-masked).
-      # Managed runs (#198): operator-plane references are gated on
-      # `inputs.tenant == ''`; the managed alias is the validated tenant
-      # input and the managed customer number is the tenant-only
+      # Operator-plane and per-anchor values (#204) are read directly here:
+      # this job selects the tenant environment, so GitHub resolves the
+      # environment's value first. The ungated visibility-banner job refuses
+      # a managed dispatch while any of those names is still defined at
+      # repository or organization level, so a repo-level value never falls
+      # through to a tenant (#198). The managed alias is the validated
+      # tenant input and the managed customer number is the tenant-only
       # TENANT_CUSTOMER_NUMBER (environment scope).
       # No HOSTNAME secret: derived below as anchor-01-<tenant>.
       # No SCP_USER_ID secret by default: resolved from the token via OIDC
@@ -401,10 +471,10 @@ jobs:
             echo "::error::environment '$TENANT_INPUT' does not carry MANAGED_TENANT='$TENANT_INPUT' — refusing (a typo'd/partial environment would silently read repo-level values). Provisioned tenant environments set the marker; see docs/invariants.md invariant 3."
             exit 1
           fi
-          # Operator-plane separation (#198): a managed run reads none of the
-          # operator's repo-level values except the platform-plane
-          # CLOUDFRONT_ORIGIN_SECRET and MAIN_BOX_IPV4. Every operator-plane reference in
-          # this workflow is gated on `inputs.tenant == ''` (pinned by
+          # Operator-plane separation (#198, #204): a managed run reads no
+          # repo-level value except the platform-plane
+          # CLOUDFRONT_ORIGIN_SECRET and MAIN_BOX_IPV4 (the banner job's
+          # repo-scope check refused the dispatch otherwise; pinned by
           # tests/managed-operator-plane), and the managed customer number
           # comes from the tenant-only TENANT_CUSTOMER_NUMBER, which is never
           # defined at repo level. Empty = the approver guard could never
@@ -440,8 +510,8 @@ jobs:
           TENANT_USER: ${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
           MODE: ${{ inputs.mode }}
           HEAD_SHA: ${{ github.sha }}
-          NTFY_TOPIC: ${{ inputs.tenant == '' && secrets.NTFY_TOPIC || '' }}
-          NTFY_TOKEN: ${{ inputs.tenant == '' && secrets.NTFY_TOKEN || '' }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
         run: |
           set -euo pipefail
           # C2: device_code never crosses a job boundary. The old split
@@ -666,11 +736,11 @@ jobs:
           NETCUP_SCP_ACCESS_TOKEN: ${{ env.NETCUP_SCP_ACCESS_TOKEN }}
           NETCUP_SCP_REFRESH_TOKEN_FILE: ${{ env.NETCUP_SCP_REFRESH_TOKEN_FILE }}
           NETCUP_SCP_TOKEN_ENDPOINT: ${{ env.NETCUP_SCP_TOKEN_ENDPOINT }}
-          ANCHOR_IPV4: ${{ inputs.tenant == '' && secrets.ANCHOR_IPV4 || '' }}
-          SCP_USER_ID_IN: ${{ inputs.tenant == '' && secrets.SCP_USER_ID || '' }}
+          ANCHOR_IPV4: ${{ secrets.ANCHOR_IPV4 }}
+          SCP_USER_ID_IN: ${{ secrets.SCP_USER_ID }}
           CUSTOMER_NUMBER: ${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}
           TENANT_USER: ${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
-          ANCHOR_ROLE: ${{ inputs.tenant == '' && vars.ANCHOR_ROLE || '' }}
+          ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE }}
         run: |
           set -euo pipefail
           # Handoff-write guard (review security): every API-derived value
@@ -722,7 +792,8 @@ jobs:
           # the ungated visibility-banner job; the tenant-environment binding
           # is re-checked at the top of this job. Nothing to re-check here.)
           [ -n "${TENANT_USER:-}" ] || { echo "::error::TENANT_USER repo variable is empty — set it to the tenant username (gh variable set TENANT_USER --body <you>)."; exit 1; }
-          # ANCHOR_ROLE (issue #134): optional operator-plane repo variable.
+          # ANCHOR_ROLE (issue #134): optional operator-plane variable (the
+          # anchor's environment on a managed run, #204).
           # Empty or `tenant` = the platform row is monitor-only; `operator` =
           # it alerts (with a push topic). Anything else fails the run before
           # any netcup use; the on-box render validates again (defense in depth).
@@ -1081,11 +1152,12 @@ jobs:
           TF_VAR_allow_main_box_ipv4: ${{ secrets.MAIN_BOX_IPV4 }}
         run: |
           set -euo pipefail
-          # Secret values used here (repo-level, never committed):
+          # Secret values used here (environment-scoped on a managed run,
+          # #204; never committed):
           # MAIN_BOX_IPV4, ANCHOR_IPV4,
           # ANCHOR_ROOT_PASSWORD (masked one-run input, dead after root lock).
           # Public inputs arrive as repo VARIABLES: TENANT_USER (hostname/DNS
-          # derivation). Monitor targets + push arrive as repo-level secret values:
+          # derivation). Monitor targets + push arrive as secret values:
           # GATUS_ENDPOINTS (comma-separated name=url), NTFY_TOPIC/NTFY_TOKEN.
           # (NETCUP_SERVER_ID retired: the resolve step derives server_id
           # at runtime from ANCHOR_IPV4 — nothing numeric to copy.)
@@ -1148,7 +1220,7 @@ jobs:
           SCP_USER_ID: ${{ env.SCP_USER_ID_EFF }}
           RUN_ID: ${{ github.run_id }}
           ANCHOR_HOST: ${{ env.ANCHOR_HOST }}
-          ROOT_PASSWORD_SECRET: ${{ inputs.tenant == '' && secrets.ANCHOR_ROOT_PASSWORD || '' }}
+          ROOT_PASSWORD_SECRET: ${{ secrets.ANCHOR_ROOT_PASSWORD }}
         run: |
           set -euo pipefail
           # Pasted secret present -> the script skips minting (legacy path:
@@ -1182,18 +1254,18 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           ANCHOR_HOST: ${{ env.ANCHOR_HOST }}
           PINNED_IP: ${{ steps.a1-open.outputs.pinned_ip }}
-          ROOT_PASSWORD: ${{ inputs.tenant == '' && secrets.ANCHOR_ROOT_PASSWORD || '' }}
+          ROOT_PASSWORD: ${{ secrets.ANCHOR_ROOT_PASSWORD }}
           BOOTSTRAP_ROOT_PASSWORD: ${{ env.BOOTSTRAP_ROOT_PASSWORD }}
           TENANT_USER: ${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
-          ANCHOR_ROLE: ${{ inputs.tenant == '' && vars.ANCHOR_ROLE || '' }}
+          ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE }}
           # STATUS_PULLER (issue #186): repo VARIABLE, unset = legacy shape
           # (platform/main + GATUS_ENDPOINTS in config.yaml). On a
           # slice-managed anchor set it and the on-box render drops the pairs
           # with a loud dispatch-time log (D10); they move to the manifest.
-          STATUS_PULLER: ${{ inputs.tenant == '' && vars.STATUS_PULLER || '' }}
-          GATUS_ENDPOINTS: ${{ inputs.tenant == '' && secrets.GATUS_ENDPOINTS || '' }}
-          NTFY_TOPIC: ${{ inputs.tenant == '' && secrets.NTFY_TOPIC || '' }}
-          NTFY_TOKEN: ${{ inputs.tenant == '' && secrets.NTFY_TOKEN || '' }}
+          STATUS_PULLER: ${{ vars.STATUS_PULLER }}
+          GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           # Operator-plane dashboard-TLS material (set at template time — the
           # tenant pastes nothing, bootstrap stays 1 secret): the per-anchor
           # Origin CA certificate chain (leaf-first) arrives via the cert-only
@@ -1202,8 +1274,8 @@ jobs:
           # the box); CF_AOP_CA_PEM stays the legacy zone-AOP client-auth
           # bundle (repo secret; A2 retires it — expected unset post-cutover).
           # Deployed material for Caddy's :443, NOT a standing API token.
-          ORIGIN_CA_CERT_PEM: ${{ inputs.tenant == '' && vars.ORIGIN_CA_CERT_PEM || '' }}
-          CF_AOP_CA_PEM: ${{ inputs.tenant == '' && secrets.CF_AOP_CA_PEM || '' }}
+          ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
+          CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
           # CloudFront origin auth (call D): the secret header CloudFront
           # injects into the origin request — Caddy enforces it on :443 (the
           # firewall admits only the CloudFront origin-facing ranges + the
@@ -1217,23 +1289,23 @@ jobs:
           # witness lists metadata and never reads object content. All six
           # set = the witness installs; empty = the component stays dormant
           # (tenant anchors are unaffected; a previous install is removed).
-          RECORDING_WITNESS_ENDPOINT: ${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_ENDPOINT || '' }}
-          RECORDING_WITNESS_BUCKET: ${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_BUCKET || '' }}
-          RECORDING_WITNESS_AUDIT_PREFIX: ${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_AUDIT_PREFIX || '' }}
-          RECORDING_WITNESS_RECORDINGS_PREFIX: ${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_RECORDINGS_PREFIX || '' }}
-          RECORDING_WITNESS_KEY_ID: ${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_KEY_ID || '' }}
-          RECORDING_WITNESS_KEY: ${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_KEY || '' }}
+          RECORDING_WITNESS_ENDPOINT: ${{ secrets.RECORDING_WITNESS_ENDPOINT }}
+          RECORDING_WITNESS_BUCKET: ${{ secrets.RECORDING_WITNESS_BUCKET }}
+          RECORDING_WITNESS_AUDIT_PREFIX: ${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX }}
+          RECORDING_WITNESS_RECORDINGS_PREFIX: ${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}
+          RECORDING_WITNESS_KEY_ID: ${{ secrets.RECORDING_WITNESS_KEY_ID }}
+          RECORDING_WITNESS_KEY: ${{ secrets.RECORDING_WITNESS_KEY }}
           # Optional notification cadence (public repo VARIABLES, not secret values;
           # empty = the witness defaults): renotify default 1800s,
           # quiet_renotify default 86400s. quiet_signature pins the current
           # finding set (stable identities, no ages) to the quiet cadence; the
           # run-once acceptance prints the value to pin. Any finding-set
           # change pushes immediately and leaves the pin behind.
-          RECORDING_WITNESS_RENOTIFY_SECONDS: ${{ inputs.tenant == '' && vars.RECORDING_WITNESS_RENOTIFY_SECONDS || '' }}
-          RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS: ${{ inputs.tenant == '' && vars.RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS || '' }}
-          RECORDING_WITNESS_QUIET_SIGNATURE: ${{ inputs.tenant == '' && vars.RECORDING_WITNESS_QUIET_SIGNATURE || '' }}
-          RECORDING_WITNESS_COLD_START_SECONDS: ${{ inputs.tenant == '' && vars.RECORDING_WITNESS_COLD_START_SECONDS || '' }}
-          RECORDING_WITNESS_SWEEP_SECONDS: ${{ inputs.tenant == '' && vars.RECORDING_WITNESS_SWEEP_SECONDS || '' }}
+          RECORDING_WITNESS_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_RENOTIFY_SECONDS }}
+          RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS: ${{ vars.RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS }}
+          RECORDING_WITNESS_QUIET_SIGNATURE: ${{ vars.RECORDING_WITNESS_QUIET_SIGNATURE }}
+          RECORDING_WITNESS_COLD_START_SECONDS: ${{ vars.RECORDING_WITNESS_COLD_START_SECONDS }}
+          RECORDING_WITNESS_SWEEP_SECONDS: ${{ vars.RECORDING_WITNESS_SWEEP_SECONDS }}
           THUMBPRINT_FILE: thumbprint.txt
         run: |
           set -euo pipefail
@@ -1241,13 +1313,13 @@ jobs:
           # auto-masked, but the explicit mask covers every expansion path
           # (same ordering rule as the device_code mask in device-flow).
           # Guarded: masking an empty value warns without masking anything.
-          if [ -n "${{ inputs.tenant == '' && secrets.ANCHOR_ROOT_PASSWORD || '' }}" ]; then echo "::add-mask::${{ inputs.tenant == '' && secrets.ANCHOR_ROOT_PASSWORD || '' }}"; fi
+          if [ -n "${{ secrets.ANCHOR_ROOT_PASSWORD }}" ]; then echo "::add-mask::${{ secrets.ANCHOR_ROOT_PASSWORD }}"; fi
           # Mask FIRST, before any use (secret values are auto-masked; the
           # explicit masks cover every expansion path, multiline PEMs
           # included). Guarded: masking an empty value warns without masking.
           # ORIGIN_CA_CERT_PEM is public cert-only material (repo variable) —
           # deliberately NOT masked.
-          if [ -n "${{ inputs.tenant == '' && secrets.CF_AOP_CA_PEM || '' }}" ]; then echo "::add-mask::${{ inputs.tenant == '' && secrets.CF_AOP_CA_PEM || '' }}"; fi
+          if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
           # CloudFront origin secret: masked at first receipt before any use
           # (secret values are auto-masked; the explicit mask covers every
           # expansion path). The main-box address is masked too (it already
@@ -1258,12 +1330,12 @@ jobs:
           # (secret values are auto-masked; the explicit masks cover every
           # expansion path). Never echoed, never logged, never in argv.
           for witness_value in \
-            "${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_ENDPOINT || '' }}" \
-            "${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_BUCKET || '' }}" \
-            "${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_AUDIT_PREFIX || '' }}" \
-            "${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_RECORDINGS_PREFIX || '' }}" \
-            "${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_KEY_ID || '' }}" \
-            "${{ inputs.tenant == '' && secrets.RECORDING_WITNESS_KEY || '' }}"; do
+            "${{ secrets.RECORDING_WITNESS_ENDPOINT }}" \
+            "${{ secrets.RECORDING_WITNESS_BUCKET }}" \
+            "${{ secrets.RECORDING_WITNESS_AUDIT_PREFIX }}" \
+            "${{ secrets.RECORDING_WITNESS_RECORDINGS_PREFIX }}" \
+            "${{ secrets.RECORDING_WITNESS_KEY_ID }}" \
+            "${{ secrets.RECORDING_WITNESS_KEY }}"; do
             if [ -n "$witness_value" ]; then echo "::add-mask::$witness_value"; fi
           done
           # Pre-SSH IP re-fetch (mismatch aborts to sweep inside the script);
@@ -1341,8 +1413,8 @@ jobs:
       - name: Notify operator on failure (surplus/orphan hint)
         if: failure()
         env:
-          NTFY_TOPIC: ${{ inputs.tenant == '' && secrets.NTFY_TOPIC || '' }}
-          NTFY_TOKEN: ${{ inputs.tenant == '' && secrets.NTFY_TOKEN || '' }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           TENANT_USER: ${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
         run: |
           set -euo pipefail
