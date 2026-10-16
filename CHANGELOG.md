@@ -72,6 +72,7 @@ All notable changes to this project will be documented in this file.
 - *(banner)* Count workflows against the full base ref + fail loud (closes #130)
 - *(a1)* Post-sweep no-token no-op short-circuits before the id guards (closes #196)
 - *(managed)* A managed tenant run never reads the operator-plane repo values (closes #198)
+- *(managed)* Environment-scoped operator values + banner repo-scope check (closes #204)
 
 ### 💼 Other
 
