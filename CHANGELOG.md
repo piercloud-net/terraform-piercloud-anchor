@@ -115,6 +115,7 @@ All notable changes to this project will be documented in this file.
 - Allow the Gcore DNS API endpoint in the contract allowlist (closes #157)
 - *(132)* Account concurrency lane + managed tenant environment (closes #132)
 - *(allowlist)* Permit the pc-control broker report endpoint (closes #181)
+- *(external-watch)* Per-tenant targets for managed anchors (closes #207)
 
 
 ## [Unreleased]
