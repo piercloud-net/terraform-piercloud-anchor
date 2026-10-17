@@ -166,6 +166,8 @@ jobs:
       - name: Config incident (open while refused; auto-close when fixed)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job: gh needs the repo named explicitly (#211).
+          GH_REPO: ${{ github.repository }}
           TARGETS_RESULT: ${{ needs.targets.result }}
           REFUSED: ${{ needs.targets.outputs.refused }}
           WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}

@@ -32,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=220
+MIN_CHECKS=222
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -450,6 +450,12 @@ mkdir -p "$WORK/stubs"
 cat >"$WORK/stubs/gh" <<'STUB'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >>"$STUB_LOG"
+# Like the real gh: with no GH_REPO and no git work tree it cannot resolve the
+# repo (#211 — the config job has no checkout).
+if [ -z "${GH_REPO:-}" ] && [ -z "${STUB_GIT_TREE:-}" ]; then
+  echo "failed to run git: fatal: not a git repository" >&2
+  exit 1
+fi
 case "$1 $2" in
   "issue list") printf '%s\n' "${GH_LIST_JSON:-[]}" ;;
   "issue view") printf '%s\n' "${GH_VIEW_LAST:-}" ;;
@@ -481,57 +487,69 @@ drive() { # $1 script; env passes through; sets D_RC, D_LOG
       RUN_URL=https://example.invalid/run bash "$1" ) >"$WORK/drive.out" 2>&1 || D_RC=$?
   D_LOG="$(cat "$WORK/stub.log")"
 }
+# Repo context comes from the workflow, not the driver: the config job gets
+# GH_REPO only if its step env sets it; the watch job has a git work tree only
+# if it checks the repo out (#211).
+job_span() { awk -v j="  $1:" '$0==j{f=1;next} f&&/^  [a-z][a-z-]*:$/{exit} f' "$WATCH"; }
+CFG_GH_REPO=""
+grep -qxF '          GH_REPO: ${{ github.repository }}' <(job_span config) && CFG_GH_REPO="owner/repo"
+WATCH_GIT_TREE=""
+grep -q '^      - uses: actions/checkout@' <(job_span watch) && WATCH_GIT_TREE=1
+cdrive() { GH_REPO="$CFG_GH_REPO" STUB_GIT_TREE="" drive "$@"; }
+idrive() { GH_REPO="" STUB_GIT_TREE="$WATCH_GIT_TREE" drive "$@"; }
 calls() { printf '%s\n' "$D_LOG" | grep -c "$1" || true; }
 CFG_OPEN='[{"number":7,"title":"[external-watch] watch config refused: x"},{"number":3,"title":"[external-watch] pier: dashboard probe failing: y"}]'
 
+is "config job names the repo for gh (#211)" "owner/repo" "$CFG_GH_REPO"
+is "watch job checks the repo out (gh resolves it from the work tree)" "1" "$WATCH_GIT_TREE"
 # config: refused, no incident yet -> create once, push once, run fails
-TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 drive "$WORK/config.sh"
+TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 cdrive "$WORK/config.sh"
 is "config refused: run fails" "1" "$D_RC"
 is "config refused: one incident created" "1" "$(calls '^gh issue create')"
 has "config refused: incident title carries the prefix" "$D_LOG" '--title [external-watch] watch config refused: bad alias'
 is "config refused: one ntfy push" "1" "$(calls '^curl ')"
 has "config refused: push goes to the watch topic" "$D_LOG" 'https://ntfy.sh/t1'
 # config: refused, incident already open -> no duplicate, no re-push, still fails
-TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 GH_LIST_JSON="$CFG_OPEN" drive "$WORK/config.sh"
+TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 GH_LIST_JSON="$CFG_OPEN" cdrive "$WORK/config.sh"
 is "config refused + open: run fails" "1" "$D_RC"
 is "config refused + open: no duplicate incident" "0" "$(calls '^gh issue create')"
 is "config refused + open: no re-push" "0" "$(calls '^curl ')"
 # config: targets job broken -> alert
-TARGETS_RESULT=failure REFUSED="" drive "$WORK/config.sh"
+TARGETS_RESULT=failure REFUSED="" cdrive "$WORK/config.sh"
 is "config targets failed: run fails" "1" "$D_RC"
 has "config targets failed: incident names the result" "$D_LOG" "the targets job ended 'failure'"
 # config: refused, push fails -> incident still filed, run still fails
-TARGETS_RESULT=success REFUSED="bad" REPO_NTFY_TOPIC=t2 CURL_RC=22 drive "$WORK/config.sh"
+TARGETS_RESULT=success REFUSED="bad" REPO_NTFY_TOPIC=t2 CURL_RC=22 cdrive "$WORK/config.sh"
 is "config push failure: run still fails" "1" "$D_RC"
 is "config push failure: incident still created" "1" "$(calls '^gh issue create')"
 has "config push failure: repo topic used when no watch topic" "$D_LOG" 'https://ntfy.sh/t2'
 # config: valid list, open config incident -> closed, run green; the tenant incident is untouched
-TARGETS_RESULT=success REFUSED="" GH_LIST_JSON="$CFG_OPEN" drive "$WORK/config.sh"
+TARGETS_RESULT=success REFUSED="" GH_LIST_JSON="$CFG_OPEN" cdrive "$WORK/config.sh"
 is "config valid: run green" "0" "$D_RC"
 is "config valid: closes the config incident only" "gh issue close 7" "$(printf '%s\n' "$D_LOG" | grep '^gh issue close')"
 is "config valid: no create, no push" "0" "$(( $(calls '^gh issue create') + $(calls '^curl ') ))"
 # config: valid/unset, nothing open -> silent green
-TARGETS_RESULT=success REFUSED="" drive "$WORK/config.sh"
+TARGETS_RESULT=success REFUSED="" cdrive "$WORK/config.sh"
 is "config valid + nothing open: run green" "0" "$D_RC"
 is "config valid + nothing open: no issue writes" "0" "$(printf '%s\n' "$D_LOG" | grep -cE '^gh issue (create|comment|close)' || true)"
 
 # incident: tenant leg failing, none open -> per-tenant incident created
-OK=false DETAIL=boom WATCH_ALIAS=pier drive "$WORK/incident.sh"
+OK=false DETAIL=boom WATCH_ALIAS=pier idrive "$WORK/incident.sh"
 is "incident fail: step exits 0 (the Fail step fails the run)" "0" "$D_RC"
 has "incident fail: per-tenant title" "$D_LOG" '--title [external-watch] pier: dashboard probe failing: boom'
 # incident: tenant leg failing, its incident open with a fresh comment -> no spam
-OK=false DETAIL=boom WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" GH_VIEW_LAST="$(date -u +%FT%TZ)" drive "$WORK/incident.sh"
+OK=false DETAIL=boom WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" GH_VIEW_LAST="$(date -u +%FT%TZ)" idrive "$WORK/incident.sh"
 is "incident fail + open (<6h): no create, no comment" "0" "$(printf '%s\n' "$D_LOG" | grep -cE '^gh issue (create|comment)' || true)"
 # incident: tenant leg green -> closes ITS incident, never the config one
-OK=true WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" drive "$WORK/incident.sh"
+OK=true WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" idrive "$WORK/incident.sh"
 is "incident recovered: closes the tenant incident only" "gh issue close 3" "$(printf '%s\n' "$D_LOG" | grep '^gh issue close')"
 # incident: legacy leg (blank label) never matches a tenant-titled incident
-OK=true WATCH_ALIAS="" GH_LIST_JSON="$CFG_OPEN" drive "$WORK/incident.sh"
+OK=true WATCH_ALIAS="" GH_LIST_JSON="$CFG_OPEN" idrive "$WORK/incident.sh"
 is "incident legacy leg: tenant incident untouched" "0" "$(calls '^gh issue close')"
-OK=false DETAIL=boom WATCH_ALIAS="" drive "$WORK/incident.sh"
+OK=false DETAIL=boom WATCH_ALIAS="" idrive "$WORK/incident.sh"
 has "incident legacy leg: legacy title kept" "$D_LOG" '--title [external-watch] dashboard probe failing: boom'
 # incident: label attach fails -> created without it
-OK=false DETAIL=boom WATCH_ALIAS=pier GH_CREATE_FAIL_LABEL=1 drive "$WORK/incident.sh"
+OK=false DETAIL=boom WATCH_ALIAS=pier GH_CREATE_FAIL_LABEL=1 idrive "$WORK/incident.sh"
 is "incident label failure: retried without the label" "2" "$(calls '^gh issue create')"
 
 # Fail step: the run goes red on a failed probe (exact condition).
@@ -572,7 +590,7 @@ is "permissions block is exact (whole block, to the blank line)" "permissions:
 is "permissions block is unique (no job-level override)" "1" "$(grep -cE '^[[:space:]]*permissions:' "$WATCH")"
 is "cron cadence is exact" '    - cron: "*/15 * * * *"' "$(grep -E '^[[:space:]]*- cron:' "$WATCH")"
 # Config incident label fallback: a missing/unattachable label still files it.
-TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 drive "$WORK/config.sh"
+TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 cdrive "$WORK/config.sh"
 is "config label failure: retried without the label" "2" "$(calls '^gh issue create')"
 is "config label failure: run still fails" "1" "$D_RC"
 
