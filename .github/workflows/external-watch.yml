@@ -6,8 +6,9 @@
 # the PUBLIC dashboard from GitHub's network — if both boxes are gone, the
 # runner still runs and still files the incident.
 #
-# The probe itself is credential-free: public GETs only, no box access. The
-# only secrets are the optional ntfy publish pairs (EXTERNAL_WATCH_NTFY_* or
+# The probe itself is credential-free: public GETs only, no box access. Besides
+# the run's GITHUB_TOKEN (issues: write, for the incident issues) the only
+# secrets are the optional ntfy publish pairs (EXTERNAL_WATCH_NTFY_* or
 # NTFY_*, #207); the push degrades to a logged no-op until a topic exists.
 #
 # Deliberately NOT in .github/scripts/: that path is scanned by CI's SCP
@@ -42,8 +43,9 @@ concurrency:
 
 jobs:
   # Issue #207: one watch leg per tenant. A managed anchor keeps its values in
-  # its own tenant environment, which only deploys from `v*` tags — a
-  # scheduled run (default branch) cannot read it. EXTERNAL_WATCH_TENANTS (repo variable)
+  # its own tenant environment; no job here selects an `environment:`, so the
+  # watch cannot read them (tenant environments are also expected to deploy
+  # from `v*` tags only — docs/usage.md). EXTERNAL_WATCH_TENANTS (repo variable)
   # lists the watched tenants instead; unset = the single legacy target.
   targets:
     name: resolve the watched tenants
@@ -74,32 +76,35 @@ jobs:
               '[{alias:$alias, label:"", puller:$puller, probe_url:$url, legacy:true}]'
           }
           # Parses the list; on a refusal prints the reason on stderr and
-          # returns 1 (no partial matrix).
+          # returns 1 (no partial matrix). A refusal names the entry's
+          # position and the rule it broke, never its text: the reason lands
+          # in the public run log, the config incident and the ntfy push.
           tenant_matrix() {
-            local seen=" " matrix="[]" count=0 entry alias flag puller
+            local seen=" " matrix="[]" count=0 n=0 entry alias flag puller
             for entry in ${WATCH_TENANTS//,/ }; do
+              n=$((n + 1))
               alias="${entry%%:*}"
               flag=""
               if [ "$alias" != "$entry" ]; then
                 flag="${entry#*:}"
-                [ -n "$flag" ] || { echo "empty flag on '${alias}' (write '${alias}' or '${alias}:puller')" >&2; return 1; }
+                [ -n "$flag" ] || { echo "entry ${n}: empty flag (write 'alias' or 'alias:puller')" >&2; return 1; }
               fi
               # The managed alias grammar (provision.yml tenant input):
               # ^[a-z0-9]{3,15}$, no reserved prefix, no reserved name.
               case "$alias" in
-                ''|*[!a-z0-9]*) echo "bad alias '${alias}' (must match ^[a-z0-9]{3,15}$, the managed tenant grammar)" >&2; return 1 ;;
-                anchor*|status*|pcu*|platform*) echo "bad alias '${alias}' (reserved prefix anchor/status/pcu/platform)" >&2; return 1 ;;
-                edge|console|ops|keys|unlock|bounce|mail|broker|www) echo "bad alias '${alias}' (reserved platform name)" >&2; return 1 ;;
+                ''|*[!a-z0-9]*) echo "entry ${n}: bad alias (must match ^[a-z0-9]{3,15}$, the managed tenant grammar)" >&2; return 1 ;;
+                anchor*|status*|pcu*|platform*) echo "entry ${n}: bad alias (reserved prefix anchor/status/pcu/platform)" >&2; return 1 ;;
+                edge|console|ops|keys|unlock|bounce|mail|broker|www) echo "entry ${n}: bad alias (reserved platform name)" >&2; return 1 ;;
               esac
               if [ "${#alias}" -lt 3 ] || [ "${#alias}" -gt 15 ]; then
-                echo "bad alias '${alias}' (must match ^[a-z0-9]{3,15}$, the managed tenant grammar)" >&2; return 1
+                echo "entry ${n}: bad alias (length ${#alias}; must match ^[a-z0-9]{3,15}$, the managed tenant grammar)" >&2; return 1
               fi
               case "$flag" in
                 '') puller="" ;;
                 puller) puller=on ;;
-                *) echo "unknown flag '${flag}' on '${alias}' (only ':puller')" >&2; return 1 ;;
+                *) echo "entry ${n}: unknown flag (only ':puller')" >&2; return 1 ;;
               esac
-              case "$seen" in *" ${alias} "*) echo "duplicate alias '${alias}'" >&2; return 1 ;; esac
+              case "$seen" in *" ${alias} "*) echo "entry ${n}: duplicate alias" >&2; return 1 ;; esac
               seen="${seen}${alias} "
               count=$((count + 1))
               matrix="$(jq -c --arg alias "$alias" --arg puller "$puller" \
@@ -165,6 +170,7 @@ jobs:
           REPO_NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # --- watch-config:start ---
           set -euo pipefail
           detail=""
           if [ "$TARGETS_RESULT" != "success" ]; then
@@ -205,6 +211,7 @@ jobs:
           fi
           echo "::error::${detail}"
           exit 1
+          # --- watch-config:end ---
 
   watch:
     name: probe ${{ matrix.target.label || 'the dashboard' }} from GitHub's network
@@ -419,8 +426,8 @@ jobs:
         if: steps.probe.outcome == 'failure'
         env:
           # EXTERNAL_WATCH_NTFY_* (#207): the watch's own channel — a managed
-          # anchor's NTFY_* live in its environment, which a scheduled run
-          # cannot read. Outside the managed repo-scope refusal list on
+          # anchor's NTFY_* live in its environment, which this job (no
+          # `environment:` key) cannot read. Outside the managed repo-scope refusal list on
           # purpose (no managed run reads them).
           WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}
           WATCH_NTFY_TOKEN: ${{ secrets.EXTERNAL_WATCH_NTFY_TOKEN }}
@@ -444,12 +451,15 @@ jobs:
           fi
           NTFY_AUTH=()
           [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-H "Authorization: Bearer ${NTFY_TOKEN}")
-          curl -sS --fail "${NTFY_AUTH[@]}" \
+          if curl -sS --fail "${NTFY_AUTH[@]}" \
             -H "Title: ${WATCH_ALIAS:+${WATCH_ALIAS}: }anchor dashboard unreachable (external watch)" \
             -H "Priority: high" -H "Tags: rotating_light" \
             -d "${DETAIL:-probe failed} — ${RUN_URL}" \
-            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null
-          echo "ntfy push sent."
+            "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null; then
+            echo "ntfy push sent."
+          else
+            echo "::warning::ntfy push failed - the incident step still runs"
+          fi
 
       - name: Incident state (issue = open while failing; auto-close on recovery)
         env:
@@ -461,6 +471,7 @@ jobs:
           # which keeps the old title.
           WATCH_ALIAS: ${{ matrix.target.label }}
         run: |
+          # --- watch-incident:start ---
           set -euo pipefail
           label=external-watch
           prefix="[external-watch] ${WATCH_ALIAS:+${WATCH_ALIAS}: }dashboard probe failing:"
@@ -493,6 +504,7 @@ jobs:
               gh issue create --title "${prefix} ${DETAIL:-unknown}" --body "$body"
             fi
           fi
+          # --- watch-incident:end ---
 
       - name: Fail the run on probe failure (GitHub notifies watchers)
         if: steps.probe.outcome == 'failure'

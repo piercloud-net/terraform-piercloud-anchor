@@ -32,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=132
+MIN_CHECKS=181
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -325,24 +325,34 @@ refuses() { # $1 label, $2 list, $3 expected message fragment, [$4 override]
   esac
 }
 refuses "refuse: override with two targets" "pier alice" "overrides exactly one target" "https://x.example/"
-refuses "refuse: duplicate alias" "pier pier:puller" "duplicate alias 'pier'"
-refuses "refuse: unknown flag" "pier:loud" "unknown flag 'loud'"
-refuses "refuse: empty flag" "pier:" "empty flag on 'pier'"
-refuses "refuse: double flag" "pier:puller:x" "unknown flag 'puller:x'"
-refuses "refuse: uppercase alias" "Pier" "bad alias 'Pier'"
-refuses "refuse: hyphen" "pier-2" "bad alias 'pier-2'"
-refuses "refuse: underscore" "pier_2" "bad alias 'pier_2'"
-refuses "refuse: host injection" "pier.evil.example" "bad alias 'pier.evil.example'"
-refuses "refuse: path injection" "pier/x" "bad alias 'pier/x'"
-refuses "refuse: 2 chars" "ab" "bad alias 'ab'"
+refuses "refuse: duplicate alias" "pier pier:puller" "entry 2: duplicate alias"
+refuses "refuse: unknown flag" "pier:loud" "entry 1: unknown flag"
+refuses "refuse: empty flag" "pier:" "entry 1: empty flag"
+refuses "refuse: double flag" "pier:puller:x" "entry 1: unknown flag"
+refuses "refuse: uppercase alias" "Pier" "entry 1: bad alias"
+refuses "refuse: hyphen" "pier-2" "entry 1: bad alias"
+refuses "refuse: underscore" "pier_2" "entry 1: bad alias"
+refuses "refuse: host injection" "pier.evil.example" "entry 1: bad alias"
+refuses "refuse: path injection" "pier/x" "entry 1: bad alias"
+refuses "refuse: 2 chars" "ab" "entry 1: bad alias"
 refuses "refuse: 16 chars" "$(printf 'a%.0s' $(seq 1 16))" "bad alias"
-refuses "refuse: glob stays a word" "*" "bad alias '*'"
+refuses "refuse: glob stays a word" "*" "entry 1: bad alias"
+# Trust r2 F1: a refused entry's text reaches the public log, the config
+# incident and ntfy, so the reason names the position and rule, never the value.
+for sv in 'trust-sentinel-xyz' 'pier trust-sentinel-xyz' 'pier:trust-sentinel-xyz' 'Trust-Sentinel'; do
+  r="$(WATCH_TENANTS="$sv" LEGACY_TENANT_USER=zed targets 2>&1)"
+  case "$r" in
+    refused\|*) case "$r" in *[Ss]entinel*) bad "refusal never echoes the entry ('${sv}')" ;; *) ok "refusal never echoes the entry ('${sv}')" ;; esac ;;
+    *) bad "sentinel list refused ('${sv}'): $r" ;;
+  esac
+done
 refuses "refuse: reserved prefix status" "statusx" "reserved prefix"
 refuses "refuse: reserved prefix pcu" "pcu12345" "reserved prefix"
 refuses "refuse: reserved prefix anchor" "anchor01" "reserved prefix"
 refuses "refuse: reserved prefix platform" "platformx" "reserved prefix"
-refuses "refuse: reserved name edge" "edge" "reserved platform name"
-refuses "refuse: reserved name console" "console" "reserved platform name"
+for rn in edge console ops keys unlock bounce mail broker www; do
+  refuses "refuse: reserved name ${rn}" "$rn" "reserved platform name"
+done
 # Locale (#208 round 1): the caller's UTF-8 locale must not widen [a-z].
 for na in 'pièr' 'aéb' 'ßab' 'ａｂｃ'; do refuses "refuse: non-ASCII '${na}' under a UTF-8 locale" "$na" "bad alias"; done
 refuses "refuse: fullwidth digit 'pier２'" 'pier２' "bad alias"
@@ -384,7 +394,7 @@ is "repo fallback pairs the repo topic with the repo token (leg + config)" "2" "
 is "watch-channel pair (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"' "$WATCH")"
 cfg="$(awk '/^  config:$/{f=1} /^  watch:$/{f=0} f' "$WATCH")"
 has "config job waits on targets" "$cfg" "needs: targets"
-has "config job always runs" "$cfg" "if: always()"
+is "config job always runs (exact line, no extra condition)" "1" "$(printf '%s\n' "$cfg" | grep -cx '    if: always()' || true)"
 has "config job reads the targets result" "$cfg" 'TARGETS_RESULT: ${{ needs.targets.result }}'
 has "config job reads the refusal" "$cfg" 'REFUSED: ${{ needs.targets.outputs.refused }}'
 has "config job fails the run while refused" "$cfg" 'exit 1'
@@ -393,9 +403,112 @@ has "job name uses the label (legacy name unchanged)" "$wf" "name: probe \${{ ma
 # Invariant 4 carve-out (#208 round 1): the watch channel names are read by
 # external-watch.yml only, never by a managed run.
 is "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml" "" \
-  "$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github ':!.github/workflows/external-watch.yml' || true)"
+  "$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github scripts ':!.github/workflows/external-watch.yml' || true)"
 has "invariant 4 carries the scoped watch-channel amendment" "$(cat "${ROOT}/docs/invariants.md")" "Scoped amendment — the external watch's own push channel"
 lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.github/workflows/provision.yml")" 'EXTERNAL_WATCH_'
+
+# ---- #208 round 2: behavioural drivers for the config + incident steps -----
+# Both steps run against stub gh/curl on PATH; every call is logged, so the
+# assertions are on what the step DOES (create/comment/close/push, exit code),
+# not on substrings of the workflow.
+mkdir -p "$WORK/stubs"
+cat >"$WORK/stubs/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"$STUB_LOG"
+case "$1 $2" in
+  "issue list") printf '%s\n' "${GH_LIST_JSON:-[]}" ;;
+  "issue view") printf '%s\n' "${GH_VIEW_LAST:-}" ;;
+  "issue create") [ -n "${GH_CREATE_FAIL_LABEL:-}" ] && case "$*" in *--label*) exit 1 ;; esac; exit 0 ;;
+esac
+exit 0
+STUB
+cat >"$WORK/stubs/curl" <<'STUB'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$STUB_LOG"
+exit "${CURL_RC:-0}"
+STUB
+chmod +x "$WORK/stubs/gh" "$WORK/stubs/curl"
+
+span() { # $1 marker name -> extracted, dedented step body
+  local a b
+  a="$(grep -n "# --- $1:start ---" "$WATCH" | cut -d: -f1)"
+  b="$(grep -n "# --- $1:end ---" "$WATCH" | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] || return 1
+  sed -n "$((a + 1)),$((b - 1))p" "$WATCH" | sed 's/^          //'
+}
+if span watch-config >"$WORK/config.sh" && bash -n "$WORK/config.sh"; then ok "config step extracted + parses"; else bad "config step extracted + parses"; fi
+if span watch-incident >"$WORK/incident.sh" && bash -n "$WORK/incident.sh"; then ok "incident step extracted + parses"; else bad "incident step extracted + parses"; fi
+
+drive() { # $1 script; env passes through; sets D_RC, D_LOG
+  : >"$WORK/stub.log"
+  D_RC=0
+  ( cd "$WORK" && PATH="$WORK/stubs:$PATH" STUB_LOG="$WORK/stub.log" GH_TOKEN=x \
+      RUN_URL=https://example.invalid/run bash "$1" ) >"$WORK/drive.out" 2>&1 || D_RC=$?
+  D_LOG="$(cat "$WORK/stub.log")"
+}
+calls() { printf '%s\n' "$D_LOG" | grep -c "$1" || true; }
+CFG_OPEN='[{"number":7,"title":"[external-watch] watch config refused: x"},{"number":3,"title":"[external-watch] pier: dashboard probe failing: y"}]'
+
+# config: refused, no incident yet -> create once, push once, run fails
+TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 drive "$WORK/config.sh"
+is "config refused: run fails" "1" "$D_RC"
+is "config refused: one incident created" "1" "$(calls '^gh issue create')"
+has "config refused: incident title carries the prefix" "$D_LOG" '--title [external-watch] watch config refused: bad alias'
+is "config refused: one ntfy push" "1" "$(calls '^curl ')"
+has "config refused: push goes to the watch topic" "$D_LOG" 'https://ntfy.sh/t1'
+# config: refused, incident already open -> no duplicate, no re-push, still fails
+TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 GH_LIST_JSON="$CFG_OPEN" drive "$WORK/config.sh"
+is "config refused + open: run fails" "1" "$D_RC"
+is "config refused + open: no duplicate incident" "0" "$(calls '^gh issue create')"
+is "config refused + open: no re-push" "0" "$(calls '^curl ')"
+# config: targets job broken -> alert
+TARGETS_RESULT=failure REFUSED="" drive "$WORK/config.sh"
+is "config targets failed: run fails" "1" "$D_RC"
+has "config targets failed: incident names the result" "$D_LOG" "the targets job ended 'failure'"
+# config: refused, push fails -> incident still filed, run still fails
+TARGETS_RESULT=success REFUSED="bad" REPO_NTFY_TOPIC=t2 CURL_RC=22 drive "$WORK/config.sh"
+is "config push failure: run still fails" "1" "$D_RC"
+is "config push failure: incident still created" "1" "$(calls '^gh issue create')"
+has "config push failure: repo topic used when no watch topic" "$D_LOG" 'https://ntfy.sh/t2'
+# config: valid list, open config incident -> closed, run green; the tenant incident is untouched
+TARGETS_RESULT=success REFUSED="" GH_LIST_JSON="$CFG_OPEN" drive "$WORK/config.sh"
+is "config valid: run green" "0" "$D_RC"
+is "config valid: closes the config incident only" "gh issue close 7" "$(printf '%s\n' "$D_LOG" | grep '^gh issue close')"
+is "config valid: no create, no push" "0" "$(( $(calls '^gh issue create') + $(calls '^curl ') ))"
+# config: valid/unset, nothing open -> silent green
+TARGETS_RESULT=success REFUSED="" drive "$WORK/config.sh"
+is "config valid + nothing open: run green" "0" "$D_RC"
+is "config valid + nothing open: no issue writes" "0" "$(printf '%s\n' "$D_LOG" | grep -cE '^gh issue (create|comment|close)' || true)"
+
+# incident: tenant leg failing, none open -> per-tenant incident created
+OK=false DETAIL=boom WATCH_ALIAS=pier drive "$WORK/incident.sh"
+is "incident fail: step exits 0 (the Fail step fails the run)" "0" "$D_RC"
+has "incident fail: per-tenant title" "$D_LOG" '--title [external-watch] pier: dashboard probe failing: boom'
+# incident: tenant leg failing, its incident open with a fresh comment -> no spam
+OK=false DETAIL=boom WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" GH_VIEW_LAST="$(date -u +%FT%TZ)" drive "$WORK/incident.sh"
+is "incident fail + open (<6h): no create, no comment" "0" "$(printf '%s\n' "$D_LOG" | grep -cE '^gh issue (create|comment)' || true)"
+# incident: tenant leg green -> closes ITS incident, never the config one
+OK=true WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" drive "$WORK/incident.sh"
+is "incident recovered: closes the tenant incident only" "gh issue close 3" "$(printf '%s\n' "$D_LOG" | grep '^gh issue close')"
+# incident: legacy leg (blank label) never matches a tenant-titled incident
+OK=true WATCH_ALIAS="" GH_LIST_JSON="$CFG_OPEN" drive "$WORK/incident.sh"
+is "incident legacy leg: tenant incident untouched" "0" "$(calls '^gh issue close')"
+OK=false DETAIL=boom WATCH_ALIAS="" drive "$WORK/incident.sh"
+has "incident legacy leg: legacy title kept" "$D_LOG" '--title [external-watch] dashboard probe failing: boom'
+# incident: label attach fails -> created without it
+OK=false DETAIL=boom WATCH_ALIAS=pier GH_CREATE_FAIL_LABEL=1 drive "$WORK/incident.sh"
+is "incident label failure: retried without the label" "2" "$(calls '^gh issue create')"
+
+# Fail step: the run goes red on a failed probe (exact condition).
+failstep="$(awk '/- name: Fail the run on probe failure/{f=1;next} f&&n<2{print;n++}' "$WATCH")"
+is "Fail step condition + body are exact" "        if: steps.probe.outcome == 'failure'
+        run: exit 1" "$failstep"
+pushstep="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&n<1{print;n++}' "$WATCH")"
+is "leg ntfy step fires on a failed probe (exact condition)" "        if: steps.probe.outcome == 'failure'" "$pushstep"
+# A failed leg push must not skip the incident step (the step has no if:).
+pushbody="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
+has "leg ntfy push is guarded by if (a curl failure never fails the step)" "$pushbody" '          if curl -sS --fail "${NTFY_AUTH[@]}" \'
+has "leg ntfy failure is a warning, not a step failure" "$pushbody" $'          else\n            echo "::warning::ntfy push failed - the incident step still runs"\n          fi'
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/external-watch/run-test.sh"
