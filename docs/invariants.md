@@ -120,6 +120,15 @@ as the repo-side controls.
 
 **Rationale.** Issue #198 closed the fall-through by blanking these values on every managed run, which also made a managed operator anchor impossible (no role, no witness, no alerts). Environment-scoped values give each anchor its own set; the refusal keeps the fall-through closed. Enforced by: the ungated banner job's repo-scope step (one presence probe per name, refuses a managed dispatch on any repository- or organization-level copy, before any gate or device card), and the `tests/managed-operator-plane` pin (bare reads only inside tenant-environment jobs; elsewhere only gated literals or the named shared forms (`CLOUDFRONT_ORIGIN_SECRET`, `MAIN_BOX_IPV4`), with the tenant-only `MANAGED_TENANT` and `TENANT_CUSTOMER_NUMBER` forms allowed only inside tenant-environment jobs (a job outside the banner closure gets only the global forms); the probe set equal to the pin's declared environment-scoped names plus the two tenant-only names; allowlisted workflow/banner keys; the preflight and repo-scope steps pinned by digest as banner steps 1–2; every tenant-environment job behind the banner with no status function in its `if:`). Unlike #198's unconditional blanking, this is a refusal with a disclosed race. `TENANT_USER` and `CUSTOMER_NUMBER` stay operator-only and are never read by a managed run; the platform-plane `CLOUDFRONT_ORIGIN_SECRET` and `MAIN_BOX_IPV4` are shared by design. **Residual:** a repository-level value created after a run's banner job passed is read by that run's later jobs (an operator-controlled race; the next dispatch refuses).
 
+### Scoped amendment — the external watch's own push channel (2026-10-17, issue #207)
+
+> Invariant 4's "no such value at repository level" is amended for exactly
+> two names: the repository secrets `EXTERNAL_WATCH_NTFY_TOPIC` and
+> `EXTERNAL_WATCH_NTFY_TOKEN` may exist at repository level. They are read by
+> `.github/workflows/external-watch.yml` only, and never by a managed run.
+
+**Rationale.** The scheduled external watch selects no `environment:`, so it cannot read a tenant environment (tenant environments are also expected to be limited to `v*` tags by the platform, not verified in this repo — see `docs/usage.md`). Its push channel must therefore live at repository level. The names are distinct from every environment-scoped name, so GitHub's per-name fall-through cannot hand them to a managed anchor: no managed job references them. Enforced by: `tests/external-watch` (the names appear in no file under `.github/` or `scripts/` other than `external-watch.yml`, and are absent from the managed repo-scope list, which they need not join because nothing managed reads them). The harness runs from the PR checkout, so a PR can edit this pin; review of the harness diff is the control.
+
 ## S1 — every netcup use human-approved per run
 
 > No stored tokens, no crons. Each run authenticates via the tenant's

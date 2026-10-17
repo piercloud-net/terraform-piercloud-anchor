@@ -18,7 +18,9 @@
 #     means the puller never applied the change);
 #   - a manifest 5xx or an aged generated_at fails (producer staleness); a
 #     404/410 is not-published (no page; the puller keeps last-known-good);
-#   - TENANT_USER unset degrades to the platform channel only.
+#   - TENANT_USER unset degrades to the platform channel only;
+#   - #207: the per-tenant target parser (legacy fallback, flags, refusals,
+#     the probe_url override rule) and the matrix/incident/ntfy wiring.
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=40
+MIN_CHECKS=220
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -268,6 +270,311 @@ out="$(TENANT_USER="" run_block "$CASE")"
 lacks "no alias: no manifest failure" "$out" "missing from the dashboard"
 has "no alias: platform-only notice" "$out" "TENANT_USER unset"
 lacks "no alias: tenant manifest not fetched" "$(cat "$CASE/calls.txt")" "$TENANT_URL"
+
+# ---- #207: watch targets (per-tenant matrix) ------------------------------
+tstart="$(grep -n 'watch-targets:start' "$WATCH" | cut -d: -f1)"
+tend="$(grep -n 'watch-targets:end' "$WATCH" | cut -d: -f1)"
+if [ -n "$tstart" ] && [ -n "$tend" ]; then ok "targets markers present"; else bad "targets markers present"; fi
+sed -n "$((tstart + 1)),$((tend - 1))p" "$WATCH" | sed 's/^          //' >"${WORK}/targets.sh"
+if bash -n "${WORK}/targets.sh"; then ok "targets block parses (bash -n)"; else bad "targets block fails bash -n"; fi
+
+targets() { # env: WATCH_TENANTS PROBE_OVERRIDE LEGACY_*; prints "0|matrix", "refused|reason|matrix" or "rc|output"
+  local out rc refused
+  out="$( ( cd "$WORK" && env -u GITHUB_OUTPUT \
+      WATCH_TENANTS="${WATCH_TENANTS-}" PROBE_OVERRIDE="${PROBE_OVERRIDE-}" \
+      LEGACY_PROBE_URL="${LEGACY_PROBE_URL-}" LEGACY_STATUS_PULLER="${LEGACY_STATUS_PULLER-}" \
+      LEGACY_TENANT_USER="${LEGACY_TENANT_USER-}" GITHUB_OUTPUT="$WORK/gh_out" \
+      LC_ALL="${TARGETS_LC_ALL-en_US.UTF-8}" \
+      bash "${WORK}/targets.sh" ) 2>&1 )" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    refused="$(sed -n 's/^refused=//p' "$WORK/gh_out" | tail -n1)"
+    if [ -n "$refused" ]; then
+      printf 'refused|%s|%s' "$refused" "$(sed -n 's/^matrix=//p' "$WORK/gh_out" | tail -n1)"
+    else
+      printf '0|%s' "$(sed -n 's/^matrix=//p' "$WORK/gh_out" | tail -n1)"
+    fi
+    printf '\n%s' "$out" >"$WORK/last_out"
+  else
+    printf '%s|%s' "$rc" "$out"
+  fi
+  rm -f "$WORK/gh_out"
+}
+
+r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=on LEGACY_PROBE_URL=https://pier.status.piercloud.net/ targets)"
+is "legacy: unset list = one legacy target" '0|[{"alias":"pier","label":"","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":true}]' "$r"
+r="$(WATCH_TENANTS=" , " LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=no targets)"
+is "legacy: blank list + puller off" '0|[{"alias":"pier","label":"","puller":"","probe_url":"","legacy":true}]' "$r"
+# Functional r3 F2: the legacy puller mapping (same accepted set as the puller).
+for pv in 1 true yes on; do
+  r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER="$pv" targets)"
+  has "legacy: puller '${pv}' maps to on" "$r" '"puller":"on"'
+done
+for pv in 0 false no off ON True; do
+  r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER="$pv" targets)"
+  has "legacy: puller '${pv}' maps to off" "$r" '"puller":""'
+done
+r="$(WATCH_TENANTS="" LEGACY_PROBE_URL=https://a.example/ PROBE_OVERRIDE=https://b.example/ targets)"
+has "legacy: probe_url override wins" "$r" '"probe_url":"https://b.example/"'
+
+r="$(WATCH_TENANTS="pier:puller, alice bob:puller" LEGACY_STATUS_PULLER=on LEGACY_TENANT_USER=zed targets)"
+is "list: three legs, flags, nested URLs, legacy values ignored" \
+  '0|[{"alias":"pier","label":"pier","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":false},{"alias":"alice","label":"alice","puller":"","probe_url":"https://alice.status.piercloud.net/","legacy":false},{"alias":"bob","label":"bob","puller":"on","probe_url":"https://bob.status.piercloud.net/","legacy":false}]' "$r"
+r="$(WATCH_TENANTS="pier:puller" PROBE_OVERRIDE=https://x.example/ targets)"
+has "list: single target takes the override" "$r" '"probe_url":"https://x.example/"'
+
+refuses() { # $1 label, $2 list, $3 expected message fragment, [$4 override]
+  local r legacy
+  r="$(WATCH_TENANTS="$2" PROBE_OVERRIDE="${4-}" LEGACY_TENANT_USER=zed LEGACY_PROBE_URL=https://zed.example/ targets)"
+  legacy='[{"alias":"zed","label":"","puller":"","probe_url":"'"${4:-https://zed.example/}"'","legacy":true}]'
+  case "$r" in
+    refused\|*)
+      has "$1" "$r" "$3"
+      is "$1: falls back to the legacy target" "$legacy" "${r##*|}" ;;
+    *) bad "$1 (not refused: $r)" ;;
+  esac
+}
+refuses "refuse: override with two targets" "pier alice" "overrides exactly one target" "https://x.example/"
+refuses "refuse: duplicate alias" "pier pier:puller" "entry 2: duplicate alias"
+refuses "refuse: unknown flag" "pier:loud" "entry 1: unknown flag"
+refuses "refuse: empty flag" "pier:" "entry 1: empty flag"
+refuses "refuse: double flag" "pier:puller:x" "entry 1: unknown flag"
+refuses "refuse: uppercase alias" "Pier" "entry 1: bad alias"
+refuses "refuse: hyphen" "pier-2" "entry 1: bad alias"
+refuses "refuse: underscore" "pier_2" "entry 1: bad alias"
+refuses "refuse: host injection" "pier.evil.example" "entry 1: bad alias"
+refuses "refuse: path injection" "pier/x" "entry 1: bad alias"
+refuses "refuse: 2 chars" "ab" "entry 1: bad alias"
+refuses "refuse: 16 chars" "$(printf 'a%.0s' $(seq 1 16))" "bad alias"
+refuses "refuse: glob stays a word" "*" "entry 1: bad alias"
+# Trust r2 F1: a refused entry's text reaches the public log, the config
+# incident and ntfy, so the reason names the position and rule, never the value.
+for sv in 'trust-sentinel-xyz' 'pier trust-sentinel-xyz' 'pier:trust-sentinel-xyz' 'Trust-Sentinel'; do
+  r="$(WATCH_TENANTS="$sv" LEGACY_TENANT_USER=zed targets 2>&1)"
+  case "$r" in
+    refused\|*) case "$r" in *[Ss]entinel*) bad "refusal never echoes the entry ('${sv}')" ;; *) ok "refusal never echoes the entry ('${sv}')" ;; esac ;;
+    *) bad "sentinel list refused ('${sv}'): $r" ;;
+  esac
+done
+refuses "refuse: reserved prefix status" "statusx" "reserved prefix"
+refuses "refuse: reserved prefix pcu" "pcu12345" "reserved prefix"
+refuses "refuse: reserved prefix anchor" "anchor01" "reserved prefix"
+refuses "refuse: reserved prefix platform" "platformx" "reserved prefix"
+for rn in edge console ops keys unlock bounce mail broker www; do
+  refuses "refuse: reserved name ${rn}" "$rn" "reserved platform name"
+done
+# Locale (#208 round 1): the caller's UTF-8 locale must not widen [a-z].
+for na in 'pièr' 'aéb' 'ßab' 'ａｂｃ'; do refuses "refuse: non-ASCII '${na}' under a UTF-8 locale" "$na" "bad alias"; done
+refuses "refuse: fullwidth digit 'pier２'" 'pier２' "bad alias"
+# Unicode-space-only list: never the silent legacy path (C locale: not [[:space:]]).
+refuses "refuse: U+2003-only list" $'\u2003' "bad alias"
+refuses "refuse: U+3000-only list" $'\u3000' "bad alias"
+# Functional r3 F1: ASCII control whitespace the gate saw as blank but the
+# parser (IFS split) sees as a word.
+refuses "refuse: CR-only list" $'\r' "bad alias"
+refuses "refuse: VT-only list" $'\v' "bad alias"
+refuses "refuse: FF-only list" $'\f' "bad alias"
+# Functional r4 F2: the gate strips the separator BYTES, never the letters t/n
+# or a backslash (an over-wide bracket would turn these into the legacy path).
+r="$(WATCH_TENANTS="tnt" targets)"
+is "accept: alias of only t/n letters is one tenant leg" '0|[{"alias":"tnt","label":"tnt","puller":"","probe_url":"https://tnt.status.piercloud.net/","legacy":false}]' "$r"
+refuses "refuse: backslash-only list" '\\' "bad alias"
+refuses "refuse: t/n-only short list" "tn" "bad alias"
+r="$(WATCH_TENANTS=$' \t\n, ' LEGACY_TENANT_USER=pier targets)"
+case "$r" in 0\|*'"legacy":true'*) ok "legacy: space/tab/newline/comma-only list" ;; *) bad "legacy: space/tab/newline/comma-only list ($r)" ;; esac
+refuses "refuse: 257 tenants (matrix cap)" "$(for i in $(seq 100 356); do printf 'abc%s ' "$i"; done)" "exceed the 256-leg matrix cap"
+r="$(WATCH_TENANTS="$(for i in $(seq 100 355); do printf 'abc%s ' "$i"; done)" targets)"
+case "$r" in 0\|*) ok "accept: 256 tenants" ;; *) bad "accept: 256 tenants (${r:0:120})" ;; esac
+r="$(TARGETS_LC_ALL=C.UTF-8 WATCH_TENANTS='pièr' LEGACY_TENANT_USER=zed LEGACY_PROBE_URL=https://zed.example/ targets)"
+case "$r" in refused\|*) ok "refuse: non-ASCII under C.UTF-8" ;; *) bad "refuse: non-ASCII under C.UTF-8 ($r)" ;; esac
+r="$(WATCH_TENANTS="$(printf 'a%.0s' $(seq 1 15))" targets)"
+case "$r" in 0\|*) ok "accept: 15-char alias" ;; *) bad "accept: 15-char alias ($r)" ;; esac
+r="$(WATCH_TENANTS="p1x" targets)"
+case "$r" in 0\|*) ok "accept: 3-char digit alias" ;; *) bad "accept: 3-char digit alias ($r)" ;; esac
+# The refusal is loud in the log and the targets line prints a count, never the aliases.
+r="$(WATCH_TENANTS="pier Pier" LEGACY_TENANT_USER=zed targets)"
+has "refusal: ::error:: line names the fallback" "$(cat "$WORK/last_out")" "falling back to the legacy single target"
+r="$(WATCH_TENANTS="alice bob" targets)"
+is "targets line: count only" "watch targets: 2 (per-tenant)" "$(grep '^watch targets:' "$WORK/last_out")"
+lacks "targets line: no alias list" "$(grep '^watch targets:' "$WORK/last_out")" "alice"
+
+# Wiring: the legs read the matrix, never the repo-level switch / target.
+wf="$(cat "$WATCH")"
+has "watch job is a matrix over the targets output" "$wf" 'target: ${{ fromJSON(needs.targets.outputs.matrix) }}'
+has "probe reads the leg URL" "$wf" 'PROBE_URL: ${{ matrix.target.probe_url }}'
+has "probe reads the leg puller flag" "$wf" 'STATUS_PULLER: ${{ matrix.target.puller }}'
+has "probe reads the leg alias" "$wf" 'TENANT_USER: ${{ matrix.target.alias }}'
+is "probe never reads repo-level STATUS_PULLER/TENANT_USER directly" "0" \
+  "$(grep -cE '^[[:space:]]+(STATUS_PULLER|TENANT_USER|PROBE_URL): \$\{\{ (vars|inputs)\.' "$WATCH" || true)"
+has "incident title is per tenant" "$wf" 'prefix="[external-watch] ${WATCH_ALIAS:+${WATCH_ALIAS}: }dashboard probe failing:"'
+has "incident lookup filters by the tenant prefix" "$wf" 'select(.title | startswith($p))'
+is "incident + ntfy read the leg label (blank on the legacy leg)" "2" "$(grep -c 'WATCH_ALIAS: ${{ matrix.target.label }}' "$WATCH")"
+has "watch ntfy topic is read" "$wf" 'WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}'
+has "topic/token pair never crosses channels" "$wf" 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"'
+is "fail-fast stays off (a failed leg never cancels the other tenants)" "1" "$(grep -c '^      fail-fast: false$' "$WATCH")"
+is "incident lookups read up to 100 open issues (leg + config)" "2" "$(grep -c 'gh issue list --label "$label" --state open --limit 100 --json number,title' "$WATCH")"
+is "repo fallback pairs the repo topic with the repo token (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="${REPO_NTFY_TOPIC:-}"; NTFY_TOKEN="${REPO_NTFY_TOKEN:-}"' "$WATCH")"
+is "watch-channel pair (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"' "$WATCH")"
+cfg="$(awk '/^  config:$/{f=1} /^  watch:$/{f=0} f' "$WATCH")"
+has "config job waits on targets" "$cfg" "needs: targets"
+is "config job always runs (exact line, no extra condition)" "1" "$(printf '%s\n' "$cfg" | grep -cx '    if: always()' || true)"
+has "config job reads the targets result" "$cfg" 'TARGETS_RESULT: ${{ needs.targets.result }}'
+has "config job reads the refusal" "$cfg" 'REFUSED: ${{ needs.targets.outputs.refused }}'
+has "config job fails the run while refused" "$cfg" 'exit 1'
+has "targets job exports the refusal" "$wf" 'refused: ${{ steps.targets.outputs.refused }}'
+has "job name uses the label (legacy name unchanged)" "$wf" "name: probe \${{ matrix.target.label || 'the dashboard' }} from GitHub's network"
+# Invariant 4 carve-out (#208 round 1): the watch channel names are read by
+# external-watch.yml only, never by a managed run.
+# Trust r3 F1: never vacuous — outside a git work tree the pin fails loudly.
+if (cd "$ROOT" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+  ewn_rc=0
+  ewn="$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github scripts ':!.github/workflows/external-watch.yml')" || ewn_rc=$?
+  # git grep: 0 = matches, 1 = none, anything else = error.
+  case "$ewn_rc" in
+    1) ok "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml" ;;
+    0) bad "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml (also in: ${ewn})" ;;
+    *) bad "EXTERNAL_WATCH_NTFY_* pin: git grep failed (rc ${ewn_rc})" ;;
+  esac
+  is "external-watch.yml itself is tracked (the pin scope is real)" "1" \
+    "$(cd "$ROOT" && git ls-files -- .github/workflows/external-watch.yml | wc -l | tr -d ' ')"
+else
+  bad "EXTERNAL_WATCH_NTFY_* pin needs a git work tree (refusing to pass vacuously)"
+fi
+has "invariant 4 carries the scoped watch-channel amendment" "$(cat "${ROOT}/docs/invariants.md")" "Scoped amendment — the external watch's own push channel"
+lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.github/workflows/provision.yml")" 'EXTERNAL_WATCH_'
+
+# ---- #208 round 2: behavioural drivers for the config + incident steps -----
+# Both steps run against stub gh/curl on PATH; every call is logged, so the
+# assertions are on what the step DOES (create/comment/close/push, exit code),
+# not on substrings of the workflow.
+mkdir -p "$WORK/stubs"
+cat >"$WORK/stubs/gh" <<'STUB'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"$STUB_LOG"
+case "$1 $2" in
+  "issue list") printf '%s\n' "${GH_LIST_JSON:-[]}" ;;
+  "issue view") printf '%s\n' "${GH_VIEW_LAST:-}" ;;
+  "issue create") [ -n "${GH_CREATE_FAIL_LABEL:-}" ] && case "$*" in *--label*) exit 1 ;; esac; exit 0 ;;
+esac
+exit 0
+STUB
+cat >"$WORK/stubs/curl" <<'STUB'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$STUB_LOG"
+exit "${CURL_RC:-0}"
+STUB
+chmod +x "$WORK/stubs/gh" "$WORK/stubs/curl"
+
+span() { # $1 marker name -> extracted, dedented step body
+  local a b
+  a="$(grep -n "# --- $1:start ---" "$WATCH" | cut -d: -f1)"
+  b="$(grep -n "# --- $1:end ---" "$WATCH" | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] || return 1
+  sed -n "$((a + 1)),$((b - 1))p" "$WATCH" | sed 's/^          //'
+}
+if span watch-config >"$WORK/config.sh" && bash -n "$WORK/config.sh"; then ok "config step extracted + parses"; else bad "config step extracted + parses"; fi
+if span watch-incident >"$WORK/incident.sh" && bash -n "$WORK/incident.sh"; then ok "incident step extracted + parses"; else bad "incident step extracted + parses"; fi
+
+drive() { # $1 script; env passes through; sets D_RC, D_LOG
+  : >"$WORK/stub.log"
+  D_RC=0
+  ( cd "$WORK" && PATH="$WORK/stubs:$PATH" STUB_LOG="$WORK/stub.log" GH_TOKEN=x \
+      RUN_URL=https://example.invalid/run bash "$1" ) >"$WORK/drive.out" 2>&1 || D_RC=$?
+  D_LOG="$(cat "$WORK/stub.log")"
+}
+calls() { printf '%s\n' "$D_LOG" | grep -c "$1" || true; }
+CFG_OPEN='[{"number":7,"title":"[external-watch] watch config refused: x"},{"number":3,"title":"[external-watch] pier: dashboard probe failing: y"}]'
+
+# config: refused, no incident yet -> create once, push once, run fails
+TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 drive "$WORK/config.sh"
+is "config refused: run fails" "1" "$D_RC"
+is "config refused: one incident created" "1" "$(calls '^gh issue create')"
+has "config refused: incident title carries the prefix" "$D_LOG" '--title [external-watch] watch config refused: bad alias'
+is "config refused: one ntfy push" "1" "$(calls '^curl ')"
+has "config refused: push goes to the watch topic" "$D_LOG" 'https://ntfy.sh/t1'
+# config: refused, incident already open -> no duplicate, no re-push, still fails
+TARGETS_RESULT=success REFUSED="bad alias 'X'" WATCH_NTFY_TOPIC=t1 GH_LIST_JSON="$CFG_OPEN" drive "$WORK/config.sh"
+is "config refused + open: run fails" "1" "$D_RC"
+is "config refused + open: no duplicate incident" "0" "$(calls '^gh issue create')"
+is "config refused + open: no re-push" "0" "$(calls '^curl ')"
+# config: targets job broken -> alert
+TARGETS_RESULT=failure REFUSED="" drive "$WORK/config.sh"
+is "config targets failed: run fails" "1" "$D_RC"
+has "config targets failed: incident names the result" "$D_LOG" "the targets job ended 'failure'"
+# config: refused, push fails -> incident still filed, run still fails
+TARGETS_RESULT=success REFUSED="bad" REPO_NTFY_TOPIC=t2 CURL_RC=22 drive "$WORK/config.sh"
+is "config push failure: run still fails" "1" "$D_RC"
+is "config push failure: incident still created" "1" "$(calls '^gh issue create')"
+has "config push failure: repo topic used when no watch topic" "$D_LOG" 'https://ntfy.sh/t2'
+# config: valid list, open config incident -> closed, run green; the tenant incident is untouched
+TARGETS_RESULT=success REFUSED="" GH_LIST_JSON="$CFG_OPEN" drive "$WORK/config.sh"
+is "config valid: run green" "0" "$D_RC"
+is "config valid: closes the config incident only" "gh issue close 7" "$(printf '%s\n' "$D_LOG" | grep '^gh issue close')"
+is "config valid: no create, no push" "0" "$(( $(calls '^gh issue create') + $(calls '^curl ') ))"
+# config: valid/unset, nothing open -> silent green
+TARGETS_RESULT=success REFUSED="" drive "$WORK/config.sh"
+is "config valid + nothing open: run green" "0" "$D_RC"
+is "config valid + nothing open: no issue writes" "0" "$(printf '%s\n' "$D_LOG" | grep -cE '^gh issue (create|comment|close)' || true)"
+
+# incident: tenant leg failing, none open -> per-tenant incident created
+OK=false DETAIL=boom WATCH_ALIAS=pier drive "$WORK/incident.sh"
+is "incident fail: step exits 0 (the Fail step fails the run)" "0" "$D_RC"
+has "incident fail: per-tenant title" "$D_LOG" '--title [external-watch] pier: dashboard probe failing: boom'
+# incident: tenant leg failing, its incident open with a fresh comment -> no spam
+OK=false DETAIL=boom WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" GH_VIEW_LAST="$(date -u +%FT%TZ)" drive "$WORK/incident.sh"
+is "incident fail + open (<6h): no create, no comment" "0" "$(printf '%s\n' "$D_LOG" | grep -cE '^gh issue (create|comment)' || true)"
+# incident: tenant leg green -> closes ITS incident, never the config one
+OK=true WATCH_ALIAS=pier GH_LIST_JSON="$CFG_OPEN" drive "$WORK/incident.sh"
+is "incident recovered: closes the tenant incident only" "gh issue close 3" "$(printf '%s\n' "$D_LOG" | grep '^gh issue close')"
+# incident: legacy leg (blank label) never matches a tenant-titled incident
+OK=true WATCH_ALIAS="" GH_LIST_JSON="$CFG_OPEN" drive "$WORK/incident.sh"
+is "incident legacy leg: tenant incident untouched" "0" "$(calls '^gh issue close')"
+OK=false DETAIL=boom WATCH_ALIAS="" drive "$WORK/incident.sh"
+has "incident legacy leg: legacy title kept" "$D_LOG" '--title [external-watch] dashboard probe failing: boom'
+# incident: label attach fails -> created without it
+OK=false DETAIL=boom WATCH_ALIAS=pier GH_CREATE_FAIL_LABEL=1 drive "$WORK/incident.sh"
+is "incident label failure: retried without the label" "2" "$(calls '^gh issue create')"
+
+# Fail step: the run goes red on a failed probe (exact condition).
+failstep="$(awk '/- name: Fail the run on probe failure/{f=1;next} f&&n<2{print;n++}' "$WATCH")"
+is "Fail step condition + body are exact" "        if: steps.probe.outcome == 'failure'
+        run: exit 1" "$failstep"
+pushstep="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&n<1{print;n++}' "$WATCH")"
+is "leg ntfy step fires on a failed probe (exact condition)" "        if: steps.probe.outcome == 'failure'" "$pushstep"
+# A failed leg push must not skip the incident step (the step has no if:).
+pushbody="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
+has "leg ntfy push is guarded by if (a curl failure never fails the step)" "$pushbody" '          if curl -sS --fail "${NTFY_AUTH[@]}" \'
+has "leg ntfy failure is a warning, not a step failure" "$pushbody" $'          else\n            echo "::warning::ntfy push failed - the incident step still runs"\n          fi'
+
+# #208 round 3 (red-team F1): the step headers that decide whether the
+# incident path runs at all. A probe without continue-on-error stops the job
+# before the incident step; an incident step with an `if:` stops filing on a
+# failure or stops closing on recovery.
+probehdr="$(awk '/- name: "Probe: HTTP 200 \+ Gatus data \+ edge cert >= 14d"/{f=1;next} f&&n<3{print;n++}' "$WATCH")"
+is "probe step header is exact (id + continue-on-error + env)" "        id: probe
+        continue-on-error: true
+        env:" "$probehdr"
+incstep="$(awk '/- name: Incident state \(issue = open while failing; auto-close on recovery\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
+is "incident step: env: follows the name directly" "        env:" "$(printf '%s\n' "$incstep" | head -n1)"
+is "incident step carries no if: (runs on failure AND recovery)" "0" "$(printf '%s\n' "$incstep" | grep -cE '^        if:' || true)"
+# Red-team r4 F1: the incident step's env bindings (the drivers stub these
+# values, so pin the YAML lines themselves, inside the step).
+for bl in '          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' '          OK: ${{ steps.probe.outputs.ok }}' '          DETAIL: ${{ steps.probe.outputs.detail }}' '          WATCH_ALIAS: ${{ matrix.target.label }}'; do
+  is "incident step binds: ${bl#"${bl%%[! ]*}"}" "1" "$(printf '%s\n' "$incstep" | grep -cxF -- "$bl" || true)"
+done
+is "incident step has no continue-on-error" "0" "$(printf '%s\n' "$incstep" | grep -c 'continue-on-error' || true)"
+is "watch concurrency never cancels a running watcher" "  group: external-watch
+  cancel-in-progress: false" "$(grep -A1 '^  group: external-watch$' "$WATCH")"
+is "legs run one at a time (ordered incident calls)" "1" "$(grep -cx '      max-parallel: 1' "$WATCH")"
+is "incident step exists exactly once" "1" "$(grep -c '^      - name: Incident state (issue = open while failing; auto-close on recovery)$' "$WATCH")"
+is "permissions block is exact (whole block, to the blank line)" "permissions:
+  contents: read
+  issues: write" "$(awk '/^permissions:$/{f=1} f&&/^$/{exit} f' "$WATCH")"
+is "permissions block is unique (no job-level override)" "1" "$(grep -cE '^[[:space:]]*permissions:' "$WATCH")"
+is "cron cadence is exact" '    - cron: "*/15 * * * *"' "$(grep -E '^[[:space:]]*- cron:' "$WATCH")"
+# Config incident label fallback: a missing/unattachable label still files it.
+TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 drive "$WORK/config.sh"
+is "config label failure: retried without the label" "2" "$(calls '^gh issue create')"
+is "config label failure: run still fails" "1" "$D_RC"
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/external-watch/run-test.sh"

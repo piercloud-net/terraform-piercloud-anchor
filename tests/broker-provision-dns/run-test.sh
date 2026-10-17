@@ -808,8 +808,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_job_digest="$wf_job_digest|$wf:$names"
 done
 job_digest_got="$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" "$job_digest_got"
-if [ "$job_digest_got" != "fecbf8ee8084834e45f604442f29b0639bfd9260cc12c08b8000c8e206347fb2" ]; then
+is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "82d9736c9fd1b0dde8cfc0aee235310e463a1b58e89b68bc183b0cfb2b9b0245" "$job_digest_got"
+if [ "$job_digest_got" != "82d9736c9fd1b0dde8cfc0aee235310e463a1b58e89b68bc183b0cfb2b9b0245" ]; then
   printf '   job-set parts (to update the pin):\n'; printf '%s' "$wf_job_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 top_digest_got="$(printf '%s' "$wf_top_digest" | sha256sum | cut -d' ' -f1)"
@@ -850,8 +850,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "9aeb9f01b11eb71a9f82e96b18854805c1242a7f4ac3ec0a25b4ec13f1fb15e1" "$tests_digest_got"
-if [ "$tests_digest_got" != "9aeb9f01b11eb71a9f82e96b18854805c1242a7f4ac3ec0a25b4ec13f1fb15e1" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "95d4550853a4c3b78fd607cd172d6e09198cf472f8ca33d54e7ba9630925d0a3" "$tests_digest_got"
+if [ "$tests_digest_got" != "95d4550853a4c3b78fd607cd172d6e09198cf472f8ca33d54e7ba9630925d0a3" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
