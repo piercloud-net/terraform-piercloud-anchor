@@ -141,6 +141,7 @@ Dynamic monitor changes (the puller) never touch tang, Caddy or the firewall, an
 
 - A failure files an issue labelled **`external-watch`** (open = failing, with the probe detail and a run link) and fails the run, so GitHub also notifies repo watchers. Recovery auto-comments and closes the issue.
 - Push alerts need no extra setup: once `NTFY_TOPIC`/`NTFY_TOKEN` exist (§9), the watch pushes there too.
+- A dispatch repo serving several managed anchors lists them in the repository variable `EXTERNAL_WATCH_TENANTS` (`alias` or `alias:puller`, comma- or space-separated): one watch leg and one incident issue per tenant, probing `https://<alias>.status.piercloud.net/` (with the D6 checks when `:puller`). Managed values live in each anchor's environment, which a scheduled run cannot read, so the watch's own push channel is `EXTERNAL_WATCH_NTFY_TOPIC`/`EXTERNAL_WATCH_NTFY_TOKEN` (falling back to `NTFY_TOPIC`/`NTFY_TOKEN`). Unset = the single target above, unchanged.
 - Manual run / test: Actions → `external-watch` → Run workflow (`probe_url` overrides the target, which is how the failure/recovery path is proven).
 - Free on public repos; cadence is the workflow `cron`, cert window is `MIN_CERT_DAYS` in the probe step.
 

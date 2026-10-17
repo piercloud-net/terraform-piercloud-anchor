@@ -18,7 +18,9 @@
 #     means the puller never applied the change);
 #   - a manifest 5xx or an aged generated_at fails (producer staleness); a
 #     404/410 is not-published (no page; the puller keeps last-known-good);
-#   - TENANT_USER unset degrades to the platform channel only.
+#   - TENANT_USER unset degrades to the platform channel only;
+#   - #207: the per-tenant target parser (legacy fallback, flags, refusals,
+#     the probe_url override rule) and the matrix/incident/ntfy wiring.
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=40
+MIN_CHECKS=72
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -268,6 +270,74 @@ out="$(TENANT_USER="" run_block "$CASE")"
 lacks "no alias: no manifest failure" "$out" "missing from the dashboard"
 has "no alias: platform-only notice" "$out" "TENANT_USER unset"
 lacks "no alias: tenant manifest not fetched" "$(cat "$CASE/calls.txt")" "$TENANT_URL"
+
+# ---- #207: watch targets (per-tenant matrix) ------------------------------
+tstart="$(grep -n 'watch-targets:start' "$WATCH" | cut -d: -f1)"
+tend="$(grep -n 'watch-targets:end' "$WATCH" | cut -d: -f1)"
+if [ -n "$tstart" ] && [ -n "$tend" ]; then ok "targets markers present"; else bad "targets markers present"; fi
+sed -n "$((tstart + 1)),$((tend - 1))p" "$WATCH" | sed 's/^          //' >"${WORK}/targets.sh"
+if bash -n "${WORK}/targets.sh"; then ok "targets block parses (bash -n)"; else bad "targets block fails bash -n"; fi
+
+targets() { # env: WATCH_TENANTS PROBE_OVERRIDE LEGACY_*; prints "rc|matrix-or-stderr"
+  local out rc
+  out="$( ( cd "$WORK" && env -u GITHUB_OUTPUT \
+      WATCH_TENANTS="${WATCH_TENANTS-}" PROBE_OVERRIDE="${PROBE_OVERRIDE-}" \
+      LEGACY_PROBE_URL="${LEGACY_PROBE_URL-}" LEGACY_STATUS_PULLER="${LEGACY_STATUS_PULLER-}" \
+      LEGACY_TENANT_USER="${LEGACY_TENANT_USER-}" GITHUB_OUTPUT="$WORK/gh_out" \
+      bash "${WORK}/targets.sh" ) 2>&1 )" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then printf '0|%s' "$(sed -n 's/^matrix=//p' "$WORK/gh_out" | tail -n1)"; else printf '%s|%s' "$rc" "$out"; fi
+  rm -f "$WORK/gh_out"
+}
+
+r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=on LEGACY_PROBE_URL=https://pier.status.piercloud.net/ targets)"
+is "legacy: unset list = one legacy target" '0|[{"alias":"pier","label":"","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":true}]' "$r"
+r="$(WATCH_TENANTS=" , " LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=no targets)"
+is "legacy: blank list + puller off" '0|[{"alias":"pier","label":"","puller":"","probe_url":"","legacy":true}]' "$r"
+r="$(WATCH_TENANTS="" LEGACY_PROBE_URL=https://a.example/ PROBE_OVERRIDE=https://b.example/ targets)"
+has "legacy: probe_url override wins" "$r" '"probe_url":"https://b.example/"'
+
+r="$(WATCH_TENANTS="pier:puller, alice bob:puller" LEGACY_STATUS_PULLER=on LEGACY_TENANT_USER=zed targets)"
+is "list: three legs, flags, nested URLs, legacy values ignored" \
+  '0|[{"alias":"pier","label":"pier","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":false},{"alias":"alice","label":"alice","puller":"","probe_url":"https://alice.status.piercloud.net/","legacy":false},{"alias":"bob","label":"bob","puller":"on","probe_url":"https://bob.status.piercloud.net/","legacy":false}]' "$r"
+r="$(WATCH_TENANTS="pier:puller" PROBE_OVERRIDE=https://x.example/ targets)"
+has "list: single target takes the override" "$r" '"probe_url":"https://x.example/"'
+
+refuses() { # $1 label, $2 list, $3 expected message fragment, [$4 override]
+  local r
+  r="$(WATCH_TENANTS="$2" PROBE_OVERRIDE="${4-}" targets)"
+  case "$r" in 0\|*) bad "$1 (accepted: $r)" ;; *) has "$1" "$r" "$3" ;; esac
+}
+refuses "refuse: override with two targets" "pier alice" "overrides exactly one target" "https://x.example/"
+refuses "refuse: duplicate alias" "pier pier:puller" "duplicate alias 'pier'"
+refuses "refuse: unknown flag" "pier:loud" "unknown flag 'loud'"
+refuses "refuse: empty flag" "pier:" "empty flag on 'pier'"
+refuses "refuse: double flag" "pier:puller:x" "unknown flag 'puller:x'"
+refuses "refuse: uppercase alias" "Pier" "bad alias 'Pier'"
+refuses "refuse: trailing hyphen" "pier-" "bad alias 'pier-'"
+refuses "refuse: leading hyphen" "-pier" "bad alias '-pier'"
+refuses "refuse: host injection" "pier.evil.example" "bad alias 'pier.evil.example'"
+refuses "refuse: path injection" "pier/x" "bad alias 'pier/x'"
+refuses "refuse: 41 chars" "$(printf 'a%.0s' $(seq 1 41))" "bad alias"
+refuses "refuse: glob stays a word" "*" "bad alias '*'"
+r="$(WATCH_TENANTS="$(printf 'a%.0s' $(seq 1 40))" targets)"
+case "$r" in 0\|*) ok "accept: 40-char alias" ;; *) bad "accept: 40-char alias ($r)" ;; esac
+r="$(WATCH_TENANTS="p_1-x" targets)"
+case "$r" in 0\|*) ok "accept: underscore/hyphen/digit alias" ;; *) bad "accept: underscore/hyphen/digit alias ($r)" ;; esac
+
+# Wiring: the legs read the matrix, never the repo-level switch / target.
+wf="$(cat "$WATCH")"
+has "watch job is a matrix over the targets output" "$wf" 'target: ${{ fromJSON(needs.targets.outputs.matrix) }}'
+has "probe reads the leg URL" "$wf" 'PROBE_URL: ${{ matrix.target.probe_url }}'
+has "probe reads the leg puller flag" "$wf" 'STATUS_PULLER: ${{ matrix.target.puller }}'
+has "probe reads the leg alias" "$wf" 'TENANT_USER: ${{ matrix.target.alias }}'
+is "probe never reads repo-level STATUS_PULLER/TENANT_USER directly" "0" \
+  "$(grep -cE '^[[:space:]]+(STATUS_PULLER|TENANT_USER|PROBE_URL): \$\{\{ (vars|inputs)\.' "$WATCH" || true)"
+has "incident title is per tenant" "$wf" 'prefix="[external-watch] ${WATCH_ALIAS:+${WATCH_ALIAS}: }dashboard probe failing:"'
+has "incident lookup filters by the tenant prefix" "$wf" 'select(.title | startswith($p))'
+is "incident + ntfy read the leg label (blank on the legacy leg)" "2" "$(grep -c 'WATCH_ALIAS: ${{ matrix.target.label }}' "$WATCH")"
+has "watch ntfy topic is read" "$wf" 'WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}'
+has "topic/token pair never crosses channels" "$wf" 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"'
+lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.github/workflows/provision.yml")" 'EXTERNAL_WATCH_'
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/external-watch/run-test.sh"
