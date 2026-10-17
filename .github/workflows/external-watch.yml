@@ -6,9 +6,9 @@
 # the PUBLIC dashboard from GitHub's network — if both boxes are gone, the
 # runner still runs and still files the incident.
 #
-# Credential-free probe: public GETs only (no tokens, no secrets). The one
-# optional secret is the NTFY push; it degrades to a logged no-op until
-# NTFY_TOPIC exists (same pattern as provision.yml).
+# The probe itself is credential-free: public GETs only, no box access. The
+# only secrets are the optional ntfy publish pairs (EXTERNAL_WATCH_NTFY_* or
+# NTFY_*, #207); the push degrades to a logged no-op until a topic exists.
 #
 # Deliberately NOT in .github/scripts/: that path is scanned by CI's SCP
 # endpoint allowlist (scope: provision.yml + .github/scripts/*.sh), which
@@ -42,8 +42,8 @@ concurrency:
 
 jobs:
   # Issue #207: one watch leg per tenant. A managed anchor keeps its values in
-  # its own environment, which only deploys from `v*` tags — a scheduled run
-  # (default branch) cannot read it. EXTERNAL_WATCH_TENANTS (repo variable)
+  # its own tenant environment, which only deploys from `v*` tags — a
+  # scheduled run (default branch) cannot read it. EXTERNAL_WATCH_TENANTS (repo variable)
   # lists the watched tenants instead; unset = the single legacy target.
   targets:
     name: resolve the watched tenants
@@ -51,6 +51,7 @@ jobs:
     timeout-minutes: 2
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
+      refused: ${{ steps.targets.outputs.refused }}
     steps:
       - name: "Targets: EXTERNAL_WATCH_TENANTS or the legacy single target"
         id: targets
@@ -64,52 +65,149 @@ jobs:
           # --- watch-targets:start (tests/external-watch extracts this block) ---
           set -euo pipefail
           set -f  # entries are words, never globs
-          if [ -z "${WATCH_TENANTS//[[:space:],]/}" ]; then
-            # Legacy: today's single target, unchanged (tenant-owned copies).
-            case "${LEGACY_STATUS_PULLER:-}" in 1|true|yes|on) puller=on ;; *) puller="" ;; esac
-            matrix="$(jq -cn --arg alias "${LEGACY_TENANT_USER:-}" --arg puller "$puller" \
+          export LC_ALL=C  # byte ranges: [a-z] never matches a non-ASCII letter
+          legacy_matrix() {
+            local puller=""
+            case "${LEGACY_STATUS_PULLER:-}" in 1|true|yes|on) puller=on ;; esac
+            jq -cn --arg alias "${LEGACY_TENANT_USER:-}" --arg puller "$puller" \
               --arg url "${PROBE_OVERRIDE:-${LEGACY_PROBE_URL:-}}" \
-              '[{alias:$alias, label:"", puller:$puller, probe_url:$url, legacy:true}]')"
-          else
-            seen=" "
-            matrix="[]"
-            count=0
+              '[{alias:$alias, label:"", puller:$puller, probe_url:$url, legacy:true}]'
+          }
+          # Parses the list; on a refusal prints the reason on stderr and
+          # returns 1 (no partial matrix).
+          tenant_matrix() {
+            local seen=" " matrix="[]" count=0 entry alias flag puller
             for entry in ${WATCH_TENANTS//,/ }; do
               alias="${entry%%:*}"
               flag=""
               if [ "$alias" != "$entry" ]; then
                 flag="${entry#*:}"
-                [ -n "$flag" ] || { echo "::error::EXTERNAL_WATCH_TENANTS: empty flag on '${alias}' (write '${alias}' or '${alias}:puller'); refusing."; exit 1; }
+                [ -n "$flag" ] || { echo "empty flag on '${alias}' (write '${alias}' or '${alias}:puller')" >&2; return 1; }
               fi
-              if ! printf '%s' "$alias" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,39}$' || [ "${alias%-}" != "$alias" ]; then
-                echo "::error::EXTERNAL_WATCH_TENANTS: bad alias '${alias}' (lowercase alphanumeric start, [a-z0-9_-], <= 40 chars, no trailing hyphen); refusing."
-                exit 1
+              # The managed alias grammar (provision.yml tenant input):
+              # ^[a-z0-9]{3,15}$, no reserved prefix, no reserved name.
+              case "$alias" in
+                ''|*[!a-z0-9]*) echo "bad alias '${alias}' (must match ^[a-z0-9]{3,15}$, the managed tenant grammar)" >&2; return 1 ;;
+                anchor*|status*|pcu*|platform*) echo "bad alias '${alias}' (reserved prefix anchor/status/pcu/platform)" >&2; return 1 ;;
+                edge|console|ops|keys|unlock|bounce|mail|broker|www) echo "bad alias '${alias}' (reserved platform name)" >&2; return 1 ;;
+              esac
+              if [ "${#alias}" -lt 3 ] || [ "${#alias}" -gt 15 ]; then
+                echo "bad alias '${alias}' (must match ^[a-z0-9]{3,15}$, the managed tenant grammar)" >&2; return 1
               fi
               case "$flag" in
                 '') puller="" ;;
                 puller) puller=on ;;
-                *) echo "::error::EXTERNAL_WATCH_TENANTS: unknown flag '${flag}' on '${alias}' (only ':puller'); refusing."; exit 1 ;;
+                *) echo "unknown flag '${flag}' on '${alias}' (only ':puller')" >&2; return 1 ;;
               esac
-              case "$seen" in *" ${alias} "*) echo "::error::EXTERNAL_WATCH_TENANTS: duplicate alias '${alias}'; refusing."; exit 1 ;; esac
+              case "$seen" in *" ${alias} "*) echo "duplicate alias '${alias}'" >&2; return 1 ;; esac
               seen="${seen}${alias} "
               count=$((count + 1))
               matrix="$(jq -c --arg alias "$alias" --arg puller "$puller" \
                 '. + [{alias:$alias, label:$alias, puller:$puller, probe_url:("https://" + $alias + ".status.piercloud.net/"), legacy:false}]' <<<"$matrix")"
             done
+            # GitHub expands at most 256 matrix legs; refuse here, where the
+            # refusal still falls back and alerts, not at matrix expansion.
+            if [ "$count" -gt 256 ]; then
+              echo "${count} tenants exceed the 256-leg matrix cap" >&2; return 1
+            fi
             if [ -n "${PROBE_OVERRIDE:-}" ]; then
               if [ "$count" -ne 1 ]; then
-                echo "::error::probe_url overrides exactly one target; EXTERNAL_WATCH_TENANTS lists ${count}. Refusing."
-                exit 1
+                echo "probe_url overrides exactly one target; EXTERNAL_WATCH_TENANTS lists ${count}" >&2; return 1
               fi
               matrix="$(jq -c --arg url "$PROBE_OVERRIDE" 'map(.probe_url = $url)' <<<"$matrix")"
             fi
+            printf '%s\n' "$matrix"
+          }
+          refused=""
+          if [ -z "${WATCH_TENANTS//[[:space:],]/}" ]; then
+            # Legacy: today's single target, unchanged (tenant-owned copies).
+            matrix="$(legacy_matrix)"
+          else
+            errf="$(mktemp)"
+            if ! matrix="$(tenant_matrix 2>"$errf")"; then
+              # A refused list must not silence the watch: fall back to the
+              # legacy single target and let the config-incident job alert.
+              refused="EXTERNAL_WATCH_TENANTS refused: $(head -n1 "$errf" | tr -d '\r')"
+              echo "::error::${refused} - falling back to the legacy single target."
+              matrix="$(legacy_matrix)"
+            fi
+            rm -f "$errf"
           fi
-          echo "watch targets: $(jq -r 'map(.alias + (if .puller == "on" then ":puller" else "" end) + (if .legacy then " (legacy)" else "" end)) | join(", ")' <<<"$matrix")"
-          if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"; fi
+          # Count only: the per-tenant legs name their alias; one public log
+          # line listing every watched alias is not needed.
+          echo "watch targets: $(jq -r 'length' <<<"$matrix") ($(jq -r 'if .[0].legacy then "legacy" else "per-tenant" end' <<<"$matrix"))${refused:+ - config refused}"
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            {
+              echo "matrix=${matrix}"
+              echo "refused=${refused}"
+            } >> "$GITHUB_OUTPUT"
+          fi
           # --- watch-targets:end ---
 
+  # A refused EXTERNAL_WATCH_TENANTS (or a broken targets job) must alert, not
+  # skip silently: one config incident, open while refused, closed when the
+  # list parses again; the run fails while it is open.
+  config:
+    name: watch config state
+    needs: targets
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Config incident (open while refused; auto-close when fixed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGETS_RESULT: ${{ needs.targets.result }}
+          REFUSED: ${{ needs.targets.outputs.refused }}
+          WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}
+          WATCH_NTFY_TOKEN: ${{ secrets.EXTERNAL_WATCH_NTFY_TOKEN }}
+          REPO_NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          REPO_NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          detail=""
+          if [ "$TARGETS_RESULT" != "success" ]; then
+            detail="the targets job ended '${TARGETS_RESULT}' - no watch leg ran"
+          elif [ -n "${REFUSED:-}" ]; then
+            detail="${REFUSED} (watching the legacy single target only)"
+          fi
+          label=external-watch
+          prefix="[external-watch] watch config refused:"
+          gh label create "$label" --color B60205 \
+            --description "Automated external-watch incident (GitHub-side cron; open = probe failing)" 2>/dev/null || true
+          existing="$(gh issue list --label "$label" --state open --limit 100 --json number,title \
+            | jq -r --arg p "$prefix" '[.[] | select(.title | startswith($p))] | sort_by(.number) | .[0].number // ""')"
+          if [ -z "$detail" ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "Config parses again at $(date -u +%FT%TZ). Run: ${RUN_URL}"
+              gh issue close "$existing"
+            fi
+            exit 0
+          fi
+          if [ -z "$existing" ]; then
+            body="$(printf 'The external watch configuration was refused.\n\n- detail: %s\n- run: %s\n\nMachine-managed by `.github/workflows/external-watch.yml` - open = refused, auto-closed when the list parses.\n' "$detail" "$RUN_URL")"
+            gh issue create --title "${prefix} ${detail}" --label "$label" --body "$body" \
+              || gh issue create --title "${prefix} ${detail}" --body "$body"
+            # Push once, when the incident opens (same channel pair rule as the legs).
+            if [ -n "${WATCH_NTFY_TOPIC:-}" ]; then
+              NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"
+            else
+              NTFY_TOPIC="${REPO_NTFY_TOPIC:-}"; NTFY_TOKEN="${REPO_NTFY_TOKEN:-}"
+            fi
+            if [ -n "${NTFY_TOPIC:-}" ]; then
+              NTFY_AUTH=()
+              [ -n "${NTFY_TOKEN:-}" ] && NTFY_AUTH=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+              curl -sS --fail "${NTFY_AUTH[@]}" -H "Title: external watch config refused" \
+                -H "Priority: high" -H "Tags: rotating_light" -d "${detail} - ${RUN_URL}" \
+                "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || echo "::warning::ntfy push failed"
+            fi
+          fi
+          echo "::error::${detail}"
+          exit 1
+
   watch:
-    name: probe ${{ matrix.target.alias || 'the dashboard' }} from GitHub's network
+    name: probe ${{ matrix.target.label || 'the dashboard' }} from GitHub's network
     needs: targets
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -32,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=72
+MIN_CHECKS=132
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -278,14 +278,25 @@ if [ -n "$tstart" ] && [ -n "$tend" ]; then ok "targets markers present"; else b
 sed -n "$((tstart + 1)),$((tend - 1))p" "$WATCH" | sed 's/^          //' >"${WORK}/targets.sh"
 if bash -n "${WORK}/targets.sh"; then ok "targets block parses (bash -n)"; else bad "targets block fails bash -n"; fi
 
-targets() { # env: WATCH_TENANTS PROBE_OVERRIDE LEGACY_*; prints "rc|matrix-or-stderr"
-  local out rc
+targets() { # env: WATCH_TENANTS PROBE_OVERRIDE LEGACY_*; prints "0|matrix", "refused|reason|matrix" or "rc|output"
+  local out rc refused
   out="$( ( cd "$WORK" && env -u GITHUB_OUTPUT \
       WATCH_TENANTS="${WATCH_TENANTS-}" PROBE_OVERRIDE="${PROBE_OVERRIDE-}" \
       LEGACY_PROBE_URL="${LEGACY_PROBE_URL-}" LEGACY_STATUS_PULLER="${LEGACY_STATUS_PULLER-}" \
       LEGACY_TENANT_USER="${LEGACY_TENANT_USER-}" GITHUB_OUTPUT="$WORK/gh_out" \
+      LC_ALL="${TARGETS_LC_ALL-en_US.UTF-8}" \
       bash "${WORK}/targets.sh" ) 2>&1 )" && rc=0 || rc=$?
-  if [ "$rc" -eq 0 ]; then printf '0|%s' "$(sed -n 's/^matrix=//p' "$WORK/gh_out" | tail -n1)"; else printf '%s|%s' "$rc" "$out"; fi
+  if [ "$rc" -eq 0 ]; then
+    refused="$(sed -n 's/^refused=//p' "$WORK/gh_out" | tail -n1)"
+    if [ -n "$refused" ]; then
+      printf 'refused|%s|%s' "$refused" "$(sed -n 's/^matrix=//p' "$WORK/gh_out" | tail -n1)"
+    else
+      printf '0|%s' "$(sed -n 's/^matrix=//p' "$WORK/gh_out" | tail -n1)"
+    fi
+    printf '\n%s' "$out" >"$WORK/last_out"
+  else
+    printf '%s|%s' "$rc" "$out"
+  fi
   rm -f "$WORK/gh_out"
 }
 
@@ -303,9 +314,15 @@ r="$(WATCH_TENANTS="pier:puller" PROBE_OVERRIDE=https://x.example/ targets)"
 has "list: single target takes the override" "$r" '"probe_url":"https://x.example/"'
 
 refuses() { # $1 label, $2 list, $3 expected message fragment, [$4 override]
-  local r
-  r="$(WATCH_TENANTS="$2" PROBE_OVERRIDE="${4-}" targets)"
-  case "$r" in 0\|*) bad "$1 (accepted: $r)" ;; *) has "$1" "$r" "$3" ;; esac
+  local r legacy
+  r="$(WATCH_TENANTS="$2" PROBE_OVERRIDE="${4-}" LEGACY_TENANT_USER=zed LEGACY_PROBE_URL=https://zed.example/ targets)"
+  legacy='[{"alias":"zed","label":"","puller":"","probe_url":"'"${4:-https://zed.example/}"'","legacy":true}]'
+  case "$r" in
+    refused\|*)
+      has "$1" "$r" "$3"
+      is "$1: falls back to the legacy target" "$legacy" "${r##*|}" ;;
+    *) bad "$1 (not refused: $r)" ;;
+  esac
 }
 refuses "refuse: override with two targets" "pier alice" "overrides exactly one target" "https://x.example/"
 refuses "refuse: duplicate alias" "pier pier:puller" "duplicate alias 'pier'"
@@ -313,16 +330,40 @@ refuses "refuse: unknown flag" "pier:loud" "unknown flag 'loud'"
 refuses "refuse: empty flag" "pier:" "empty flag on 'pier'"
 refuses "refuse: double flag" "pier:puller:x" "unknown flag 'puller:x'"
 refuses "refuse: uppercase alias" "Pier" "bad alias 'Pier'"
-refuses "refuse: trailing hyphen" "pier-" "bad alias 'pier-'"
-refuses "refuse: leading hyphen" "-pier" "bad alias '-pier'"
+refuses "refuse: hyphen" "pier-2" "bad alias 'pier-2'"
+refuses "refuse: underscore" "pier_2" "bad alias 'pier_2'"
 refuses "refuse: host injection" "pier.evil.example" "bad alias 'pier.evil.example'"
 refuses "refuse: path injection" "pier/x" "bad alias 'pier/x'"
-refuses "refuse: 41 chars" "$(printf 'a%.0s' $(seq 1 41))" "bad alias"
+refuses "refuse: 2 chars" "ab" "bad alias 'ab'"
+refuses "refuse: 16 chars" "$(printf 'a%.0s' $(seq 1 16))" "bad alias"
 refuses "refuse: glob stays a word" "*" "bad alias '*'"
-r="$(WATCH_TENANTS="$(printf 'a%.0s' $(seq 1 40))" targets)"
-case "$r" in 0\|*) ok "accept: 40-char alias" ;; *) bad "accept: 40-char alias ($r)" ;; esac
-r="$(WATCH_TENANTS="p_1-x" targets)"
-case "$r" in 0\|*) ok "accept: underscore/hyphen/digit alias" ;; *) bad "accept: underscore/hyphen/digit alias ($r)" ;; esac
+refuses "refuse: reserved prefix status" "statusx" "reserved prefix"
+refuses "refuse: reserved prefix pcu" "pcu12345" "reserved prefix"
+refuses "refuse: reserved prefix anchor" "anchor01" "reserved prefix"
+refuses "refuse: reserved prefix platform" "platformx" "reserved prefix"
+refuses "refuse: reserved name edge" "edge" "reserved platform name"
+refuses "refuse: reserved name console" "console" "reserved platform name"
+# Locale (#208 round 1): the caller's UTF-8 locale must not widen [a-z].
+for na in 'pièr' 'aéb' 'ßab' 'ａｂｃ'; do refuses "refuse: non-ASCII '${na}' under a UTF-8 locale" "$na" "bad alias"; done
+refuses "refuse: fullwidth digit 'pier２'" 'pier２' "bad alias"
+# Unicode-space-only list: never the silent legacy path (C locale: not [[:space:]]).
+refuses "refuse: U+2003-only list" $'\u2003' "bad alias"
+refuses "refuse: U+3000-only list" $'\u3000' "bad alias"
+refuses "refuse: 257 tenants (matrix cap)" "$(for i in $(seq 100 356); do printf 'abc%s ' "$i"; done)" "exceed the 256-leg matrix cap"
+r="$(WATCH_TENANTS="$(for i in $(seq 100 355); do printf 'abc%s ' "$i"; done)" targets)"
+case "$r" in 0\|*) ok "accept: 256 tenants" ;; *) bad "accept: 256 tenants (${r:0:120})" ;; esac
+r="$(TARGETS_LC_ALL=C.UTF-8 WATCH_TENANTS='pièr' LEGACY_TENANT_USER=zed LEGACY_PROBE_URL=https://zed.example/ targets)"
+case "$r" in refused\|*) ok "refuse: non-ASCII under C.UTF-8" ;; *) bad "refuse: non-ASCII under C.UTF-8 ($r)" ;; esac
+r="$(WATCH_TENANTS="$(printf 'a%.0s' $(seq 1 15))" targets)"
+case "$r" in 0\|*) ok "accept: 15-char alias" ;; *) bad "accept: 15-char alias ($r)" ;; esac
+r="$(WATCH_TENANTS="p1x" targets)"
+case "$r" in 0\|*) ok "accept: 3-char digit alias" ;; *) bad "accept: 3-char digit alias ($r)" ;; esac
+# The refusal is loud in the log and the targets line prints a count, never the aliases.
+r="$(WATCH_TENANTS="pier Pier" LEGACY_TENANT_USER=zed targets)"
+has "refusal: ::error:: line names the fallback" "$(cat "$WORK/last_out")" "falling back to the legacy single target"
+r="$(WATCH_TENANTS="alice bob" targets)"
+is "targets line: count only" "watch targets: 2 (per-tenant)" "$(grep '^watch targets:' "$WORK/last_out")"
+lacks "targets line: no alias list" "$(grep '^watch targets:' "$WORK/last_out")" "alice"
 
 # Wiring: the legs read the matrix, never the repo-level switch / target.
 wf="$(cat "$WATCH")"
@@ -337,6 +378,23 @@ has "incident lookup filters by the tenant prefix" "$wf" 'select(.title | starts
 is "incident + ntfy read the leg label (blank on the legacy leg)" "2" "$(grep -c 'WATCH_ALIAS: ${{ matrix.target.label }}' "$WATCH")"
 has "watch ntfy topic is read" "$wf" 'WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}'
 has "topic/token pair never crosses channels" "$wf" 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"'
+is "fail-fast stays off (a failed leg never cancels the other tenants)" "1" "$(grep -c '^      fail-fast: false$' "$WATCH")"
+is "incident lookups read up to 100 open issues (leg + config)" "2" "$(grep -c 'gh issue list --label "$label" --state open --limit 100 --json number,title' "$WATCH")"
+is "repo fallback pairs the repo topic with the repo token (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="${REPO_NTFY_TOPIC:-}"; NTFY_TOKEN="${REPO_NTFY_TOKEN:-}"' "$WATCH")"
+is "watch-channel pair (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"' "$WATCH")"
+cfg="$(awk '/^  config:$/{f=1} /^  watch:$/{f=0} f' "$WATCH")"
+has "config job waits on targets" "$cfg" "needs: targets"
+has "config job always runs" "$cfg" "if: always()"
+has "config job reads the targets result" "$cfg" 'TARGETS_RESULT: ${{ needs.targets.result }}'
+has "config job reads the refusal" "$cfg" 'REFUSED: ${{ needs.targets.outputs.refused }}'
+has "config job fails the run while refused" "$cfg" 'exit 1'
+has "targets job exports the refusal" "$wf" 'refused: ${{ steps.targets.outputs.refused }}'
+has "job name uses the label (legacy name unchanged)" "$wf" "name: probe \${{ matrix.target.label || 'the dashboard' }} from GitHub's network"
+# Invariant 4 carve-out (#208 round 1): the watch channel names are read by
+# external-watch.yml only, never by a managed run.
+is "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml" "" \
+  "$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github ':!.github/workflows/external-watch.yml' || true)"
+has "invariant 4 carries the scoped watch-channel amendment" "$(cat "${ROOT}/docs/invariants.md")" "Scoped amendment — the external watch's own push channel"
 lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.github/workflows/provision.yml")" 'EXTERNAL_WATCH_'
 
 # ---- CI wiring -------------------------------------------------------------

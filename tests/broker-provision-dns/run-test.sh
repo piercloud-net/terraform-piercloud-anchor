@@ -808,8 +808,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_job_digest="$wf_job_digest|$wf:$names"
 done
 job_digest_got="$(printf '%s' "$wf_job_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "ce52d40caa536647566c7ea22820baf2dea3bdb78fdd3870db729dd208710b53" "$job_digest_got"
-if [ "$job_digest_got" != "ce52d40caa536647566c7ea22820baf2dea3bdb78fdd3870db729dd208710b53" ]; then
+is "workflow job-set digest is pinned (pin: update for a deliberate job change)" "82d9736c9fd1b0dde8cfc0aee235310e463a1b58e89b68bc183b0cfb2b9b0245" "$job_digest_got"
+if [ "$job_digest_got" != "82d9736c9fd1b0dde8cfc0aee235310e463a1b58e89b68bc183b0cfb2b9b0245" ]; then
   printf '   job-set parts (to update the pin):\n'; printf '%s' "$wf_job_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 top_digest_got="$(printf '%s' "$wf_top_digest" | sha256sum | cut -d' ' -f1)"
