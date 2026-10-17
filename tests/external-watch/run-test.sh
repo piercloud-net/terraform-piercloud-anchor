@@ -32,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=222
+MIN_CHECKS=223
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -486,7 +486,11 @@ drive() { # $1 script; env passes through; sets D_RC, D_LOG
   ( cd "$WORK" && PATH="$WORK/stubs:$PATH" STUB_LOG="$WORK/stub.log" GH_TOKEN=x \
       RUN_URL=https://example.invalid/run bash "$1" ) >"$WORK/drive.out" 2>&1 || D_RC=$?
   D_LOG="$(cat "$WORK/stub.log")"
+  # A repo-resolution failure also exits 1, which the "run fails" cases
+  # would otherwise accept as the intended failure (#211).
+  if grep -q 'not a git repository' "$WORK/drive.out"; then REPO_MISSES=$((REPO_MISSES + 1)); fi
 }
+REPO_MISSES=0
 # Repo context comes from the workflow, not the driver: the config job gets
 # GH_REPO only if its step env sets it; the watch job has a git work tree only
 # if it checks the repo out (#211).
@@ -494,7 +498,11 @@ job_span() { awk -v j="  $1:" '$0==j{f=1;next} f&&/^  [a-z][a-z-]*:$/{exit} f' "
 CFG_GH_REPO=""
 grep -qxF '          GH_REPO: ${{ github.repository }}' <(job_span config) && CFG_GH_REPO="owner/repo"
 WATCH_GIT_TREE=""
-grep -q '^      - uses: actions/checkout@' <(job_span watch) && WATCH_GIT_TREE=1
+# The work tree must exist before the incident step's gh calls, not just
+# somewhere in the job.
+co_line="$(job_span watch | grep -n '^      - uses: actions/checkout@' | head -n1 | cut -d: -f1 || true)"
+inc_line="$(job_span watch | grep -n '^      - name: Incident state' | head -n1 | cut -d: -f1 || true)"
+[ -n "$co_line" ] && [ -n "$inc_line" ] && [ "$co_line" -lt "$inc_line" ] && WATCH_GIT_TREE=1
 cdrive() { GH_REPO="$CFG_GH_REPO" STUB_GIT_TREE="" drive "$@"; }
 idrive() { GH_REPO="" STUB_GIT_TREE="$WATCH_GIT_TREE" drive "$@"; }
 calls() { printf '%s\n' "$D_LOG" | grep -c "$1" || true; }
@@ -593,6 +601,7 @@ is "cron cadence is exact" '    - cron: "*/15 * * * *"' "$(grep -E '^[[:space:]]
 TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 cdrive "$WORK/config.sh"
 is "config label failure: retried without the label" "2" "$(calls '^gh issue create')"
 is "config label failure: run still fails" "1" "$D_RC"
+is "no driver run failed on repo resolution (#211)" "0" "$REPO_MISSES"
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/external-watch/run-test.sh"
