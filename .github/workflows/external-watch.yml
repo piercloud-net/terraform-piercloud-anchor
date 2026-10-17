@@ -124,7 +124,10 @@ jobs:
             printf '%s\n' "$matrix"
           }
           refused=""
-          if [ -z "${WATCH_TENANTS//[[:space:],]/}" ]; then
+          # Strip exactly the parser's separators (IFS default + comma): a list of
+          # only CR/VT/FF is a non-empty word to the parser, so it must refuse
+          # there, never take the legacy path silently.
+          if [ -z "${WATCH_TENANTS//[$' \t\n',]/}" ]; then
             # Legacy: today's single target, unchanged (tenant-owned copies).
             matrix="$(legacy_matrix)"
           else

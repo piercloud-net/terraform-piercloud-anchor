@@ -32,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=181
+MIN_CHECKS=208
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -304,6 +304,15 @@ r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=on LEGACY_PRO
 is "legacy: unset list = one legacy target" '0|[{"alias":"pier","label":"","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":true}]' "$r"
 r="$(WATCH_TENANTS=" , " LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=no targets)"
 is "legacy: blank list + puller off" '0|[{"alias":"pier","label":"","puller":"","probe_url":"","legacy":true}]' "$r"
+# Functional r3 F2: the legacy puller mapping (same accepted set as the puller).
+for pv in 1 true yes on; do
+  r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER="$pv" targets)"
+  has "legacy: puller '${pv}' maps to on" "$r" '"puller":"on"'
+done
+for pv in 0 false no off ON True; do
+  r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER="$pv" targets)"
+  has "legacy: puller '${pv}' maps to off" "$r" '"puller":""'
+done
 r="$(WATCH_TENANTS="" LEGACY_PROBE_URL=https://a.example/ PROBE_OVERRIDE=https://b.example/ targets)"
 has "legacy: probe_url override wins" "$r" '"probe_url":"https://b.example/"'
 
@@ -359,6 +368,13 @@ refuses "refuse: fullwidth digit 'pier２'" 'pier２' "bad alias"
 # Unicode-space-only list: never the silent legacy path (C locale: not [[:space:]]).
 refuses "refuse: U+2003-only list" $'\u2003' "bad alias"
 refuses "refuse: U+3000-only list" $'\u3000' "bad alias"
+# Functional r3 F1: ASCII control whitespace the gate saw as blank but the
+# parser (IFS split) sees as a word.
+refuses "refuse: CR-only list" $'\r' "bad alias"
+refuses "refuse: VT-only list" $'\v' "bad alias"
+refuses "refuse: FF-only list" $'\f' "bad alias"
+r="$(WATCH_TENANTS=$' \t\n, ' LEGACY_TENANT_USER=pier targets)"
+case "$r" in 0\|*'"legacy":true'*) ok "legacy: space/tab/newline/comma-only list" ;; *) bad "legacy: space/tab/newline/comma-only list ($r)" ;; esac
 refuses "refuse: 257 tenants (matrix cap)" "$(for i in $(seq 100 356); do printf 'abc%s ' "$i"; done)" "exceed the 256-leg matrix cap"
 r="$(WATCH_TENANTS="$(for i in $(seq 100 355); do printf 'abc%s ' "$i"; done)" targets)"
 case "$r" in 0\|*) ok "accept: 256 tenants" ;; *) bad "accept: 256 tenants (${r:0:120})" ;; esac
@@ -402,8 +418,21 @@ has "targets job exports the refusal" "$wf" 'refused: ${{ steps.targets.outputs.
 has "job name uses the label (legacy name unchanged)" "$wf" "name: probe \${{ matrix.target.label || 'the dashboard' }} from GitHub's network"
 # Invariant 4 carve-out (#208 round 1): the watch channel names are read by
 # external-watch.yml only, never by a managed run.
-is "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml" "" \
-  "$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github scripts ':!.github/workflows/external-watch.yml' || true)"
+# Trust r3 F1: never vacuous — outside a git work tree the pin fails loudly.
+if (cd "$ROOT" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+  ewn_rc=0
+  ewn="$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github scripts ':!.github/workflows/external-watch.yml')" || ewn_rc=$?
+  # git grep: 0 = matches, 1 = none, anything else = error.
+  case "$ewn_rc" in
+    1) ok "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml" ;;
+    0) bad "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml (also in: ${ewn})" ;;
+    *) bad "EXTERNAL_WATCH_NTFY_* pin: git grep failed (rc ${ewn_rc})" ;;
+  esac
+  is "external-watch.yml itself is tracked (the pin scope is real)" "1" \
+    "$(cd "$ROOT" && git ls-files -- .github/workflows/external-watch.yml | wc -l | tr -d ' ')"
+else
+  bad "EXTERNAL_WATCH_NTFY_* pin needs a git work tree (refusing to pass vacuously)"
+fi
 has "invariant 4 carries the scoped watch-channel amendment" "$(cat "${ROOT}/docs/invariants.md")" "Scoped amendment — the external watch's own push channel"
 lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.github/workflows/provision.yml")" 'EXTERNAL_WATCH_'
 
@@ -509,6 +538,28 @@ is "leg ntfy step fires on a failed probe (exact condition)" "        if: steps.
 pushbody="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
 has "leg ntfy push is guarded by if (a curl failure never fails the step)" "$pushbody" '          if curl -sS --fail "${NTFY_AUTH[@]}" \'
 has "leg ntfy failure is a warning, not a step failure" "$pushbody" $'          else\n            echo "::warning::ntfy push failed - the incident step still runs"\n          fi'
+
+# #208 round 3 (red-team F1): the step headers that decide whether the
+# incident path runs at all. A probe without continue-on-error stops the job
+# before the incident step; an incident step with an `if:` stops filing on a
+# failure or stops closing on recovery.
+probehdr="$(awk '/- name: "Probe: HTTP 200 \+ Gatus data \+ edge cert >= 14d"/{f=1;next} f&&n<3{print;n++}' "$WATCH")"
+is "probe step header is exact (id + continue-on-error + env)" "        id: probe
+        continue-on-error: true
+        env:" "$probehdr"
+incstep="$(awk '/- name: Incident state \(issue = open while failing; auto-close on recovery\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
+is "incident step: env: follows the name directly" "        env:" "$(printf '%s\n' "$incstep" | head -n1)"
+is "incident step carries no if: (runs on failure AND recovery)" "0" "$(printf '%s\n' "$incstep" | grep -cE '^        if:' || true)"
+is "incident step exists exactly once" "1" "$(grep -c '^      - name: Incident state (issue = open while failing; auto-close on recovery)$' "$WATCH")"
+is "permissions block is exact" "permissions:
+  contents: read
+  issues: write" "$(awk '/^permissions:$/{f=1} f&&n<3{print;n++}' "$WATCH")"
+is "permissions block is unique (no job-level override)" "1" "$(grep -cE '^[[:space:]]*permissions:' "$WATCH")"
+is "cron cadence is exact" '    - cron: "*/15 * * * *"' "$(grep -E '^[[:space:]]*- cron:' "$WATCH")"
+# Config incident label fallback: a missing/unattachable label still files it.
+TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 drive "$WORK/config.sh"
+is "config label failure: retried without the label" "2" "$(calls '^gh issue create')"
+is "config label failure: run still fails" "1" "$D_RC"
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/external-watch/run-test.sh"
