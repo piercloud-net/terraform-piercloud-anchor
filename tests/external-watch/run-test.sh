@@ -32,7 +32,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=208
+MIN_CHECKS=220
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -373,6 +373,12 @@ refuses "refuse: U+3000-only list" $'\u3000' "bad alias"
 refuses "refuse: CR-only list" $'\r' "bad alias"
 refuses "refuse: VT-only list" $'\v' "bad alias"
 refuses "refuse: FF-only list" $'\f' "bad alias"
+# Functional r4 F2: the gate strips the separator BYTES, never the letters t/n
+# or a backslash (an over-wide bracket would turn these into the legacy path).
+r="$(WATCH_TENANTS="tnt" targets)"
+is "accept: alias of only t/n letters is one tenant leg" '0|[{"alias":"tnt","label":"tnt","puller":"","probe_url":"https://tnt.status.piercloud.net/","legacy":false}]' "$r"
+refuses "refuse: backslash-only list" '\\' "bad alias"
+refuses "refuse: t/n-only short list" "tn" "bad alias"
 r="$(WATCH_TENANTS=$' \t\n, ' LEGACY_TENANT_USER=pier targets)"
 case "$r" in 0\|*'"legacy":true'*) ok "legacy: space/tab/newline/comma-only list" ;; *) bad "legacy: space/tab/newline/comma-only list ($r)" ;; esac
 refuses "refuse: 257 tenants (matrix cap)" "$(for i in $(seq 100 356); do printf 'abc%s ' "$i"; done)" "exceed the 256-leg matrix cap"
@@ -550,10 +556,19 @@ is "probe step header is exact (id + continue-on-error + env)" "        id: prob
 incstep="$(awk '/- name: Incident state \(issue = open while failing; auto-close on recovery\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
 is "incident step: env: follows the name directly" "        env:" "$(printf '%s\n' "$incstep" | head -n1)"
 is "incident step carries no if: (runs on failure AND recovery)" "0" "$(printf '%s\n' "$incstep" | grep -cE '^        if:' || true)"
+# Red-team r4 F1: the incident step's env bindings (the drivers stub these
+# values, so pin the YAML lines themselves, inside the step).
+for bl in '          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' '          OK: ${{ steps.probe.outputs.ok }}' '          DETAIL: ${{ steps.probe.outputs.detail }}' '          WATCH_ALIAS: ${{ matrix.target.label }}'; do
+  is "incident step binds: ${bl#"${bl%%[! ]*}"}" "1" "$(printf '%s\n' "$incstep" | grep -cxF -- "$bl" || true)"
+done
+is "incident step has no continue-on-error" "0" "$(printf '%s\n' "$incstep" | grep -c 'continue-on-error' || true)"
+is "watch concurrency never cancels a running watcher" "  group: external-watch
+  cancel-in-progress: false" "$(grep -A1 '^  group: external-watch$' "$WATCH")"
+is "legs run one at a time (ordered incident calls)" "1" "$(grep -cx '      max-parallel: 1' "$WATCH")"
 is "incident step exists exactly once" "1" "$(grep -c '^      - name: Incident state (issue = open while failing; auto-close on recovery)$' "$WATCH")"
-is "permissions block is exact" "permissions:
+is "permissions block is exact (whole block, to the blank line)" "permissions:
   contents: read
-  issues: write" "$(awk '/^permissions:$/{f=1} f&&n<3{print;n++}' "$WATCH")"
+  issues: write" "$(awk '/^permissions:$/{f=1} f&&/^$/{exit} f' "$WATCH")"
 is "permissions block is unique (no job-level override)" "1" "$(grep -cE '^[[:space:]]*permissions:' "$WATCH")"
 is "cron cadence is exact" '    - cron: "*/15 * * * *"' "$(grep -E '^[[:space:]]*- cron:' "$WATCH")"
 # Config incident label fallback: a missing/unattachable label still files it.
