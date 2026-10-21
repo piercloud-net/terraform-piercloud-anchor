@@ -121,5 +121,38 @@ else
   ok "TMP_PREFIX is gone"
 fi
 
+# ---- the interfaces read asks the API for no reverse DNS (#216) ----------
+# The SCP API's rdns assembly broke upstream on 2026-10-21: with the parameter
+# omitted the same endpoint answered `rdns` as a list (failing the provider's
+# map-typed schema, which kills every plan) and HTTP 500 here. Both raw call
+# sites must therefore carry `loadRdns=false`; a dropped parameter is a silent
+# return of a provisioning-wide outage, so pin it behaviourally.
+{
+  cat <<'PRELUDE'
+log() { printf 'A1: %s\n' "$*" >&2; }
+die() { printf 'A1 FAIL: %s\n' "$*" >&2; exit 1; }
+valid_mac() { printf '%s' "$1" | grep -qE '^[0-9a-fA-F:]{17}$'; }
+api_ok() { return 0; }
+api_call() { # record the real path, then answer with a MAC list
+  printf '%s\n' "$2" >"$STUB_PATH_OUT"
+  HTTP_STATUS=200
+  printf -v "${4:-resp}" '%s' '[{"mac":"00:11:22:33:44:55"}]'
+}
+PRELUDE
+  extract resolve_mac
+} > "$WORK/resolve_mac.sh"
+grep -q '^resolve_mac() {' "$WORK/resolve_mac.sh" || { echo "FAIL could not extract resolve_mac"; exit 1; }
+STUB_PATH_OUT="$WORK/interfaces-path" INTERFACE_MAC= SERVER_ID=933556 \
+  bash -c 'set -euo pipefail; source "$1"; resolve_mac' _ "$WORK/resolve_mac.sh" \
+  > "$WORK/out.resolve_mac" 2> "$WORK/err.resolve_mac" || true
+is "resolve_mac asks for no rdns" "/api/v1/servers/933556/interfaces?loadRdns=false" \
+  "$(cat "$WORK/interfaces-path" 2>/dev/null)"
+is "resolve_mac still resolves the MAC" "00:11:22:33:44:55" "$(cat "$WORK/out.resolve_mac")"
+if grep -qE 'servers/\$\{SERVER_ID\}/interfaces\?loadRdns=false' "$ROOT/.github/workflows/provision.yml"; then
+  ok "import-discovery read carries loadRdns=false"
+else
+  bad "import-discovery read in provision.yml must carry ?loadRdns=false (#216)"
+fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
