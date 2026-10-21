@@ -57,7 +57,7 @@ done
 
 RC_OF() { # $1 label, $2 fixture, $3 real function
   local rc=0
-  STUB_POLICIES="$2" ANCHOR_HOSTNAME=anchor-01-pier SERVER_ID=933556 SCP_USER_ID=1 \
+  STUB_POLICIES="$2" ANCHOR_HOSTNAME=anchor-01-pier SERVER_ID=424242 SCP_USER_ID=1 \
   STEADY_PREFIX="$STEADY_PREFIX" OWN_NAME="$OWN_NAME" \
   bash -c 'set -euo pipefail; source "$1"; "$2"' _ "$WORK/functions.sh" "$3" \
     > "$WORK/out.$1" 2>&1 || rc=$?
@@ -75,7 +75,7 @@ eval "$(grep -E '^STEADY_PREFIX=' "$SCRIPT")"
 # ---- server's legacy prefix; see plan R1/B1) ------------------------------
 TMP_FIXTURE='[
  {"id":"1","name":"piercloud-tmp-12345","description":""},
- {"id":"2","name":"piercloud-tmp-933556-legacy","description":""},
+ {"id":"2","name":"piercloud-tmp-424242-legacy","description":""},
  {"id":"3","name":"piercloud-tmp-777-old","description":""},
  {"id":"4","name":"piercloud-anchor-anchor-01-pier","description":""},
  {"id":"5","name":"unrelated-policy","description":""},
@@ -92,7 +92,7 @@ is "t1 tmp scope (new + legacy this-server only)" '["1","2"]' "$(IDS t1)"
 # ---- steady scope: new name + legacy migration name, nothing else --------
 STEADY_FIXTURE='[
  {"id":"11","name":"piercloud-anchor-anchor-01-pier","description":""},
- {"id":"12","name":"piercloud-anchor-anchor-01-pier-933556","description":""},
+ {"id":"12","name":"piercloud-anchor-anchor-01-pier-424242","description":""},
  {"id":"13","name":"piercloud-anchor-anchor-02-pier","description":""},
  {"id":"14","name":"piercloud-anchor-other-01-777","description":""},
  {"id":"15","name":"piercloud-anchor-anchor-01-pier-777","description":""},
@@ -110,7 +110,7 @@ is "s2 envelope dispatch" '["21"]' "$(IDS s2)"
 
 # ---- name construction: no server id in OWN_NAME, TMP_PREFIX gone --------
 is "own name shape" "piercloud-tmp-999" "$OWN_NAME"
-if printf '%s' "$OWN_NAME" | grep -q '933556'; then
+if printf '%s' "$OWN_NAME" | grep -q '424242'; then
   bad "OWN_NAME must not carry the server id"
 else
   ok "OWN_NAME carries no server id"
@@ -119,6 +119,129 @@ if grep -qE '^TMP_PREFIX=' "$SCRIPT"; then
   bad "TMP_PREFIX should be removed (unused after the rename)"
 else
   ok "TMP_PREFIX is gone"
+fi
+
+# ---- the interfaces read asks the API for no reverse DNS (#216) ----------
+# The SCP API's rdns assembly broke upstream on 2026-10-21: with the parameter
+# omitted the same endpoint answered `rdns` as a list (failing the provider's
+# map-typed schema, which kills every plan) and HTTP 500 here. Both raw call
+# sites must therefore carry `loadRdns=false`; a dropped parameter is a silent
+# return of a provisioning-wide outage, so pin it behaviourally.
+{
+  cat <<'PRELUDE'
+log() { printf 'A1: %s\n' "$*" >&2; }
+die() { printf 'A1 FAIL: %s\n' "$*" >&2; exit 1; }
+api_ok() { [ "$1" = "200" ]; }
+api_call() { # record method + path, then answer per STUB_STATUS (bash dynamic scope)
+  printf '%s %s\n' "$1" "$2" >"$STUB_PATH_OUT"
+  HTTP_STATUS="${STUB_STATUS:-200}"
+  printf -v "${4:-resp}" '%s' '[{"mac":"00:11:22:33:44:55"}]'
+}
+PRELUDE
+  # The real valid_mac (whole-value anchored, newline-safe), not a weaker copy.
+  extract valid_mac
+  extract resolve_mac
+} > "$WORK/resolve_mac.sh"
+for fn in valid_mac resolve_mac; do
+  grep -q "^$fn() {" "$WORK/resolve_mac.sh" || { echo "FAIL could not extract $fn"; exit 1; }
+done
+RUN_RESOLVE() { # $1 label, $2 stub status, $3 INTERFACE_MAC override -> rc; side files per label
+  local rc=0
+  STUB_STATUS="$2" STUB_PATH_OUT="$WORK/interfaces-path.$1" INTERFACE_MAC="${3-}" SERVER_ID=424242 \
+    bash -c 'set -euo pipefail; source "$1"; resolve_mac' _ "$WORK/resolve_mac.sh" \
+    > "$WORK/out.resolve_mac.$1" 2> "$WORK/err.resolve_mac.$1" || rc=$?
+  printf '%s' "$rc"
+}
+rc="$(RUN_RESOLVE ok 200)"
+is "resolve_mac rc on 200" "0" "$rc"
+is "resolve_mac asks for no rdns (method + path)" \
+  "GET /api/v1/servers/424242/interfaces?loadRdns=false" \
+  "$(cat "$WORK/interfaces-path.ok" 2>/dev/null)"
+is "resolve_mac still resolves the MAC" "00:11:22:33:44:55" "$(cat "$WORK/out.resolve_mac.ok")"
+rc="$(RUN_RESOLVE fail 500)"
+if [ "$rc" -ne 0 ] && grep -q 'list server interfaces failed (HTTP 500)' "$WORK/err.resolve_mac.fail"; then
+  ok "resolve_mac fails closed on a non-200 interfaces read"
+else
+  bad "resolve_mac must die on a non-200 interfaces read (rc=$rc)"
+fi
+# The shipped valid_mac's newline/CR guard is a security property (an embedded
+# newline made a value match on its FIRST line, review N2). Feed it hostile
+# values so removing the guard reds here.
+rc="$(RUN_RESOLVE nl 200 $'00:11:22:33:44:55\nanything')"
+if [ "$rc" -ne 0 ] && grep -q 'INTERFACE_MAC override is not a 17-char hex/colon MAC' "$WORK/err.resolve_mac.nl"; then
+  ok "valid_mac rejects an override with a trailing newline"
+else
+  bad "valid_mac must reject a newline-bearing MAC override (rc=$rc)"
+fi
+rc="$(RUN_RESOLVE good 200 'AA:BB:CC:DD:EE:FF')"
+is "valid_mac accepts a clean override" "AA:BB:CC:DD:EE:FF" "$(cat "$WORK/out.resolve_mac.good")"
+
+# Real YAML parse, not a text grep (docs/verification.md §1: no hand-rolled
+# parsers in verification artifacts). A comment quoting the parameter must not
+# satisfy this; only an executed `run:` script can.
+if ROOT="$ROOT" python3 - <<'PYEOF'
+import os, re, sys, yaml
+
+doc = yaml.safe_load(open(os.path.join(os.environ["ROOT"], ".github/workflows/provision.yml")))
+# Bind to the ONE step that resolves the interface MAC for the import file
+# (its `run` builds POLICY_NAME + reads /interfaces). Scanning every job's run
+# strings would let an unrelated `echo` or a shell comment satisfy the tooth.
+MARK = 'POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}"'
+URL = '/servers/${SERVER_ID}/interfaces?loadRdns=false'
+steps = [st for job in (doc.get("jobs") or {}).values()
+         for st in (job.get("steps") or [])
+         if isinstance(st, dict) and isinstance(st.get("run"), str)]
+bound = [st["run"] for st in steps if MARK in st["run"]]
+if len(bound) != 1:
+    sys.exit(2)  # the marker must identify exactly one step, else the tooth is stale
+# Two evasions to defeat, both proven against earlier revisions of this tooth:
+#   - a trailing comment on some other line (`... )"  # was: "...?loadRdns=false"`),
+#   - an `echo "...?loadRdns=false"` inside the same step.
+# So: drop whole-line comments, fold `\`-continuations into logical commands,
+# and require the parameter to sit inside a command that actually runs `curl`.
+body = re.sub(r'(?m)^\s*#.*$', '', bound[0])
+cmds, cur = [], []
+for ln in body.splitlines():
+    cur.append(ln)
+    if not ln.rstrip().endswith('\\'):
+        cmds.append('\n'.join(cur))
+        cur = []
+if cur:
+    cmds.append('\n'.join(cur))
+
+# ... and the line carrying it must be LIVE shell, not a trailing comment and
+# not a jq string: no `#` on that line, and it must sit in a `curl` command.
+def live_url_line(cmd):
+    if 'curl' not in cmd:
+        return False
+    return any(URL in ln and '#' not in ln for ln in cmd.splitlines())
+
+sys.exit(0 if any(live_url_line(c) for c in cmds) else 1)
+PYEOF
+then
+  ok "import-discovery read carries loadRdns=false (parsed from the run script)"
+else
+  bad "import-discovery read in provision.yml must carry ?loadRdns=false (#216)"
+fi
+# The data source half: the argument must sit inside the interfaces data source
+# and be LIVE. HCL has no stdlib parser here, so strip comments first — a
+# commented-out `# load_rdns = false` inside the block must not satisfy it.
+if ROOT="$ROOT" python3 - <<'PYEOF'
+import os, re, sys
+
+src = open(os.path.join(os.environ["ROOT"], "main.tf")).read()
+src = re.sub(r'/\*.*?\*/', '', src, flags=re.S)          # block comments
+src = re.sub(r'(?m)^\s*(#|//).*$', '', src)              # line comments
+blocks = re.findall(r'(?ms)^data\s+"netcup_scp_server_interfaces"\s+"anchor"\s*\{(.*?)^\}', src)
+if len(blocks) != 1:
+    sys.exit(2)
+attrs = re.findall(r'(?m)^\s*load_rdns\s*=\s*(\w+)', blocks[0])
+sys.exit(0 if attrs == ['false'] else 1)
+PYEOF
+then
+  ok "interfaces data source carries load_rdns = false"
+else
+  bad "main.tf: the interfaces data source must set load_rdns = false (#216)"
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

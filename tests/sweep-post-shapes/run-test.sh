@@ -123,7 +123,7 @@ tmp_entry() { # $1 id, $2 run-id suffix, $3 age-seconds ("orphan" = unstamped de
 STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-01-pier","description":""}]'
 # Pre-change (#121) id-suffixed shape — kept only as the migration clause's
 # input; the real filter recognizes it once (tests/policy-naming).
-STEADY_LEGACY='[{"id":43,"name":"piercloud-anchor-anchor-01-pier-933556","description":""}]'
+STEADY_LEGACY='[{"id":43,"name":"piercloud-anchor-anchor-01-pier-424242","description":""}]'
 
 RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]; RC_TOKEN overrides the token (default AT)
   local l="$1" rc=0
@@ -131,7 +131,7 @@ RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]; RC_TOKE
   STUB_LIST_TMP="$2" STUB_IFACE="$3" STUB_STEADY="${4:-[]}" \
   PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" \
   GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE=apply \
-  SERVER_ID=933556 SCP_USER_ID=1 RUN_ID=999 ANCHOR_HOSTNAME=anchor-01-pier \
+  SERVER_ID=424242 SCP_USER_ID=1 RUN_ID=999 ANCHOR_HOSTNAME=anchor-01-pier \
   OWN_NAME="piercloud-tmp-999" NETCUP_SCP_ACCESS_TOKEN="${RC_TOKEN-AT}" TMP_TTL_SECONDS=7200 \
   bash -c 'set -euo pipefail; source "$1"; cmd_sweep_post' _ "$WORK/functions.sh" \
     > "$WORK/out.$l" 2>&1 || rc=$?

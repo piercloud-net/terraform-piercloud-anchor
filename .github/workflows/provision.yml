@@ -1109,8 +1109,11 @@ jobs:
           # "sorted for determinism"). On a >1-NIC server any other pick
           # resolves the wrong interface: the attached steady-state policy is
           # looked for (and later swept) against the wrong NIC.
+          # loadRdns=false: see issue #216 — the API's reverse-DNS assembly is
+          # broken upstream (a list where the provider schema expects a map, and
+          # HTTP 500 with the parameter omitted). Nothing here reads rdns.
           MAC="$(curl -sS --fail-with-body -H "Authorization: Bearer $NETCUP_SCP_ACCESS_TOKEN" \
-            "$SCP/api/v1/servers/${SERVER_ID}/interfaces" \
+            "$SCP/api/v1/servers/${SERVER_ID}/interfaces?loadRdns=false" \
             | jq -r 'if type == "array" then . elif has("data") then .data elif has("items") then .items elif has("interfaces") then .interfaces else . end | if type == "array" then (map(.mac // empty) | sort | .[0] // empty) else (.mac // empty) end')"
           [ -n "$MAC" ] || { echo "No interface MAC resolved — refusing to guess the firewall policy" >&2; exit 1; }
           # Newline-safe (review security N2): grep is line-oriented, so a

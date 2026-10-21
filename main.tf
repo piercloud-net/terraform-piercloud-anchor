@@ -10,9 +10,18 @@ data "netcup_scp_servers" "all" {
   count = var.server_name != null ? 1 : 0
 }
 
+# Reverse DNS is not consumed by this module, and the SCP API's
+# representation of it is not stable (2026-10-21: it started returning a list
+# where the provider's generated schema declares a map, which fails the read
+# with "State Conversion Error: expected map for type
+# tftypes.Map[tftypes.String]" — issue #216). `load_rdns = false` asks the API
+# not to send the field at all; an absent attribute converts to null and the
+# read succeeds. Only `mac` / `ipv4addresses` / `ipv6addresses` are used
+# (main.tf, outputs.tf).
 data "netcup_scp_server_interfaces" "anchor" {
   count     = local.resolved_server_id != null ? 1 : 0
   server_id = local.resolved_server_id
+  load_rdns = false
 }
 
 # Stateless re-adopt note (no `import` block lives here on purpose): import
