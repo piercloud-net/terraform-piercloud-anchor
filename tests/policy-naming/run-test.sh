@@ -187,7 +187,7 @@ doc = yaml.safe_load(open(os.path.join(os.environ["ROOT"], ".github/workflows/pr
 # (its `run` builds POLICY_NAME + reads /interfaces). Scanning every job's run
 # strings would let an unrelated `echo` or a shell comment satisfy the tooth.
 MARK = 'POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}"'
-WANT = '/interfaces?loadRdns=false'
+URL = '/servers/${SERVER_ID}/interfaces?loadRdns=false'
 steps = [st for job in (doc.get("jobs") or {}).values()
          for st in (job.get("steps") or [])
          if isinstance(st, dict) and isinstance(st.get("run"), str)]
@@ -208,7 +208,15 @@ for ln in body.splitlines():
         cur = []
 if cur:
     cmds.append('\n'.join(cur))
-sys.exit(0 if any('curl' in c and WANT in c for c in cmds) else 1)
+
+# ... and the line carrying it must be LIVE shell, not a trailing comment and
+# not a jq string: no `#` on that line, and it must sit in a `curl` command.
+def live_url_line(cmd):
+    if 'curl' not in cmd:
+        return False
+    return any(URL in ln and '#' not in ln for ln in cmd.splitlines())
+
+sys.exit(0 if any(live_url_line(c) for c in cmds) else 1)
 PYEOF
 then
   ok "import-discovery read carries loadRdns=false (parsed from the run script)"
