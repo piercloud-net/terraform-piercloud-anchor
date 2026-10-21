@@ -74,6 +74,7 @@ All notable changes to this project will be documented in this file.
 - *(managed)* A managed tenant run never reads the operator-plane repo values (closes #198)
 - *(managed)* Environment-scoped operator values + banner repo-scope check (closes #204)
 - *(external-watch)* Name the repo for gh in the config job (closes #211)
+- *(scp)* Ask the API for no reverse DNS on every interfaces read (closes #216)
 
 ### 💼 Other
 
