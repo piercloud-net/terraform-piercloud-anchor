@@ -9112,6 +9112,7 @@ spec.loader.exec_module(module)
 now = 1_800_000_000
 SIG_A = "sha256:" + "a" * 64
 SIG_B = "sha256:" + "b" * 64
+SIG_C = "sha256:" + "c" * 64
 # Raw helper invariants: fixtures happen to feed sorted inputs, so pin order
 # independence directly, and pin the state entering the digest.
 if module.identity_digest(["b", "a"]) != module.identity_digest(["a", "b"]):
@@ -9149,24 +9150,46 @@ for label, actual, expected in [
     ("an unchanged signature stays inside the window",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A), False),
     ("a pinned signature quiets to the quiet window",
-     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), False),
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), False),
     ("a pinned signature renotifies after the quiet window",
-     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), True),
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), True),
     ("an unpinned signature keeps the default window",
-     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_B, SIG_B, SIG_A, 86400), True),
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A}, 86400), True),
     ("an unpinned signature stays inside the default window",
-     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_B, SIG_B, SIG_A, 86400), False),
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A}, 86400), False),
     ("a pinned signature that changed still pushes immediately",
-     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A, SIG_A, 86400), True),
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A, {SIG_A}, 86400), True),
     ("a pinned non-green transition still pushes",
-     module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), True),
+     module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), True),
     ("an empty signature skips the change-trigger",
-     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, "", "", "", 86400), False),
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, "", "", frozenset(), 86400), False),
     ("the fixed error digest is never quieted",
      module.should_notify("error", now - 1800, "error", now, 1800, 0, 0,
                           module.finding_signature("error", []),
+                          {module.finding_signature("error", [])}, 86400), True),
+    ("every signature of a multi-entry pin quiets to the quiet window",
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A, SIG_B}, 86400), False),
+    ("the other signature of a multi-entry pin quiets too",
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A, SIG_B}, 86400), False),
+    ("a multi-entry pin still renotifies after the quiet window",
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A, SIG_B}, 86400), True),
+    ("an unpinned third signature keeps the default window under a multi-entry pin",
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_C, SIG_C, {SIG_A, SIG_B}, 86400), True),
+    ("a multi-entry pin never quiets a change to an unpinned shape",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_C, SIG_B, {SIG_A, SIG_B}, 86400), True),
+    ("a flip between two pinned shapes is not new information",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_B, {SIG_A, SIG_B}, 86400), False),
+    ("a flip from a pinned shape to an unpinned one pushes immediately",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_C, SIG_A, {SIG_A, SIG_B}, 86400), True),
+    ("settling back onto a pinned shape is quiet (the unpinned shape already pushed)",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A, SIG_B}, 86400), False),
+    ("an empty pin is not a membership match",
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_A, SIG_A, frozenset(), 86400), True),
+    ("a multi-entry pin does not quiet an error state",
+     module.should_notify("error", now - 1800, "error", now, 1800, 0, 0,
                           module.finding_signature("error", []),
-                          module.finding_signature("error", []), 86400), True),
+                          module.finding_signature("error", []),
+                          {module.finding_signature("error", [])}, 86400), True),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
@@ -9203,16 +9226,51 @@ os.environ.pop("RECORDING_WITNESS_RENOTIFY_SECONDS")
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS")
 if not any("outside [60, 7776000]" in entry for entry in config_logs):
     raise SystemExit("an out-of-range window must warn")
+def _pin(raw):
+    """Parse one pin value through Config; return (signatures, warned)."""
+    os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = raw
+    del config_logs[:]
+    parsed = module.Config()
+    return parsed.quiet_signatures, any("quiet signature is malformed" in entry for entry in config_logs)
+
+
+# A single signature still validates exactly as before.
+pin, warned = _pin(SIG_A)
+if pin != frozenset({SIG_A}) or warned:
+    raise SystemExit("a single-signature pin must validate cleanly: %r %r" % (pin, warned))
+# A comma-separated list is the #213 shape: every entry is a valid signature.
+pin, warned = _pin(SIG_A + "," + SIG_B)
+if pin != frozenset({SIG_A, SIG_B}) or warned:
+    raise SystemExit("a two-entry pin must validate to both signatures: %r %r" % (pin, warned))
+# Duplicates are harmless (a set), so a copy-paste repeat still quiets.
+pin, warned = _pin(SIG_A + "," + SIG_A)
+if pin != frozenset({SIG_A}) or warned:
+    raise SystemExit("a duplicated pin entry must dedupe, not fail: %r %r" % (pin, warned))
 # Python's `$` also matches before a trailing newline: a full-string match is
 # what keeps a newline-suffixed pin from being accepted-but-never-matching.
-os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A + "\n"
-config = module.Config()
-if config.quiet_signature:
-    raise SystemExit("a trailing-newline pin must not validate")
-if not any("quiet signature is malformed" in entry for entry in config_logs):
-    raise SystemExit("a malformed pin must warn")
-if any(SIG_A in entry for entry in config_logs):
-    raise SystemExit("the malformed-pin warning must not echo the value")
+for label, raw in [
+    ("a trailing newline", SIG_A + "\n"),
+    ("a trailing comma", SIG_A + ","),
+    ("a leading comma", "," + SIG_A),
+    ("a doubled comma", SIG_A + ",," + SIG_B),
+    ("one bad entry among good ones", SIG_A + ",sha256:XYZ"),
+    ("a trailing-newline entry", SIG_A + "," + SIG_B + "\n"),
+    ("whitespace around an entry", SIG_A + ", " + SIG_B),
+]:
+    pin, warned = _pin(raw)
+    if pin or not warned:
+        raise SystemExit("%s must disable quieting with a warning: %r %r" % (label, pin, warned))
+    if any(SIG_A in entry for entry in config_logs):
+        raise SystemExit("the malformed-pin warning must not echo the value (%s)" % label)
+# The list is bounded: a pin is an operator convenience, not a data channel.
+over_cap = ",".join("sha256:" + ("%064x" % (index + 1)) for index in range(module.QUIET_SIGNATURE_MAX + 1))
+pin, warned = _pin(over_cap)
+if pin or not warned:
+    raise SystemExit("an over-cap pin must disable quieting with a warning")
+at_cap = ",".join("sha256:" + ("%064x" % (index + 1)) for index in range(module.QUIET_SIGNATURE_MAX - 1)) + "," + SIG_A
+pin, warned = _pin(at_cap)
+if len(pin) != module.QUIET_SIGNATURE_MAX or warned:
+    raise SystemExit("a pin at the cap must validate: %d entries, warned=%r" % (len(pin), warned))
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE")
 module.log = real_log
 for name, value in saved_env.items():
@@ -9598,9 +9656,43 @@ if len(captured) != 6:
     raise SystemExit("a malformed pin must fall back to the default window, got %d" % len(captured))
 if json.load(open(state_path)).get("state") != "alert":
     raise SystemExit("a malformed pin must not take the witness down")
+# #213: a known finding set that FLAPS between two exact shapes. A single pin
+# can only hold for the half of the cycle it was copied from, so every flip
+# pushed; a two-entry pin quiets both shapes and still renotifies on the quiet
+# window. This is the live operator-anchor shape (hidden-object alone, and
+# hidden-object + heartbeat-stale).
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A + "," + SIG_B
+os.environ["RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"] = "86400"
+# The previous run left last_notify_signature at SIG_B, so start from SIG_B.
+_set_last_epoch(-1801)
+codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a listed signature must stay quiet inside the quiet window, got %d" % len(captured))
+sig[:] = [SIG_A]
+_set_last_epoch(-1801)
+codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a flip to the other listed signature must stay quiet, got %d" % len(captured))
+sig[:] = [SIG_B]
+_set_last_epoch(-1801)
+codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a flip back must stay quiet under a list pin, got %d" % len(captured))
+if json.load(open(state_path)).get("last_notify_epoch") == 0:
+    raise SystemExit("a list pin must not zero the notify bookkeeping")
+_set_last_epoch(-86401)
+codes.append(module.main())
+if len(captured) != 7:
+    raise SystemExit("a list pin must still renotify after the quiet window, got %d" % len(captured))
+# A shape outside the list is new information: push immediately, default window.
+sig[:] = [SIG_C]
+_set_last_epoch(-100)
+codes.append(module.main())
+if len(captured) != 8:
+    raise SystemExit("an unlisted shape must push immediately, got %d" % len(captured))
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
-if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
+if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
     raise SystemExit("signature/pin exit codes wrong: %r" % codes)
 
 # Round-5 R1: a corrupted numeric field in a type-valid state.json used to

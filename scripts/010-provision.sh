@@ -3691,11 +3691,42 @@ SESSION_MODE_EVENTS = frozenset({"session.start", "session.end"})
 # Anchoring is hygiene only here: the input is the newline-free etype capture,
 # never a raw key name.
 CONFLICT_SUFFIX_RE = re.compile(r"_[0-9a-f]{16}\Z")
-# The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): a finding
-# signature exactly as emitted in state.json. \A/\Z is a FULL-string match -
-# Python's `$` also matches before a trailing newline, which would accept a
-# pin that can never equal a real signature and silently disable quieting.
+# The operator's quiet pin (RECORDING_WITNESS_QUIET_SIGNATURE): one finding
+# signature exactly as emitted in state.json, or a comma-separated list of
+# them. The list exists because a known finding set can FLAP between a few
+# shapes (the pre-existing artifacts plus a heartbeat that ages in and out):
+# a single exact value only ever matches the half of the cycle it was copied
+# from, so the pin never holds and the flip re-notifies every time. Every
+# entry is still an EXACT signature, so a shape the operator did not declare
+# is new information and pushes immediately - the list widens what counts as
+# known, it never turns the pin into a subset match. \A/\Z is a FULL-string
+# match - Python's `$` also matches before a trailing newline, which would
+# accept a pin that can never equal a real signature and silently disable
+# quieting.
 QUIET_SIGNATURE_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+# Bounded: a pin is an operator convenience, not a data channel. The cap keeps
+# a pathological value from growing the 0600 env file or the parse cost.
+QUIET_SIGNATURE_MAX = 16
+
+
+def parse_quiet_signatures(raw):
+    """Validate the quiet pin; return (frozenset of signatures, error).
+
+    Fail-closed on the WHOLE value: one malformed entry disables quieting for
+    the entire pin (the caller warns without echoing it) instead of quietly
+    honoring a prefix of the list. An empty entry - a leading, trailing or
+    doubled comma - is malformed too, so a copy-paste slip cannot narrow the
+    pin silently. Duplicates are harmless (a set).
+    """
+    if not raw:
+        return frozenset(), ""
+    entries = raw.split(",")
+    if len(entries) > QUIET_SIGNATURE_MAX:
+        return frozenset(), "more than %d entries" % QUIET_SIGNATURE_MAX
+    for entry in entries:
+        if not QUIET_SIGNATURE_RE.match(entry):
+            return frozenset(), "want sha256:<64 lowercase hex>, comma-separated for a list"
+    return frozenset(entries), ""
 
 
 def canonical_conflict_type(event_type):
@@ -3909,14 +3940,14 @@ class Config(object):
             self.sweep_seconds = 6 * 3600
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
-        self.quiet_signature = env("RECORDING_WITNESS_QUIET_SIGNATURE")
-        if self.quiet_signature and not QUIET_SIGNATURE_RE.match(self.quiet_signature):
+        self.quiet_signatures, quiet_error = parse_quiet_signatures(env("RECORDING_WITNESS_QUIET_SIGNATURE"))
+        if quiet_error:
             # Same posture as a bad ntfy token: skip the optional behavior
             # with a bounded warning that never contains the value; the
             # verdict still lands, so a typo'd pin cannot take the witness
             # down (it only keeps the default cadence).
-            log("WARNING: quiet signature is malformed (want sha256:<64 lowercase hex>); quieting disabled")
-            self.quiet_signature = ""
+            log("WARNING: quiet signature is malformed (%s); quieting disabled" % quiet_error)
+            self.quiet_signatures = frozenset()
         self.ntfy_topic = env("NTFY_TOPIC")
         self.ntfy_token = env("NTFY_TOKEN")
         self.heartbeat_prefix = self.audit_prefix + "heartbeat/"
@@ -5646,17 +5677,22 @@ def notify(config, state, detail):
 
 def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
                   state_since_run=0, last_notify_run=0, signature="", last_signature="",
-                  quiet_signature="", quiet_renotify=86400):
+                  quiet_signatures=frozenset(), quiet_renotify=86400):
     """Notification bookkeeping.
 
     Non-green states push on transition and whenever the finding signature
     changed (a new hidden marker, drift key or session alert is new
     information no matter how recently the previous push landed). An
     unchanged non-green state re-notifies every `renotify` window - or every
-    `quiet_renotify` window while an `alert` state's signature equals the
-    operator's quiet pin, so a pinned known finding set reminds daily instead
-    of every 30 minutes, and any signature change leaves the pin behind
-    automatically. The quiet pin applies to `alert` finding sets only: the
+    `quiet_renotify` window while an `alert` state's signature is a member of
+    the operator's quiet pin, so a pinned known finding set reminds daily
+    instead of every 30 minutes. The pin is a set of exact signatures because
+    a known finding set can flap between a few shapes (an age-bounded finding
+    coming and going): while every observed shape is declared, a flip is not
+    new information and the quiet window governs it. A shape OUTSIDE the pin
+    still pushes immediately on the change trigger, so no new finding is ever
+    hidden, and the pin leaves itself behind as soon as the observed set is no
+    longer declared. The quiet pin applies to `alert` finding sets only: the
     fixed `error`/`ok` signatures are never quieted, so a new failure cause
     always keeps the default cadence.
 
@@ -5683,12 +5719,18 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
         # wall clock catches up; an impossible value is not a reason to stay
         # silent.
         return True
-    if signature and signature != last_signature:
+    # A pinned `alert` finding set is one the operator has DECLARED known: the
+    # quiet window governs it, including a flip between two declared shapes.
+    # That flip is exactly the noise the pin exists for (a known set that
+    # alternates because an age-bounded finding comes and goes), and it is not
+    # new information. Nothing is hidden: a finding outside the declared set
+    # changes the signature to an UNPINNED one, which still pushes on the
+    # change trigger below.
+    quiet = bool(quiet_signatures) and state == "alert" and signature in quiet_signatures
+    if signature and signature != last_signature and not quiet:
         # The finding set itself changed: push regardless of the window.
         return True
-    window = renotify
-    if state == "alert" and quiet_signature and signature == quiet_signature:
-        window = quiet_renotify
+    window = quiet_renotify if quiet else renotify
     return now_epoch - last_epoch >= int(window)
 
 
@@ -6111,7 +6153,7 @@ def main():
 
     renotify = config.renotify if config is not None else 1800
     quiet_renotify = config.quiet_renotify if config is not None else 86400
-    quiet_signature = config.quiet_signature if config is not None else ""
+    quiet_signatures = config.quiet_signatures if config is not None else frozenset()
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
     last_notify_signature = previous.get("last_notify_signature")
@@ -6134,7 +6176,7 @@ def main():
         state_since_epoch = now_epoch
     if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify,
                      state_since_run, last_notify_run, signature, last_notify_signature,
-                     quiet_signature, quiet_renotify):
+                     quiet_signatures, quiet_renotify):
         if config is not None and notify(config, state, detail):
             last_notify_epoch = now_epoch
             last_notify_run = run_seq
