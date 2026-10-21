@@ -119,6 +119,7 @@ All notable changes to this project will be documented in this file.
 - *(132)* Account concurrency lane + managed tenant environment (closes #132)
 - *(allowlist)* Permit the pc-control broker report endpoint (closes #181)
 - *(external-watch)* Per-tenant targets for managed anchors (closes #207)
+- Allow the provider-release host in the endpoint allowlist (closes #221)
 
 
 ## [Unreleased]
