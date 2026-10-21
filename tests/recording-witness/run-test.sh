@@ -7437,21 +7437,41 @@ if [ "${list_entries}" -eq 2 ] && ! printf '%s' "${list_systemd}" | grep -q '\\'
 else
   bad "the rendered list is not two clean entries (${list_entries} matched): '${list_systemd}'"
 fi
-# Drive the real parser when this host has a user bus. `--pipe` returns the
-# child's stdout; a bounded timeout keeps a wedged bus from hanging the suite.
-# No user bus (a CI runner) skips with a notice rather than failing - the exact
-# bytes above are the CI-side tooth.
-if command -v systemd-run >/dev/null 2>&1 \
-   && timeout 15 systemd-run --user --wait --pipe -p "EnvironmentFile=${RECORDING_WITNESS_ENV_FILE}" \
-        /usr/bin/env >"${WORK}/systemd-env.out" 2>"${WORK}/systemd-env.err"; then
-  systemd_value="$(sed -n 's/^RECORDING_WITNESS_QUIET_SIGNATURE=//p' "${WORK}/systemd-env.out" | head -n1)"
-  if [ "${systemd_value}" = "sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" ]; then
+# Drive the real parser where a user bus actually works. Grading the
+# EnvironmentFile leg on "this command exited 0" would be fail-open: a refused
+# unit or a wedged bus would be reported as a skip and read as a pass, on
+# exactly the host class the leg exists for. So probe the bus FIRST (a trivial
+# unit), and only where that succeeds is the EnvironmentFile leg graded - there
+# a failure is a real finding, not an environment limitation. Where no bus is
+# reachable the leg skips with the diagnosed reason (never a bare "skipped"),
+# and the exact-bytes pin above remains the CI-side tooth. Either path emits
+# exactly one check, so the floor is stable.
+bus_rc=0
+bus_note="systemd-run is absent"
+if command -v systemd-run >/dev/null 2>&1; then
+  bus_note="the user bus probe produced no result"
+  timeout 15 systemd-run --user --wait --pipe /usr/bin/env \
+    >/dev/null 2>"${WORK}/systemd-bus.err" || bus_rc=$?
+  if [ "${bus_rc}" -eq 124 ]; then
+    bus_note="the user bus probe timed out after 15s (a wedged bus)"
+  elif [ "${bus_rc}" -ne 0 ]; then
+    bus_note="no usable user bus (systemd-run exited ${bus_rc})"
+  fi
+fi
+if [ "${bus_rc}" -eq 0 ] && command -v systemd-run >/dev/null 2>&1; then
+  env_rc=0
+  timeout 15 systemd-run --user --wait --pipe -p "EnvironmentFile=${RECORDING_WITNESS_ENV_FILE}" \
+    /usr/bin/env >"${WORK}/systemd-env.out" 2>"${WORK}/systemd-env.err" || env_rc=$?
+  systemd_value="$(sed -n 's/^RECORDING_WITNESS_QUIET_SIGNATURE=//p' "${WORK}/systemd-env.out" 2>/dev/null | head -n1)"
+  if [ "${env_rc}" -ne 0 ]; then
+    bad "the EnvironmentFile probe failed (rc=${env_rc}) on a host whose user bus works - the parser leg is graded here, not skipped"
+  elif [ "${systemd_value}" = "sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" ]; then
     ok "the real EnvironmentFile parser hands the witness both entries unescaped"
   else
     bad "the real EnvironmentFile parser handed '${systemd_value}' (want both entries, no backslash)"
   fi
 else
-  ok "real EnvironmentFile parser probe skipped (no usable systemd --user bus)"
+  ok "real EnvironmentFile parser probe skipped: ${bus_note} (the model above stands; disclosed residual)"
 fi
 unset RECORDING_WITNESS_QUIET_SIGNATURE
 if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
