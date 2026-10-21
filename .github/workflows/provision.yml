@@ -1074,14 +1074,26 @@ jobs:
           # for `tofu init`, so the committed lock file still verifies the
           # registry build. Remove this step and bump the `~> 1.2` pin once
           # upstream releases the fix.
-          PROVIDER_URL: https://github.com/piercloud-net/terraform-provider-netcup/releases/download/v1.2.1-patch.1/terraform-provider-netcup_v1.2.1-patch.1_linux_amd64 # ci-allowlist: pinned patched provider build for issue #218; upstream PR #47 pending
-          PROVIDER_SHA256: 899d67c3abedbbcc706845d76ea91e7bd80f555d944e3ebe52a463fd90e72fc9
+          #
+          # DISCLOSED LIMIT (review red-team F3): `dev_overrides` BYPASSES the
+          # lock file, so plan/apply executes a binary the committed
+          # `.terraform.lock.hcl` does NOT cover — for those steps the lock's
+          # guarantee is gone. This binary's integrity rests on exactly two
+          # things: the sha256 pin below, and the provenance recorded in the
+          # release notes (the upstream `v1.2.1` tag + one cherry-picked fix
+          # commit, diff = 2 files, built from that tree). It also inherits
+          # this job's `NETCUP_SCP_ACCESS_TOKEN` / `NETCUP_SCP_REFRESH_TOKEN_FILE`
+          # (exported earlier via $GITHUB_ENV), i.e. it runs with the tenant's
+          # plan/apply credential — the same privilege the registry build has
+          # at that point, but no longer a build the lock vouches for.
+          PROVIDER_URL: https://github.com/piercloud-net/terraform-provider-netcup/releases/download/v1.2.1-patch.2/terraform-provider-netcup_v1.2.1-patch.2_linux_amd64 # rationale: pinned patched provider build for issue #218 (host is on the endpoint allowlist since #221); upstream PR #47 pending
+          PROVIDER_SHA256: 2e9348050558497c7f575b191ee7565994083ff2a1fc70678d6ed7c40f29dfac
         run: |
           set -euo pipefail
           # No token is read here; nothing is printed but the digest check.
           bin_dir="$RUNNER_TEMP/pc-provider"
           mkdir -p "$bin_dir"
-          out="$bin_dir/terraform-provider-netcup_v1.2.1-patch.1"
+          out="$bin_dir/terraform-provider-netcup_v1.2.1-patch.2"
           curl -fsSL --max-time 120 -o "$out" "$PROVIDER_URL"
           printf '%s  %s\n' "$PROVIDER_SHA256" "$out" | sha256sum -c - >/dev/null
           chmod 0755 "$out"

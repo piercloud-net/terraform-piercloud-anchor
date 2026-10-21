@@ -16,11 +16,20 @@
 #   3. The step is scoped to `mode == 'apply'` and names the stopgap, so it is
 #      deleted (not forgotten) when upstream ships the fix.
 #
+# Two review findings are pinned as teeth rather than prose (red-team F2/F3):
+#   * the download URL must sit on the endpoint allowlist, cross-checked
+#     against ci.yml's own `allowed_url` line (a host removed there reds here);
+#   * the step must DISCLOSE that `dev_overrides` bypasses the lock file and
+#     that the binary inherits the job's netcup token — the assertions below
+#     only ever inspect the YAML block, so they must not claim to prove the
+#     runtime environment.
+#
 # Cred-free, offline: static assertions over the workflow file only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WF="$ROOT/.github/workflows/provision.yml"
+CI="$ROOT/.github/workflows/ci.yml"
 
 pass=0
 fail=0
@@ -44,6 +53,15 @@ if [ -n "$step_line" ] && [ -n "$init_line" ] && [ "$step_line" -gt "$init_line"
   ok "the stopgap step runs AFTER tofu init (lock-file verification unchanged)"
 else
   bad "the stopgap step must run after tofu init, else init sees dev_overrides and the lock check is bypassed"
+fi
+
+# A SECOND init after the export would see dev_overrides and skip the lock check,
+# so the single-init property is load-bearing, not cosmetic (review red-team).
+init_count="$(grep -cE '^[[:space:]]*tofu init' "$WF" || true)"
+if [ "$init_count" = "1" ]; then
+  ok "exactly one 'tofu init' in the workflow (no init can run after the override is exported)"
+else
+  bad "expected exactly one 'tofu init', found $init_count — a later init would run under dev_overrides"
 fi
 
 if [ -n "$step_line" ] && [ -n "$plan_line" ] && [ "$step_line" -lt "$plan_line" ]; then
@@ -84,17 +102,52 @@ else
   bad "the override must be exported through \$GITHUB_ENV so tofu init never sees it"
 fi
 
-if printf '%s\n' "$block" | grep -q 'ci-allowlist:'; then
-  ok "the pinned download URL carries the allowlist exemption reason"
+if printf '%s\n' "$block" | grep -q 'rationale:'; then
+  ok "the pinned download URL carries a rationale comment (why this URL exists)"
 else
-  bad "the pinned download URL needs a 'ci-allowlist: <reason>' marker (the URL is outside the API allowlist)"
+  bad "the pinned download URL needs a 'rationale: <why>' comment"
 fi
 
-# The step must not run with a credential it could print: no token in its env.
-if printf '%s\n' "$block" | grep -qE 'NETCUP_SCP_ACCESS_TOKEN|NTFY_TOKEN|RECORDING_WITNESS_KEY'; then
-  bad "the stopgap step must not carry a credential in its env"
+# The URL host must be on the endpoint allowlist as ci.yml declares it — the
+# gate reads that pattern from origin/main, so a removal there would only fail
+# in CI; this catches it in the local battery.
+prov_url="$(printf '%s\n' "$block" | sed -n 's/^ *PROVIDER_URL: *\([^ ]*\).*/\1/p' | head -1)"
+if [ -z "$prov_url" ]; then
+  bad "could not extract PROVIDER_URL from the stopgap step"
 else
-  ok "no credential in the stopgap step's env"
+  allowed_url_re="$(grep -E '^ *allowed_url=' "$CI" | head -n1 | cut -d"'" -f2)"
+  if [ -z "$allowed_url_re" ]; then
+    bad "could not read allowed_url from ci.yml"
+  elif printf '%s' "$prov_url" | grep -qE "$allowed_url_re"; then
+    ok "the download URL host is on ci.yml's endpoint allowlist"
+  else
+    bad "the download URL is NOT matched by ci.yml's allowed_url pattern: $prov_url"
+  fi
+fi
+
+# This assertion inspects the step's YAML env block only — the step still
+# INHERITS the job's netcup token from $GITHUB_ENV (disclosed in the step
+# comment, asserted below). Keep the wording honest.
+if printf '%s\n' "$block" | grep -qE '^ +NETCUP_SCP_ACCESS_TOKEN|^ +NTFY_TOKEN|^ +RECORDING_WITNESS_KEY'; then
+  bad "the stopgap step must not add a credential to its own env block"
+else
+  ok "the stopgap step adds no credential to its own env block (inherited env is disclosed, not prevented)"
+fi
+
+# F3: the step must disclose both halves — lock bypass and the inherited token.
+if printf '%s\n' "$block" | grep -q 'BYPASSES the' && printf '%s\n' "$block" | grep -q 'NETCUP_SCP_ACCESS_TOKEN'; then
+  ok "the step discloses the lock-file bypass and the inherited plan/apply token"
+else
+  bad "the step must disclose that dev_overrides bypasses the lock file and that the binary inherits NETCUP_SCP_ACCESS_TOKEN"
+fi
+
+# F2: provenance — the release notes must state the build base, and the digest
+# here must be the published one (single source: the URL tag and the digest are
+# updated together; a stale tag/digest pair is the failure this pins).
+if printf '%s\n' "$block" | grep -qE 'PROVIDER_URL: .*/v[0-9.]+-patch\.[0-9]+/' && printf '%s\n' "$block" | grep -q 'provenance recorded in the'; then
+  ok "the step records the build provenance and pins a patch-tagged release URL"
+else
+  bad "the step must name the provenance source (v1.2.1 + one fix commit) and pin a patch-tagged release URL"
 fi
 
 # versions.tf must still point at the community provider (no fork in the source).

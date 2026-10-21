@@ -583,7 +583,7 @@ RUN_START="$(awk -F'\t' '$2 == "      - name: Run the committed script harnesses
 RUN_END="$(awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
   RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
-  is "harness-run step blob hash (pin: update after a deliberate edit)" "ce1055bc7e53a814ddc4c9a3ef55f5d88034c0f1c91b17449536a75cc579f0f5" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "harness-run step blob hash (pin: update after a deliberate edit)" "6d942f4633fa0aa8df6f61b20eff4981e3599014f3c36cd0297d743046fb36bb" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
   is "harness-run step keeps the gate expression" "1" "$(printf '%s\n' "$RUN_STEP_BLOB" | grep -cE '^        if: steps\.gate\.outputs\.run == .yes.$')"
 else
   bad "harness-run step span not found in ci.yml"
@@ -593,7 +593,7 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # see an inserted step in the same job that rewrites a harness on the runner
 # before the pinned run step executes it (the static harnesses read the PR
 # tree, not the runner workspace). Any deliberate job edit updates this pin.
-is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "08c1324f6545b0627e543cbd014c7544a6598ee36e70da7e3aba22c9431efbe8" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "108f11f144d6db02cdc53744bc59f8458d5aad7b1ca21a3a4d4389f1a2ac3f5f" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -850,8 +850,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "95d4550853a4c3b78fd607cd172d6e09198cf472f8ca33d54e7ba9630925d0a3" "$tests_digest_got"
-if [ "$tests_digest_got" != "95d4550853a4c3b78fd607cd172d6e09198cf472f8ca33d54e7ba9630925d0a3" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "f184f93e8c404086ed59e509d7a07aa815681940c4ea9f0722fde3d685e86195" "$tests_digest_got"
+if [ "$tests_digest_got" != "f184f93e8c404086ed59e509d7a07aa815681940c4ea9f0722fde3d685e86195" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
@@ -895,7 +895,7 @@ GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts
 GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
-  is "gate step blob hash (pin: update after a deliberate edit)" "e64511b2a02fc2ecc0b9f57d17a3dbc4eac1f4e08ecfe3c5432cdd8bbc0f37b4" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "gate step blob hash (pin: update after a deliberate edit)" "630df1b592f92f58c18315fcc0e022f07857cce111c9128bf9bf23f0b9d96cbe" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "gate step span not found in ci.yml"
 fi
@@ -1262,7 +1262,7 @@ done
 # deleting an ok-less guard, or this block itself — is invisible here and
 # relies on review plus the CI run list. Update deliberately when adding or
 # removing checks.
-CHECK_FLOOR=297
+CHECK_FLOOR=298
 if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
