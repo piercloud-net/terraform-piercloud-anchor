@@ -142,7 +142,7 @@ PRELUDE
   extract resolve_mac
 } > "$WORK/resolve_mac.sh"
 grep -q '^resolve_mac() {' "$WORK/resolve_mac.sh" || { echo "FAIL could not extract resolve_mac"; exit 1; }
-STUB_PATH_OUT="$WORK/interfaces-path" INTERFACE_MAC= SERVER_ID=933556 \
+STUB_PATH_OUT="$WORK/interfaces-path" INTERFACE_MAC='' SERVER_ID=933556 \
   bash -c 'set -euo pipefail; source "$1"; resolve_mac' _ "$WORK/resolve_mac.sh" \
   > "$WORK/out.resolve_mac" 2> "$WORK/err.resolve_mac" || true
 is "resolve_mac asks for no rdns" "/api/v1/servers/933556/interfaces?loadRdns=false" \
