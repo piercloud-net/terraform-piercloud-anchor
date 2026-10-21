@@ -194,9 +194,21 @@ steps = [st for job in (doc.get("jobs") or {}).values()
 bound = [st["run"] for st in steps if MARK in st["run"]]
 if len(bound) != 1:
     sys.exit(2)  # the marker must identify exactly one step, else the tooth is stale
-# Strip shell comments before matching: a commented-out example is not the call.
-live = [re.sub(r'(?m)^\s*#.*$', '', r) for r in bound]
-sys.exit(0 if any(WANT in r for r in live) else 1)
+# Two evasions to defeat, both proven against earlier revisions of this tooth:
+#   - a trailing comment on some other line (`... )"  # was: "...?loadRdns=false"`),
+#   - an `echo "...?loadRdns=false"` inside the same step.
+# So: drop whole-line comments, fold `\`-continuations into logical commands,
+# and require the parameter to sit inside a command that actually runs `curl`.
+body = re.sub(r'(?m)^\s*#.*$', '', bound[0])
+cmds, cur = [], []
+for ln in body.splitlines():
+    cur.append(ln)
+    if not ln.rstrip().endswith('\\'):
+        cmds.append('\n'.join(cur))
+        cur = []
+if cur:
+    cmds.append('\n'.join(cur))
+sys.exit(0 if any('curl' in c and WANT in c for c in cmds) else 1)
 PYEOF
 then
   ok "import-discovery read carries loadRdns=false (parsed from the run script)"
