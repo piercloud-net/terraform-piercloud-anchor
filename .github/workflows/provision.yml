@@ -1070,35 +1070,49 @@ jobs:
           # suppress the field.
           #
           # Scope: this is a STOPGAP, not a fork in the supply chain. It is
-          # installed only for plan/apply on this job (dev_overrides), never
-          # for `tofu init`, so the committed lock file still verifies the
-          # registry build. Remove this step and bump the `~> 1.2` pin once
-          # upstream releases the fix.
+          # installed only for plan/apply on this job (dev_overrides) and never
+          # for `tofu init` — though measured on OpenTofu 1.12.2, init still
+          # verifies the lock even with the override present, so that ordering
+          # is belt-and-braces, not the lock's guarantee. Remove this step and
+          # bump the `~> 1.2` pin once upstream releases the fix.
           #
           # DISCLOSED LIMIT (review red-team F3): `dev_overrides` BYPASSES the
           # lock file, so plan/apply executes a binary the committed
           # `.terraform.lock.hcl` does NOT cover — for those steps the lock's
           # guarantee is gone. This binary's integrity rests on exactly two
-          # things: the sha256 pin below, and the provenance recorded in the
-          # release notes (the upstream `v1.2.1` tag + one cherry-picked fix
-          # commit, diff = 2 files, built from that tree). It also inherits
+          # things: the sha256 pin below, and its provenance. It also inherits
           # this job's `NETCUP_SCP_ACCESS_TOKEN` / `NETCUP_SCP_REFRESH_TOKEN_FILE`
           # (exported earlier via $GITHUB_ENV), i.e. it runs with the tenant's
           # plan/apply credential — the same privilege the registry build has
           # at that point, but no longer a build the lock vouches for.
+          #
+          # PROVENANCE (verify these two commands; the harness pins the triple
+          # tag+commit+digest as one record, so a bump cannot update half):
+          #   gh api repos/piercloud-net/terraform-provider-netcup/compare/v1.2.1...v1.2.1-patch.2
+          #     -> ahead_by=1, files: json_to_tf.go + json_to_tf_test.go
+          #   go version -m <the downloaded binary> | grep vcs.revision
+          #     -> vcs.revision=2254e9bea19e52ed114e0c2c814767c669d93307 (vcs.modified=false)
+          # i.e. the tag sits on `v1.2.1` + one fix commit, and the binary names
+          # that same commit. Removal order (#218): delete THIS STEP first, then
+          # the release, then the fork branch — never the release first, or every
+          # apply fails closed at the download.
           PROVIDER_URL: https://github.com/piercloud-net/terraform-provider-netcup/releases/download/v1.2.1-patch.2/terraform-provider-netcup_v1.2.1-patch.2_linux_amd64 # rationale: pinned patched provider build for issue #218 (host is on the endpoint allowlist since #221); upstream PR #47 pending
-          PROVIDER_SHA256: 2e9348050558497c7f575b191ee7565994083ff2a1fc70678d6ed7c40f29dfac
+          PROVIDER_SHA256: b8d3e7ffff2ed01a27ddf9dcc141ca6641e0d79615527dd0aa0977668085bb19
         run: |
           set -euo pipefail
           # No token is read here; nothing is printed but the digest check.
           bin_dir="$RUNNER_TEMP/pc-provider"
+          # Empty the directory first: `tofu plan` executes whatever sits in
+          # there, so nothing written by an earlier or later step may survive
+          # next to the verified binary (review red-team F4).
+          rm -rf "$bin_dir"
           mkdir -p "$bin_dir"
           out="$bin_dir/terraform-provider-netcup_v1.2.1-patch.2"
-          curl -fsSL --max-time 120 -o "$out" "$PROVIDER_URL"
+          curl -fsSL --proto '=https' --proto-redir '=https' --max-time 120 -o "$out" "$PROVIDER_URL"
           printf '%s  %s\n' "$PROVIDER_SHA256" "$out" | sha256sum -c - >/dev/null
           chmod 0755 "$out"
           # dev_overrides only affects plan/apply; `tofu init` above ran without
-          # this file, so the lock-file verification is unchanged.
+          # this file (see the ordering note in the comment block).
           rc="$RUNNER_TEMP/tofurc"
           printf 'provider_installation {\n  dev_overrides {\n    "registry.opentofu.org/rixlhq/netcup" = "%s"\n  }\n  direct {}\n}\n' "$bin_dir" > "$rc"
           chmod 0600 "$rc"
