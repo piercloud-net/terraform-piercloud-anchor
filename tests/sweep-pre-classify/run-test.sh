@@ -88,7 +88,7 @@ entry() { # $1 id, $2 name, $3 age-seconds ("orphan" = unstamped description)
   fi
 }
 
-RC_OF() { local l="$1" mode="${3-apply}"; STUB_LIST="$2" STUB_FAIL_DETACH_PID="${STUB_FAIL_DETACH_PID:-}" PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE="$mode" SERVER_ID=933556 OWN_NAME="piercloud-tmp-999" TMP_TTL_SECONDS=7200 \
+RC_OF() { local l="$1" mode="${3-apply}"; STUB_LIST="$2" STUB_FAIL_DETACH_PID="${STUB_FAIL_DETACH_PID:-}" PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE="$mode" SERVER_ID=424242 OWN_NAME="piercloud-tmp-999" TMP_TTL_SECONDS=7200 \
   bash -c 'set -euo pipefail; source "$1"; cmd_sweep_pre' _ "$WORK/functions.sh" > "$WORK/out.$l" 2>&1 && echo 0 || echo $?; }
 ACTIONS() { [ -f "$WORK/actions.$1" ] && paste -sd' ' "$WORK/actions.$1" || echo ""; }
 OUT() { cat "$WORK/out.$1" 2>/dev/null || echo ""; }
