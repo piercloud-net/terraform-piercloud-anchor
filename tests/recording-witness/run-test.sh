@@ -132,12 +132,15 @@
 #   (j) ntfy bookkeeping: state transitions push, a first-ever green never
 #       pushes (and does not arm the recovery retry), a repeated non-green
 #       state is suppressed inside the renotify window, renotifies outside it,
-#       a changed finding signature pushes immediately and an unchanged one
+#       a changed finding signature pushes immediately when the new shape is
+#       outside the operator's quiet pin, a flip between two pinned shapes does
+#       not push, and an unchanged one
 #       stays quiet (signatures hash stable identities only - the separate
 #       finding-signature teeth below prove age-only drift never changes one
 #       and that every identity component moves it: all sequence-gap ranges,
 #       the hidden version_id, the drift key, the session-start condition),
-#       the operator's quiet pin quiets exactly its own `alert` signature to
+#       the operator's quiet pin (one signature or a comma-separated list) quiets
+#       exactly its own `alert` signatures to
 #       the quiet window while any other signature keeps the default window
 #       (a malformed pin - including a trailing newline - disables quieting
 #       with a bounded warning, never aborting or echoing; an out-of-range
@@ -235,7 +238,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1010
+MIN_CHECKS=1014
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -7401,6 +7404,85 @@ if grep -q '^RECORDING_WITNESS_QUIET_SIGNATURE=sha256:0' "${RECORDING_WITNESS_EN
 else
   bad "installed env file lost the optional quiet signature"
 fi
+# #213: a LIST pin must survive the render. `printf %q` escapes the comma as
+# `\,` (a bare comma is not a shell metacharacter, but %q quotes
+# conservatively), and systemd's EnvironmentFile parser drops the backslash for
+# an unquoted value. Pin both halves so a render change that mangles the list is
+# caught here instead of on the box: the exact bytes, and the value the witness
+# receives. The unescape below is a MODEL of systemd's documented unquoted-value
+# rule, and where a user bus actually works the harness also drives the REAL
+# parser (`systemd-run --user --wait --pipe -p EnvironmentFile=<rendered>
+# /usr/bin/env`) and asserts the same two entries. Residual, disclosed: the leg
+# is graded only where the BUS PROBE SUCCEEDS - an absent binary, no reachable
+# bus, a wedged bus or a probe unit the bus refuses all skip (each labelled with
+# its own diagnosed reason, systemd's words included) - and on a skip a wrong
+# model would still pass. The exact-bytes pin above is what catches a mangled
+# render in CI, on every host.
+RECORDING_WITNESS_QUIET_SIGNATURE="sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" \
+  recording_witness_install
+list_line="$(grep '^RECORDING_WITNESS_QUIET_SIGNATURE=' "${RECORDING_WITNESS_ENV_FILE}" | head -n1)"
+list_raw="${list_line#RECORDING_WITNESS_QUIET_SIGNATURE=}"
+case "${list_raw}" in
+  'sha256:0000000000000000000000000000000000000000000000000000000000000000\,sha256:0000000000000000000000000000000000000000000000000000000000000001')
+    ok "a list pin renders with the %q-escaped comma" ;;
+  *) bad "a list pin must render as <sig>\\,<sig>, got '${list_raw}'" ;;
+esac
+# systemd's unquoted-value rule: a backslash escapes the next character.
+list_systemd="$(printf '%s' "${list_raw}" | sed 's/\\\(.\)/\1/g')"
+if [ "${list_systemd}" = "sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" ]; then
+  ok "systemd's unescape restores the exact two-entry list"
+else
+  bad "systemd's unescape did not restore the list: '${list_systemd}'"
+fi
+list_entries="$(printf '%s' "${list_systemd}" | tr ',' '\n' | grep -c '^sha256:[0-9a-f]\{64\}$')"
+if [ "${list_entries}" -eq 2 ] && ! printf '%s' "${list_systemd}" | grep -q '\\'; then
+  ok "the rendered list carries two full-signature entries and no leftover backslash"
+else
+  bad "the rendered list is not two clean entries (${list_entries} matched): '${list_systemd}'"
+fi
+# Drive the real parser where a user bus actually works. Grading the
+# EnvironmentFile leg on "this command exited 0" would be fail-open: a refused
+# unit or a wedged bus would be reported as a skip and read as a pass, on
+# exactly the host class the leg exists for. So probe the bus FIRST (a trivial
+# unit), and only where that succeeds is the EnvironmentFile leg graded - there
+# a failure is a real finding, not an environment limitation. Where no bus is
+# reachable - or the bus refuses the probe unit - the leg skips with the
+# diagnosed reason (the exit code plus systemd's own first stderr line, never a
+# bare "skipped"), and the exact-bytes pin above remains the CI-side tooth.
+# Either path emits exactly one check, so the floor is stable.
+bus_rc=0
+bus_note="systemd-run is absent"
+if command -v systemd-run >/dev/null 2>&1; then
+  bus_note="the user bus probe produced no result"
+  timeout 15 systemd-run --user --wait --pipe /usr/bin/env \
+    >/dev/null 2>"${WORK}/systemd-bus.err" || bus_rc=$?
+  if [ "${bus_rc}" -eq 124 ]; then
+    bus_note="the user bus probe timed out after 15s (a wedged bus)"
+  elif [ "${bus_rc}" -ne 0 ]; then
+    # The exit code alone does not separate "no bus" from "a bus refused this
+    # unit" (both are rc=1), so surface what systemd actually said. First
+    # non-empty stderr line, bounded: the transient unit name is the only
+    # content, and it carries nothing sensitive.
+    bus_err="$(grep -m1 -v '^[[:space:]]*$' "${WORK}/systemd-bus.err" 2>/dev/null | cut -c1-120 || true)"
+    bus_note="the user bus probe failed (systemd-run exited ${bus_rc}${bus_err:+: ${bus_err}})"
+  fi
+fi
+if [ "${bus_rc}" -eq 0 ] && command -v systemd-run >/dev/null 2>&1; then
+  env_rc=0
+  timeout 15 systemd-run --user --wait --pipe -p "EnvironmentFile=${RECORDING_WITNESS_ENV_FILE}" \
+    /usr/bin/env >"${WORK}/systemd-env.out" 2>"${WORK}/systemd-env.err" || env_rc=$?
+  systemd_value="$(sed -n 's/^RECORDING_WITNESS_QUIET_SIGNATURE=//p' "${WORK}/systemd-env.out" 2>/dev/null | head -n1)"
+  if [ "${env_rc}" -ne 0 ]; then
+    bad "the EnvironmentFile probe failed (rc=${env_rc}) on a host whose user bus works - the parser leg is graded here, not skipped"
+  elif [ "${systemd_value}" = "sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" ]; then
+    ok "the real EnvironmentFile parser hands the witness both entries unescaped"
+  else
+    bad "the real EnvironmentFile parser handed '${systemd_value}' (want both entries, no backslash)"
+  fi
+else
+  ok "real EnvironmentFile parser probe skipped: ${bus_note} (the model above stands; disclosed residual)"
+fi
+unset RECORDING_WITNESS_QUIET_SIGNATURE
 if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
   ok "installed env file carries the optional cold-start window"
 else
@@ -9112,6 +9194,7 @@ spec.loader.exec_module(module)
 now = 1_800_000_000
 SIG_A = "sha256:" + "a" * 64
 SIG_B = "sha256:" + "b" * 64
+SIG_C = "sha256:" + "c" * 64
 # Raw helper invariants: fixtures happen to feed sorted inputs, so pin order
 # independence directly, and pin the state entering the digest.
 if module.identity_digest(["b", "a"]) != module.identity_digest(["a", "b"]):
@@ -9149,24 +9232,50 @@ for label, actual, expected in [
     ("an unchanged signature stays inside the window",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A), False),
     ("a pinned signature quiets to the quiet window",
-     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), False),
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), False),
     ("a pinned signature renotifies after the quiet window",
-     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), True),
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), True),
     ("an unpinned signature keeps the default window",
-     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_B, SIG_B, SIG_A, 86400), True),
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A}, 86400), True),
     ("an unpinned signature stays inside the default window",
-     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_B, SIG_B, SIG_A, 86400), False),
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A}, 86400), False),
     ("a pinned signature that changed still pushes immediately",
-     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A, SIG_A, 86400), True),
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A, {SIG_A}, 86400), True),
     ("a pinned non-green transition still pushes",
-     module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A, SIG_A, 86400), True),
+     module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), True),
     ("an empty signature skips the change-trigger",
-     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, "", "", "", 86400), False),
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, "", "", frozenset(), 86400), False),
     ("the fixed error digest is never quieted",
      module.should_notify("error", now - 1800, "error", now, 1800, 0, 0,
                           module.finding_signature("error", []),
+                          {module.finding_signature("error", [])}, 86400), True),
+    ("every signature of a multi-entry pin quiets to the quiet window",
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A, SIG_B}, 86400), False),
+    ("the other signature of a multi-entry pin quiets too",
+     module.should_notify("alert", now - 1799, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A, SIG_B}, 86400), False),
+    ("a multi-entry pin still renotifies after the quiet window",
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_B, SIG_B, {SIG_A, SIG_B}, 86400), True),
+    ("an unpinned third signature keeps the default window under a multi-entry pin",
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_C, SIG_C, {SIG_A, SIG_B}, 86400), True),
+    ("a multi-entry pin never quiets a change to an unpinned shape",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_C, SIG_B, {SIG_A, SIG_B}, 86400), True),
+    ("a flip between two pinned shapes is not new information",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_B, {SIG_A, SIG_B}, 86400), False),
+    ("a flip from a pinned shape to an unpinned one pushes immediately",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_C, SIG_A, {SIG_A, SIG_B}, 86400), True),
+    ("settling back onto a pinned shape from an unpinned one pushes once",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A, SIG_B}, 86400), True),
+    ("a failed transition push into a pinned alert is retried on the next run",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A}, 86400), True),
+    ("a flip is only quiet when the last notified shape is pinned too",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_C, {SIG_A, SIG_B}, 86400), True),
+    ("an empty pin is not a membership match",
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_A, SIG_A, frozenset(), 86400), True),
+    ("a multi-entry pin does not quiet an error state",
+     module.should_notify("error", now - 1800, "error", now, 1800, 0, 0,
                           module.finding_signature("error", []),
-                          module.finding_signature("error", []), 86400), True),
+                          module.finding_signature("error", []),
+                          {module.finding_signature("error", [])}, 86400), True),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
@@ -9203,16 +9312,51 @@ os.environ.pop("RECORDING_WITNESS_RENOTIFY_SECONDS")
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS")
 if not any("outside [60, 7776000]" in entry for entry in config_logs):
     raise SystemExit("an out-of-range window must warn")
+def _pin(raw):
+    """Parse one pin value through Config; return (signatures, warned)."""
+    os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = raw
+    del config_logs[:]
+    parsed = module.Config()
+    return parsed.quiet_signatures, any("quiet signature is malformed" in entry for entry in config_logs)
+
+
+# A single signature still validates exactly as before.
+pin, warned = _pin(SIG_A)
+if pin != frozenset({SIG_A}) or warned:
+    raise SystemExit("a single-signature pin must validate cleanly: %r %r" % (pin, warned))
+# A comma-separated list is the #213 shape: every entry is a valid signature.
+pin, warned = _pin(SIG_A + "," + SIG_B)
+if pin != frozenset({SIG_A, SIG_B}) or warned:
+    raise SystemExit("a two-entry pin must validate to both signatures: %r %r" % (pin, warned))
+# Duplicates are harmless (a set), so a copy-paste repeat still quiets.
+pin, warned = _pin(SIG_A + "," + SIG_A)
+if pin != frozenset({SIG_A}) or warned:
+    raise SystemExit("a duplicated pin entry must dedupe, not fail: %r %r" % (pin, warned))
 # Python's `$` also matches before a trailing newline: a full-string match is
 # what keeps a newline-suffixed pin from being accepted-but-never-matching.
-os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A + "\n"
-config = module.Config()
-if config.quiet_signature:
-    raise SystemExit("a trailing-newline pin must not validate")
-if not any("quiet signature is malformed" in entry for entry in config_logs):
-    raise SystemExit("a malformed pin must warn")
-if any(SIG_A in entry for entry in config_logs):
-    raise SystemExit("the malformed-pin warning must not echo the value")
+for label, raw in [
+    ("a trailing newline", SIG_A + "\n"),
+    ("a trailing comma", SIG_A + ","),
+    ("a leading comma", "," + SIG_A),
+    ("a doubled comma", SIG_A + ",," + SIG_B),
+    ("one bad entry among good ones", SIG_A + ",sha256:XYZ"),
+    ("a trailing-newline entry", SIG_A + "," + SIG_B + "\n"),
+    ("whitespace around an entry", SIG_A + ", " + SIG_B),
+]:
+    pin, warned = _pin(raw)
+    if pin or not warned:
+        raise SystemExit("%s must disable quieting with a warning: %r %r" % (label, pin, warned))
+    if any(SIG_A in entry for entry in config_logs):
+        raise SystemExit("the malformed-pin warning must not echo the value (%s)" % label)
+# The list is bounded: a pin is an operator convenience, not a data channel.
+over_cap = ",".join("sha256:" + ("%064x" % (index + 1)) for index in range(module.QUIET_SIGNATURE_MAX + 1))
+pin, warned = _pin(over_cap)
+if pin or not warned:
+    raise SystemExit("an over-cap pin must disable quieting with a warning")
+at_cap = ",".join("sha256:" + ("%064x" % (index + 1)) for index in range(module.QUIET_SIGNATURE_MAX - 1)) + "," + SIG_A
+pin, warned = _pin(at_cap)
+if len(pin) != module.QUIET_SIGNATURE_MAX or warned:
+    raise SystemExit("a pin at the cap must validate: %d entries, warned=%r" % (len(pin), warned))
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE")
 module.log = real_log
 for name, value in saved_env.items():
@@ -9580,7 +9724,9 @@ _set_last_epoch(-86401)
 codes.append(module.main())
 if len(captured) != 4:
     raise SystemExit("a pinned signature must renotify after the quiet window, got %d" % len(captured))
-# A finding-set change leaves the pin behind: push immediately, default cadence.
+# A change to an UNPINNED shape pushes immediately and then runs on the default
+# cadence. The pin is not consumed by it (nothing edits quiet_signatures), so it
+# applies again if the set returns to a pinned shape.
 sig[:] = [SIG_B]
 _set_last_epoch(0)
 codes.append(module.main())
@@ -9598,9 +9744,65 @@ if len(captured) != 6:
     raise SystemExit("a malformed pin must fall back to the default window, got %d" % len(captured))
 if json.load(open(state_path)).get("state") != "alert":
     raise SystemExit("a malformed pin must not take the witness down")
+# #213: a known finding set that FLAPS between two exact shapes. A single pin
+# can only hold for the half of the cycle it was copied from, so every flip
+# pushed; a two-entry pin quiets both shapes and still renotifies on the quiet
+# window. This is the live operator-anchor shape (hidden-object alone, and
+# hidden-object + heartbeat-stale).
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A + "," + SIG_B
+os.environ["RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"] = "86400"
+# The previous run left last_notify_signature at SIG_B, so start from SIG_B.
+_set_last_epoch(-1801)
+codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a listed signature must stay quiet inside the quiet window, got %d" % len(captured))
+sig[:] = [SIG_A]
+_set_last_epoch(-1801)
+codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a flip to the other listed signature must stay quiet, got %d" % len(captured))
+sig[:] = [SIG_B]
+_set_last_epoch(-1801)
+codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a flip back must stay quiet under a list pin, got %d" % len(captured))
+if json.load(open(state_path)).get("last_notify_epoch") == 0:
+    raise SystemExit("a list pin must not zero the notify bookkeeping")
+_set_last_epoch(-86401)
+codes.append(module.main())
+if len(captured) != 7:
+    raise SystemExit("a list pin must still renotify after the quiet window, got %d" % len(captured))
+# A shape outside the list is new information: push immediately, default window.
+sig[:] = [SIG_C]
+_set_last_epoch(-100)
+codes.append(module.main())
+if len(captured) != 8:
+    raise SystemExit("an unlisted shape must push immediately, got %d" % len(captured))
+# #213 round-1 red-team F1: a failed push must not be swallowed by the pin.
+# last_notify_signature only advances on a LANDED push, so a membership rule
+# that looked at the current signature alone would read the failed transition
+# push as "already told" and wait out a whole quiet window - one transient ntfy
+# failure would delay the first notification of that alert by up to a day. The
+# quiet branch therefore requires the last NOTIFIED signature to be pinned too,
+# which keeps the change trigger armed for the retry. Last landed shape here is
+# SIG_C (unpinned), so the transition into the pinned SIG_A must retry.
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A
+sig[:] = [SIG_A]
+flaky["fail"] = True
+codes.append(module.main())  # transition push attempted, fails
+if len(captured) != 9:
+    raise SystemExit("a failed pinned-alert transition must attempt exactly one push, got %d" % len(captured))
+if json.load(open(state_path)).get("last_notify_signature") == SIG_A:
+    raise SystemExit("a failed push must not advance last_notify_signature")
+flaky["fail"] = False
+codes.append(module.main())  # next run retries
+if len(captured) != 10:
+    raise SystemExit("a failed pinned-alert push must retry on the next run, got %d pushes" % len(captured))
+if json.load(open(state_path)).get("last_notify_signature") != SIG_A:
+    raise SystemExit("the landed retry must advance last_notify_signature")
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
-if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
+if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
     raise SystemExit("signature/pin exit codes wrong: %r" % codes)
 
 # Round-5 R1: a corrupted numeric field in a type-valid state.json used to
