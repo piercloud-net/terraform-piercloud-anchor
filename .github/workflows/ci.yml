@@ -345,10 +345,14 @@ jobs:
           #   direct Cloudflare/Gcore DNS APIs are retired (b3b #189): once
           #   this lands, a re-appearance fails this gate (PR runs use the
           #   pattern fetched from origin/main).
+          #   github.com: the pinned release download of the temporarily
+          #   patched community provider (issue #219 / #218 stopgap; the
+          #   artifact is sha256-pinned in provision.yml, so the host grants
+          #   nothing by itself).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|broker\.piercloud\.net)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|broker\.piercloud\.net|github\.com)(/|$)'
           # Passwordless bootstrap (issue #50) extends the surface with task
           # polling (/tasks) and the approver guard (/users/{id}); the
           # provisioning-only stems above stay intact (sanity check enforces).
