@@ -145,9 +145,9 @@ PRELUDE
 for fn in valid_mac resolve_mac; do
   grep -q "^$fn() {" "$WORK/resolve_mac.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
-RUN_RESOLVE() { # $1 label, $2 stub status -> rc; side files per label
+RUN_RESOLVE() { # $1 label, $2 stub status, $3 INTERFACE_MAC override -> rc; side files per label
   local rc=0
-  STUB_STATUS="$2" STUB_PATH_OUT="$WORK/interfaces-path.$1" INTERFACE_MAC='' SERVER_ID=424242 \
+  STUB_STATUS="$2" STUB_PATH_OUT="$WORK/interfaces-path.$1" INTERFACE_MAC="${3-}" SERVER_ID=424242 \
     bash -c 'set -euo pipefail; source "$1"; resolve_mac' _ "$WORK/resolve_mac.sh" \
     > "$WORK/out.resolve_mac.$1" 2> "$WORK/err.resolve_mac.$1" || rc=$?
   printf '%s' "$rc"
@@ -164,28 +164,61 @@ if [ "$rc" -ne 0 ] && grep -q 'list server interfaces failed (HTTP 500)' "$WORK/
 else
   bad "resolve_mac must die on a non-200 interfaces read (rc=$rc)"
 fi
+# The shipped valid_mac's newline/CR guard is a security property (an embedded
+# newline made a value match on its FIRST line, review N2). Feed it hostile
+# values so removing the guard reds here.
+rc="$(RUN_RESOLVE nl 200 $'00:11:22:33:44:55\nanything')"
+if [ "$rc" -ne 0 ] && grep -q 'INTERFACE_MAC override is not a 17-char hex/colon MAC' "$WORK/err.resolve_mac.nl"; then
+  ok "valid_mac rejects an override with a trailing newline"
+else
+  bad "valid_mac must reject a newline-bearing MAC override (rc=$rc)"
+fi
+rc="$(RUN_RESOLVE good 200 'AA:BB:CC:DD:EE:FF')"
+is "valid_mac accepts a clean override" "AA:BB:CC:DD:EE:FF" "$(cat "$WORK/out.resolve_mac.good")"
+
 # Real YAML parse, not a text grep (docs/verification.md §1: no hand-rolled
 # parsers in verification artifacts). A comment quoting the parameter must not
 # satisfy this; only an executed `run:` script can.
-if WORK="$WORK" ROOT="$ROOT" python3 - <<'PYEOF'
-import os, sys, yaml
+if ROOT="$ROOT" python3 - <<'PYEOF'
+import os, re, sys, yaml
+
 doc = yaml.safe_load(open(os.path.join(os.environ["ROOT"], ".github/workflows/provision.yml")))
-runs = []
-for job in (doc.get("jobs") or {}).values():
-    for step in (job.get("steps") or []):
-        if isinstance(step, dict) and isinstance(step.get("run"), str):
-            runs.append(step["run"])
-want = "/interfaces?loadRdns=false"
-sys.exit(0 if any(want in r for r in runs) else 1)
+# Bind to the ONE step that resolves the interface MAC for the import file
+# (its `run` builds POLICY_NAME + reads /interfaces). Scanning every job's run
+# strings would let an unrelated `echo` or a shell comment satisfy the tooth.
+MARK = 'POLICY_NAME="piercloud-anchor-${ANCHOR_HOSTNAME}"'
+WANT = '/interfaces?loadRdns=false'
+steps = [st for job in (doc.get("jobs") or {}).values()
+         for st in (job.get("steps") or [])
+         if isinstance(st, dict) and isinstance(st.get("run"), str)]
+bound = [st["run"] for st in steps if MARK in st["run"]]
+if len(bound) != 1:
+    sys.exit(2)  # the marker must identify exactly one step, else the tooth is stale
+# Strip shell comments before matching: a commented-out example is not the call.
+live = [re.sub(r'(?m)^\s*#.*$', '', r) for r in bound]
+sys.exit(0 if any(WANT in r for r in live) else 1)
 PYEOF
 then
   ok "import-discovery read carries loadRdns=false (parsed from the run script)"
 else
   bad "import-discovery read in provision.yml must carry ?loadRdns=false (#216)"
 fi
-# The data source half: the argument must sit inside the interfaces data source.
-if awk '/^data "netcup_scp_server_interfaces" "anchor" \{/{f=1} f&&/load_rdns[[:space:]]*=[[:space:]]*false/{print "yes"; exit} f&&/^\}/{f=0}' \
-     "$ROOT/main.tf" | grep -q yes; then
+# The data source half: the argument must sit inside the interfaces data source
+# and be LIVE. HCL has no stdlib parser here, so strip comments first — a
+# commented-out `# load_rdns = false` inside the block must not satisfy it.
+if ROOT="$ROOT" python3 - <<'PYEOF'
+import os, re, sys
+
+src = open(os.path.join(os.environ["ROOT"], "main.tf")).read()
+src = re.sub(r'/\*.*?\*/', '', src, flags=re.S)          # block comments
+src = re.sub(r'(?m)^\s*(#|//).*$', '', src)              # line comments
+blocks = re.findall(r'(?ms)^data\s+"netcup_scp_server_interfaces"\s+"anchor"\s*\{(.*?)^\}', src)
+if len(blocks) != 1:
+    sys.exit(2)
+attrs = re.findall(r'(?m)^\s*load_rdns\s*=\s*(\w+)', blocks[0])
+sys.exit(0 if attrs == ['false'] else 1)
+PYEOF
+then
   ok "interfaces data source carries load_rdns = false"
 else
   bad "main.tf: the interfaces data source must set load_rdns = false (#216)"
