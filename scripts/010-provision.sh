@@ -5691,8 +5691,9 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     coming and going): while BOTH the current and the last notified shape are
     declared, a flip is not new information and the quiet window governs it.
     A shape OUTSIDE the pin still pushes immediately on the change trigger, so
-    no new finding is ever hidden, and the pin leaves itself behind as soon as
-    the observed set is no longer declared. Requiring the last notified shape
+    no new finding is ever hidden; while such a shape persists the default
+    window applies, and the pin is never consumed - it applies again if the
+    observed set returns to a declared shape. Requiring the last notified shape
     to be pinned as well keeps the retry path intact: a failed push does not
     advance it, so the next run retries instead of waiting out a quiet window. The quiet pin applies to `alert` finding sets only: the
     fixed `error`/`ok` signatures are never quieted, so a new failure cause

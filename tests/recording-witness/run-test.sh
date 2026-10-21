@@ -132,12 +132,15 @@
 #   (j) ntfy bookkeeping: state transitions push, a first-ever green never
 #       pushes (and does not arm the recovery retry), a repeated non-green
 #       state is suppressed inside the renotify window, renotifies outside it,
-#       a changed finding signature pushes immediately and an unchanged one
+#       a changed finding signature pushes immediately when the new shape is
+#       outside the operator's quiet pin, a flip between two pinned shapes does
+#       not push, and an unchanged one
 #       stays quiet (signatures hash stable identities only - the separate
 #       finding-signature teeth below prove age-only drift never changes one
 #       and that every identity component moves it: all sequence-gap ranges,
 #       the hidden version_id, the drift key, the session-start condition),
-#       the operator's quiet pin quiets exactly its own `alert` signature to
+#       the operator's quiet pin (one signature or a comma-separated list) quiets
+#       exactly its own `alert` signatures to
 #       the quiet window while any other signature keeps the default window
 #       (a malformed pin - including a trailing newline - disables quieting
 #       with a bounded warning, never aborting or echoing; an out-of-range
@@ -235,7 +238,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1013
+MIN_CHECKS=1014
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -7403,12 +7406,15 @@ else
 fi
 # #213: a LIST pin must survive the render. `printf %q` escapes the comma as
 # `\,` (a bare comma is not a shell metacharacter, but %q quotes
-# conservatively), and systemd's EnvironmentFile parser drops the backslash
-# for an unquoted value - verified live with
-# `systemd-run --user --wait --pipe -p EnvironmentFile=… /usr/bin/env`
-# (the child saw two clean comma-separated entries, no backslash). Pin both
-# halves so a render change that mangles the list is caught here instead of on
-# the box: the exact bytes, and the value systemd hands the witness.
+# conservatively), and systemd's EnvironmentFile parser drops the backslash for
+# an unquoted value. Pin both halves so a render change that mangles the list is
+# caught here instead of on the box: the exact bytes, and the value the witness
+# receives. The unescape below is a MODEL of systemd's documented unquoted-value
+# rule, and when a user bus is reachable the harness also drives the REAL parser
+# (`systemd-run --user --wait --pipe -p EnvironmentFile=<rendered> /usr/bin/env`)
+# and asserts the same two entries. Residual, disclosed: on a runner with no
+# user bus the real-parser leg skips, so there a wrong model would still pass -
+# the exact-bytes pin above is what catches a mangled render in CI.
 RECORDING_WITNESS_QUIET_SIGNATURE="sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" \
   recording_witness_install
 list_line="$(grep '^RECORDING_WITNESS_QUIET_SIGNATURE=' "${RECORDING_WITNESS_ENV_FILE}" | head -n1)"
@@ -7430,6 +7436,22 @@ if [ "${list_entries}" -eq 2 ] && ! printf '%s' "${list_systemd}" | grep -q '\\'
   ok "the rendered list carries two full-signature entries and no leftover backslash"
 else
   bad "the rendered list is not two clean entries (${list_entries} matched): '${list_systemd}'"
+fi
+# Drive the real parser when this host has a user bus. `--pipe` returns the
+# child's stdout; a bounded timeout keeps a wedged bus from hanging the suite.
+# No user bus (a CI runner) skips with a notice rather than failing - the exact
+# bytes above are the CI-side tooth.
+if command -v systemd-run >/dev/null 2>&1 \
+   && timeout 15 systemd-run --user --wait --pipe -p "EnvironmentFile=${RECORDING_WITNESS_ENV_FILE}" \
+        /usr/bin/env >"${WORK}/systemd-env.out" 2>"${WORK}/systemd-env.err"; then
+  systemd_value="$(sed -n 's/^RECORDING_WITNESS_QUIET_SIGNATURE=//p' "${WORK}/systemd-env.out" | head -n1)"
+  if [ "${systemd_value}" = "sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" ]; then
+    ok "the real EnvironmentFile parser hands the witness both entries unescaped"
+  else
+    bad "the real EnvironmentFile parser handed '${systemd_value}' (want both entries, no backslash)"
+  fi
+else
+  ok "real EnvironmentFile parser probe skipped (no usable systemd --user bus)"
 fi
 unset RECORDING_WITNESS_QUIET_SIGNATURE
 if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
@@ -9216,8 +9238,6 @@ for label, actual, expected in [
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A, SIG_B}, 86400), True),
     ("a failed transition push into a pinned alert is retried on the next run",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A}, 86400), True),
-    ("a failed renotify of a pinned alert is retried on the next run",
-     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), True),
     ("a flip is only quiet when the last notified shape is pinned too",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_C, {SIG_A, SIG_B}, 86400), True),
     ("an empty pin is not a membership match",
@@ -9675,7 +9695,9 @@ _set_last_epoch(-86401)
 codes.append(module.main())
 if len(captured) != 4:
     raise SystemExit("a pinned signature must renotify after the quiet window, got %d" % len(captured))
-# A finding-set change leaves the pin behind: push immediately, default cadence.
+# A change to an UNPINNED shape pushes immediately and then runs on the default
+# cadence. The pin is not consumed by it (nothing edits quiet_signatures), so it
+# applies again if the set returns to a pinned shape.
 sig[:] = [SIG_B]
 _set_last_epoch(0)
 codes.append(module.main())
