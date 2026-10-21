@@ -235,7 +235,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1010
+MIN_CHECKS=1013
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -7401,6 +7401,37 @@ if grep -q '^RECORDING_WITNESS_QUIET_SIGNATURE=sha256:0' "${RECORDING_WITNESS_EN
 else
   bad "installed env file lost the optional quiet signature"
 fi
+# #213: a LIST pin must survive the render. `printf %q` escapes the comma as
+# `\,` (a bare comma is not a shell metacharacter, but %q quotes
+# conservatively), and systemd's EnvironmentFile parser drops the backslash
+# for an unquoted value - verified live with
+# `systemd-run --user --wait --pipe -p EnvironmentFile=… /usr/bin/env`
+# (the child saw two clean comma-separated entries, no backslash). Pin both
+# halves so a render change that mangles the list is caught here instead of on
+# the box: the exact bytes, and the value systemd hands the witness.
+RECORDING_WITNESS_QUIET_SIGNATURE="sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" \
+  recording_witness_install
+list_line="$(grep '^RECORDING_WITNESS_QUIET_SIGNATURE=' "${RECORDING_WITNESS_ENV_FILE}" | head -n1)"
+list_raw="${list_line#RECORDING_WITNESS_QUIET_SIGNATURE=}"
+case "${list_raw}" in
+  'sha256:0000000000000000000000000000000000000000000000000000000000000000\,sha256:0000000000000000000000000000000000000000000000000000000000000001')
+    ok "a list pin renders with the %q-escaped comma" ;;
+  *) bad "a list pin must render as <sig>\\,<sig>, got '${list_raw}'" ;;
+esac
+# systemd's unquoted-value rule: a backslash escapes the next character.
+list_systemd="$(printf '%s' "${list_raw}" | sed 's/\\\(.\)/\1/g')"
+if [ "${list_systemd}" = "sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" ]; then
+  ok "systemd's unescape restores the exact two-entry list"
+else
+  bad "systemd's unescape did not restore the list: '${list_systemd}'"
+fi
+list_entries="$(printf '%s' "${list_systemd}" | tr ',' '\n' | grep -c '^sha256:[0-9a-f]\{64\}$')"
+if [ "${list_entries}" -eq 2 ] && ! printf '%s' "${list_systemd}" | grep -q '\\'; then
+  ok "the rendered list carries two full-signature entries and no leftover backslash"
+else
+  bad "the rendered list is not two clean entries (${list_entries} matched): '${list_systemd}'"
+fi
+unset RECORDING_WITNESS_QUIET_SIGNATURE
 if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
   ok "installed env file carries the optional cold-start window"
 else
@@ -9181,8 +9212,14 @@ for label, actual, expected in [
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_B, {SIG_A, SIG_B}, 86400), False),
     ("a flip from a pinned shape to an unpinned one pushes immediately",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_C, SIG_A, {SIG_A, SIG_B}, 86400), True),
-    ("settling back onto a pinned shape is quiet (the unpinned shape already pushed)",
-     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A, SIG_B}, 86400), False),
+    ("settling back onto a pinned shape from an unpinned one pushes once",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A, SIG_B}, 86400), True),
+    ("a failed transition push into a pinned alert is retried on the next run",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_C, {SIG_A}, 86400), True),
+    ("a failed renotify of a pinned alert is retried on the next run",
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A, {SIG_A}, 86400), True),
+    ("a flip is only quiet when the last notified shape is pinned too",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_C, {SIG_A, SIG_B}, 86400), True),
     ("an empty pin is not a membership match",
      module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_A, SIG_A, frozenset(), 86400), True),
     ("a multi-entry pin does not quiet an error state",
@@ -9690,9 +9727,31 @@ _set_last_epoch(-100)
 codes.append(module.main())
 if len(captured) != 8:
     raise SystemExit("an unlisted shape must push immediately, got %d" % len(captured))
+# #213 round-1 red-team F1: a failed push must not be swallowed by the pin.
+# last_notify_signature only advances on a LANDED push, so a membership rule
+# that looked at the current signature alone would read the failed transition
+# push as "already told" and wait out a whole quiet window - one transient ntfy
+# failure would delay the first notification of that alert by up to a day. The
+# quiet branch therefore requires the last NOTIFIED signature to be pinned too,
+# which keeps the change trigger armed for the retry. Last landed shape here is
+# SIG_C (unpinned), so the transition into the pinned SIG_A must retry.
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A
+sig[:] = [SIG_A]
+flaky["fail"] = True
+codes.append(module.main())  # transition push attempted, fails
+if len(captured) != 9:
+    raise SystemExit("a failed pinned-alert transition must attempt exactly one push, got %d" % len(captured))
+if json.load(open(state_path)).get("last_notify_signature") == SIG_A:
+    raise SystemExit("a failed push must not advance last_notify_signature")
+flaky["fail"] = False
+codes.append(module.main())  # next run retries
+if len(captured) != 10:
+    raise SystemExit("a failed pinned-alert push must retry on the next run, got %d pushes" % len(captured))
+if json.load(open(state_path)).get("last_notify_signature") != SIG_A:
+    raise SystemExit("the landed retry must advance last_notify_signature")
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
-if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
+if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
     raise SystemExit("signature/pin exit codes wrong: %r" % codes)
 
 # Round-5 R1: a corrupted numeric field in a type-valid state.json used to

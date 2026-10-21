@@ -5688,11 +5688,13 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     the operator's quiet pin, so a pinned known finding set reminds daily
     instead of every 30 minutes. The pin is a set of exact signatures because
     a known finding set can flap between a few shapes (an age-bounded finding
-    coming and going): while every observed shape is declared, a flip is not
-    new information and the quiet window governs it. A shape OUTSIDE the pin
-    still pushes immediately on the change trigger, so no new finding is ever
-    hidden, and the pin leaves itself behind as soon as the observed set is no
-    longer declared. The quiet pin applies to `alert` finding sets only: the
+    coming and going): while BOTH the current and the last notified shape are
+    declared, a flip is not new information and the quiet window governs it.
+    A shape OUTSIDE the pin still pushes immediately on the change trigger, so
+    no new finding is ever hidden, and the pin leaves itself behind as soon as
+    the observed set is no longer declared. Requiring the last notified shape
+    to be pinned as well keeps the retry path intact: a failed push does not
+    advance it, so the next run retries instead of waiting out a quiet window. The quiet pin applies to `alert` finding sets only: the
     fixed `error`/`ok` signatures are never quieted, so a new failure cause
     always keeps the default cadence.
 
@@ -5726,7 +5728,17 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     # new information. Nothing is hidden: a finding outside the declared set
     # changes the signature to an UNPINNED one, which still pushes on the
     # change trigger below.
-    quiet = bool(quiet_signatures) and state == "alert" and signature in quiet_signatures
+    #
+    # The LAST LANDED signature must be pinned too, not just the current one.
+    # A failed push never advances last_signature, so a one-sided rule would
+    # read a failed transition push as "already told" and then stay silent for
+    # a whole quiet window: a single transient ntfy failure would delay the
+    # first notification of that alert by up to a day. With both sides pinned,
+    # the failed push keeps the change trigger armed and the next run retries
+    # it (the pre-#213 behaviour), while a real flip between declared shapes
+    # still lands on the quiet window.
+    quiet = (bool(quiet_signatures) and state == "alert"
+             and signature in quiet_signatures and last_signature in quiet_signatures)
     if signature and signature != last_signature and not quiet:
         # The finding set itself changed: push regardless of the window.
         return True
