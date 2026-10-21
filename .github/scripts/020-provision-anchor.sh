@@ -593,7 +593,11 @@ resolve_mac() {
     printf '%s' "$INTERFACE_MAC"
     return 0
   fi
-  api_call GET "/api/v1/servers/${SERVER_ID}/interfaces" "" resp
+  # loadRdns=false on purpose (issue #216): the API's reverse-DNS assembly is
+  # broken upstream. With the parameter omitted, the same endpoint returned
+  # `rdns` as a list (which breaks the provider's map-typed schema, killing
+  # every plan) and HTTP 500 on this sweep. Nothing here reads rdns.
+  api_call GET "/api/v1/servers/${SERVER_ID}/interfaces?loadRdns=false" "" resp
   api_ok "$HTTP_STATUS" || die "list server interfaces failed (HTTP $HTTP_STATUS)"
   # Lexicographically smallest MAC — the exact same jq rule as the
   # import-discovery step in provision.yml and main.tf's local.interface_mac
