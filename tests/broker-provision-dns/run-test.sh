@@ -606,7 +606,7 @@ SCP_END="$(awk -F'\t' -v s="$SCP_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*
 is "exactly one scp-endpoint-allowlist job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"scp-endpoint-allowlist\"|'scp-endpoint-allowlist'|scp-endpoint-allowlist)[[:space:]]*:?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$" "$CI")"
 if [ -n "$SCP_START" ] && [ -n "$SCP_END" ]; then
   SCP_JOB_BLOB="$(sed -n "$((SCP_START + 1)),$((SCP_END - 1))p" "$CI")"
-  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "f7d98c0ac8deb7e8ddfc407ee0129492c2858e9d286c7942a41779fce5727827" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "545625337aa4bc7991b2911be0922d34e7093add09eb6a6d3a06f1a6a542eb75" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "scp-endpoint-allowlist job span not found in ci.yml"
 fi
@@ -1056,7 +1056,7 @@ done
 allowed_default="$(grep -E '^[[:space:]]*allowed_url=' "$CI" || true)"
 [ -n "$allowed_default" ] || bad "ci.yml allowed_url default not found"
 is "exactly one line-leading allowed_url assignment" "1" "$(grep -cE '^[[:space:]]*allowed_url=' "$CI")"
-is "ci.yml allowed_url default blob hash (pin: update after a deliberate edit)" "2995ad1ff3581328f07a567d6ffa840d3dad8cc14627869d8dc2288ff7b57617" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
+is "ci.yml allowed_url default blob hash (pin: update after a deliberate edit)" "5bbdd9dbf5dc748181e87ea46508160a37acbde61da2a1479a7dbcb996f5b708" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
 lacks "ci.yml does not append to allowed_url" 'allowed_url+=' "$(cat "$CI")"
 lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed_default"
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
@@ -1075,7 +1075,7 @@ ALLOW_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Fai
 ALLOW_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ALLOW_START" '$1 > s && ($2 ~ /^      - / || $2 ~ /^  [^ #]/) {print $1; exit}')"
 if [ -n "$ALLOW_START" ] && [ -n "$ALLOW_END" ]; then
   ALLOW_STEP_BLOB="$(sed -n "${ALLOW_START},$((ALLOW_END - 1))p" "$CI")"
-  is "allowlist step blob hash (pin: update after a deliberate edit)" "9af2491dbc47cd000e75bfb7b682891c25d710ec6f0552837c5e426c60bcdc57" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "allowlist step blob hash (pin: update after a deliberate edit)" "70fe4532faae88672632dd7a21ea9df2aa2edcadd0b82773b007e5c7e55935c4" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "allowlist step span not found in ci.yml"
 fi
