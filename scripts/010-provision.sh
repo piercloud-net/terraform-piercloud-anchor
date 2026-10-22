@@ -230,19 +230,35 @@ render_caddyfile() { # print the Caddyfile to stdout
 # --- BEGIN HARDENING CHECK (tests/edge-origin-auth extracts this span; keep markers) ---
 # Origin-hardening converge assertion (issue #225): the SERVING Caddyfile must
 # carry the hardened shape — no :80 dashboard handler, no header-derived
-# client-IP trust, HSTS on the :443 site. Fail-loud on purpose: a re-introduced
-# :80 handler or a proxy-trust directive fails the run instead of passing
-# silently. Callers skip it under CADDY_SKIP_HTTPS (the harness render has no
-# :443 site); tests/edge-origin-auth executes this function (extracted, never
-# a copy) against a hardened render and three regressed fixtures.
+# client-IP trust, HSTS on the :443 site. Fail-loud on purpose, so a regressed
+# render fails the run instead of passing silently. It is a TEXT tripwire over
+# the serving file (comment lines excluded, so a prose mention neither hides
+# nor trips it), not a boundary: the behavioural tooth is tests/bind-e2e's
+# served peer/header + :80 matrix, which CI runs and a dispatch does not.
+# Callers skip it under CADDY_SKIP_HTTPS (the harness render has no :443 site);
+# tests/edge-origin-auth executes this function (extracted, never a copy)
+# against a hardened render and a regressed fixture per leg.
 assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving one)
-  local cfg="${1:-${CADDY_CONFIG}}"
-  if grep -q '@status' "$cfg" || grep -q 'client_ip_headers\|trusted_proxies' "$cfg"; then
+  local cfg="${1:-${CADDY_CONFIG}}" live http_block
+  [ -r "$cfg" ] && [ -s "$cfg" ] || die "cannot read the rendered Caddyfile $cfg — the origin-hardening check cannot run; refusing to finish blind"
+  # Direct configuration lines only: a comment mentioning a retired directive
+  # (this render carries one for `client_ip`) must neither hide nor trip it.
+  live="$(grep -v '^[[:space:]]*#' "$cfg" || true)"
+  if printf '%s\n' "$live" | grep -Eq '@status|client_ip_headers|trusted_proxies'; then
     docker logs caddy 2>&1 | tail -20 || true
     die "serving Caddyfile $cfg still carries the removed :80 dashboard handler and/or header-derived proxy trust — the origin-hardening render did not converge; refusing to finish blind"
   fi
-  grep -q 'Strict-Transport-Security "max-age=15552000"' "$cfg" \
-    || die "serving Caddyfile $cfg lacks the :443 HSTS header — the origin-hardening render did not converge; refusing to finish blind"
+  # The :80 site must not proxy the dashboard under ANY matcher name (a
+  # renamed handler evades the @status grep above): the Gatus port must not
+  # appear as a :80 upstream.
+  http_block="$(printf '%s\n' "$live" | awk -v hdr="${CADDY_HTTP_ADDR:-:80} {" '$0 == hdr { on = 1 } on { print } on && /^}$/ { exit }')"
+  [ -n "$http_block" ] || die "serving Caddyfile $cfg has no ${CADDY_HTTP_ADDR:-:80} site block — the origin-hardening check cannot prove :80 is dashboard-free; refusing to finish blind"
+  if printf '%s\n' "$http_block" | grep -q "reverse_proxy 127.0.0.1:${GATUS_PORT}"; then
+    docker logs caddy 2>&1 | tail -20 || true
+    die "serving Caddyfile $cfg proxies the dashboard on ${CADDY_HTTP_ADDR:-:80} (reverse_proxy 127.0.0.1:${GATUS_PORT} in that site) — the :80 dashboard handler is back; refusing to finish blind"
+  fi
+  printf '%s\n' "$live" | grep -Fq 'header Strict-Transport-Security "max-age=15552000"' \
+    || die "serving Caddyfile $cfg lacks the :443 HSTS header (max-age=15552000) — the origin-hardening render did not converge; refusing to finish blind"
   return 0
 }
 # --- END HARDENING CHECK ---
@@ -2889,10 +2905,15 @@ gatus_puller_run_once
 #    moved to 127.0.0.1:${TANG_PORT} in section (a); Gatus stays loopback-only
 #    (127.0.0.1:8080, Caddy proxies the status host to it).
 #
-#    Shape (issue #49, decided): explicit per-tenant site blocks, NEVER
-#    on_demand TLS. :80 serves tang paths plain (NO redirect), the ACME
-#    HTTP-01 path, and the status host plain; everything else aborts.
+#    Shape (issue #49, decided; hardened by issue #225): explicit per-tenant
+#    site blocks, NEVER on_demand TLS. :80 serves tang paths plain (NO
+#    redirect) and the ACME HTTP-01 path; everything else aborts (in the
+#    auto-TLS state Caddy's HTTP->HTTPS redirect answers the status host on
+#    :80 before this site's catch-all — a redirect, never dashboard content).
 #    :443 serves the dashboard for the one explicit status hostname below.
+#    The :443 gate matches the raw TCP peer and the render carries no
+#    trusted_proxies/client_ip_headers; the converge self-check below asserts
+#    that hardened shape.
 #
 #    Env in (operator-plane — the tenant pastes nothing, so tenant bootstrap
 #    stays 1 secret): ORIGIN_CA_CERT_PEM (the per-anchor Origin CA cert

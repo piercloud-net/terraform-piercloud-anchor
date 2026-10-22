@@ -150,10 +150,14 @@ hasnt "${WORK}/http.block" "127.0.0.1:${GATUS_PORT}" ":80 has no dashboard proxy
 hasnt "${WORK}/Caddyfile.443" '@status' "render has no @status matcher"
 
 # ---- hardening self-check (extracted, never a copy) -----------------------
-# The converge self-check that runs on the box is the only thing standing
-# between a regressed render and a green apply. Execute it here against the
-# hardened render and three regressed fixtures, so a render/matcher drift
-# reddens CI instead of every live run.
+# The converge self-check that runs on the box is the thing standing between a
+# regressed render and a green apply. Execute it here against the hardened
+# render and one regressed fixture per leg, so a render/matcher drift reddens
+# CI instead of every live run. The check is a text tripwire, not a boundary
+# (tests/bind-e2e is the behavioural tooth); these fixtures keep every leg of
+# it load-bearing and keep a prose mention from being a false reject.
+is "exactly one BEGIN HARDENING CHECK marker" "1" "$(grep -c 'BEGIN HARDENING CHECK' "${PROVISION_SH}")"
+is "exactly one END HARDENING CHECK marker" "1" "$(grep -c 'END HARDENING CHECK' "${PROVISION_SH}")"
 hc_b="$(grep -n -m1 'BEGIN HARDENING CHECK' "${PROVISION_SH}" | cut -d: -f1)"
 hc_e="$(grep -n -m1 'END HARDENING CHECK' "${PROVISION_SH}" | cut -d: -f1)"
 [ -n "$hc_b" ] && [ -n "$hc_e" ] && [ "$hc_b" -lt "$hc_e" ] || die "hardening-check markers missing/ambiguous in ${PROVISION_SH}"
@@ -168,21 +172,56 @@ hard_ok() { # $1 file, $2 label -> the self-check must ACCEPT it
 hard_die() { # $1 file, $2 label -> the self-check must REFUSE it
   if ( assert_caddyfile_hardened "$1" ) >/dev/null 2>&1; then bad "$2 (self-check accepted a regressed render)"; else ok "$2"; fi
 }
+# Call-site wiring: the definition is executed by a real no-argument call, so
+# deleting the call (or retargeting its default) cannot stay green.
+is "assert_caddyfile_hardened: one definition + one call" "2" "$(grep -c 'assert_caddyfile_hardened' "${PROVISION_SH}")"
+has "${PROVISION_SH}" '    assert_caddyfile_hardened' "the converge self-check is called at the provision call site"
+hasnt "${PROVISION_SH}" 'assert_caddyfile_hardened "' "the call site passes no argument (it asserts the serving Caddyfile)"
+has "${PROVISION_SH}" 'if [ -z "${CADDY_SKIP_HTTPS:-}" ]; then' "the self-check stays behind the CADDY_SKIP_HTTPS harness guard"
+
 hard_ok "${WORK}/Caddyfile.443" "self-check accepts the hardened render"
-# Fixture 1: a re-introduced :80 dashboard handler.
+# Fixture 1: a :80 dashboard handler under a DIFFERENT matcher name (the @status
+# grep alone is not the tooth; the Gatus-port upstream in the :80 site is).
+sed 's#^\tlog_skip$#\tlog_skip\n\t@dash {\n\t\thost citest.status.piercloud.net\n\t}\n\thandle @dash {\n\t\treverse_proxy 127.0.0.1:'"${GATUS_PORT}"'\n\t}#' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.dash-regressed"
+has "${WORK}/Caddyfile.dash-regressed" "reverse_proxy 127.0.0.1:${GATUS_PORT}" "regressed fixture 1 carries a :80 dashboard handler"
+hasnt "${WORK}/Caddyfile.dash-regressed" '@status' "regressed fixture 1 avoids the @status spelling"
+hard_die "${WORK}/Caddyfile.dash-regressed" "self-check refuses a renamed :80 dashboard handler"
+# Fixture 2: the removed @status spelling back.
 sed 's#^\tlog_skip$#\tlog_skip\n\t@status {\n\t\thost citest.status.piercloud.net\n\t}#' \
   "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.status-regressed"
-has "${WORK}/Caddyfile.status-regressed" '@status {' "regressed fixture 1 carries the :80 handler"
-hard_die "${WORK}/Caddyfile.status-regressed" "self-check refuses a re-introduced :80 dashboard handler"
-# Fixture 2: a re-introduced header-derived proxy trust.
-sed 's#^\tlog_skip$#\tlog_skip\n\ttrusted_proxies static 192.0.2.0/24#' \
+has "${WORK}/Caddyfile.status-regressed" '@status {' "regressed fixture 2 carries @status"
+hard_die "${WORK}/Caddyfile.status-regressed" "self-check refuses the @status spelling"
+# Fixture 3: the header-derived proxy trust back, in its real position (the
+# global servers option block), not a stray site-block line.
+sed 's#^\tadmin 127.0.0.1:2019$#\tadmin 127.0.0.1:2019\n\tservers {\n\t\ttrusted_proxies static 192.0.2.0/24\n\t}#' \
   "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.trust-regressed"
-has "${WORK}/Caddyfile.trust-regressed" 'trusted_proxies static' "regressed fixture 2 carries trusted_proxies"
+has "${WORK}/Caddyfile.trust-regressed" 'trusted_proxies static 192.0.2.0/24' "regressed fixture 3 carries trusted_proxies"
 hard_die "${WORK}/Caddyfile.trust-regressed" "self-check refuses re-introduced proxy trust"
-# Fixture 3: HSTS dropped.
-grep -v 'Strict-Transport-Security' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.no-hsts"
-hasnt "${WORK}/Caddyfile.no-hsts" 'Strict-Transport-Security' "regressed fixture 3 has no HSTS"
-hard_die "${WORK}/Caddyfile.no-hsts" "self-check refuses a :443 site without HSTS"
+# Fixture 4: client_ip_headers alone (the other half of the removed pair).
+sed 's#^\tadmin 127.0.0.1:2019$#\tadmin 127.0.0.1:2019\n\tservers {\n\t\tclient_ip_headers CloudFront-Viewer-Address\n\t}#' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.clientip-regressed"
+has "${WORK}/Caddyfile.clientip-regressed" 'client_ip_headers CloudFront-Viewer-Address' "regressed fixture 4 carries client_ip_headers"
+hasnt "${WORK}/Caddyfile.clientip-regressed" 'trusted_proxies' "regressed fixture 4 carries no trusted_proxies (the legs are independent)"
+hard_die "${WORK}/Caddyfile.clientip-regressed" "self-check refuses client_ip_headers alone"
+# Fixture 5: HSTS present but commented out (must not satisfy the leg).
+sed 's|^\theader Strict-Transport-Security|\t# header Strict-Transport-Security|' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.hsts-commented"
+has "${WORK}/Caddyfile.hsts-commented" '# header Strict-Transport-Security' "regressed fixture 5 comments the HSTS line out"
+hard_die "${WORK}/Caddyfile.hsts-commented" "self-check refuses a commented-out HSTS line"
+# Fixture 6: HSTS max-age drifted (the literal is pinned, not just the header).
+sed 's|max-age=15552000|max-age=1|' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.hsts-drift"
+has "${WORK}/Caddyfile.hsts-drift" 'max-age=1' "regressed fixture 6 carries a drifted max-age"
+hard_die "${WORK}/Caddyfile.hsts-drift" "self-check refuses a drifted HSTS max-age"
+# Fixture 7: no :80 site block at all (the check cannot prove :80 is clear).
+printf '%s\n' '# no :80 block here' > "${WORK}/Caddyfile.no-http-block"
+hard_die "${WORK}/Caddyfile.no-http-block" "self-check refuses a render with no :80 block"
+# Fixture 8: a hardened render whose COMMENTS mention the retired directives
+# must still pass (the check reads configuration lines, not prose).
+sed 's|^\tlog_skip$|\tlog_skip\n\t# retired: @status + trusted_proxies client_ip_headers (issue 225)|' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.prose-mention"
+has "${WORK}/Caddyfile.prose-mention" '# retired: @status + trusted_proxies client_ip_headers' "fixture 8 mentions the directives in a comment"
+hard_ok "${WORK}/Caddyfile.prose-mention" "self-check ignores a prose mention of the retired directives"
 
 not_edge_line="$(grep -m1 '@not_edge_peer' "${WORK}/Caddyfile.443" || true)"
 case "${not_edge_line}" in
