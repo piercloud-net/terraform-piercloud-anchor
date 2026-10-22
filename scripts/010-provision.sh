@@ -4043,6 +4043,18 @@ class Config(object):
             # off, the default cadence applies, the verdict still lands.
             log("WARNING: acknowledged identity set is malformed (%s); acking disabled" % ack_error)
             self.ack_identities = frozenset()
+        else:
+            # A bare class id is not a set snapshot: it matches EVERY future
+            # occurrence of that class, including one with a different root
+            # cause weeks later, until the operator takes it out of the
+            # variable (#223 review). Name the classes, never the digests.
+            bare_classes = sorted(entry for entry in self.ack_identities if ":" not in entry)
+            if bare_classes:
+                log(
+                    "WARNING: the acknowledged identity set carries class id(s) (%s): a bare class id"
+                    " acknowledges EVERY future occurrence of that class until it is removed from"
+                    " RECORDING_WITNESS_ACK_IDENTITIES" % clip(", ".join(bare_classes), 200)
+                )
         if self.ack_configured and self.quiet_signatures:
             log("WARNING: both the acknowledged identity set and the quiet signature are set; the acknowledged identity set takes precedence")
         self.ntfy_topic = env("NTFY_TOPIC")
@@ -5241,9 +5253,16 @@ def run_checks(config, now, plan):
         # The delta since the operator's acknowledged set (#223): the count of
         # THIS class's identities that the ack does not carry. Only rendered
         # when an ack is configured - a delta with no ack would be noise.
+        # Gated on the PARSED set, not on `ack_configured`: a value that is set
+        # but malformed disables acking, and a delta rendered there would claim
+        # an ack is in force while every run pushes. The wording names the
+        # class on purpose - another class's unacked identity can still make
+        # this run push, so "0 new since ack" would read as "nothing to see".
+        # Above the identity budget a REMOVAL moves the overflow digest and is
+        # counted here too (that is the documented cap caveat).
         ack_note = ""
-        if config.ack_configured:
-            ack_note = " — %d new since ack" % sum(
+        if config.ack_identities:
+            ack_note = " — %d hidden-object id(s) not in ack" % sum(
                 1 for finding_id in hidden_ids if finding_id not in config.ack_identities)
         alerts.append(
             "hidden-object: %d hidden object(s) (delete marker) — hiding detected "
@@ -5890,7 +5909,11 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     #     it pushes immediately (and again on the next run if that push fails,
     #     because last_notify_signature only advances on a LANDED push);
     #   - a pure SHRINK (markers expired, nothing new) -> still a subset -> no
-    #     change push, the normal quiet window applies;
+    #     change push, the normal quiet window applies. This holds WHILE the
+    #     emitted set is per-identity; above the 256-identity budget the folded
+    #     tail is ONE digest, so any change inside it - an expiry included -
+    #     is a new identity and pushes (documented caveat: a stable fold would
+    #     otherwise hide an addition inside it);
     #   - churn among acked identities -> still a subset -> quiet.
     # No `last_notify_ids` state is needed, and none is added: the ack is a
     # property of the CURRENT set only. A value that is configured but
@@ -5898,8 +5921,14 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     # broken ack errs toward notifying, never toward silence. The ack never
     # applies to `error`/`ok`, so a new failure cause always keeps the default
     # cadence.
+    #
+    # An EMPTY current set is never an acknowledgement match: `set() <= S` is
+    # true for every S, so an alert that carried no identity (none does today)
+    # would be silenced by any configured ack, a malformed one included. No
+    # findings means no acknowledgement to match against.
     if ack_configured:
-        quiet = state == "alert" and set(finding_ids) <= ack_identities
+        quiet = (state == "alert" and bool(finding_ids)
+                 and set(finding_ids) <= ack_identities)
     else:
         quiet = (bool(quiet_signatures) and state == "alert"
                  and signature in quiet_signatures and last_signature in quiet_signatures)
@@ -6410,6 +6439,14 @@ def main():
     ackable_ids = [entry for entry in finding_ids if ACK_IDENTITY_RE.match(entry)]
     if ackable_ids:
         record["finding_ids"] = ackable_ids[:ACK_IDENTITY_MAX]
+        if len(ackable_ids) > ACK_IDENTITY_MAX:
+            # More ack-expressible identities than one ack can carry: the
+            # printed value provably cannot cover this run's set (an ack is
+            # capped at ACK_IDENTITY_MAX too), so quieting stays off for it.
+            # Record how many were dropped so the acceptance can say so
+            # instead of handing the operator a value that silently cannot
+            # match (over-notifying, never hiding - but it must be visible).
+            record["finding_ids_omitted"] = len(ackable_ids) - ACK_IDENTITY_MAX
     if state_bad_reason or observed_reason:
         # Explicit repair evidence: an unreadable/invalid record (or an
         # invalid observed block) has no trustworthy view, so the observed
@@ -6649,7 +6686,7 @@ recording_witness_accept() { # timer-stopped synchronous acceptance (one run, al
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced signature ack_identities
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced signature ack_identities ack_omitted
   # Issue #143: on a long-up box the timer's OnBootSec=2min has already
   # elapsed, so the timer fires the service as soon as it is enabled (fresh
   # install) and a reinstall can find a timer-triggered invocation already
@@ -6753,6 +6790,8 @@ recording_witness_run_once() { # run one check now and surface the verdict
     log "witness finding signature: ${signature}"
   fi
   ack_identities="$(jq -r '(.finding_ids // []) | join(",")' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  ack_omitted="$(jq -r '.finding_ids_omitted // 0' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  case "${ack_omitted}" in ''|*[!0-9]*) ack_omitted=0 ;; esac
   if [ -n "${ack_identities}" ]; then
     # Safe to log: stable finding identities - fixed class ids and sha256
     # digests over key+version / drift / interval sets, never a raw key or a
@@ -6762,6 +6801,12 @@ recording_witness_run_once() { # run one check now and surface the verdict
     # 256 entries (hidden identities first), and the cut below only guards a
     # hand-edited record from producing an absurd log line.
     log "witness ack identities: $(printf '%s' "${ack_identities}" | cut -c1-32768)"
+    if [ "${ack_omitted}" -gt 0 ]; then
+      # Say it out loud: this run emitted more ack-expressible identities than
+      # one ack can carry, so the printed value cannot cover the whole set and
+      # quieting stays off for it (over-notify, never hide).
+      log "witness ack identities truncated: ${ack_omitted} ack-expressible identity(ies) not printed; one ack cannot cover this run's whole finding set, so quieting stays off until it shrinks"
+    fi
   fi
   coverage_mode="$(jq -r '.observed.coverage.mode // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   if [ -n "${coverage_mode}" ]; then

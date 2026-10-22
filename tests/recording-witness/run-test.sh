@@ -238,7 +238,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1034
+MIN_CHECKS=1042
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3616,29 +3616,40 @@ start_mock
 run_case "${ACK_DIR}"
 is "per-identity hidden ids are stable across runs" "${ids_two}" "$(hidden_ids)"
 # Churn that only ADDS an acked identity is not news: with every current id
-# acked the alert body says 0 new, and with one id unacked it says 1 new. The
-# suffix is only rendered when an ack is configured at all.
+# acked the alert body says 0 not-in-ack, and with one id unacked it says 1.
+# The suffix is only rendered when a parsed ack is configured at all, and it
+# names the class on purpose: another class's unacked identity can still make
+# the run push, so a bare "0 new since ack" read as "nothing to see".
 acked_two="$(printf '%s' "${ids_two}" | tr '\n' ',' | sed 's/,$//')"
 RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=${acked_two}"
 start_mock
 run_case "${ACK_DIR}"
 case "${CASE_DETAIL}" in
-  *"— 0 new since ack"*) ok "an ack covering every hidden identity renders 0 new since ack" ;;
-  *) bad "acked hidden set must render '0 new since ack': ${CASE_DETAIL}" ;;
+  *"— 0 hidden-object id(s) not in ack"*) ok "an ack covering every hidden identity renders 0 not in ack" ;;
+  *) bad "acked hidden set must render '0 hidden-object id(s) not in ack': ${CASE_DETAIL}" ;;
 esac
 one_id="$(printf '%s\n' "${ids_two}" | head -n1)"
 RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=${one_id}"
 start_mock
 run_case "${ACK_DIR}"
 case "${CASE_DETAIL}" in
-  *"— 1 new since ack"*) ok "one unacked hidden identity renders 1 new since ack" ;;
-  *) bad "partially acked hidden set must render '1 new since ack': ${CASE_DETAIL}" ;;
+  *"— 1 hidden-object id(s) not in ack"*) ok "one unacked hidden identity renders 1 not in ack" ;;
+  *) bad "partially acked hidden set must render '1 hidden-object id(s) not in ack': ${CASE_DETAIL}" ;;
+esac
+# A configured-but-MALFORMED ack disables acking: it must not render a delta
+# claiming an ack is in force while every run keeps the default cadence.
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=NOT-AN-ID"
+start_mock
+run_case "${ACK_DIR}"
+case "${CASE_DETAIL}" in
+  *"not in ack"*) bad "a malformed ack must not render an ack-relative delta: ${CASE_DETAIL}" ;;
+  *) ok "a configured-but-malformed ack renders no delta suffix" ;;
 esac
 unset RECORDING_WITNESS_EXTRA_ENV
 start_mock
 run_case "${ACK_DIR}"
 case "${CASE_DETAIL}" in
-  *"new since ack"*) bad "no ack configured must not render a delta: ${CASE_DETAIL}" ;;
+  *"not in ack"*) bad "no ack configured must not render a delta: ${CASE_DETAIL}" ;;
   *) ok "no ack configured renders no delta suffix" ;;
 esac
 # The identity list is bounded: 260 markers emit 255 per-marker ids plus ONE
@@ -3706,6 +3717,56 @@ if [ -n "${overflow_sig}" ] && [ "${overflow_sig}" != "$(state_field signature)"
 else
   bad "an identity added inside the fold did not move the signature (${overflow_sig})"
 fi
+# The cap caveat is REAL and published: above the identity budget the folded
+# tail is ONE digest, so a REMOVAL inside the fold re-partitions the emitted
+# ids and pages once. Pin it end-to-end (the unit shrink teeth use synthetic
+# ids and never exercise the fold) so the docs cannot drift from the code.
+overflow_ack="$(python3 -c '
+import json, sys
+record = json.load(open(sys.argv[1]))
+print(",".join(entry for entry in record.get("finding_ids") or []
+              if isinstance(entry, str) and entry.startswith("hidden-object")))
+' "${WORK}/overflow-state/state.json")"
+if [ "$(printf '%s' "${overflow_ack}" | tr ',' '\n' | grep -c '^hidden-object')" -eq 256 ]; then
+  ok "the folded set still emits exactly 256 ack-expressible identities"
+else
+  bad "the folded set did not emit 256 identities"
+fi
+python3 - "${WORK}/overflow-fixture.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+# Drop the marker added above: a removal INSIDE the folded tail. Also plant one
+# drift key so the run emits 257 ack-expressible identities (256 hidden + one
+# `contract-mismatch:<digest>`): that is the truncation boundary the acceptance
+# must disclose - one ack can carry 256, so the printed value cannot cover this
+# run's whole set.
+data["versions"] = [entry for entry in data["versions"]
+                    if entry["key"] != "recordings/overflow-259b.tar"]
+data["objects"].append({"key": "audit/20260925T135000Z-user.login.json", "ago": 300})
+json.dump(data, open(sys.argv[1], "w"))
+PY
+fixture <"${WORK}/overflow-fixture.json"
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=${overflow_ack}"
+start_mock
+run_case "${WORK}/overflow-state"
+case "${CASE_DETAIL}" in
+  *"— 1 hidden-object id(s) not in ack"*)
+    ok "a removal inside the fold moves the overflow digest (the documented cap caveat)" ;;
+  *) bad "a removal inside the fold must move the overflow digest: ${CASE_DETAIL}" ;;
+esac
+if [ "$(state_field finding_ids_omitted)" = "1" ] \
+   && [ "$(python3 -c '
+import json, sys
+record = json.load(open(sys.argv[1]))
+print(len(record.get("finding_ids") or []))
+' "${WORK}/overflow-state/state.json")" = "256" ]; then
+  ok "a run above the ack capacity records how many identities it could not print"
+else
+  bad "a run above the ack capacity must record finding_ids_omitted (got '$(state_field finding_ids_omitted)')"
+fi
+unset RECORDING_WITNESS_EXTRA_ENV
 
 # ---- (f) strictly list-only + SigV4 proof over every request -------------
 if python3 - "${REQUEST_LOG}" <<'PY'
@@ -7643,6 +7704,28 @@ if [ "${ack_entries}" -eq 2 ] && ! printf '%s' "${ack_systemd}" | grep -q '\\'; 
 else
   bad "the rendered ack is not two clean entries (${ack_entries} matched): '${ack_systemd}'"
 fi
+# The CAP is the real bound: a full 256-entry value (~20 KB) must survive the
+# same render + unescape, or the mechanism breaks exactly where the operator
+# needs it (a mass delete). 255 escaped commas, 256 entries, no residue.
+ACK_CAP_VALUE="$(python3 -c 'print(",".join("hidden-object:%064x" % (i + 1) for i in range(256)))')"
+RECORDING_WITNESS_ACK_IDENTITIES="${ACK_CAP_VALUE}" recording_witness_install
+ack_cap_line="$(grep '^RECORDING_WITNESS_ACK_IDENTITIES=' "${RECORDING_WITNESS_ENV_FILE}" | head -n1)"
+ack_cap_raw="${ack_cap_line#RECORDING_WITNESS_ACK_IDENTITIES=}"
+ack_cap_systemd="$(printf '%s' "${ack_cap_raw}" | sed 's/\\\(.\)/\1/g')"
+ack_cap_commas="$(printf '%s' "${ack_cap_raw}" | grep -o '\\,' | wc -l | tr -d ' ')"
+ack_cap_entries="$(printf '%s' "${ack_cap_systemd}" | tr ',' '\n' | grep -c '^hidden-object:[0-9a-f]\{64\}$')"
+if [ "${ack_cap_commas}" -eq 255 ] && [ "${ack_cap_entries}" -eq 256 ] \
+   && ! printf '%s' "${ack_cap_systemd}" | grep -q '\\' \
+   && [ "${ack_cap_systemd}" = "${ACK_CAP_VALUE}" ]; then
+  ok "a 256-entry ack survives the %q render and the systemd unescape byte for byte"
+else
+  bad "the 256-entry ack did not round-trip (commas=${ack_cap_commas} entries=${ack_cap_entries})"
+fi
+if [ "$(printf '%s' "${ack_cap_systemd}" | wc -c | tr -d ' ')" -lt 32768 ]; then
+  ok "the 256-entry ack fits under the acceptance's 32 KiB print bound"
+else
+  bad "a 256-entry ack exceeds the acceptance print bound"
+fi
 unset RECORDING_WITNESS_ACK_IDENTITIES
 if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
   ok "installed env file carries the optional cold-start window"
@@ -7775,6 +7858,30 @@ esac
 case "${runonce_out}" in
   *"${SID}"*) bad "run-once leaked the raw session id through the ack identities" ;;
   *) ok "the ack-identities line carries no session identifier" ;;
+esac
+# A record whose ack-expressible list was TRUNCATED says so out loud: an
+# operator pasting a capped line would otherwise hold an ack that provably
+# cannot cover the run's set (over-notify, never hide - but it must be visible).
+python3 - "${WORK}/state/state.json" <<'PYSTATE'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["finding_ids_omitted"] = 2
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PYSTATE
+export FAKE_EXEC_STATUS=1
+run_once_call
+case "${runonce_out}" in
+  *"witness ack identities truncated: 2 ack-expressible"*)
+    ok "run-once discloses a truncated ack-identities list" ;;
+  *) bad "a truncated ack-identities list must be disclosed: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"${SID}"*) bad "the truncation disclosure leaked the raw session id" ;;
+  *) ok "the truncation disclosure carries no session identifier" ;;
 esac
 # A record with no identities (an ok run, or a legacy record) prints no line
 # and must not fail the acceptance.
@@ -9502,6 +9609,12 @@ for label, actual, expected in [
     ("a configured-but-empty ack (malformed value) never quiets",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
                           frozenset(), 86400, ["heartbeat-stale"], frozenset(), True), True),
+    ("an alert with an EMPTY finding-id set is never quieted by an ack",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, [], {"heartbeat-stale"}, True), True),
+    ("an alert with an EMPTY finding-id set is never quieted by a malformed ack either",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, [], frozenset(), True), True),
     ("the ack takes precedence over a pin that would have quieted",
      module.should_notify("alert", now - 1801, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
                           {SIG_A}, 86400, ["hidden-object:" + "a" * 64],
@@ -9625,6 +9738,18 @@ if ids != frozenset({HID_A, HID_B}) or not configured or warned:
 ids, configured, warned = _ack(HID_A + "," + HID_A)
 if ids != frozenset({HID_A}) or warned:
     raise SystemExit("a duplicated ack entry must dedupe, not fail: %r %r" % (ids, warned))
+# A bare class id is acked FOREVER (every future occurrence of that class), so
+# the witness must say so once per run - naming the classes, never a digest.
+ids, configured, warned = _ack("heartbeat-stale," + HID_A)
+if ids != frozenset({"heartbeat-stale", HID_A}) or warned:
+    raise SystemExit("a class id plus a digest must validate: %r %r" % (ids, warned))
+if not any("class id" in entry and "heartbeat-stale" in entry for entry in config_logs):
+    raise SystemExit("acking a bare class id must warn that it covers every future occurrence")
+if any(HID_A in entry for entry in config_logs):
+    raise SystemExit("the class-id permanence warning must not echo digested ids")
+ids, configured, warned = _ack(HID_A)
+if any("class id" in entry for entry in config_logs):
+    raise SystemExit("a digest-only ack must not carry the class-id permanence warning")
 if module.ACK_IDENTITY_MAX != module.HIDDEN_FINDING_MAX:
     raise SystemExit("the ack cap and the per-run hidden identity budget must agree")
 # No ack configured at all: empty set, precedence switch OFF (the quiet pin
