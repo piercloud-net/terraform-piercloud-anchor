@@ -149,6 +149,41 @@ hasnt "${WORK}/http.block" "${DASH_HOST}" ":80 has no dashboard Host matcher"
 hasnt "${WORK}/http.block" "127.0.0.1:${GATUS_PORT}" ":80 has no dashboard proxy"
 hasnt "${WORK}/Caddyfile.443" '@status' "render has no @status matcher"
 
+# ---- hardening self-check (extracted, never a copy) -----------------------
+# The converge self-check that runs on the box is the only thing standing
+# between a regressed render and a green apply. Execute it here against the
+# hardened render and three regressed fixtures, so a render/matcher drift
+# reddens CI instead of every live run.
+hc_b="$(grep -n -m1 'BEGIN HARDENING CHECK' "${PROVISION_SH}" | cut -d: -f1)"
+hc_e="$(grep -n -m1 'END HARDENING CHECK' "${PROVISION_SH}" | cut -d: -f1)"
+[ -n "$hc_b" ] && [ -n "$hc_e" ] && [ "$hc_b" -lt "$hc_e" ] || die "hardening-check markers missing/ambiguous in ${PROVISION_SH}"
+sed -n "$((hc_b + 1)),$((hc_e - 1))p" "${PROVISION_SH}" > "${WORK}/hardening.src"
+# shellcheck disable=SC1090
+source "${WORK}/hardening.src"
+command -v assert_caddyfile_hardened >/dev/null || die "extraction did not yield assert_caddyfile_hardened"
+docker() { return 1; } # the failure path's log dump is not part of the assertion
+hard_ok() { # $1 file, $2 label -> the self-check must ACCEPT it
+  if ( assert_caddyfile_hardened "$1" ) >/dev/null 2>&1; then ok "$2"; else bad "$2 (self-check refused a hardened render)"; fi
+}
+hard_die() { # $1 file, $2 label -> the self-check must REFUSE it
+  if ( assert_caddyfile_hardened "$1" ) >/dev/null 2>&1; then bad "$2 (self-check accepted a regressed render)"; else ok "$2"; fi
+}
+hard_ok "${WORK}/Caddyfile.443" "self-check accepts the hardened render"
+# Fixture 1: a re-introduced :80 dashboard handler.
+sed 's#^\tlog_skip$#\tlog_skip\n\t@status {\n\t\thost citest.status.piercloud.net\n\t}#' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.status-regressed"
+has "${WORK}/Caddyfile.status-regressed" '@status {' "regressed fixture 1 carries the :80 handler"
+hard_die "${WORK}/Caddyfile.status-regressed" "self-check refuses a re-introduced :80 dashboard handler"
+# Fixture 2: a re-introduced header-derived proxy trust.
+sed 's#^\tlog_skip$#\tlog_skip\n\ttrusted_proxies static 192.0.2.0/24#' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.trust-regressed"
+has "${WORK}/Caddyfile.trust-regressed" 'trusted_proxies static' "regressed fixture 2 carries trusted_proxies"
+hard_die "${WORK}/Caddyfile.trust-regressed" "self-check refuses re-introduced proxy trust"
+# Fixture 3: HSTS dropped.
+grep -v 'Strict-Transport-Security' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.no-hsts"
+hasnt "${WORK}/Caddyfile.no-hsts" 'Strict-Transport-Security' "regressed fixture 3 has no HSTS"
+hard_die "${WORK}/Caddyfile.no-hsts" "self-check refuses a :443 site without HSTS"
+
 not_edge_line="$(grep -m1 '@not_edge_peer' "${WORK}/Caddyfile.443" || true)"
 case "${not_edge_line}" in
   *"!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX}/32'))"*) ok "not_edge_peer matcher lists all 81 ranges + loopback (v4+v6) + the main box" ;;

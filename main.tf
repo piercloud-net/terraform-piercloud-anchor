@@ -177,9 +177,11 @@ locals {
 
   # Cloudflare edge ranges (public constants — same class as the Keycloak
   # discovery URL baked into the workflow; source: the IP Ranges page
-  # linked from cloudflare.com). Refresh here AND in the Caddy
-  # trusted_proxies line in scripts/010-provision.sh when they change
-  # (stale ranges read as edge 403s at the dashboard, never at tang).
+  # linked from cloudflare.com). These feed the :80 firewall rule only (tang +
+  # ACME); the :443 dashboard gate uses the CloudFront ranges in
+  # cloudfront_ranges.tf, and the rendered Caddyfile carries no proxy-trust
+  # list. Refresh here when they change (stale :80 ranges read as tang/ACME
+  # unreachable at the edge, never as a dashboard 403).
   cf_edge_cidrs = [
     "173.245.48.0/20",
     "103.21.244.0/22",

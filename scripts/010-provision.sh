@@ -227,6 +227,26 @@ render_caddyfile() { # print the Caddyfile to stdout
 }
 # --- END CADDY RENDER ---
 
+# --- BEGIN HARDENING CHECK (tests/edge-origin-auth extracts this span; keep markers) ---
+# Origin-hardening converge assertion (issue #225): the SERVING Caddyfile must
+# carry the hardened shape — no :80 dashboard handler, no header-derived
+# client-IP trust, HSTS on the :443 site. Fail-loud on purpose: a re-introduced
+# :80 handler or a proxy-trust directive fails the run instead of passing
+# silently. Callers skip it under CADDY_SKIP_HTTPS (the harness render has no
+# :443 site); tests/edge-origin-auth executes this function (extracted, never
+# a copy) against a hardened render and three regressed fixtures.
+assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving one)
+  local cfg="${1:-${CADDY_CONFIG}}"
+  if grep -q '@status' "$cfg" || grep -q 'client_ip_headers\|trusted_proxies' "$cfg"; then
+    docker logs caddy 2>&1 | tail -20 || true
+    die "serving Caddyfile $cfg still carries the removed :80 dashboard handler and/or header-derived proxy trust — the origin-hardening render did not converge; refusing to finish blind"
+  fi
+  grep -q 'Strict-Transport-Security "max-age=15552000"' "$cfg" \
+    || die "serving Caddyfile $cfg lacks the :443 HSTS header — the origin-hardening render did not converge; refusing to finish blind"
+  return 0
+}
+# --- END HARDENING CHECK ---
+
 ROTATE=0
 case "${1:-}" in
   "") ;; # normal provision
@@ -3222,12 +3242,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
   # proxy-trust directive now fails the run loud). Dashboard serving itself is
   # proven right below: the :443 loopback handshake (and the edge pull).
   if [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
-    if grep -q '@status' "${CADDY_CONFIG}" || grep -q 'client_ip_headers\|trusted_proxies' "${CADDY_CONFIG}"; then
-      docker logs caddy 2>&1 | tail -20 || true
-      die "serving Caddyfile ${CADDY_CONFIG} still carries the removed :80 dashboard handler and/or header-derived proxy trust — the origin-hardening render did not converge; refusing to finish blind"
-    fi
-    grep -q 'Strict-Transport-Security "max-age=15552000"' "${CADDY_CONFIG}" \
-      || die "serving Caddyfile ${CADDY_CONFIG} lacks the :443 HSTS header — the origin-hardening render did not converge; refusing to finish blind"
+    assert_caddyfile_hardened
     log "serving Caddyfile carries the origin hardening (no :80 dashboard handler, no proxy-trust directives, HSTS) (OK)"
   fi
   # SNI must be the real hostname: curl sends no SNI for an IP-literal URL
