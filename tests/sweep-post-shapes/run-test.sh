@@ -42,6 +42,15 @@
 # attachment compare still protects the live policy in both; the filter
 # itself is covered by tests/policy-naming.
 #
+# Issue #200 (exact names): the filter is no longer a stub here — the REAL
+# list_steady_policies runs over the raw /firewall-policies response, so
+# cases c10/c10b/c11 pin the whole chain. STUB_STEADY is the API body; a
+# sibling server's policy whose name only SHARES this server's suffix
+# (piercloud-anchor-staging-anchor-01-pier, and the legacy
+# ...-staging-...-<this id> form) must be dropped by the filter and never
+# detached/deleted in any mode, while the live policy stays and a genuine
+# EXACT orphan is still retired in apply mode.
+#
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
 # network, no credentials.
@@ -63,6 +72,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
+MIN_CHECKS=163
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -76,19 +86,29 @@ log()  { printf 'A1: %s\n' "$*"; }
 warn() { printf 'A1 WARNING: %s\n' "$*" >&2; }
 die()  { printf 'A1 FAIL: %s\n' "$*" >&2; exit 1; }
 list_tmp_policies()    { printf '%s' "$STUB_LIST_TMP"; }
-list_steady_policies() { printf '%s' "$STUB_STEADY"; }
+# The REAL list_steady_policies (extracted below) sits behind a stubbed API
+# boundary: STUB_STEADY is the raw /firewall-policies response body, so every
+# case runs the SHIPPED name filter plus the real sweep — not a hand-built
+# list a stub could keep green while the filter over-matched (issue #200).
+policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
+api_ok()        { return 0; }
+api_call() { # method path body outvar -> fixture into the outvar (dynamic scope)
+  HTTP_STATUS=200
+  printf -v "${4:-resp}" '%s' "$STUB_STEADY"
+}
 resolve_mac()          { printf '%s' "${STUB_MAC:-aa:bb:cc:dd:ee:ff}"; }
 iface_fw_get()         { printf '%s' "$STUB_IFACE"; }
 detach_policy() { printf 'detach %s\n' "$1" >> "$STUB_ACTIONS"; }
 delete_policy() { printf 'delete %s\n' "$1" >> "$STUB_ACTIONS"; }
 PRELUDE
+  extract list_steady_policies
   extract sweep_destructive
   extract sweep_note
   extract policy_age
   extract close_policy
   extract cmd_sweep_post
 } > "$WORK/functions.sh"
-for fn in sweep_destructive sweep_note policy_age close_policy cmd_sweep_post; do
+for fn in list_steady_policies sweep_destructive sweep_note policy_age close_policy cmd_sweep_post; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
@@ -121,18 +141,30 @@ tmp_entry() { # $1 id, $2 run-id suffix, $3 age-seconds ("orphan" = unstamped de
 # One steady-state policy (id 42) — the live attachment under test. New
 # (#121) piercloud-anchor-<hostname> shape.
 STEADY_LIVE='[{"id":42,"name":"piercloud-anchor-anchor-01-pier","description":""}]'
-# Pre-change (#121) id-suffixed shape — kept only as the migration clause's
-# input; the real filter recognizes it once (tests/policy-naming).
+# Pre-change (#121) id-suffixed shape — the migration clause's input, and the
+# exact name the shipped filter still recognizes (tests/policy-naming).
 STEADY_LEGACY='[{"id":43,"name":"piercloud-anchor-anchor-01-pier-424242","description":""}]'
+# A SIBLING server's policy whose name merely ENDS with this hostname (the
+# #200 repro shape: anchor-01-staging-pier vs anchor-01-pier). It is
+# account-wide and unattached here, so the pre-#200 suffix filter returned it
+# and an apply-mode sweep detached+deleted another server's live policy.
+STEADY_FOREIGN='{"id":44,"name":"piercloud-anchor-staging-anchor-01-pier","description":""}'
+# Same idea through the pre-#121 id arm: it ends with THIS server's id, so the
+# old `endswith(-<server id>)` arm returned it too.
+STEADY_FOREIGN_LEGACY='{"id":46,"name":"piercloud-anchor-anchor-01-staging-pier-424242","description":""}'
 
-RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY]; RC_TOKEN overrides the token (default AT)
+# The shipped STEADY_PREFIX (eval'd, not a copy).
+eval "$(grep -E '^STEADY_PREFIX=' "$SCRIPT")"
+
+RC_OF() { # $1 label, $2 STUB_LIST_TMP, $3 STUB_IFACE, [$4 STUB_STEADY], [$5 MODE]
   local l="$1" rc=0
   : > "$WORK/actions.$l"
   STUB_LIST_TMP="$2" STUB_IFACE="$3" STUB_STEADY="${4:-[]}" \
   PATH="$WORK/bin:$PATH" STUB_ACTIONS="$WORK/actions.$l" \
-  GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE=apply \
+  GITHUB_STEP_SUMMARY="$WORK/summary.$l" MODE="${5:-apply}" \
   SERVER_ID=424242 SCP_USER_ID=1 RUN_ID=999 ANCHOR_HOSTNAME=anchor-01-pier \
   OWN_NAME="piercloud-tmp-999" NETCUP_SCP_ACCESS_TOKEN="${RC_TOKEN-AT}" TMP_TTL_SECONDS=7200 \
+  STEADY_PREFIX="$STEADY_PREFIX" \
   bash -c 'set -euo pipefail; source "$1"; cmd_sweep_post' _ "$WORK/functions.sh" \
     > "$WORK/out.$l" 2>&1 || rc=$?
   printf '%s' "$rc"
@@ -169,6 +201,36 @@ rc="$(RC_OF c5c "[]" '{"userPolicies":[43]}' "$STEADY_LEGACY")"
 is "c5c rc" "0" "$rc"
 is "c5c actions (legacy live kept)" "" "$(ACTIONS c5c)"
 is "c5c kept log" "1" "$(grep -c 'is attached — kept' "$WORK/out.c5c" || true)"
+
+# ---- #200: a suffix-sharing FOREIGN policy is never retired --------------
+# Same account, another server: both foreign names share this server's
+# hostname / server-id suffix, so the retired suffix filter returned them,
+# they read as unattached here (the attached list is THIS server's interface)
+# and apply-mode close_policy detached+deleted another server's live policy.
+# This block runs the REAL list_steady_policies over the raw response:
+# it must drop both foreign entries before cmd_sweep_post ever sees them.
+FOREIGN_RESPONSE="[{\"id\":42,\"name\":\"piercloud-anchor-anchor-01-pier\",\"description\":\"\"},$STEADY_FOREIGN,$STEADY_FOREIGN_LEGACY]"
+# c10 apply: this server's live policy is kept and NEITHER foreign entry is
+# listed, let alone detached — the API response carries all three.
+rc="$(RC_OF c10 "[]" '{"userPolicies":[42]}' "$FOREIGN_RESPONSE")"
+is "c10 rc" "0" "$rc"
+is "c10 actions (foreign untouched, live kept, nothing swept)" "" "$(ACTIONS c10)"
+is "c10 foreign name never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier' "$WORK/out.c10" || true)"
+is "c10 live kept" "1" "$(grep -c 'is attached — kept' "$WORK/out.c10" || true)"
+# c10b apply: a genuine EXACT orphan (legacy name, unattached) is retired in
+# the same response — the fix narrows scope, it does not stop sweeping.
+FOREIGN_ORPHAN_RESPONSE="[$STEADY_FOREIGN,{\"id\":45,\"name\":\"piercloud-anchor-anchor-01-pier-424242\",\"description\":\"\"},$STEADY_FOREIGN_LEGACY]"
+rc="$(RC_OF c10b "[]" '{"userPolicies":[]}' "$FOREIGN_ORPHAN_RESPONSE")"
+is "c10b rc" "0" "$rc"
+is "c10b actions (only the exact orphan retired)" "detach 45 delete 45" "$(ACTIONS c10b)"
+is "c10b foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier' "$WORK/out.c10b" || true)"
+# c11 check mode: report-only, and the foreign policy is not even reported as
+# a would-be sweep — a check run must not advertise a sibling's policy.
+rc="$(RC_OF c11 "[]" '{"userPolicies":[42]}' "$FOREIGN_ORPHAN_RESPONSE" check)"
+is "c11 rc" "0" "$rc"
+is "c11 actions (report-only mutates nothing)" "" "$(ACTIONS c11)"
+is "c11 foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier' "$WORK/out.c11" || true)"
+is "c11 exact orphan still reported" "1" "$(grep -c "REPORT-ONLY.*piercloud-anchor-anchor-01-pier-424242" "$WORK/out.c11" || true)"
 
 # ---- case 6: tmp orphan (no parseable created_at) still retired in apply ----
 rc="$(RC_OF c6 "[$(tmp_entry 7 other orphan)]" '{"userPolicies":[]}' "[]")"
@@ -359,4 +421,8 @@ is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"
 is "e6 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e6" || true)"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
+if [ "$pass" -lt "$MIN_CHECKS" ]; then
+  printf 'FAIL check-count floor: %s < %s\n' "$pass" "$MIN_CHECKS"
+  fail=$((fail + 1))
+fi
 [ "$fail" -eq 0 ]
