@@ -9690,6 +9690,18 @@ if kept_before != kept_after:
 cap_ids, cap_folded = module.ack_identity_set(many_fids)
 if cap_folded or len(cap_ids) != module.ACK_IDENTITY_MAX:
     raise SystemExit("exactly at the cap nothing folds: %d ids, %d folded" % (len(cap_ids), cap_folded))
+# The folded COUNT is not bounded by the list: a run twice the size folds twice
+# as many identities into the SAME single id (verify X1 - main() used to reject
+# a count >= the list length, which silently dropped the acceptance's
+# disclosure at 511+ identities while the docs promised it).
+big_fids = ["hidden-object:" + ("%064x" % index) for index in range(511)]
+big_ids, big_folded = module.ack_identity_set(big_fids + ["contract-mismatch:" + "e" * 64])
+if (len(big_ids) != module.ACK_IDENTITY_MAX
+        or big_folded != 512 - (module.ACK_IDENTITY_MAX - 1)):
+    raise SystemExit("511 hidden + 1 drift must fold 257 identities into one id: %d ids, %d folded"
+                     % (len(big_ids), big_folded))
+if sum(1 for entry in big_ids if entry.startswith(module.ACK_OVERFLOW_CLASS)) != 1:
+    raise SystemExit("a 511-finding run must still carry exactly one ack-overflow id")
 for label, actual, expected in [
     ("first non-green pushes", module.should_notify(None, 0, "alert", now, 1800), True),
     ("repeat inside window suppresses", module.should_notify("alert", now - 100, "alert", now, 1800), False),
@@ -9968,11 +9980,18 @@ if any(CLASS_ONLY_ACK in entry for entry in config_logs):
 ids, configured, warned = _ack(module.ack_identity("hidden-object:" + "a" * 64))
 if any("class-only finding id(s)" in entry for entry in config_logs):
     raise SystemExit("a per-instance ack id must not carry the class-only warning")
-# Every class-only finding id the checks emit must be covered by that warning,
-# or a new one would be acknowledged permanently in silence.
-for class_only in ("cold-start", "heartbeat-missing", "heartbeat-stale"):
-    if class_only not in module.ACK_CLASS_ONLY:
-        raise SystemExit("a class-only finding class is missing from ACK_CLASS_ONLY: %r" % class_only)
+# Every class-only finding id the checks actually emit must be covered by that
+# warning, or a new one would be acknowledged permanently in silence. This is
+# derived from the SHIPPED source (every `finding_ids.append("<literal>")` with
+# no colon - the appends that carry no per-instance discriminator), not from a
+# re-typed list, so a future `finding_ids.append("clock-skew")` reddens here.
+import re as _re
+
+_span_source = open(module.__file__, encoding="utf-8").read()
+_emitted_class_only = set(_re.findall(r'finding_ids\.append\(\s*"([a-z][a-z0-9-]*)"\s*\)', _span_source))
+if _emitted_class_only != set(module.ACK_CLASS_ONLY):
+    raise SystemExit("ACK_CLASS_ONLY must equal the class-only finding ids the checks emit: %r vs %r"
+                     % (sorted(_emitted_class_only), sorted(module.ACK_CLASS_ONLY)))
 # No ack configured at all: empty set, precedence switch OFF (the quiet pin
 # still governs) - that is the "keep the pin working unchanged" property.
 ids, configured, warned = _ack("")
@@ -10289,7 +10308,8 @@ ack_override = []
 
 def _fake_run_checks(config, now, plan):
     if ack_override:
-        ack_ids, ack_folded = list(ack_override[0]), 0
+        ack_ids = list(ack_override[0])
+        ack_folded = ack_override[1] if len(ack_override) > 1 else 0
     else:
         ack_ids, ack_folded = module.ack_identity_set(list(fids))
     return (
@@ -10689,11 +10709,28 @@ for index, (label, bad_list) in enumerate([
     if len(captured) != 1:
         raise SystemExit("a corrupted payload ack list (%s) must not quiet, got %d pushes"
                          % (label, len(captured)))
+# A fold of MORE identities than the list length is ordinary, so main() must
+# record the disclosure count instead of clamping it away (verify X1: the old
+# guard `folded >= len(list)` silently dropped `ack_identities_folded` at 511+
+# findings while both docs promised the disclosure).
+big_ack = [module.ack_identity("hidden-object:" + ("%064x" % index))
+           for index in range(module.ACK_IDENTITY_MAX - 1)]
+big_ack.append(module.ACK_OVERFLOW_CLASS + ":" + "0" * 64)
+ack_override[:] = [big_ack, 257]
+fids[:] = [AID_A]
+sig[:] = ["sha256:" + "%064x" % 77]
+captured[:] = []
+ack_codes.append(module.main())
+big_record = json.load(open(os.path.join(ack_dir, "state.json")))
+if (big_record.get("ack_identities_folded") != 257
+        or len(big_record.get("ack_identities") or []) != module.ACK_IDENTITY_MAX):
+    raise SystemExit("a 511-finding fold must be recorded with its count: %r"
+                     % (big_record.get("ack_identities_folded"),))
 ack_override[:] = []
 os.environ.pop("RECORDING_WITNESS_ACK_IDENTITIES", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
-if ack_codes != [1] * 15:
+if ack_codes != [1] * 16:
     raise SystemExit("ack exit codes wrong: %r" % ack_codes)
 
 # Round-5 R1: a corrupted numeric field in a type-valid state.json used to

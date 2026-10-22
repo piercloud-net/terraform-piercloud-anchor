@@ -3888,6 +3888,21 @@ def ack_identity_list(finding_ids):
                   key=_ack_sort_key)
 
 
+def _ack_fold(finding_ids):
+    """The ONE fold: (all ack ids sorted, folded ids, overflow id or None).
+
+    Both the printed/rule list and the body delta cut their tail here, so the
+    boundary (and the overflow digest) cannot be edited on one side only - a
+    one-sided edit would let the body's delta disagree with the rule it sits
+    next to, which is the class of lie this whole change exists to remove.
+    """
+    ack_ids = ack_identity_list(finding_ids)
+    if len(ack_ids) <= ACK_IDENTITY_MAX:
+        return ack_ids, [], None
+    folded = ack_ids[ACK_IDENTITY_MAX - 1:]
+    return ack_ids, folded, "%s:%s" % (ACK_OVERFLOW_CLASS, identity_digest(folded))
+
+
 def ack_identity_set(finding_ids):
     """The run's ack identities, bounded: (ack_ids, folded_count).
 
@@ -3899,11 +3914,9 @@ def ack_identity_set(finding_ids):
     rule and the printed list consume this same list, so no finding can be
     counted by one and missing from the other.
     """
-    ack_ids = ack_identity_list(finding_ids)
-    if len(ack_ids) <= ACK_IDENTITY_MAX:
+    ack_ids, folded, overflow = _ack_fold(finding_ids)
+    if overflow is None:
         return ack_ids, 0
-    folded = ack_ids[ACK_IDENTITY_MAX - 1:]
-    overflow = "%s:%s" % (ACK_OVERFLOW_CLASS, identity_digest(folded))
     return ack_ids[: ACK_IDENTITY_MAX - 1] + [overflow], len(folded)
 
 
@@ -3918,13 +3931,10 @@ def ack_missing(finding_ids, ack_identities, classes):
     already quieted - and that number is the operator's only signal that the
     ack took. `classes` are finding-id class tokens (`hidden-object`, ...).
     """
-    ack_ids = ack_identity_list(finding_ids)
-    folded_ids = ack_ids[ACK_IDENTITY_MAX - 1:] if len(ack_ids) > ACK_IDENTITY_MAX else []
+    ack_ids, folded_ids, overflow = _ack_fold(finding_ids)
     covered = set(entry for entry in ack_ids if entry in ack_identities)
-    if folded_ids:
-        overflow = "%s:%s" % (ACK_OVERFLOW_CLASS, identity_digest(folded_ids))
-        if overflow in ack_identities:
-            covered.update(folded_ids)
+    if overflow is not None and overflow in ack_identities:
+        covered.update(folded_ids)
     return sum(
         1 for finding_id in finding_ids
         if finding_id.split(":", 1)[0] in classes
@@ -6527,9 +6537,13 @@ def main():
         ack_ids = []
     ack_folded = payload.get("ack_folded") if isinstance(payload, dict) else None
     if (isinstance(ack_folded, bool) or not isinstance(ack_folded, int)
-            or ack_folded < 0 or ack_folded >= max(len(ack_ids), 1)):
-        # Disclosure only (the acceptance's truncation line): an impossible
-        # count on a readable list is treated as "not folded".
+            or ack_folded < 0 or (ack_folded and len(ack_ids) != ACK_IDENTITY_MAX)):
+        # Disclosure only (the acceptance's truncation line). The invariant is
+        # `folded > 0` IFF the list is exactly at the cap - a much bigger run
+        # folds MORE identities into the same single id (511 findings -> 256
+        # folded, 1023 -> 768), so the count must not be capped by the list
+        # length. A count that contradicts the list it describes is "not
+        # folded".
         ack_folded = 0
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
