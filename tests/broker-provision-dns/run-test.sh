@@ -15,6 +15,9 @@
 # `|`/`>` scalar (anchors/tags/quoted keys included) that quotes the job or
 # the CI run step cannot stand in for the real one, and the raw
 # exactly-one-job-key counts catch a form the stripper does not recognise.
+# The workflow `on:`/`permissions:` spans and the LF/BOM check are
+# parser-based (PyYAML compose / a Python byte predicate), not hand-rolled
+# scanners (#195).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,122 +44,130 @@ lacks() { # $1 label, $2 needle, $3 haystack -- ok when the needle is ABSENT
 lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
   if grep -qwE -- "$2" <<<"$3"; then bad "$1 (found '$2')"; else ok "$1"; fi
 }
-# End line of a key's span, flow-aware: the span runs from the key's line
-# ($2) to the first column-0 non-comment line seen while the flow depth is
-# zero, no quoted scalar is open, and the line is neither a block-sequence
-# entry (`- ...`) nor a block-scalar header (`|`/`>...`), both of which
-# continue the key's value instead of starting a new top-level key
-# (r26/r27 HIGH). A mixed-indent flow collection (`on: [`
-# + column-0 entries + a later indent-2 entry) is one collection to YAML, so
-# a plain "next column-0 line" terminator let an added trigger hide between
-# them (r22 functional LOW).
-#
-# Comment and quote indicators are recognised at a YAML TOKEN BOUNDARY only,
-# tracked as `tokend` (line start, whitespace, a flow indicator, or a REAL
-# quote/collection close; `:` and `?` preserve the boundary state they are
-# in). A mid-token `'`/`"`/`#`/`:`/`?` is plain-scalar content (`it's`,
-# `a#b`, `a:#`, `a?#b`, `dogs'#`): treating one as an opener/comment dropped
-# the rest of the line and closed a live flow early, hiding a trigger from
-# every pin — the r23/r24 HIGH class across a `]`/`}` inside quotes, a
-# mid-token `#`, the explicit-key `?`, a post-close `#`, a `:` before a flow
-# value, and mid-plain quote chars (r23 red-team/functional, r24
-# trust/functional). A double-quoted scalar's escape state is LINE-LOCAL:
-# a `\` at EOL escapes the break itself, so it must not consume the next
-# line's first character (r25 HIGH). Quoted contents are not counted at
-# all, so a mis-read can only extend the span. Empty when no terminator is
-# found (EOF).
-flow_end() { # $1 file, $2 start line
-  awk -v s="$2" '
-    function sq() { return sprintf("%c", 39) }
-    function depth(line,   i, c, d, tokend) {
-      d = 0; tokend = 1
-      for (i = 1; i <= length(line); i++) {
-        c = substr(line, i, 1)
-        if (q == "") {
-          if (c == "#") { if (tokend) break; tokend = 0 }
-          else if (c == "\"" || c == sq()) { if (tokend) { q = c }; tokend = 0 }
-          else if (c == "[" || c == "{") { d++; tokend = 1 }
-          else if (c == "]" || c == "}") { d--; tokend = 1 }
-          else if (c == ",") { tokend = 1 }
-          else if (c == " " || c == "\t") { tokend = 1 }
-          else if (c != ":" && c != "?") { tokend = 0 }
-        } else if (q == "\"") {
-          if (esc) { esc = 0 }
-          else if (c == "\\") { esc = 1 }
-          else if (c == "\"") { q = ""; tokend = 1 }
-          else { tokend = 0 }
-        } else {
-          if (c == sq()) {
-            if (substr(line, i + 1, 1) == sq()) { i++ }
-            else { q = ""; tokend = 1 }
-          } else { tokend = 0 }
-        }
-      }
-      # A trailing backslash inside a double-quoted scalar escapes the
-      # LINE BREAK itself (YAML), so the escape is consumed by the newline
-      # and must not leak into the next line: the continuation line has a
-      # fresh first character. Carrying `esc` across lines let a `\`-at-EOL
-      # + `\"` continuation close the scalar early, ending the `on:` span
-      # at a column-0 line YAML still parses inside the open flow (r25 HIGH).
-      if (q == "\"" && esc) esc = 0
-      return d
-    }
-    NR == s { d = depth($0); next }
-    NR > s {
-      if ($0 ~ /^[[:space:]]*$/) { next }
-      # A column-0 BLOCK SEQUENCE entry (`- x`, `-`, `- |`) continues the
-      # current key value: YAML lets a block sequence sit at the same
-      # indent as its parent key (`on:` then `- push`), and a block-scalar
-      # entry hides indented content that no other pin sees (r26 HIGH).
-      # A column-0 BLOCK SCALAR HEADER (`|`, `|-`, `>2-`, ...) is the
-      # value NODE itself when it follows `on:` directly, and its content
-      # is indented (r27 HIGH). Neither form is ever a top-level key, so
-      # neither terminates the span.
-      if (q == "" && d <= 0 && $0 ~ /^[^[:space:]#]/ && $0 !~ /^-([[:space:]]|$)/ && $0 !~ /^[|>]/) { print NR; exit }
-      d += depth($0)
-    }
-  ' "$1"
+# The workflow `on:` trigger and `permissions:` scope spans are derived from
+# a REAL YAML parse (PyYAML `compose`, #195), not a tokenizer: the span of
+# each key runs from its top-level key line through the parsed value node's
+# end mark, so every child — an indent-2 trigger, a flow entry, a column-0
+# block-sequence entry, a block-scalar body — is inside the hashed bytes.
+# A file that does not parse, a missing/duplicate key, or a multi-document
+# file fails closed. Python runs with -B/PYTHONDONTWRITEBYTECODE so the
+# harness never writes an in-tree __pycache__.
+wf_spans() { # $1 workflow file -- "ERR<TAB>reason" or "OK<TAB>on#<TAB>on_start<TAB>on_last<TAB>perm#<TAB>perm_start<TAB>perm_last"
+  PYTHONDONTWRITEBYTECODE=1 python3 -B - "$1" <<'PY'
+import sys
+import yaml
+
+
+def span(key, value):
+    start = key.start_mark.line + 1  # 1-based key line
+    if value is None:
+        return start, start
+    end_line = value.end_mark.line  # 0-based line of the node end
+    # A node ending at column 0 ends at the START of that line, so the line
+    # itself is outside the span; any other end column is inside it.
+    last = end_line if value.end_mark.column == 0 else end_line + 1
+    return start, max(start, last)
+
+
+def fail(reason):
+    print("ERR\t%s" % reason)
+    raise SystemExit(0)
+
+
+path = sys.argv[1]
+try:
+    text = open(path, "rb").read().decode("utf-8")
+except Exception as exc:  # fail closed: bad encoding is not parseable YAML
+    fail("not valid UTF-8: %s" % exc)
+try:
+    docs = list(yaml.compose_all(text, Loader=yaml.SafeLoader))
+except Exception as exc:  # fail closed: an unparseable tree is untrusted
+    fail("YAML does not parse: %s" % str(exc).splitlines()[0])
+if len(docs) != 1:
+    fail("expected exactly one YAML document, got %d" % len(docs))
+if docs[0] is None:
+    fail("empty YAML document")
+root = docs[0]
+if not isinstance(root, yaml.MappingNode):
+    fail("root node is not a mapping")
+found = {}
+for key, value in root.value:
+    if isinstance(key, yaml.ScalarNode) and key.value in ("on", "permissions"):
+        found.setdefault(key.value, []).append((key, value))
+fields = []
+for name in ("on", "permissions"):
+    entries = found.get(name, [])
+    if len(entries) != 1:
+        fields.extend([str(len(entries)), "0", "0"])
+        continue
+    key, value = entries[0]
+    # An alias value (`on: *t`) composes to the anchored node, whose marks
+    # point at the anchor definition, not at this key: the span would then
+    # pin bytes that are not this key's value. Fail closed instead.
+    if value is not None and value.start_mark.index < key.start_mark.index:
+        fail("%s value starts before its key (alias/relocated bytes)" % name)
+    start, last = span(key, value)
+    fields.extend(["1", str(start), str(last)])
+print("OK\t" + "\t".join(fields))
+PY
 }
-# flow_end unit fixtures: the span end must never move EARLIER than the real
-# YAML block (r23 HIGH regression). Each case pins the exact end line; a
-# fixture with no terminator prints nothing (EOF extension).
-fe_case() { # $1 expected end ("EOF" = no terminator), $2 label, $3 content
-  local f got
+span_hash() { # $1 file, $2 start line, $3 last line (inclusive)
+  sed -n "$2,$3p" "$1" | sha256sum | cut -d' ' -f1
+}
+# Parser-span fixtures: adding an unexpected trigger/permission to a quoted,
+# flow or alias-bearing workflow must change the pinned bytes, and an
+# unparseable/multi-document/duplicate-key workflow must fail closed. This is
+# the parser-derived replacement for the 29 tokenizer fixtures (#195).
+sp_case() { # $1 expected (OK/ERR), $2 label, $3 content
+  local f sp status
   f="$(mktemp)"
   printf '%s' "$3" > "$f"
-  got="$(flow_end "$f" 1)"
+  sp="$(wf_spans "$f")"
   rm -f "$f"
-  if [ "$1" = "EOF" ]; then is "$2" "" "$got"; else is "$2" "$1" "$got"; fi
+  status="${sp%%$'\t'*}"
+  if [ "$1" = "OK" ]; then
+    if [ "$status" = "OK" ]; then ok "$2"; else bad "$2 (expected a parse, got '$sp')"; fi
+  else
+    if [ "$status" = "ERR" ]; then ok "$2"; else bad "$2 (expected fail-closed, got '$sp')"; fi
+  fi
 }
-fe_case 5 "flow_end: quoted ] inside a flow does not end the span early" $'on: ["a]b",\npush,\n  pull_request_target,\n]\npermissions:\n'
-fe_case 4 "flow_end: quoted } inside a flow mapping does not end the span early" $'on: {"a}b": x,\n  pull_request_target,\n}\npermissions:\n'
-fe_case 7 "flow_end: mid-token # is plain content, not a comment" $'on: [a#b, [c,\npush,\n],\npush2,\n  pull_request_target,\n]\npermissions:\n'
-fe_case 3 "flow_end: # after a flow comma is a comment" $'on: [a,# ]\npush]\npermissions:\n'
-fe_case 5 "flow_end: ? explicit-key quoted scalar does not end the span early" $'on: [?\'a]b\',\npush,\n  pull_request_target,\n]\npermissions:\n'
-fe_case 3 "flow_end: # after an explicit-key ? is a comment" $'on: [?# ]\npush]\npermissions:\n'
-fe_case 5 "flow_end: # after a closing quote is a comment" $'on: [a, "b"# ] decoy\n, d,\n  pull_request_target,\n]\npermissions:\n'
-fe_case 5 "flow_end: # after a closing collection is a comment" $'on: {"pull_request": {branches: [main]}# ] decoy\n, workflow_dispatch,\n  pull_request_target,\n}\npermissions:\n'
-fe_case 5 "flow_end: quoted value after : in a flow mapping is not counted" $'on: {"pull_request": {"branches":"x]y"}\n, workflow_dispatch: null,\n  pull_request_target: null,\n}\npermissions:\n'
-fe_case 3 "flow_end: multi-line quoted scalar continuation is not a terminator" $'on: "a\nb"\npermissions:\n'
-fe_case 5 "flow_end: mid-token apostrophe does not open a quote" $'on: [it\'s, [a, b\'s,\n], push,\npull_request_target,\n]\npermissions:\n'
-fe_case 5 "flow_end: mid-token double quote does not open a quote" $'on: [it"s, [a, b"s,\n], push,\npull_request_target,\n]\npermissions:\n'
-fe_case 6 "flow_end: mid-plain apostrophe + # is content, not a comment" $'on: {"a": dogs\'# , "b": [c,\n]\n, workflow_dispatch,\n    pull_request_target,\n}\npermissions:\n'
-fe_case 7 "flow_end: mid-plain : + # is content, not a comment" $'on: {push: {branches: [main, a:#], schedule: [{cron: \'0 0 * * *\',\n}],\n}\n,\n  pull_request_target: null,\n}\npermissions:\n'
-fe_case "EOF" "flow_end: unterminated flow extends to EOF (no early end)" $'on: [it\'s,\n  push,\n'
-fe_case 5 "flow_end: escaped line break keeps the quoted scalar open (r25 F1)" $'on: {push: {branches: ["x\\\n\\"]y", main, \'release/*\']},\nworkflow_dispatch: null,\n}\npermissions:\n'
-fe_case 3 "flow_end: escaped line break then a real close ends at the terminator (r25 F1)" $'on: ["a\\\n" , b]\npermissions:\n'
-fe_case 5 "flow_end: single-quoted close then # is a comment" $'on: [a, \'b\'# ] decoy\n, d,\n  pull_request_target,\n]\npermissions:\n'
-fe_case 4 "flow_end: block-scalar entry under a column-0 sequence is pinned (r26 HIGH)" $'on:\n- >-\n  push\npermissions:\n'
-fe_case 4 "flow_end: mapping entry under a column-0 sequence is pinned (r26 HIGH)" $'on:\n- push: null\n  pull_request_target: null\npermissions:\n'
-fe_case 4 "flow_end: plain column-0 sequence entries are pinned (r26 HIGH)" $'on:\n- push\n- pull_request_target\npermissions:\n'
-fe_case 4 "flow_end: bare column-0 block-scalar header is pinned (r27 HIGH)" $'on:\n|-\n  push\npermissions:\n'
-fe_case 4 "flow_end: folded block-scalar header with indicators is pinned (r27 HIGH)" $'on:\n>2-\n  push\npermissions:\n'
-fe_case 4 "flow_end: literal block-scalar entry under a column-0 sequence is pinned (r27 LOW)" $'on:\n- |\n  push\npermissions:\n'
-fe_case 4 "flow_end: bare column-0 sequence entry is pinned (r27 LOW)" $'on:\n-\n  push\npermissions:\n'
-fe_case 4 "flow_end: bare literal header with no indicators is pinned (r28 LOW)" $'on:\n|\n  push\npermissions:\n'
-fe_case 4 "flow_end: bare folded header with no indicators is pinned (r28 LOW)" $'on:\n>\n  push\npermissions:\n'
-fe_case 4 "flow_end: header with indicator and comment is pinned (r28 LOW)" $'on:\n|- # c\n  push\npermissions:\n'
-fe_case 4 "flow_end: header with a trailing space is pinned (r28 LOW)" $'on:\n|- \n  push\npermissions:\n'
+span_hash_of() { # $1 file, $2 key (on|permissions) -- span sha, empty on error
+  local sp status on_c on_s on_e p_c p_s p_e
+  sp="$(wf_spans "$1")"
+  IFS=$'\t' read -r status on_c on_s on_e p_c p_s p_e <<<"$sp"
+  [ "$status" = "OK" ] || return 0
+  case "$2" in
+    on) [ "$on_c" = "1" ] && span_hash "$1" "$on_s" "$on_e" ;;
+    permissions) [ "$p_c" = "1" ] && span_hash "$1" "$p_s" "$p_e" ;;
+  esac
+  return 0
+}
+span_changes() { # $1 label, $2 key, $3 base, $4 mutant
+  local b m bh mh
+  b="$(mktemp)"; m="$(mktemp)"
+  printf '%s' "$3" > "$b"; printf '%s' "$4" > "$m"
+  bh="$(span_hash_of "$b" "$2")"; mh="$(span_hash_of "$m" "$2")"
+  rm -f "$b" "$m"
+  if [ -n "$bh" ] && [ -n "$mh" ] && [ "$bh" != "$mh" ]; then
+    ok "$1"
+  else
+    bad "$1 (span hash did not change: '$bh' vs '$mh')"
+  fi
+}
+sp_base=$'name: x\non: [push]\npermissions: {contents: read}\njobs: {}\n'
+sp_case OK "yaml span: quoted key still parses" $'name: x\n"on": [push]\npermissions: {contents: read}\njobs: {}\n'
+span_changes "yaml span: added flow trigger changes the pinned bytes" on "$sp_base" $'name: x\non: [push, pull_request_target]\npermissions: {contents: read}\njobs: {}\n'
+span_changes "yaml span: added quoted mapping trigger changes the pinned bytes" on "$sp_base" $'name: x\non: {push: null, "pull_request_target": null}\npermissions: {contents: read}\njobs: {}\n'
+span_changes "yaml span: alias-shaped trigger entry changes the pinned bytes" on "$sp_base" $'name: x\nother: &t pull_request_target\non: [push, *t]\npermissions: {contents: read}\njobs: {}\n'
+span_changes "yaml span: added permission scope changes the pinned bytes" permissions "$sp_base" $'name: x\non: [push]\npermissions: {contents: read, id-token: write}\njobs: {}\n'
+span_changes "yaml span: indent-2 trigger changes the pinned bytes" on "$sp_base" $'name: x\non:\n  push:\n  pull_request_target:\npermissions: {contents: read}\njobs: {}\n'
+span_changes "yaml span: block-scalar trigger body changes the pinned bytes" on "$sp_base" $'name: x\non:\n- >-\n  push\npermissions: {contents: read}\njobs: {}\n'
+sp_case ERR "yaml span: unparseable workflow fails closed" $'name: x\non: [push\n'
+sp_case ERR "yaml span: multi-document workflow fails closed" $'name: x\non: [push]\n---\non: [pull_request_target]\n'
+sp_case ERR "yaml span: alias value with relocated bytes fails closed" $'name: x\nx: &t [push, pull_request_target]\non: *t\npermissions: {contents: read}\njobs: {}\n'
+spf="$(mktemp)"; printf '%s' $'name: x\non: [push]\non: [pull_request_target]\n' > "$spf"
+is "yaml span: duplicate on: key count (fail-closed input)" "2" "$(wf_spans "$spf" | cut -f2)"
+rm -f "$spf"
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
@@ -704,36 +715,32 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   # are not top-level). Spelling stability is traded for that coverage: a
   # cosmetic respelling or reorder also reds (deliberate pin update).
   wf_top_digest="$wf_top_digest|$wf:$(grep -E '^[^[:space:]#]' "$wf" | sha256sum | cut -d' ' -f1 || true)"
-  # The `on:` trigger block is pinned per workflow: the top-level line digest
-  # sees only column-0 lines, so an indent-2 trigger added under `on:`
-  # (e.g. `pull_request_target:`) was invisible to every other pin (r21 F4).
-  # The span is hashed raw from the `on:` key line to the next column-0
-  # non-comment line; flow continuations at column 0 are already in the
-  # top-level digest, and a missing or ambiguous `on:` key fails closed.
-  on_lines="$(grep -nE '^((&|!)[^[:space:]]+[[:space:]]+)*(["'"'"']?on["'"'"']?)[[:space:]]*:' "$wf" | cut -d: -f1 || true)"
-  on_count="$(printf '%s\n' "$on_lines" | grep -c . || true)"
+  # The `on:` trigger and `permissions:` scope spans are pinned per workflow
+  # from the REAL YAML parse: the span runs from the top-level key line
+  # through the value node's end mark, so an indent-2 trigger (r21 F4), a
+  # flow entry, a column-0 block-sequence entry and a block-scalar body are
+  # all inside the hashed bytes. A missing/duplicate key, a multi-document
+  # file or an unparseable file fails closed (#195).
+  wf_sp="$(wf_spans "$wf")"
+  IFS=$'\t' read -r wf_status on_count on_start on_last perm_count perm_start perm_last <<<"$wf_sp"
+  if [ "$wf_status" != "OK" ]; then
+    bad "$wf YAML does not parse (fail closed): ${wf_sp#ERR$'\t'}"
+    wf_on_digest="$wf_on_digest|$wf:PARSE"
+    wf_perm_digest="$wf_perm_digest|$wf:PARSE"
+    wf_job_digest="$wf_job_digest|$wf:PARSE"
+    continue
+  fi
   if [ "$on_count" != "1" ]; then
     bad "$wf top-level on: key count (expected 1, got $on_count)"
     wf_on_digest="$wf_on_digest|$wf:AMBIGUOUS"
   else
-    on_end="$(flow_end "$wf" "$on_lines")"
-    [ -n "$on_end" ] || on_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
-    wf_on_digest="$wf_on_digest|$wf:$(sed -n "${on_lines},$((on_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
+    wf_on_digest="$wf_on_digest|$wf:$(span_hash "$wf" "$on_start" "$on_last")"
   fi
-  # The top-level `permissions:` block is pinned per workflow too: token
-  # scopes are security-relevant and an indented child value rewrite
-  # (`contents: read` -> `write`) is invisible to the raw top-level line
-  # digest and to the count-only censuses (r22 trust MEDIUM / r21 F7). Same
-  # span/locator doctrine as `on:`; every in-tree workflow has exactly one.
-  perm_lines="$(grep -nE '^((&|!)[^[:space:]]+[[:space:]]+)*(["'"'"']?permissions["'"'"']?)[[:space:]]*:' "$wf" | cut -d: -f1 || true)"
-  perm_count="$(printf '%s\n' "$perm_lines" | grep -c . || true)"
   if [ "$perm_count" != "1" ]; then
     bad "$wf top-level permissions: key count (expected 1, got $perm_count)"
     wf_perm_digest="$wf_perm_digest|$wf:AMBIGUOUS"
   else
-    perm_end="$(flow_end "$wf" "$perm_lines")"
-    [ -n "$perm_end" ] || perm_end=$(( $(awk 'END{print NR}' "$wf") + 1 ))
-    wf_perm_digest="$wf_perm_digest|$wf:$(sed -n "${perm_lines},$((perm_end - 1))p" "$wf" | sha256sum | cut -d' ' -f1)"
+    wf_perm_digest="$wf_perm_digest|$wf:$(span_hash "$wf" "$perm_start" "$perm_last")"
   fi
   jobs_keys="$(grep -cE "^((&|!)[^[:space:]]+[[:space:]]+)*([\"']?jobs[\"']?)[[:space:]]*:[[:space:]]*(#.*)?\$" "$wf" || true)"
   if [ "$jobs_keys" != "1" ]; then
@@ -941,81 +948,33 @@ if [ -z "$local_refs" ]; then ok "no workflow references .local (outside the sca
 # top-level keys passed all 21 harnesses). Psych also treats a U+FEFF BOM
 # as ignorable anywhere, so `env: [\n\uFEFF&a push\n]` + `on: *a` resolves
 # while every byte-oriented prefix misses the anchor (r32 red-team F1).
-# The in-tree workflows are LF-only and BOM-free, so fail closed on any
-# non-LF line break OR a BOM byte sequence and keep the line models aligned.
-line_break_scan() { # $1.. files -- prints files with a non-LF break or a BOM byte
-  LC_ALL=C grep -lE $'(\r|\xc2\x85|\xe2\x80\xa8|\xe2\x80\xa9|\xef\xbb\xbf)' "$@" 2>/dev/null || true
+# The in-tree workflows are LF-only and BOM-free. A real byte predicate
+# (Python, #195) rejects any U+FEFF byte sequence anywhere and any non-LF
+# line break over the exact workflow glob set; there is no shell scanner and
+# no scanner call site to pin.
+wf_bytes_bad() { # $1.. files -- prints files with a BOM or a non-LF break
+  PYTHONDONTWRITEBYTECODE=1 python3 -B - "$@" <<'PYEOF'
+import os
+import sys
+
+BREAKS = (
+    (b"\xef\xbb\xbf", "BOM"),
+    (b"\r", "CR"),
+    (b"\xc2\x85", "NEL"),
+    (b"\xe2\x80\xa8", "LS"),
+    (b"\xe2\x80\xa9", "PS"),
+)
+for path in sys.argv[1:]:
+    if not os.path.isfile(path):  # an unmatched glob stays literal in the call
+        continue
+    data = open(path, "rb").read()
+    hits = [name for seq, name in BREAKS if seq in data]
+    if hits:
+        print("%s (%s)" % (path, ",".join(hits)))
+PYEOF
 }
-# The scan's teeth (r32 red-team F1 mutation gap): a clean LF file passes;
-# every hostile byte sequence fails closed. Extracted so a drop of any
-# alternative is caught here, not only on a hostile in-tree tree.
-lbf="$(mktemp)"
-is "line-break scan: clean file passes" "" "$(line_break_scan "$lbf")"
-for lbcase in CR NEL LS PS BOM; do
-  case "$lbcase" in
-    CR)  printf 'name: x\r\n' > "$lbf" ;;
-    NEL) printf 'name: x\xc2\x85\n' > "$lbf" ;;
-    LS)  printf 'name: x\xe2\x80\xa8\n' > "$lbf" ;;
-    PS)  printf 'name: x\xe2\x80\xa9\n' > "$lbf" ;;
-    BOM) printf 'env: [\n\xef\xbb\xbf&a push\n]\n' > "$lbf" ;;
-  esac
-  is "line-break scan: $lbcase fails closed" "$lbf" "$(line_break_scan "$lbf")"
-done
-# Multi-file arity (r33 red-team LOW): a "$@"->"$1" mutant must not survive.
-lbf2="$(mktemp)"; printf 'name: y\n' > "$lbf2"
-printf 'name: x\r\n' > "$lbf"
-is "line-break scan: every listed file is scanned" "$lbf" "$(line_break_scan "$lbf2" "$lbf")"
-is "line-break scan: dirty first file is scanned" "$lbf" "$(line_break_scan "$lbf" "$lbf2")"
-rm -f "$lbf" "$lbf2"
-# The in-tree call site is pinned structurally AND at runtime (r35
-# red-team MEDIUM/LOW): the scan result is held in a READONLY variable
-# (any later overwrite — bare, indented, inline-after-`then`, declare/
-# export/eval — is a fatal assignment error in a non-interactive shell,
-# so a hostile tree stays red), and the call line must be the exact
-# readonly globs line. Any other assignment shape anywhere
-# (word-boundary match), any other call text (a swapped directory, a
-# decoy glob, an added flag) and any glob-disable (`set -f`-style)
-# fails closed. The patterns avoid the literal assignment/call tokens so
-# this check's own lines cannot self-match.
-lb_assign_lines() { # $1 file -- any-shape assignment lines
-  grep -nE '(^|[^[:alnum:]_])lb_files(\+)?[[:space:]]*=' "$1" || true
-}
-lb_setf_lines() { # $1 file -- `set -f`-style glob-disable lines
-  grep -nE '(^|[^[:alnum:]_])set[[:space:]]+-[[:alpha:]]*f([[:space:]]|$)' "$1" || true
-}
-lb_call_lines() { # $1 file -- exact scan-call tokens
-  grep -cE '(^|[^[:alnum:]_])line_break_scan \.github/workflows/\*\.yml \.github/workflows/\*\.yaml($|[^[:alnum:]_])' "$1" || true
-}
-lb_files="$(line_break_scan .github/workflows/*.yml .github/workflows/*.yaml)"
-readonly lb_files
-is "line-break scan call site: exactly one assignment (any shape)" "1" "$(lb_assign_lines "$0" | grep -c . || true)"
-is "line-break scan call site: exact scan assignment line" "1" "$(grep -cE '^lb_file[s]="\$\(line_break_scan \.github/workflows/\*\.yml \.github/workflows/\*\.yaml\)"$' "$0" || true)"
-is "line-break scan call site: readonly guard present" "1" "$(grep -cE '^readonly lb_file[s]$' "$0" || true)"
-is "line-break scan call site: no glob disable" "0" "$(lb_setf_lines "$0" | grep -c . || true)"
-# Teeth: every assignment shape counts; the call token must be exact.
-lbfa="$(mktemp)"
-printf 'lb_file%s=""\n' 's' > "$lbfa"
-is "lb assign scan: bare assignment found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
-printf '  lb_file%s=""\n' 's' > "$lbfa"
-is "lb assign scan: indented overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
-printf 'if true; then lb_file%s=""; fi\n' 's' > "$lbfa"
-is "lb assign scan: inline-after-then overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
-printf 'declare lb_file%s=""\n' 's' > "$lbfa"
-is "lb assign scan: declare-prefixed overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
-printf 'eval lb_file%s=""\n' 's' > "$lbfa"
-is "lb assign scan: eval-built overwrite found" "1" "$(lb_assign_lines "$lbfa" | grep -c . || true)"
-printf 'run: make && make test\n' > "$lbfa"
-is "lb assign scan: shell && is not an assignment" "" "$(lb_assign_lines "$lbfa")"
-printf 'set -%s\n' 'ef' > "$lbfa"
-is "lb setf scan: short-flag glob disable found" "1" "$(lb_setf_lines "$lbfa" | grep -c . || true)"
-printf 'run: set -eu\n' > "$lbfa"
-is "lb setf scan: set -eu is not a glob disable" "" "$(lb_setf_lines "$lbfa")"
-printf 'line_break_scan .github/workflows/%s.yml .github/workflows/%s.yaml\n' '*' '*' > "$lbfa"
-is "lb call scan: exact call token counted" "1" "$(lb_call_lines "$lbfa")"
-printf 'line_break_scan docs/%s.yml docs/%s.yaml\n' '*' '*' > "$lbfa"
-is "lb call scan: swapped directory not counted" "0" "$(lb_call_lines "$lbfa")"
-rm -f "$lbfa"
-if [ -z "$lb_files" ]; then ok "workflows are LF-only and BOM-free (no CR/NEL/LS/PS/U+FEFF — YAML vs grep parity)"; else bad "workflow contains a non-LF line break or a BOM (YAML vs grep differential): $lb_files"; fi
+wf_break_bad="$(wf_bytes_bad .github/workflows/*.yml .github/workflows/*.yaml)"
+if [ -z "$wf_break_bad" ]; then ok "workflows are LF-only and BOM-free (no CR/NEL/LS/PS/U+FEFF — YAML vs grep parity)"; else bad "workflow contains a non-LF line break or a BOM (YAML vs grep differential): $wf_break_bad"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
 # invisible to every key regex. Block, flow and tagged spellings (`<< :`,
@@ -1256,14 +1215,14 @@ for t in "${harnesses[@]}"; do
   fi
 done
 
-# Exact passing-check floor (count-only, same class as banner-workflow-diff):
-# deleting or emptying a counted check (the byte-pin block included) fails
-# the suite instead of silently reducing coverage; a same-count gutting —
-# deleting an ok-less guard, or this block itself — is invisible here and
-# relies on review plus the CI run list. Update deliberately when adding or
-# removing checks.
-CHECK_FLOOR=298
-if [ "$pass" -eq "$CHECK_FLOOR" ]; then :; else bad "check floor: expected exactly $CHECK_FLOOR passing checks, got $pass"; fi
+# Passing-check floor (count-only, same class as banner-workflow-diff): a
+# pass below the committed floor fails the suite instead of silently
+# reducing coverage; a same-count gutting — deleting an ok-less guard, or
+# this block itself — is invisible here and relies on review plus the CI run
+# list. The floor is a MINIMUM (adding checks stays green); update it
+# deliberately when checks are removed.
+MIN_CHECKS=258
+if [ "$pass" -lt "$MIN_CHECKS" ]; then bad "check floor: expected at least $MIN_CHECKS passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
