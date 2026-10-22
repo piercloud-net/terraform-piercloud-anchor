@@ -76,6 +76,7 @@ All notable changes to this project will be documented in this file.
 - *(external-watch)* Name the repo for gh in the config job (closes #211)
 - *(scp)* Ask the API for no reverse DNS on every interfaces read (closes #216)
 - *(provision)* Stage a checksummed patched provider for plan/apply (closes #219)
+- *(edge)* Remove the dead client-IP trust + the ungated :80 dashboard, add HSTS (closes #225)
 
 ### 💼 Other
 
