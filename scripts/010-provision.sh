@@ -115,10 +115,6 @@ if [ -z "${STATUS_HOST:-}" ]; then
   STATUS_HOST=""
   warn "TENANT_USER unset — dashboard TLS block and TLS-expiry probe skipped (re-dispatch with TENANT_USER to converge them)"
 fi
-# Exact Host value for the :80 dashboard matcher (review: a wildcard span was
-# never verified — render the exact name; hand runs get a never-matching
-# sentinel so the :80 block still validates).
-STATUS_MATCH="${STATUS_HOST:-status-invalid.invalid}"
 }
 
 render_caddyfile() { # print the Caddyfile to stdout
@@ -133,20 +129,17 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# admin.disabled:true would refuse the reload, and publishing :2019"
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
-  printf '%s\n' "	servers {"
-  printf '%s\n' "		# Real client IP behind the CloudFront edge. CloudFront-Viewer-Address"
-  printf '%s\n' "		# only — never X-Forwarded-For (spoofable through the edge); the"
-  printf '%s\n' "		# origin-request policy forwards that header to the origin."
-  printf '%s\n' "		trusted_proxies static ${CLOUDFRONT_ORIGIN_CIDRS}"
-  printf '%s\n' "		client_ip_headers CloudFront-Viewer-Address"
-  printf '%s\n' "	}"
+  printf '%s\n' "	# The :443 gate matches the raw TCP peer (remote_ip). Admission is"
+  printf '%s\n' "	# never derived from CloudFront-Viewer-Address or any forwarded"
+  printf '%s\n' "	# header: a distribution can set them. Do not switch the gate to"
+  printf '%s\n' "	# client_ip; the header is logging-only, never admission."
   printf '%s\n' "}"
   printf '%s\n' ""
   printf '%s\n' "# Tang front (:80, plain HTTP, NO redirect): ONLY /adv*|/rec* reach"
   printf '%s\n' "# tangd. ACME HTTP-01 answers here (zone-side cache bypass + no WAF"
-  printf '%s\n' "# block on that path are operator steps, see docs/dr.md). The status"
-  printf '%s\n' "# host on :80 proxies the dashboard plain (no redirect by design);"
-  printf '%s\n' "# TLS lives on :443 below. Everything else aborts."
+  printf '%s\n' "# block on that path are operator steps, see docs/dr.md). The"
+  printf '%s\n' "# dashboard is served on :443 only — :80 has no dashboard handler."
+  printf '%s\n' "# Everything else aborts."
   printf '%s\n' "${CADDY_HTTP_ADDR:-:80} {"
   printf '%s\n' "	log_skip"
   printf '%s\n' "	header -Server"
@@ -166,15 +159,6 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus the"
   printf '%s\n' "		# CloudFront origin gate on :443 when the edge is live (docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
-  printf '%s\n' "	}"
-  printf '%s\n' "	# Named matcher keeps the dashboard off tang paths (disjoint by"
-  printf '%s\n' "	# construction, so handle order cannot misroute)."
-  printf '%s\n' "	@status {"
-  printf '%s\n' "		host ${STATUS_MATCH}"
-  printf '%s\n' "		not path /adv* /rec* /.well-known/acme-challenge/*"
-  printf '%s\n' "	}"
-  printf '%s\n' "	handle @status {"
-  printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
   printf '%s\n' "	}"
   printf '%s\n' "	handle {"
   printf '%s\n' "		abort"
@@ -202,6 +186,7 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "# Dashboard (explicit per-tenant block — this name only, never on_demand)."
     printf '%s\n' "https://${STATUS_HOST} {"
     printf '%s\n' "	header -Server"
+    printf '%s\n' "	header Strict-Transport-Security \"max-age=15552000\""
     printf '%s\n' "${DASH_TLS_STANZA}"
     printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
     printf '%s\n' "	@dashtang path /adv* /rec*"
@@ -3112,7 +3097,8 @@ if [ "${ORIGIN_CERT_CHANGED:-0}" = "1" ]; then
 fi
 # Prove tang DIRECT on loopback first (this host curl is the direct proof that
 # replaces a Gatus direct endpoint — see the render comment above), then tang
-# through Caddy's :80, dashboard by Host.
+# through Caddy's :80, then the dashboard via Gatus on loopback (:80 serves
+# tang + ACME only; the :443 handshake follows).
 # The /adv body is a flattened JWS: upstream tang (v11..v15, src/keys.c
 # jwk_sign) packs {"payload": b64u({"keys":[...]}), "protected": ...,
 # "signature": ...} — the literal string "kty" exists ONLY inside the
@@ -3228,24 +3214,21 @@ if [ "$ok" != "1" ]; then
 fi
 log "Caddy :80 proxies tang (OK)"
 if [ -n "${STATUS_HOST:-}" ]; then
-  # Dashboard proof goes through the Host matcher to Gatus's own statuses API
-  # (deterministic body: our rendered endpoint name, not UI branding bytes).
-  # Two legitimate states (live 2026-09-10, #83): under CADDY_SKIP_HTTPS the
-  # :80 vhost proxies straight to Gatus; with automatic HTTPS (no operator
-  # origin pair yet) Caddy answers :80 with the HTTP->HTTPS redirect for that
-  # name. Both prove the Host matched the dashboard vhost; an unmatched host
-  # hits the render's `handle { abort }` (empty reply, code 000) instead.
-  if curl -sf -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses -o /tmp/caddy-dash.json && grep -q 'tang (via Caddy)' /tmp/caddy-dash.json; then
-    log "Caddy :80 serves the dashboard vhost for ${STATUS_HOST} (OK)"
-  else
-    dash_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${STATUS_HOST}" http://127.0.0.1/api/v1/endpoints/statuses 2>/dev/null || true)"
-    case "${dash_code}" in
-      301|302|307|308)
-        log "Caddy :80 matches the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code} -> HTTPS; auto-TLS stopgap — this run's anchor-dns job writes both the anchor A and the explicit dashboard CNAME, live 2026-10-07)" ;;
-      *)
-        docker logs caddy 2>&1 | tail -20 || true
-        die "Caddy :80 does not serve the dashboard vhost for ${STATUS_HOST} (HTTP ${dash_code:-000}) — refusing to finish blind" ;;
-    esac
+  # Origin-hardening converge check (issue #225): the SERVING Caddyfile must
+  # carry the hardened shape — no :80 dashboard handler, no header-derived
+  # client-IP trust, HSTS on the :443 site. The old check proved the
+  # dashboard by curling the :80 exact-Host proxy; that handler is gone, so
+  # this asserts the removal landed instead (a re-introduced :80 handler or a
+  # proxy-trust directive now fails the run loud). Dashboard serving itself is
+  # proven right below: the :443 loopback handshake (and the edge pull).
+  if [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
+    if grep -q '@status' "${CADDY_CONFIG}" || grep -q 'client_ip_headers\|trusted_proxies' "${CADDY_CONFIG}"; then
+      docker logs caddy 2>&1 | tail -20 || true
+      die "serving Caddyfile ${CADDY_CONFIG} still carries the removed :80 dashboard handler and/or header-derived proxy trust — the origin-hardening render did not converge; refusing to finish blind"
+    fi
+    grep -q 'Strict-Transport-Security "max-age=15552000"' "${CADDY_CONFIG}" \
+      || die "serving Caddyfile ${CADDY_CONFIG} lacks the :443 HSTS header — the origin-hardening render did not converge; refusing to finish blind"
+    log "serving Caddyfile carries the origin hardening (no :80 dashboard handler, no proxy-trust directives, HSTS) (OK)"
   fi
   # SNI must be the real hostname: curl sends no SNI for an IP-literal URL
   # and Caddy selects the origin cert by SNI, so a Host header alone fails a

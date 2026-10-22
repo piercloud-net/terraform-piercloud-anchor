@@ -3,13 +3,16 @@
 #
 # The :443 origin leg has two independent controls: the firewall admits only
 # the CloudFront origin-facing ranges + the main box (main.tf), and Caddy
-# requires the X-Piercloud-Origin secret header from those peers
+# requires the X-Piercloud-Origin secret header from those peers while
+# matching the RAW TCP peer (remote_ip; never header-derived)
 # (scripts/010-provision.sh). This harness drives the REAL render span
 # (extracted, never a copy) and asserts:
 #   - fail-closed: missing/ill-formed CLOUDFRONT_ORIGIN_SECRET or
 #     MAIN_BOX_IPV4 refuses to render the :443 dashboard block;
 #   - gate content: both CEL matchers + aborts, the secret, the main-box
-#     bypass, the CloudFront trusted_proxies list, client_ip_headers;
+#     bypass, remote_ip, and NO trusted_proxies/client_ip_headers;
+#   - :80 serves tang + ACME only (no @status dashboard handler);
+#   - HSTS on the :443 site (max-age=15552000, no includeSubDomains);
 #   - sync tooth: the 010 constant == cloudfront_ranges.tf (same set, 81);
 #   - firewall wiring: :443 loops the CloudFront ranges + the main-box rule,
 #     :80 still loops cf_edge_cidrs;
@@ -39,6 +42,9 @@ is()  { # $1 label, $2 expected, $3 actual
 has() { # $1 file, $2 literal, $3 label
   if grep -Fq -- "$2" "$1"; then ok "$3"; else bad "$3 (missing '$2' in $1)"; fi
 }
+hasnt() { # $1 file, $2 literal, $3 label
+  if grep -Fq -- "$2" "$1"; then bad "$3 (unexpected '$2' in $1)"; else ok "$3"; fi
+}
 
 # ---- real render span (extracted, never a copy) ---------------------------
 die()  { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
@@ -56,6 +62,8 @@ eval "$(grep '^CLOUDFRONT_ORIGIN_CIDRS=' "${PROVISION_SH}")"
 [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS extraction failed"
 
 MAIN_BOX="192.0.2.99"
+DASH_HOST="prodprobe.status.piercloud.net"
+GATUS_PORT="8080"
 SECRET="harness-origin-secret"
 cf_cel="$(printf "'%s'," ${CLOUDFRONT_ORIGIN_CIDRS})"
 cf_cel="${cf_cel%,}"
@@ -63,7 +71,7 @@ cf_cel="${cf_cel%,}"
 render_443() { # print the :443 dashboard shape (fail-closed on bad env)
   export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export CADDY_CHALLENGE_DIR="${WORK}/acme-challenge"
-  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export TENANT_USER=prodprobe STATUS_HOST=""
   export DASH_TLS_STANZA="	# harness: no origin pair; auto-HTTPS stub."
   caddy_status_names
   render_caddyfile
@@ -124,8 +132,22 @@ export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="${MAIN_BOX}"
 has "${WORK}/Caddyfile.443" 'abort @not_edge_peer' "gate aborts non-CloudFront peers"
 has "${WORK}/Caddyfile.443" 'abort @unauthorized' "gate aborts peers without the secret"
 has "${WORK}/Caddyfile.443" "${SECRET}" "gate carries the origin secret"
-has "${WORK}/Caddyfile.443" "trusted_proxies static ${CLOUDFRONT_ORIGIN_CIDRS}" "trusted_proxies = the CloudFront origin ranges"
-has "${WORK}/Caddyfile.443" 'client_ip_headers CloudFront-Viewer-Address' "client_ip_headers = CloudFront-Viewer-Address"
+has "${WORK}/Caddyfile.443" 'remote_ip(' "gate matches the raw TCP peer (remote_ip)"
+hasnt "${WORK}/Caddyfile.443" 'trusted_proxies' "no trusted_proxies (header cannot move the peer gate)"
+hasnt "${WORK}/Caddyfile.443" 'client_ip_headers' "no client_ip_headers (header is never admission)"
+has "${WORK}/Caddyfile.443" 'header Strict-Transport-Security "max-age=15552000"' "HSTS max-age=15552000 on the :443 site"
+hasnt "${WORK}/Caddyfile.443" 'includeSubDomains' "HSTS does not includeSubDomains"
+
+# :80 carries tang + ACME only — no dashboard handler (origin hardening).
+awk '/^:80 \{/{f=1} f{print} f&&/^}$/{exit}' "${WORK}/Caddyfile.443" > "${WORK}/http.block"
+has "${WORK}/http.block" 'handle /.well-known/acme-challenge/*' ":80 keeps the ACME challenge handler"
+has "${WORK}/http.block" 'handle /adv*' ":80 keeps tang /adv*"
+has "${WORK}/http.block" 'handle /rec*' ":80 keeps tang /rec*"
+has "${WORK}/http.block" 'abort' ":80 keeps the catch-all abort"
+has "${WORK}/Caddyfile.443" "https://${DASH_HOST} {" ":443 site covers the derived dashboard host"
+hasnt "${WORK}/http.block" "${DASH_HOST}" ":80 has no dashboard Host matcher"
+hasnt "${WORK}/http.block" "127.0.0.1:${GATUS_PORT}" ":80 has no dashboard proxy"
+hasnt "${WORK}/Caddyfile.443" '@status' "render has no @status matcher"
 
 not_edge_line="$(grep -m1 '@not_edge_peer' "${WORK}/Caddyfile.443" || true)"
 case "${not_edge_line}" in
