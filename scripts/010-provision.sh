@@ -4044,7 +4044,7 @@ class Config(object):
             log("WARNING: acknowledged identity set is malformed (%s); acking disabled" % ack_error)
             self.ack_identities = frozenset()
         else:
-            # A bare class id is not a set snapshot: it matches EVERY future
+            # A bare class id is not a frozen identity: it matches EVERY future
             # occurrence of that class, including one with a different root
             # cause weeks later, until the operator takes it out of the
             # variable (#223 review). Name the classes, never the digests.
