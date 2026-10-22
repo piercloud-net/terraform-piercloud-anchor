@@ -238,7 +238,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1014
+MIN_CHECKS=1034
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3568,6 +3568,143 @@ if [ -n "${sig_ss_a}" ] && [ "${sig_ss_a}" != "$(state_field signature)" ]; then
   ok "session-start-missing identity is tagged by condition (events vs orphan tar)"
 else
   bad "session-start-missing conditions collapsed to one identity (${sig_ss_a})"
+fi
+
+# ---- #223: one finding identity per hidden marker + the ack delta ---------
+# The hidden-object finding used to be ONE digest over every marker identity,
+# so any change in the marker set moved the signature and re-notified. The
+# operator now ACKS the exact identities instead (RECORDING_WITNESS_ACK_
+# IDENTITIES), which only works if each marker carries its own identity id.
+ACK_DIR="${WORK}/ack-state"
+hidden_ids() { # the hidden-object finding ids of the current state record
+  python3 -c '
+import json, sys
+try:
+    record = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(0)
+for entry in record.get("finding_ids") or []:
+    if isinstance(entry, str) and entry.startswith("hidden-object"):
+        print(entry)
+' "${ACK_DIR}/state.json"
+}
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":45},
+  {"key":"audit/20260925T135000Z-session.start.${SID}.1.shell.json","ago":300},
+  {"key":"audit/20260925T135100Z-session.data.${SID}.2.json","ago":299},
+  {"key":"audit/20260925T135200Z-session.end.${SID}.3.shell.json","ago":298},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[],
+ "versions":[
+  {"key":"${K_HIDDEN_A}","version_id":"dm-1","is_latest":true,"delete_marker":true,"ago":120},
+  {"key":"${K_HIDDEN_B}","version_id":"dm-2","is_latest":true,"delete_marker":true,"ago":119}]}
+JSON
+start_mock
+run_case "${ACK_DIR}"
+is "two delete markers -> alert (per-identity ids)" "alert" "${CASE_STATE}"
+ids_two="$(hidden_ids)"
+if [ "$(printf '%s\n' "${ids_two}" | grep -c '^hidden-object:[0-9a-f]\{64\}$')" -eq 2 ]; then
+  ok "each hidden marker carries its own hidden-object:<64 hex> identity"
+else
+  bad "per-marker hidden identities wrong: $(printf '%s' "${ids_two}" | tr '\n' ' ')"
+fi
+# The ids hash (key, version_id): the same set from a fresh server yields the
+# same two ids whatever the listing order.
+start_mock
+run_case "${ACK_DIR}"
+is "per-identity hidden ids are stable across runs" "${ids_two}" "$(hidden_ids)"
+# Churn that only ADDS an acked identity is not news: with every current id
+# acked the alert body says 0 new, and with one id unacked it says 1 new. The
+# suffix is only rendered when an ack is configured at all.
+acked_two="$(printf '%s' "${ids_two}" | tr '\n' ',' | sed 's/,$//')"
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=${acked_two}"
+start_mock
+run_case "${ACK_DIR}"
+case "${CASE_DETAIL}" in
+  *"— 0 new since ack"*) ok "an ack covering every hidden identity renders 0 new since ack" ;;
+  *) bad "acked hidden set must render '0 new since ack': ${CASE_DETAIL}" ;;
+esac
+one_id="$(printf '%s\n' "${ids_two}" | head -n1)"
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=${one_id}"
+start_mock
+run_case "${ACK_DIR}"
+case "${CASE_DETAIL}" in
+  *"— 1 new since ack"*) ok "one unacked hidden identity renders 1 new since ack" ;;
+  *) bad "partially acked hidden set must render '1 new since ack': ${CASE_DETAIL}" ;;
+esac
+unset RECORDING_WITNESS_EXTRA_ENV
+start_mock
+run_case "${ACK_DIR}"
+case "${CASE_DETAIL}" in
+  *"new since ack"*) bad "no ack configured must not render a delta: ${CASE_DETAIL}" ;;
+  *) ok "no ack configured renders no delta suffix" ;;
+esac
+# The identity list is bounded: 260 markers emit 255 per-marker ids plus ONE
+# overflow id over the folded rest (256 total, so one ack can express the whole
+# set), and an addition INSIDE the fold still moves the signature.
+python3 - "${WORK}/overflow-fixture.json" <<'PY'
+import json
+import sys
+
+versions = [
+    {"key": "recordings/overflow-%03d.tar" % index, "version_id": "dm-over-%03d" % index,
+     "is_latest": True, "delete_marker": True, "ago": 100 + index}
+    for index in range(260)
+]
+json.dump({"bucket": "pc-admin-dr",
+           "objects": [{"key": "audit/heartbeat/20260925T140000Z.json", "ago": 45}],
+           "uploads": [], "versions": versions}, open(sys.argv[1], "w"))
+PY
+fixture <"${WORK}/overflow-fixture.json"
+start_mock
+run_case "${WORK}/overflow-state"
+is "260 delete markers -> alert" "alert" "${CASE_STATE}"
+overflow_ids="$(python3 -c '
+import json, sys
+record = json.load(open(sys.argv[1]))
+ids = [entry for entry in record.get("finding_ids") or []
+       if isinstance(entry, str) and entry.startswith("hidden-object")]
+print(len(ids))
+print(sum(1 for entry in ids if entry.startswith("hidden-object-overflow:")))
+print(sum(1 for entry in ids if not entry.startswith("hidden-object-overflow:")))
+' "${WORK}/overflow-state/state.json" | tr '\n' ' ' | sed 's/ *$//')"
+is "the hidden identity list is capped at 256 with one overflow id (255 individual)" "256 1 255" "${overflow_ids}"
+overflow_id="$(python3 -c '
+import json, sys
+record = json.load(open(sys.argv[1]))
+print([entry for entry in record.get("finding_ids") or []
+       if entry.startswith("hidden-object-overflow:")][0])
+' "${WORK}/overflow-state/state.json")"
+if printf '%s' "${overflow_id}" | grep -Eq '^hidden-object-overflow:[0-9a-f]{64}$'; then
+  ok "the overflow identity has the ackable <class>:<64 hex> shape"
+else
+  bad "the overflow identity is not copy-pasteable into the ack (${overflow_id})"
+fi
+case "${CASE_DETAIL}" in
+  *"5 folded into the overflow identity"*) ok "the body says how many identities are folded" ;;
+  *) bad "the folded count must appear in the body: ${CASE_DETAIL}" ;;
+esac
+overflow_sig="$(state_field signature)"
+python3 - "${WORK}/overflow-fixture.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+# One MORE marker whose identity sorts INSIDE the folded tail: the emitted
+# individual list cannot change, so only the overflow digest can carry it.
+data["versions"].append({"key": "recordings/overflow-259b.tar", "version_id": "dm-over-259b",
+                         "is_latest": True, "delete_marker": True, "ago": 400})
+json.dump(data, open(sys.argv[1], "w"))
+PY
+fixture <"${WORK}/overflow-fixture.json"
+start_mock
+run_case "${WORK}/overflow-state"
+if [ -n "${overflow_sig}" ] && [ "${overflow_sig}" != "$(state_field signature)" ]; then
+  ok "an identity added inside the fold still moves the signature (overflow digest)"
+else
+  bad "an identity added inside the fold did not move the signature (${overflow_sig})"
 fi
 
 # ---- (f) strictly list-only + SigV4 proof over every request -------------
@@ -7440,6 +7577,7 @@ if [ "${list_entries}" -eq 2 ] && ! printf '%s' "${list_systemd}" | grep -q '\\'
 else
   bad "the rendered list is not two clean entries (${list_entries} matched): '${list_systemd}'"
 fi
+
 # Drive the real parser where a user bus actually works. Grading the
 # EnvironmentFile leg on "this command exited 0" would be fail-open: a refused
 # unit or a wedged bus would be reported as a skip and read as a pass, on
@@ -7483,6 +7621,29 @@ else
   ok "real EnvironmentFile parser probe skipped: ${bus_note} (the model above stands; disclosed residual)"
 fi
 unset RECORDING_WITNESS_QUIET_SIGNATURE
+# Issue #223: the acknowledged identity set renders through the same 0600 env
+# file path with the same %q escaping (systemd's EnvironmentFile parser drops
+# the backslash for an unquoted value), so a comma-separated list reaches the
+# witness intact. Pinned as exact bytes plus the systemd unescape.
+ACK_SEED_A="hidden-object:$(printf '%064d' 0)"
+ACK_SEED_B="hidden-object:$(printf '%064d' 1)"
+RECORDING_WITNESS_ACK_IDENTITIES="${ACK_SEED_A},${ACK_SEED_B}" recording_witness_install
+ack_line="$(grep '^RECORDING_WITNESS_ACK_IDENTITIES=' "${RECORDING_WITNESS_ENV_FILE}" | head -n1)"
+ack_raw="${ack_line#RECORDING_WITNESS_ACK_IDENTITIES=}"
+case "${ack_raw}" in
+  "hidden-object:$(printf '%064d' 0)"'\,'"hidden-object:$(printf '%064d' 1)")
+    ok "the acknowledged identity set renders with the %q-escaped comma" ;;
+  *) bad "the ack must render as <id>\\,<id>, got '${ack_raw}'" ;;
+esac
+ack_systemd="$(printf '%s' "${ack_raw}" | sed 's/\\\(.\)/\1/g')"
+is "systemd's unescape restores the exact two-entry ack" "${ACK_SEED_A},${ACK_SEED_B}" "${ack_systemd}"
+ack_entries="$(printf '%s' "${ack_systemd}" | tr ',' '\n' | grep -c '^hidden-object:[0-9a-f]\{64\}$')"
+if [ "${ack_entries}" -eq 2 ] && ! printf '%s' "${ack_systemd}" | grep -q '\\'; then
+  ok "the rendered ack carries two full-identity entries and no leftover backslash"
+else
+  bad "the rendered ack is not two clean entries (${ack_entries} matched): '${ack_systemd}'"
+fi
+unset RECORDING_WITNESS_ACK_IDENTITIES
 if grep -q '^RECORDING_WITNESS_COLD_START_SECONDS=7200$' "${RECORDING_WITNESS_ENV_FILE}"; then
   ok "installed env file carries the optional cold-start window"
 else
@@ -7587,6 +7748,43 @@ esac
 case "${runonce_out}" in
   *"witness finding signature: ${SIGNATURE_SEED}"*) ok "run-once surfaces the finding signature for pinning" ;;
   *) bad "run-once signature line missing: ${runonce_out}" ;;
+esac
+# Issue #223: the acceptance also prints the CURRENT finding identities in the
+# copy-pasteable form RECORDING_WITNESS_ACK_IDENTITIES takes. Digests and fixed
+# class ids only - never a raw key or a session id - so the public run log stays
+# non-identifying.
+ACK_TOOTH_ID="hidden-object:$(printf '%064d' 7)"
+seed_state alert "$(fresh_stamp)"
+python3 - "${WORK}/state/state.json" "${ACK_TOOTH_ID}" <<'PYSTATE'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+data["finding_ids"] = [sys.argv[2], "heartbeat-stale"]
+with open(sys.argv[1], "w") as handle:
+    json.dump(data, handle)
+PYSTATE
+export FAKE_EXEC_STATUS=1
+run_once_call
+case "${runonce_out}" in
+  *"witness ack identities: ${ACK_TOOTH_ID},heartbeat-stale"*)
+    ok "run-once surfaces the current finding identities for acking" ;;
+  *) bad "run-once ack-identities line missing: ${runonce_out}" ;;
+esac
+case "${runonce_out}" in
+  *"${SID}"*) bad "run-once leaked the raw session id through the ack identities" ;;
+  *) ok "the ack-identities line carries no session identifier" ;;
+esac
+# A record with no identities (an ok run, or a legacy record) prints no line
+# and must not fail the acceptance.
+seed_state ok "$(fresh_stamp)"
+export FAKE_EXEC_STATUS=0
+run_once_call
+is "run-once without finding identities still succeeds" "0" "${runonce_rc}"
+case "${runonce_out}" in
+  *"witness ack identities:"*) bad "a record with no finding identities printed an ack line" ;;
+  *) ok "no ack-identities line without finding identities" ;;
 esac
 
 # alert (exit 1) makes systemctl start return non-zero; that must warn, not die
@@ -9276,6 +9474,52 @@ for label, actual, expected in [
                           module.finding_signature("error", []),
                           module.finding_signature("error", []),
                           {module.finding_signature("error", [])}, 86400), True),
+    # Issue #223: the acknowledged identity set. The quiet window governs iff
+    # EVERY current finding identity is acked; the change trigger still fires
+    # for an identity outside the set. Positional tail: quiet_signatures,
+    # quiet_renotify, finding_ids, ack_identities, ack_configured.
+    ("an acked identity set quiets the change trigger",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"], {"heartbeat-stale"}, True), False),
+    ("a new unacked identity pushes immediately inside the window",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale", "hidden-object:" + "a" * 64],
+                          {"heartbeat-stale"}, True), True),
+    ("a pure shrink stays quiet on the change trigger",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"],
+                          {"heartbeat-stale", "hidden-object:" + "a" * 64}, True), False),
+    ("churn among acked identities stays quiet",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_C, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"],
+                          {"heartbeat-stale", "hidden-object:" + "a" * 64}, True), False),
+    ("the acked set still renotifies after the quiet window",
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"], {"heartbeat-stale"}, True), True),
+    ("the acked set stays inside the quiet window",
+     module.should_notify("alert", now - 1800, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"], {"heartbeat-stale"}, True), False),
+    ("a configured-but-empty ack (malformed value) never quiets",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"], frozenset(), True), True),
+    ("the ack takes precedence over a pin that would have quieted",
+     module.should_notify("alert", now - 1801, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
+                          {SIG_A}, 86400, ["hidden-object:" + "a" * 64],
+                          {"heartbeat-stale"}, True), True),
+    ("the ack quiets where the pin would not (the default window has expired)",
+     module.should_notify("alert", now - 1801, "alert", now, 1800, 0, 0, SIG_C, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"], {"heartbeat-stale"}, True), False),
+    ("an ack never quiets an error state",
+     module.should_notify("error", now - 1800, "error", now, 1800, 0, 0,
+                          module.finding_signature("error", []),
+                          module.finding_signature("error", []), frozenset(), 86400,
+                          ["heartbeat-stale"], {"heartbeat-stale"}, True), True),
+    ("an acked set still pushes the non-green transition",
+     module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
+                          frozenset(), 86400, ["heartbeat-stale"], {"heartbeat-stale"}, True), True),
+    ("with no ack configured the pin is unchanged",
+     module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
+                          {SIG_A}, 86400, ["heartbeat-stale"], frozenset(), False), False),
 ]:
     if actual is not expected:
         raise SystemExit("should_notify %s: expected %r got %r" % (label, expected, actual))
@@ -9291,7 +9535,7 @@ config_env = {
     "RECORDING_WITNESS_KEY": "s",
 }
 config_knobs = ["RECORDING_WITNESS_RENOTIFY_SECONDS", "RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS",
-                "RECORDING_WITNESS_QUIET_SIGNATURE"]
+                "RECORDING_WITNESS_QUIET_SIGNATURE", "RECORDING_WITNESS_ACK_IDENTITIES"]
 saved_env = {name: os.environ.get(name) for name in list(config_env) + config_knobs}
 os.environ.update(config_env)
 for name in config_knobs:
@@ -9357,7 +9601,112 @@ at_cap = ",".join("sha256:" + ("%064x" % (index + 1)) for index in range(module.
 pin, warned = _pin(at_cap)
 if len(pin) != module.QUIET_SIGNATURE_MAX or warned:
     raise SystemExit("a pin at the cap must validate: %d entries, warned=%r" % (len(pin), warned))
+# Issue #223: the acknowledged identity set. Fail-closed on the WHOLE value
+# (a prefix of the list is never honoured, an empty entry is malformed), bounded
+# at the same cap as the per-run hidden identity budget, and never echoed.
+def _ack(raw):
+    """Parse one ack value through Config; return (ids, configured, warned)."""
+    os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = raw
+    del config_logs[:]
+    parsed = module.Config()
+    return (parsed.ack_identities, parsed.ack_configured,
+            any("acknowledged identity set is malformed" in entry for entry in config_logs))
+
+
+HID_A = "hidden-object:" + "a" * 64
+HID_B = "hidden-object-overflow:" + "b" * 64
+# A fixed class id and a digested id both validate; the value is a set.
+ids, configured, warned = _ack("heartbeat-stale")
+if ids != frozenset({"heartbeat-stale"}) or not configured or warned:
+    raise SystemExit("a fixed class id must validate: %r %r %r" % (ids, configured, warned))
+ids, configured, warned = _ack(HID_A + "," + HID_B)
+if ids != frozenset({HID_A, HID_B}) or not configured or warned:
+    raise SystemExit("a two-entry ack must validate to both ids: %r %r" % (ids, warned))
+ids, configured, warned = _ack(HID_A + "," + HID_A)
+if ids != frozenset({HID_A}) or warned:
+    raise SystemExit("a duplicated ack entry must dedupe, not fail: %r %r" % (ids, warned))
+if module.ACK_IDENTITY_MAX != module.HIDDEN_FINDING_MAX:
+    raise SystemExit("the ack cap and the per-run hidden identity budget must agree")
+# No ack configured at all: empty set, precedence switch OFF (the quiet pin
+# still governs) - that is the "keep the pin working unchanged" property.
+ids, configured, warned = _ack("")
+if ids or configured or warned:
+    raise SystemExit("an unset ack must not configure acking: %r %r %r" % (ids, configured, warned))
+# Every malformed shape disables acking for the WHOLE value, warns, and keeps
+# the precedence switch ON (a broken ack never resurrects the quiet pin).
+for label, raw in [
+    ("a trailing newline", HID_A + "\n"),
+    ("a trailing comma", HID_A + ","),
+    ("a leading comma", "," + HID_A),
+    ("a doubled comma", HID_A + ",," + HID_B),
+    ("one bad entry among good ones", HID_A + ",NOT-AN-ID"),
+    ("a trailing-newline entry", HID_A + "," + HID_B + "\n"),
+    ("whitespace around an entry", HID_A + ", " + HID_B),
+    ("a 63-hex entry (a prefix of a real id)", "hidden-object:" + "a" * 63),
+    ("a 65-hex entry", "hidden-object:" + "a" * 65),
+    ("an uppercase hex entry", "hidden-object:" + "A" * 64),
+    ("a bare prefix with no digest", "hidden-object:"),
+    ("a doubled colon", "hidden-object::" + "a" * 64),
+    ("the pre-#223 overflow spelling (two colons)", "hidden-object:overflow:" + "a" * 64),
+    ("a digest with a trailing segment", HID_A + ":x"),
+    ("a non-hex second segment", "session-end-missing:9f8c0f0e"),
+    ("an uppercase class", "Hidden-object:" + "a" * 64),
+    ("a leading digit class", "9hidden-object"),
+    ("an underscore in a class", "hidden_object:" + "a" * 64),
+]:
+    ids, configured, warned = _ack(raw)
+    if ids or not warned or not configured:
+        raise SystemExit("%s must disable acking for the whole value (configured stays on): %r %r %r"
+                         % (label, ids, configured, warned))
+    if any(HID_A in entry for entry in config_logs):
+        raise SystemExit("the malformed-ack warning must not echo the value (%s)" % label)
+# Over-cap is all-or-nothing too; at the cap it validates.
+over_cap = ",".join("hidden-object:" + ("%064x" % (index + 1)) for index in range(module.ACK_IDENTITY_MAX + 1))
+ids, configured, warned = _ack(over_cap)
+if ids or not warned or not configured:
+    raise SystemExit("an over-cap ack must disable acking with a warning")
+at_cap = ",".join("hidden-object:" + ("%064x" % (index + 1)) for index in range(module.ACK_IDENTITY_MAX))
+ids, configured, warned = _ack(at_cap)
+if len(ids) != module.ACK_IDENTITY_MAX or warned:
+    raise SystemExit("an ack at the cap must validate: %d entries, warned=%r" % (len(ids), warned))
+# Every finding id the witness can emit for the classes the ack is FOR must be
+# ackable, or the acceptance print would hand the operator a value its own
+# parser rejects. A session/interval identity stays deliberately unackable
+# (its segments are not a digest; acking one would need a looser grammar).
+for ackable in ("heartbeat-missing", "heartbeat-stale", "cold-start",
+                "hidden-object:" + "a" * 64, "hidden-object-overflow:" + "b" * 64,
+                "naming-contract:" + "c" * 64, "contract-mismatch:" + "d" * 64):
+    if not module.ACK_IDENTITY_RE.match(ackable):
+        raise SystemExit("an emitted finding id must be ackable: %r" % ackable)
+for unackable in ("session-end-missing:9f8c0f0e-1b2c-4d5e-8f90-0123456789ab",
+                  "sequence-origin:9f8c0f0e-1b2c-4d5e-8f90-0123456789ab:1",
+                  "recording-gap:pending:9f8c0f0e-1b2c-4d5e-8f90-0123456789ab"):
+    if module.ACK_IDENTITY_RE.match(unackable):
+        raise SystemExit("a session identity must stay unackable: %r" % unackable)
+# Both mechanisms set: the ack takes precedence and says so (bounded warning,
+# no value echoed), and the pin is NOT the fallback for a broken ack.
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A
+os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = HID_A
+del config_logs[:]
+both = module.Config()
+if both.ack_identities != frozenset({HID_A}) or both.quiet_signatures != frozenset({SIG_A}):
+    raise SystemExit("both mechanisms must parse; the ack wins at notify time")
+if not any("takes precedence" in entry for entry in config_logs):
+    raise SystemExit("a configured ack + pin must warn about the precedence")
+os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = "NOT-AN-ID"
+del config_logs[:]
+broken_both = module.Config()
+if broken_both.ack_identities or not broken_both.ack_configured:
+    raise SystemExit("a broken ack with a pin set must stay configured-but-empty (no pin fallback)")
+os.environ.pop("RECORDING_WITNESS_ACK_IDENTITIES")
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE")
+os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = HID_A
+del config_logs[:]
+only_ack = module.Config()
+if only_ack.quiet_signatures:
+    raise SystemExit("the quiet pin must stay empty when it is not set")
+os.environ.pop("RECORDING_WITNESS_ACK_IDENTITIES")
+
 module.log = real_log
 for name, value in saved_env.items():
     if value is None:
@@ -9572,6 +9921,9 @@ module._NTFY_OPENER = FakeOpener(flaky_urlopen)
 captured[:] = []
 verdict = ["alert"]
 sig = ["sha256:" + "1" * 64]
+# The run's stable finding identities (issue #223): the ack rule reads them out
+# of the payload, exactly as the real run_checks() publishes them.
+fids = []
 module.run_checks = lambda config, now, plan: (
     verdict[0], "detail", sig[0],
     {
@@ -9585,6 +9937,7 @@ module.run_checks = lambda config, now, plan: (
         "audit_objects": {},
         "recording_objects": {},
         "hidden": [],
+        "finding_ids": list(fids),
     },
 )
 
@@ -9805,6 +10158,120 @@ os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
 if codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
     raise SystemExit("signature/pin exit codes wrong: %r" % codes)
 
+# Issue #223: the acknowledged identity set, through main(). The operator
+# declares the exact finding identities they have seen; the quiet window then
+# governs iff EVERY current identity is in the set, so marker churn (a set-shape
+# change) is quiet while a NEW identity still pushes immediately, even inside
+# the quiet window and even after a failed push (last_notify_signature only
+# advances on a LANDED push).
+AID_A = "hidden-object:" + "a" * 64
+AID_B = "hidden-object:" + "b" * 64
+AID_NEW = "hidden-object:" + "e" * 64
+SIG_D = "sha256:" + "d" * 64
+ack_dir = os.path.join(work, "ntfy-ack-state")
+os.environ["RECORDING_WITNESS_STATE_DIR"] = ack_dir
+os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = AID_A + "," + AID_B
+os.environ["RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"] = "86400"
+os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
+captured[:] = []
+ack_codes = []
+verdict[0] = "alert"
+fids[:] = [AID_A, AID_B]
+sig[:] = [SIG_A]
+ack_codes.append(module.main())  # first alert: the transition pushes once
+if len(captured) != 1:
+    raise SystemExit("an acked alert transition must still push once, got %d" % len(captured))
+ack_record = json.load(open(os.path.join(ack_dir, "state.json")))
+if ack_record.get("finding_ids") != [AID_A, AID_B]:
+    raise SystemExit("the record must carry the run's finding identities for the acceptance print: %r"
+                     % (ack_record.get("finding_ids"),))
+# A session/interval identity is NOT recorded for the acceptance print (it is
+# unackable and carries a raw session id, which the public run log must never
+# carry) even though it still enters the ack RULE - so it can never be quieted.
+# The epoch is past the DEFAULT window: a run that wrongly treated it as acked
+# would sit on the quiet window and stay silent.
+fids[:] = [AID_A, "session-end-missing:9f8c0f0e-1b2c-4d5e-8f90-0123456789ab"]
+sig[:] = [SIG_A]
+ack_state_path = os.path.join(ack_dir, "state.json")
+ack_state = json.load(open(ack_state_path))
+ack_state["last_notify_epoch"] = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 1801
+json.dump(ack_state, open(ack_state_path, "w"))
+ack_codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("an unackable session identity must not quiet, got %d" % len(captured))
+ack_record = json.load(open(os.path.join(ack_dir, "state.json")))
+if ack_record.get("finding_ids") != [AID_A]:
+    raise SystemExit("an unackable session identity must not be recorded for the print: %r"
+                     % (ack_record.get("finding_ids"),))
+fids[:] = [AID_A, AID_B]
+sig[:] = [SIG_A]
+ack_codes.append(module.main())  # same acked set: quiet window, no push
+if len(captured) != 2:
+    raise SystemExit("an unchanged acked set must stay quiet, got %d" % len(captured))
+# Marker CHURN among acked identities moves the signature but is not news.
+sig[:] = [SIG_B]
+ack_codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("a shape change inside the acked set must not push, got %d" % len(captured))
+# A pure SHRINK (a marker expired) is informational: no change push, quiet
+# window. The acked set still holds the retired identity harmlessly.
+fids[:] = [AID_A]
+sig[:] = [SIG_C]
+ack_codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("a pure shrink must not push on the change trigger, got %d" % len(captured))
+# A NEW identity is new information: push immediately, inside a fresh quiet
+# window, however recently the last push landed.
+now_epoch = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+ack_record = json.load(open(os.path.join(ack_dir, "state.json")))
+if int(ack_record.get("last_notify_epoch") or 0) == 0:
+    raise SystemExit("the acked-set pushes must record last_notify_epoch")
+fids[:] = [AID_A, AID_NEW]
+sig[:] = [SIG_D]
+ack_codes.append(module.main())
+if len(captured) != 3:
+    raise SystemExit("an unacked identity must push immediately inside the quiet window, got %d"
+                     % len(captured))
+# A failed push must not swallow the new identity: the change trigger stays
+# armed because last_notify_signature only advances on a LANDED push.
+fids[:] = [AID_A, AID_B, AID_NEW]
+sig[:] = [SIG_A]
+flaky["fail"] = True
+ack_codes.append(module.main())  # attempted, fails
+if len(captured) != 4:
+    raise SystemExit("a failed unacked-identity push must be attempted, got %d" % len(captured))
+if json.load(open(os.path.join(ack_dir, "state.json"))).get("last_notify_signature") == SIG_A:
+    raise SystemExit("a failed push must not advance last_notify_signature under an ack")
+flaky["fail"] = False
+ack_codes.append(module.main())  # the next run retries it
+if len(captured) != 5:
+    raise SystemExit("a failed unacked-identity push must retry on the next run, got %d"
+                     % len(captured))
+if json.load(open(os.path.join(ack_dir, "state.json"))).get("last_notify_signature") != SIG_A:
+    raise SystemExit("the landed ack retry must advance last_notify_signature")
+# A value that is configured but malformed disables acking for the WHOLE value
+# (no prefix honoring) and never falls back to the quiet pin: the DEFAULT
+# window applies (the last landed signature is SIG_A and stays current, so only
+# the window can push) and the verdict still lands.
+os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = AID_A + "," + "NOT-AN-ID"
+os.environ["RECORDING_WITNESS_QUIET_SIGNATURE"] = SIG_A
+fids[:] = [AID_A, AID_B]
+sig[:] = [SIG_A]
+ack_state_path = os.path.join(ack_dir, "state.json")
+ack_state = json.load(open(ack_state_path))
+ack_state["last_notify_epoch"] = now_epoch - 1801
+json.dump(ack_state, open(ack_state_path, "w"))
+ack_codes.append(module.main())
+if len(captured) != 6:
+    raise SystemExit("a malformed ack must keep the default cadence, got %d" % len(captured))
+if json.load(open(os.path.join(ack_dir, "state.json"))).get("state") != "alert":
+    raise SystemExit("a malformed ack must not take the witness down")
+os.environ.pop("RECORDING_WITNESS_ACK_IDENTITIES", None)
+os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
+os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
+if ack_codes != [1, 1, 1, 1, 1, 1, 1, 1, 1]:
+    raise SystemExit("ack exit codes wrong: %r" % ack_codes)
+
 # Round-5 R1: a corrupted numeric field in a type-valid state.json used to
 # crash main() before notify/write_state (no push, no verdict, forever). It
 # must repair, report error, and push the error verdict (fake notifier).
@@ -9934,8 +10401,8 @@ done
 # evaluated with sentinels) so a regression to an empty assignment cannot stay
 # green behind a name grep.
 for witness_var in RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS \
-                   RECORDING_WITNESS_QUIET_SIGNATURE RECORDING_WITNESS_COLD_START_SECONDS \
-                   RECORDING_WITNESS_SWEEP_SECONDS; do
+                   RECORDING_WITNESS_QUIET_SIGNATURE RECORDING_WITNESS_ACK_IDENTITIES \
+                   RECORDING_WITNESS_COLD_START_SECONDS RECORDING_WITNESS_SWEEP_SECONDS; do
   if grep -q "$witness_var" "${ROOT}/.github/workflows/provision.yml"; then
     ok "provision.yml carries $witness_var"
   else
@@ -9943,6 +10410,7 @@ for witness_var in RECORDING_WITNESS_RENOTIFY_SECONDS RECORDING_WITNESS_QUIET_RE
   fi
 done
 q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
+ACK_PASS="hidden-object:$(printf '%064d' 2),hidden-object:$(printf '%064d' 3)"
 export TENANT_USER="tenant-sentinel" ANCHOR_HOSTNAME="anchor-sentinel" STATUS_HOST="status-sentinel" \
   GATUS_ENDPOINTS="" NTFY_TOPIC="" NTFY_TOKEN="" ORIGIN_CA_CERT_PEM="" CF_AOP_CA_PEM="" \
   RECORDING_WITNESS_ENDPOINT="endpoint-sentinel" RECORDING_WITNESS_BUCKET="bucket-sentinel" \
@@ -9950,12 +10418,16 @@ export TENANT_USER="tenant-sentinel" ANCHOR_HOSTNAME="anchor-sentinel" STATUS_HO
   RECORDING_WITNESS_KEY_ID="keyid-sentinel" RECORDING_WITNESS_KEY="key-sentinel" \
   RECORDING_WITNESS_RENOTIFY_SECONDS="2400" RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS="172800" \
   RECORDING_WITNESS_QUIET_SIGNATURE="${SIGNATURE_SEED}" \
+  RECORDING_WITNESS_ACK_IDENTITIES="${ACK_PASS}" \
   RECORDING_WITNESS_COLD_START_SECONDS="7200" RECORDING_WITNESS_SWEEP_SECONDS="3600"
 eval "$(sed -n 's/^  \(ENV_PREFIX=.*\)$/\1/p' "${ROOT}/.github/scripts/020-provision-anchor.sh")"
 eval "$ENV_PREFIX"
 is "020 ENV_PREFIX passes the renotify window through" "2400" "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}"
 is "020 ENV_PREFIX passes the quiet window through" "172800" "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}"
 is "020 ENV_PREFIX passes the quiet signature through" "${SIGNATURE_SEED}" "${RECORDING_WITNESS_QUIET_SIGNATURE:-}"
+# #223: the acknowledged identity set reaches the box through the same
+# pass-through, list and all (an empty assignment would silently ack nothing).
+is "020 ENV_PREFIX passes the acknowledged identity set through" "${ACK_PASS}" "${RECORDING_WITNESS_ACK_IDENTITIES:-}"
 is "020 ENV_PREFIX passes the cold-start window through" "7200" "${RECORDING_WITNESS_COLD_START_SECONDS:-}"
 is "020 ENV_PREFIX passes the sweep interval through" "3600" "${RECORDING_WITNESS_SWEEP_SECONDS:-}"
 if grep -q 'tests/recording-witness/run-test.sh' "${ROOT}/.github/workflows/ci.yml"; then

@@ -3729,6 +3729,51 @@ def parse_quiet_signatures(raw):
     return frozenset(entries), ""
 
 
+# The acknowledged identity set (RECORDING_WITNESS_ACK_IDENTITIES, issue #223):
+# the exact finding IDENTITIES the operator has already seen, so the change
+# trigger stops paging on a set-shape change (delete-marker churn) while an
+# identity outside the set still pushes immediately. Every entry is a full
+# finding id as the run-once acceptance prints it: a fixed class id
+# (`heartbeat-stale`) or `class:<64 lowercase hex>` (the hidden-object and
+# drift digests). \A/\Z is a FULL-string match - Python's `$` also matches
+# before a trailing newline, which would accept an entry that can never equal
+# a real finding id. A finding id this grammar cannot express (a session id or
+# a sequence range carries a non-hex segment) is deliberately unackable: it
+# always pushes, which is the conservative direction.
+ACK_IDENTITY_RE = re.compile(r"\A[a-z][a-z0-9-]*(?::[0-9a-f]{64})?\Z")
+# Bounded like the pin: an ack is an operator convenience, not a data channel.
+# The cap matches the per-run hidden-object identity budget below, so every
+# identity one run can emit is expressible in one ack.
+ACK_IDENTITY_MAX = 256
+# Per-run budget for the hidden-object identities. One id per delete-marker
+# identity is what makes the ack work on marker CHURN (a new marker is a new
+# id); a pathological marker set folds into ONE overflow id computed over the
+# remaining identities, so the signature still moves and the body can say how
+# many are folded. 256 total (255 individual + the overflow id) so the emitted
+# list always fits ACK_IDENTITY_MAX.
+HIDDEN_FINDING_MAX = 256
+
+
+def parse_ack_identities(raw):
+    """Validate the acknowledged identity set; return (frozenset, error).
+
+    Fail-closed on the WHOLE value, exactly like the quiet pin: one malformed
+    entry disables acking for the entire value (the caller warns without
+    echoing it) instead of honoring a prefix of the list. An empty entry - a
+    leading, trailing or doubled comma - is malformed too, so a copy-paste
+    slip cannot narrow the ack silently. Duplicates are harmless (a set).
+    """
+    if not raw:
+        return frozenset(), ""
+    entries = raw.split(",")
+    if len(entries) > ACK_IDENTITY_MAX:
+        return frozenset(), "more than %d entries" % ACK_IDENTITY_MAX
+    for entry in entries:
+        if not ACK_IDENTITY_RE.match(entry):
+            return frozenset(), "want a finding id (<class> or <class>:<64 lowercase hex>), comma-separated"
+    return frozenset(entries), ""
+
+
 def canonical_conflict_type(event_type):
     """Strip a replay-conflict `_<hash16>` suffix; return (base, is_variant)."""
     match = CONFLICT_SUFFIX_RE.search(event_type)
@@ -3948,6 +3993,21 @@ class Config(object):
             # down (it only keeps the default cadence).
             log("WARNING: quiet signature is malformed (%s); quieting disabled" % quiet_error)
             self.quiet_signatures = frozenset()
+        # The acknowledged identity set (issue #223). `ack_configured` is the
+        # PRECEDENCE switch, not the set: a value that is set but malformed
+        # disables acking for the whole value and does NOT fall back to the
+        # quiet pin (the operator declared the ack as the mechanism; a broken
+        # ack errs toward notifying, never toward the deprecated quieting).
+        ack_raw = env("RECORDING_WITNESS_ACK_IDENTITIES")
+        self.ack_configured = bool(ack_raw)
+        self.ack_identities, ack_error = parse_ack_identities(ack_raw)
+        if ack_error:
+            # Same bounded, never-echoing posture as the quiet pin: acking is
+            # off, the default cadence applies, the verdict still lands.
+            log("WARNING: acknowledged identity set is malformed (%s); acking disabled" % ack_error)
+            self.ack_identities = frozenset()
+        if self.ack_configured and self.quiet_signatures:
+            log("WARNING: both the acknowledged identity set and the quiet signature are set; the acknowledged identity set takes precedence")
         self.ntfy_topic = env("NTFY_TOPIC")
         self.ntfy_token = env("NTFY_TOKEN")
         self.heartbeat_prefix = self.audit_prefix + "heartbeat/"
@@ -5112,17 +5172,49 @@ def run_checks(config, now, plan):
                 hidden_counts.append("%s=%d" % (label, number))
         newest = sorted(hidden_objects, key=lambda marker: marker["last_modified"], reverse=True)
         hidden_keys = ", ".join(clip(marker["key"], 120) for marker in newest[:2])
+        # One finding identity PER delete-marker identity (key + version id),
+        # never one digest over the whole set: a set-shape change is not new
+        # information, a new identity is. Sorted so the same set yields the
+        # same ids (and the same fold) regardless of listing order, and
+        # bounded: anything beyond the budget folds into ONE overflow id over
+        # the remaining identities, so the signature still moves on an addition
+        # inside the fold and the operator can ack the fold as one identity.
+        hidden_identities = sorted(
+            "%s\0%s" % (marker["key"], marker["version_id"]) for marker in hidden_objects)
+        if len(hidden_identities) > HIDDEN_FINDING_MAX:
+            # Keep the emitted list inside the identity budget: 255 individual
+            # ids + ONE overflow id over everything else, so an addition inside
+            # the fold still moves the signature and one ack covers it.
+            folded = hidden_identities[HIDDEN_FINDING_MAX - 1:]
+            hidden_ids = [
+                "hidden-object:" + identity_digest([identity])
+                for identity in hidden_identities[:HIDDEN_FINDING_MAX - 1]
+            ]
+            # The overflow identity is a finding id like any other: it must fit
+            # ACK_IDENTITY_RE (`<class>[:<64 hex>]`, ONE optional digest
+            # segment), or the operator could copy it out of the acceptance and
+            # have the whole ack value rejected as malformed. Hence the dashed
+            # class token instead of a second colon.
+            hidden_ids.append("hidden-object-overflow:" + identity_digest(folded))
+            hidden_note = "; %d folded into the overflow identity" % len(folded)
+        else:
+            hidden_ids = [
+                "hidden-object:" + identity_digest([identity]) for identity in hidden_identities]
+            hidden_note = ""
+        # The delta since the operator's acknowledged set (#223): the count of
+        # THIS class's identities that the ack does not carry. Only rendered
+        # when an ack is configured - a delta with no ack would be noise.
+        ack_note = ""
+        if config.ack_configured:
+            ack_note = " — %d new since ack" % sum(
+                1 for finding_id in hidden_ids if finding_id not in config.ack_identities)
         alerts.append(
             "hidden-object: %d hidden object(s) (delete marker) — hiding detected "
             "(the pipeline never deletes; an account-admin delete-capable key hid object(s)) "
-            "[%s; keys: %s]" % (len(hidden_objects), " ".join(hidden_counts), hidden_keys)
+            "[%s; keys: %s%s]%s" % (
+                len(hidden_objects), " ".join(hidden_counts), hidden_keys, hidden_note, ack_note)
         )
-        finding_ids.append(
-            "hidden-object:"
-            + identity_digest(
-                "%s\0%s" % (marker["key"], marker["version_id"]) for marker in hidden_objects
-            )
-        )
+        finding_ids.extend(hidden_ids)
 
     heartbeat_times = []
     unrecognized = []
@@ -5483,6 +5575,11 @@ def run_checks(config, now, plan):
         "audit_objects": audit_objects if view_dirty else None,
         "recording_objects": recording_objects if view_dirty else None,
         "hidden": hidden_objects,
+        # The stable finding identities of THIS run, for the ack rule in
+        # should_notify() and (truncated to the ack cap) the run-once
+        # acceptance print. Never truncated for the RULE: an identity dropped
+        # here could not be seen as unacked, which would be a hiding path.
+        "finding_ids": finding_ids,
     }
     if alerts:
         return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
@@ -5677,7 +5774,8 @@ def notify(config, state, detail):
 
 def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
                   state_since_run=0, last_notify_run=0, signature="", last_signature="",
-                  quiet_signatures=frozenset(), quiet_renotify=86400):
+                  quiet_signatures=frozenset(), quiet_renotify=86400,
+                  finding_ids=(), ack_identities=frozenset(), ack_configured=False):
     """Notification bookkeeping.
 
     Non-green states push on transition and whenever the finding signature
@@ -5700,6 +5798,11 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     retries instead of waiting out a quiet window. The quiet pin applies to `alert` finding sets only: the
     fixed `error`/`ok` signatures are never quieted, so a new failure cause
     always keeps the default cadence.
+
+    The ACKNOWLEDGED IDENTITY SET (#223) takes precedence over the pin when
+    `ack_configured` is set: the quiet window then governs iff EVERY current
+    finding identity is acked, so a set-shape change (delete-marker churn) is
+    not news while an identity outside the set still pushes immediately.
 
     Green pushes on the non-green -> ok recovery; a recovery push that failed
     is retried while the current ok state began after the last successful
@@ -5740,8 +5843,29 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
     # the failed push keeps the change trigger armed and the next run retries
     # it (the pre-#213 behaviour), while a real flip between declared shapes
     # still lands on the quiet window.
-    quiet = (bool(quiet_signatures) and state == "alert"
-             and signature in quiet_signatures and last_signature in quiet_signatures)
+    # The acknowledged identity set (#223) takes precedence when it is
+    # configured: the operator declared the exact identities they have seen, so
+    # the quiet window governs iff EVERY current finding identity is in the set
+    # (`set(finding_ids) <= ack_identities`).
+    #
+    # One rule covers the whole churn matrix:
+    #   - a NEW identity -> not a subset -> the change trigger below fires and
+    #     it pushes immediately (and again on the next run if that push fails,
+    #     because last_notify_signature only advances on a LANDED push);
+    #   - a pure SHRINK (markers expired, nothing new) -> still a subset -> no
+    #     change push, the normal quiet window applies;
+    #   - churn among acked identities -> still a subset -> quiet.
+    # No `last_notify_ids` state is needed, and none is added: the ack is a
+    # property of the CURRENT set only. A value that is configured but
+    # malformed parses to an empty set, which is a subset match for nothing - a
+    # broken ack errs toward notifying, never toward silence. The ack never
+    # applies to `error`/`ok`, so a new failure cause always keeps the default
+    # cadence.
+    if ack_configured:
+        quiet = state == "alert" and set(finding_ids) <= ack_identities
+    else:
+        quiet = (bool(quiet_signatures) and state == "alert"
+                 and signature in quiet_signatures and last_signature in quiet_signatures)
     if signature and signature != last_signature and not quiet:
         # The finding set itself changed: push regardless of the window.
         return True
@@ -6169,6 +6293,15 @@ def main():
     renotify = config.renotify if config is not None else 1800
     quiet_renotify = config.quiet_renotify if config is not None else 86400
     quiet_signatures = config.quiet_signatures if config is not None else frozenset()
+    ack_identities = config.ack_identities if config is not None else frozenset()
+    ack_configured = bool(config is not None and config.ack_configured)
+    # The current run's stable finding identities (a payload that could not run
+    # the checks has none), for the ack rule below. A non-list value is treated
+    # as empty: an ack must never be satisfied by a corrupted payload.
+    finding_ids = payload.get("finding_ids") if isinstance(payload, dict) else None
+    if not isinstance(finding_ids, list):
+        finding_ids = []
+    finding_ids = [entry for entry in finding_ids if isinstance(entry, str)]
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
     last_notify_signature = previous.get("last_notify_signature")
@@ -6191,7 +6324,8 @@ def main():
         state_since_epoch = now_epoch
     if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify,
                      state_since_run, last_notify_run, signature, last_notify_signature,
-                     quiet_signatures, quiet_renotify):
+                     quiet_signatures, quiet_renotify,
+                     finding_ids, ack_identities, ack_configured):
         if config is not None and notify(config, state, detail):
             last_notify_epoch = now_epoch
             last_notify_run = run_seq
@@ -6227,6 +6361,18 @@ def main():
     }
     if observed_out is not None:
         record["observed"] = observed_out
+    # The identities the operator can actually DECLARE: the run-once acceptance
+    # prints this list in the copy-pasteable form the ack variable takes
+    # (#223). Only ack-expressible ids are recorded - a session/interval
+    # identity can never be acked and carries a raw session id, which the
+    # public run log must not print. A per-run disclosure of a non-secret
+    # digest set: never ack state, never notification bookkeeping (nothing
+    # reads it back into a rule), and capped at ACK_IDENTITY_MAX entries (the
+    # hidden identities are emitted first, so the whole hidden set always fits
+    # one ack).
+    ackable_ids = [entry for entry in finding_ids if ACK_IDENTITY_RE.match(entry)]
+    if ackable_ids:
+        record["finding_ids"] = ackable_ids[:ACK_IDENTITY_MAX]
     if state_bad_reason or observed_reason:
         # Explicit repair evidence: an unreadable/invalid record (or an
         # invalid observed block) has no trustworthy view, so the observed
@@ -6352,6 +6498,7 @@ recording_witness_install() { # render + install the component (idempotent)
     if [ -n "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_RENOTIFY_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS=%q\n' "$RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_QUIET_SIGNATURE:-}" ]; then printf 'RECORDING_WITNESS_QUIET_SIGNATURE=%q\n' "$RECORDING_WITNESS_QUIET_SIGNATURE"; fi
+    if [ -n "${RECORDING_WITNESS_ACK_IDENTITIES:-}" ]; then printf 'RECORDING_WITNESS_ACK_IDENTITIES=%q\n' "$RECORDING_WITNESS_ACK_IDENTITIES"; fi
     if [ -n "${RECORDING_WITNESS_COLD_START_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_COLD_START_SECONDS=%q\n' "$RECORDING_WITNESS_COLD_START_SECONDS"; fi
     if [ -n "${RECORDING_WITNESS_SWEEP_SECONDS:-}" ]; then printf 'RECORDING_WITNESS_SWEEP_SECONDS=%q\n' "$RECORDING_WITNESS_SWEEP_SECONDS"; fi
     if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
@@ -6465,7 +6612,7 @@ recording_witness_accept() { # timer-stopped synchronous acceptance (one run, al
 }
 
 recording_witness_run_once() { # run one check now and surface the verdict
-  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced signature
+  local rc=0 state exec_status detail updated_at before_run_seq run_seq before_invocation after_invocation repaired state_invocation state_advanced signature ack_identities
   # Issue #143: on a long-up box the timer's OnBootSec=2min has already
   # elapsed, so the timer fires the service as soon as it is enabled (fresh
   # install) and a reinstall can find a timer-triggered invocation already
@@ -6567,6 +6714,17 @@ recording_witness_run_once() { # run one check now and surface the verdict
     # operator copies it into the RECORDING_WITNESS_QUIET_SIGNATURE variable
     # to keep the daily quiet re-notify while this exact finding set persists.
     log "witness finding signature: ${signature}"
+  fi
+  ack_identities="$(jq -r '(.finding_ids // []) | join(",")' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  if [ -n "${ack_identities}" ]; then
+    # Safe to log: stable finding identities - fixed class ids and sha256
+    # digests over key+version / drift / interval sets, never a raw key or a
+    # session id (issue #223). The operator copies this line into the
+    # RECORDING_WITNESS_ACK_IDENTITIES variable, which pages on a NEW identity
+    # instead of on a set-shape change. Bounded: the witness caps the list at
+    # 256 entries (hidden identities first), and the cut below only guards a
+    # hand-edited record from producing an absurd log line.
+    log "witness ack identities: $(printf '%s' "${ack_identities}" | cut -c1-32768)"
   fi
   coverage_mode="$(jq -r '.observed.coverage.mode // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   if [ -n "${coverage_mode}" ]; then
