@@ -3809,6 +3809,18 @@ ACK_OVERFLOW_CLASS = "ack-overflow"
 # still covers the full finding id, so the identity stays one-to-one whatever
 # the class token is.
 ACK_FALLBACK_CLASS = "finding"
+# Class-only findings have no per-instance discriminator: they describe a
+# CONDITION, so their finding id is the class alone and their ack id is
+# sha256(<class>) - a fixed, public constant. Declaring it therefore
+# acknowledges every FUTURE occurrence of that class until it is removed from
+# the variable, exactly like the bare class ids the old grammar accepted: the
+# digest requirement removed the trap of an INERT bare id, not this one. The
+# witness cannot see into a sha256, so it compares the declared set against the
+# ack ids of these known class-only findings and warns, naming the CLASSES and
+# never a digest. Any class-only finding a future check emits must be added
+# here (the harness pins this tuple against the class-only finding ids the
+# checks actually append).
+ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale")
 # Per-run budget for the hidden-object identities. One id per delete-marker
 # identity is what makes the ack work on marker CHURN (a new marker is a new
 # id); a pathological marker set folds into ONE overflow id computed over the
@@ -3870,6 +3882,12 @@ def _ack_sort_key(ack_id):
     return (0 if hidden else 1, ack_id)
 
 
+def ack_identity_list(finding_ids):
+    """Every ack id of the run, sorted, UNBOUNDED (no cap, no fold)."""
+    return sorted((ack_identity(finding_id) for finding_id in finding_ids),
+                  key=_ack_sort_key)
+
+
 def ack_identity_set(finding_ids):
     """The run's ack identities, bounded: (ack_ids, folded_count).
 
@@ -3881,13 +3899,36 @@ def ack_identity_set(finding_ids):
     rule and the printed list consume this same list, so no finding can be
     counted by one and missing from the other.
     """
-    ack_ids = sorted((ack_identity(finding_id) for finding_id in finding_ids),
-                     key=_ack_sort_key)
+    ack_ids = ack_identity_list(finding_ids)
     if len(ack_ids) <= ACK_IDENTITY_MAX:
         return ack_ids, 0
     folded = ack_ids[ACK_IDENTITY_MAX - 1:]
     overflow = "%s:%s" % (ACK_OVERFLOW_CLASS, identity_digest(folded))
     return ack_ids[: ACK_IDENTITY_MAX - 1] + [overflow], len(folded)
+
+
+def ack_missing(finding_ids, ack_identities, classes):
+    """How many of `classes`' identities the ack set does not cover.
+
+    Fold-aware, in the SAME space as the quieting rule: an identity is covered
+    when the ack set literally carries its ack id, or when it was folded into
+    the run's single `ack-overflow` id and the ack set carries THAT id (one ack
+    entry stands for the whole fold, which is how the rule treats it). A count
+    that ignored the fold would print "1 id not in ack" on a run the rule had
+    already quieted - and that number is the operator's only signal that the
+    ack took. `classes` are finding-id class tokens (`hidden-object`, ...).
+    """
+    ack_ids = ack_identity_list(finding_ids)
+    folded_ids = ack_ids[ACK_IDENTITY_MAX - 1:] if len(ack_ids) > ACK_IDENTITY_MAX else []
+    covered = set(entry for entry in ack_ids if entry in ack_identities)
+    if folded_ids:
+        overflow = "%s:%s" % (ACK_OVERFLOW_CLASS, identity_digest(folded_ids))
+        if overflow in ack_identities:
+            covered.update(folded_ids)
+    return sum(
+        1 for finding_id in finding_ids
+        if finding_id.split(":", 1)[0] in classes
+        and ack_identity(finding_id) not in covered)
 
 
 def canonical_conflict_type(event_type):
@@ -4122,10 +4163,22 @@ class Config(object):
             # off, the default cadence applies, the verdict still lands.
             log("WARNING: acknowledged identity set is malformed (%s); acking disabled" % ack_error)
             self.ack_identities = frozenset()
-        # No bare-class permarience warning exists any more: a bare class is
-        # MALFORMED now (every real ack id is `<class>:<sha256>`), so it lands
-        # in the branch above and disables acking instead of silently acking
-        # every future occurrence of that class.
+        else:
+            # A bare class id is MALFORMED now (every real ack id is
+            # `<class>:<sha256>`), so it never gets here; but the CLASS-ONLY
+            # findings' ack ids are public constants, so declaring one is a
+            # permanence choice: it acknowledges every future occurrence of
+            # that class until the entry is removed. Say so once per run,
+            # naming the classes, never the digests.
+            permanent = [
+                name for name in ACK_CLASS_ONLY if ack_identity(name) in self.ack_identities]
+            if permanent:
+                log(
+                    "WARNING: the acknowledged identity set carries the class-only finding id(s)"
+                    " (%s): a class-only id acknowledges EVERY future occurrence of that class"
+                    " until it is removed from RECORDING_WITNESS_ACK_IDENTITIES"
+                    % clip(", ".join(permanent), 200)
+                )
         if self.ack_configured and self.quiet_signatures:
             log("WARNING: both the acknowledged identity set and the quiet signature are set; the acknowledged identity set takes precedence")
         self.ntfy_topic = env("NTFY_TOPIC")
@@ -5322,29 +5375,21 @@ def run_checks(config, now, plan):
                 "hidden-object:" + identity_digest([identity]) for identity in hidden_identities]
             hidden_note = ""
         # The delta since the operator's acknowledged set (#223): the count of
-        # THIS class's identities that the ack does not carry. Only rendered
-        # when an ack is configured - a delta with no ack would be noise.
-        # Gated on the PARSED set, not on `ack_configured`: a value that is set
-        # but malformed disables acking, and a delta rendered there would claim
-        # an ack is in force while every run pushes. The wording names the
-        # class on purpose - another class's unacked identity can still make
-        # this run push, so "0 new since ack" would read as "nothing to see".
-        # Above the identity budget a REMOVAL moves the overflow digest and is
-        # counted here too (that is the documented cap caveat).
-        #
-        # Compared in ACK SPACE (`ack_identity()`), not against the raw finding
-        # ids: the ack variable carries ack ids only, so this is the same
-        # comparison the quiet rule makes.
-        ack_note = ""
-        if config.ack_identities:
-            ack_note = " — %d hidden-object id(s) not in ack" % sum(
-                1 for finding_id in hidden_ids
-                if ack_identity(finding_id) not in config.ack_identities)
+        # THIS class's identities the ack does not COVER - rendered after the
+        # whole finding set is known (see the `ack_covered()` use below),
+        # because coverage is fold-aware and the fold is over the run's ack
+        # ids, not this class's. Only rendered when an ack is parsed: a delta
+        # with no ack would be noise, and a delta rendered for a
+        # configured-but-malformed ack would claim an ack is in force while
+        # every run pushes. The wording names the class on purpose - another
+        # class's unacked identity can still make this run push, so "0 new
+        # since ack" would read as "nothing to see".
+        hidden_alert_index = len(alerts)
         alerts.append(
             "hidden-object: %d hidden object(s) (delete marker) — hiding detected "
             "(the pipeline never deletes; an account-admin delete-capable key hid object(s)) "
-            "[%s; keys: %s%s]%s" % (
-                len(hidden_objects), " ".join(hidden_counts), hidden_keys, hidden_note, ack_note)
+            "[%s; keys: %s%s]" % (
+                len(hidden_objects), " ".join(hidden_counts), hidden_keys, hidden_note)
         )
         finding_ids.extend(hidden_ids)
 
@@ -5698,6 +5743,26 @@ def run_checks(config, now, plan):
         boundaries_out = _sample_boundaries(audit_objects, config.list_workers)
     else:
         boundaries_out = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
+    # ACK SPACE (#223), computed ONCE for the whole run: every finding id -
+    # hidden-object, drift, session, interval, class-only - maps to
+    # `<class>:<sha256(full finding id)>`, bounded to ACK_IDENTITY_MAX with the
+    # tail folded into one `ack-overflow:<sha256>` id. This one list is what
+    # should_notify() compares against the operator's ack AND what the run-once
+    # acceptance prints, so the declared set and the rule's input are the same
+    # space over the same total input; a finding can never be counted by one
+    # and dropped from the other, and no raw key or session id leaves the
+    # process (only a class token and a digest).
+    ack_ids, ack_folded = ack_identity_set(finding_ids)
+    if hidden_objects and config.ack_identities:
+        # The ack delta, in the SAME fold-aware space as the rule (see
+        # ack_missing()): an identity inside the folded tail counts as acked
+        # when the ack carries the run's `ack-overflow` id, exactly as the rule
+        # treats it - otherwise the body would say "1 id not in ack" on a run
+        # the rule had already quieted, and that count is the operator's only
+        # signal that the ack took.
+        missing = ack_missing(
+            finding_ids, config.ack_identities, ("hidden-object", "hidden-object-overflow"))
+        alerts[hidden_alert_index] += " — %d hidden-object id(s) not in ack" % missing
     payload = {
         "mode": run_mode,
         "window_start": window_text,
@@ -5707,11 +5772,12 @@ def run_checks(config, now, plan):
         "audit_objects": audit_objects if view_dirty else None,
         "recording_objects": recording_objects if view_dirty else None,
         "hidden": hidden_objects,
-        # The stable finding identities of THIS run, for the ack rule in
-        # should_notify() and (truncated to the ack cap) the run-once
-        # acceptance print. Never truncated for the RULE: an identity dropped
-        # here could not be seen as unacked, which would be a hiding path.
-        "finding_ids": finding_ids,
+        # The run's ACK identities (never the raw finding ids: those carry
+        # session ids and key names). The rule consumes exactly this list and
+        # the record stores it for the acceptance print, so there is one
+        # source. `ack_folded` only feeds the acceptance's truncation line.
+        "ack_ids": ack_ids,
+        "ack_folded": ack_folded,
     }
     if alerts:
         return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
@@ -6444,24 +6510,27 @@ def main():
     quiet_signatures = config.quiet_signatures if config is not None else frozenset()
     ack_identities = config.ack_identities if config is not None else frozenset()
     ack_configured = bool(config is not None and config.ack_configured)
-    # The current run's stable finding identities (a payload that could not run
-    # the checks has none), for the ack rule below. A non-list value is treated
-    # as empty: an ack must never be satisfied by a corrupted payload.
-    finding_ids = payload.get("finding_ids") if isinstance(payload, dict) else None
-    if not isinstance(finding_ids, list):
-        finding_ids = []
-    finding_ids = [entry for entry in finding_ids if isinstance(entry, str)]
-    # ACK SPACE (#223): every finding id - hidden-object, drift, session,
-    # interval, class-only - is mapped to `<class>:<sha256(full id)>` once, and
-    # that ONE bounded list is both the rule's input and the value the run-once
-    # acceptance prints. Both sides of `set(ack_ids) <= ack_identities` are then
-    # the same space, so no finding can be counted by the rule while being
-    # dropped from the print (that mismatch is what made the live ack inert),
-    # and no raw key or session id ever leaves the process. Above the cap the
-    # tail folds into one `ack-overflow:<sha256>` id, so the printed value still
-    # covers the whole run: a finding added INSIDE the fold moves that id and
-    # pushes. `ack_folded` only feeds the acceptance's disclosure.
-    ack_ids, ack_folded = ack_identity_set(finding_ids)
+    # The run's ACK identities (#223) - the same list run_checks() computed for
+    # the acceptance print, never the raw finding ids (those carry session ids
+    # and key names). Both sides of `set(ack_ids) <= ack_identities` are then
+    # one space over one total input, so no finding can be counted by the rule
+    # while being dropped from the print (that mismatch is what made the live
+    # ack inert). A payload that could not run the checks has none, and a
+    # corrupted one is treated as EMPTY: every entry must be a well-formed ack
+    # id (the same grammar the Config parser enforces) and the list must fit
+    # the ack cap, otherwise the rule sees nothing and no ack can quiet it -
+    # err toward notifying, never toward silence.
+    ack_ids = payload.get("ack_ids") if isinstance(payload, dict) else None
+    if (not isinstance(ack_ids, list) or len(ack_ids) > ACK_IDENTITY_MAX
+            or not all(isinstance(entry, str) and ACK_IDENTITY_RE.match(entry)
+                       for entry in ack_ids)):
+        ack_ids = []
+    ack_folded = payload.get("ack_folded") if isinstance(payload, dict) else None
+    if (isinstance(ack_folded, bool) or not isinstance(ack_folded, int)
+            or ack_folded < 0 or ack_folded >= max(len(ack_ids), 1)):
+        # Disclosure only (the acceptance's truncation line): an impossible
+        # count on a readable list is treated as "not folded".
+        ack_folded = 0
     last_notify_epoch = numerics["last_notify_epoch"]
     last_notify_run = numerics["last_notify_run"]
     last_notify_signature = previous.get("last_notify_signature")

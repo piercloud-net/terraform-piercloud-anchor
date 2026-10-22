@@ -238,7 +238,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1047
+MIN_CHECKS=1049
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -3820,6 +3820,26 @@ import json, sys
 record = json.load(open(sys.argv[1]))
 print(len(record.get("ack_identities") or []))
 ' "${WORK}/overflow-state/state.json")"
+# THE FOLD-AWARE DELTA (functional lens F1): the operator pastes the printed
+# value - which ends in the run's `ack-overflow` id - and re-runs. The finding
+# set is unchanged, so the rule is fully acked and the body MUST say 0: an
+# identity inside the folded tail is covered by the one overflow entry. A count
+# that ignored the fold would print "1 id not in ack" on a run it had already
+# quieted, and that count is the operator's only signal that the ack took.
+printed_ack="$(python3 -c '
+import json, sys
+record = json.load(open(sys.argv[1]))
+print(",".join(record.get("ack_identities") or []))
+' "${WORK}/overflow-state/state.json")"
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_ACK_IDENTITIES=${printed_ack}"
+start_mock
+run_case "${WORK}/overflow-state"
+case "${CASE_DETAIL}" in
+  *"— 0 hidden-object id(s) not in ack"*)
+    ok "acking the folded set renders 0 not in ack (the ack demonstrably took)" ;;
+  *) bad "a fully acked folded set must render '0 hidden-object id(s) not in ack': ${CASE_DETAIL}" ;;
+esac
+is "the re-acked run still folds its tail (same disclosure)" "2" "$(state_field ack_identities_folded)"
 if [ "${printed_count}" = "256" ] && [ "${folded_count}" = "2" ] \
    && python3 -c '
 import json, sys
@@ -9637,12 +9657,35 @@ if not folded_ids[-1].startswith(module.ACK_OVERFLOW_CLASS + ":") or not module.
     raise SystemExit("the fold must be one parseable ack-overflow id: %r" % (folded_ids[-1],))
 if sum(1 for entry in folded_ids if entry.startswith("hidden-object:")) != module.ACK_IDENTITY_MAX - 1:
     raise SystemExit("the hidden-object identities must lead and stay out of the fold")
-# An addition INSIDE the fold moves only the overflow id (no hiding path).
+# An addition that sorts INSIDE the folded tail moves ONLY the overflow id: the
+# individually printed ids must stay byte-identical, or the fold would be a
+# hiding path for the leaked individual list (trust lens T3: the old tooth
+# compared only the overflow entry, and a random extra id re-partitions the
+# boundary instead of joining the fold).
+boundary = folded_ids[-2]  # the largest id still printed individually
+
+
+def _above_boundary_hidden():
+    for index in range(1, 10 ** 6):
+        candidate = "hidden-object:" + "%064x" % index
+        if module.ack_identity(candidate) > boundary:
+            return candidate
+    raise SystemExit("no hidden finding id sorts above the fold boundary")
+
+
+added_fid = _above_boundary_hidden()
 added_ids, added_count = module.ack_identity_set(
-    many_fids + ["hidden-object:" + "%064x" % (index + 10 ** 6) for index in range(1)] + ["contract-mismatch:" + "e" * 64])
-if ([entry for entry in added_ids if entry.startswith(module.ACK_OVERFLOW_CLASS)]
+    many_fids + [added_fid] + ["contract-mismatch:" + "e" * 64])
+if (added_count != folded_count + 1
+        or [entry for entry in added_ids if entry.startswith(module.ACK_OVERFLOW_CLASS)]
         == [entry for entry in folded_ids if entry.startswith(module.ACK_OVERFLOW_CLASS)]):
     raise SystemExit("a finding added inside the fold must move the overflow id")
+kept_before = [entry for entry in folded_ids
+               if not entry.startswith(module.ACK_OVERFLOW_CLASS)]
+kept_after = [entry for entry in added_ids
+              if not entry.startswith(module.ACK_OVERFLOW_CLASS)]
+if kept_before != kept_after:
+    raise SystemExit("an addition inside the fold must leave the individual ids untouched")
 # at/under the cap there is no fold at all, so a pure shrink is quiet.
 cap_ids, cap_folded = module.ack_identity_set(many_fids)
 if cap_folded or len(cap_ids) != module.ACK_IDENTITY_MAX:
@@ -9787,6 +9830,19 @@ for label, actual, expected in [
     ("an acked set still pushes the non-green transition",
      module.should_notify("ok", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
                           frozenset(), 86400, [ACK_HS], {ACK_HS}, True), True),
+    # Red-team R2, PINNED AS A DELIBERATE TRADE (not a silent regression): an
+    # acked set whose transition push FAILED is retried at the quiet window, not
+    # on the next run - unlike the pin, which also pins the last-notified shape.
+    # Nothing new is hidden by that: a set with ANY unacked identity is not a
+    # subset, so it pushes immediately whatever the window says (the next tooth
+    # up), and a fully acked set is by definition one the operator has already
+    # declared seen. Documented in docs/recording-witness.md.
+    ("a failed push of a fully acked set waits for the quiet window (disclosed)",
+     module.should_notify("alert", now - 300, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, [ACK_HS], {ACK_HS}, True), False),
+    ("that waited acked set still renotifies at the quiet window",
+     module.should_notify("alert", now - 86400, "alert", now, 1800, 0, 0, SIG_B, SIG_A,
+                          frozenset(), 86400, [ACK_HS], {ACK_HS}, True), True),
     ("with no ack configured the pin is unchanged",
      module.should_notify("alert", now - 100, "alert", now, 1800, 0, 0, SIG_A, SIG_A,
                           {SIG_A}, 86400, [ACK_HS], frozenset(), False), False),
@@ -9896,6 +9952,27 @@ if ids != frozenset({HID_A}) or warned:
     raise SystemExit("a duplicated ack entry must dedupe, not fail: %r %r" % (ids, warned))
 if module.ACK_IDENTITY_MAX != module.HIDDEN_FINDING_MAX:
     raise SystemExit("the ack cap and the per-run hidden identity budget must agree")
+# Class-only findings have no per-instance discriminator: their ack id is
+# sha256(<class>), a public constant, so declaring one acknowledges every FUTURE
+# occurrence of that class. The witness must say so once per run - naming the
+# classes, never a digest (red-team R1: the hashed world made the trap LOOK
+# instance-specific).
+CLASS_ONLY_ACK = module.ack_identity("heartbeat-stale")
+ids, configured, warned = _ack(CLASS_ONLY_ACK)
+if ids != frozenset({CLASS_ONLY_ACK}) or not configured or warned:
+    raise SystemExit("a class-only ack id must still parse: %r %r %r" % (ids, configured, warned))
+if not any("class-only finding id(s)" in entry and "heartbeat-stale" in entry for entry in config_logs):
+    raise SystemExit("acking a class-only finding id must warn that it covers every future occurrence")
+if any(CLASS_ONLY_ACK in entry for entry in config_logs):
+    raise SystemExit("the class-only permanence warning must not echo the digest")
+ids, configured, warned = _ack(module.ack_identity("hidden-object:" + "a" * 64))
+if any("class-only finding id(s)" in entry for entry in config_logs):
+    raise SystemExit("a per-instance ack id must not carry the class-only warning")
+# Every class-only finding id the checks emit must be covered by that warning,
+# or a new one would be acknowledged permanently in silence.
+for class_only in ("cold-start", "heartbeat-missing", "heartbeat-stale"):
+    if class_only not in module.ACK_CLASS_ONLY:
+        raise SystemExit("a class-only finding class is missing from ACK_CLASS_ONLY: %r" % class_only)
 # No ack configured at all: empty set, precedence switch OFF (the quiet pin
 # still governs) - that is the "keep the pin working unchanged" property.
 ids, configured, warned = _ack("")
@@ -10202,25 +10279,39 @@ module._NTFY_OPENER = FakeOpener(flaky_urlopen)
 captured[:] = []
 verdict = ["alert"]
 sig = ["sha256:" + "1" * 64]
-# The run's stable finding identities (issue #223): the ack rule reads them out
-# of the payload, exactly as the real run_checks() publishes them.
+# The run's finding identities (issue #223). run_checks() maps them into ACK
+# SPACE and the rule reads THAT list out of the payload, so this stub maps the
+# raw ids with the shipped helper - exactly what the real run_checks() does.
 fids = []
-module.run_checks = lambda config, now, plan: (
-    verdict[0], "detail", sig[0],
-    {
-        # A synthetic exact sweep payload: main()'s state/view bookkeeping
-        # stays valid across the repeated main() calls this block drives.
-        "mode": "sweep",
-        "window_start": None,
-        "dirty": True,
-        "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
-        "boundaries": [],
-        "audit_objects": {},
-        "recording_objects": {},
-        "hidden": [],
-        "finding_ids": list(fids),
-    },
-)
+# A payload override, so a corrupted/foreign ack list can be injected.
+ack_override = []
+
+
+def _fake_run_checks(config, now, plan):
+    if ack_override:
+        ack_ids, ack_folded = list(ack_override[0]), 0
+    else:
+        ack_ids, ack_folded = module.ack_identity_set(list(fids))
+    return (
+        verdict[0], "detail", sig[0],
+        {
+            # A synthetic exact sweep payload: main()'s state/view bookkeeping
+            # stays valid across the repeated main() calls this block drives.
+            "mode": "sweep",
+            "window_start": None,
+            "dirty": True,
+            "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
+            "boundaries": [],
+            "audit_objects": {},
+            "recording_objects": {},
+            "hidden": [],
+            "ack_ids": ack_ids,
+            "ack_folded": ack_folded,
+        },
+    )
+
+
+module.run_checks = _fake_run_checks
 
 # First-ever green baseline (round-4 LOW 1): two consecutive green runs must
 # not push, and the first-ever run must not arm the recovery retry. Then a
@@ -10571,10 +10662,38 @@ if len(captured) != 6:
     raise SystemExit("a malformed ack must keep the default cadence, got %d" % len(captured))
 if json.load(open(os.path.join(ack_dir, "state.json"))).get("state") != "alert":
     raise SystemExit("a malformed ack must not take the witness down")
+# A corrupted/hostile PAYLOAD ack list never quiets either: every entry must be
+# a well-formed ack id. A raw finding id (with its session id), a bare class id
+# or an over-cap list makes main() treat the list as EMPTY (err toward
+# notifying), so the ack rule cannot be satisfied by a bad payload while the
+# record/acceptance never prints one either.
+os.environ["RECORDING_WITNESS_ACK_IDENTITIES"] = ACK_A + "," + ACK_B
+for index, (label, bad_list) in enumerate([
+    ("a raw session finding id", [ACK_A, SESSION_FID_LIVE]),
+    ("a bare class id", [ACK_A, "heartbeat-stale"]),
+    ("a non-string entry", [ACK_A, 7]),
+    ("a non-list", ACK_A),
+    ("an over-cap list", [ACK_A] * (module.ACK_IDENTITY_MAX + 1)),
+]):
+    ack_override[:] = [bad_list]
+    fids[:] = [AID_A, AID_B]
+    # A distinct signature each round so the change trigger alone proves the
+    # run pushed (no quiet) whatever the window says.
+    sig[:] = ["sha256:" + ("%064x" % (900 + index))]
+    ack_state_path = os.path.join(ack_dir, "state.json")
+    ack_state = json.load(open(ack_state_path))
+    ack_state["last_notify_epoch"] = now_epoch - 100
+    json.dump(ack_state, open(ack_state_path, "w"))
+    captured[:] = []
+    ack_codes.append(module.main())
+    if len(captured) != 1:
+        raise SystemExit("a corrupted payload ack list (%s) must not quiet, got %d pushes"
+                         % (label, len(captured)))
+ack_override[:] = []
 os.environ.pop("RECORDING_WITNESS_ACK_IDENTITIES", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_SIGNATURE", None)
 os.environ.pop("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", None)
-if ack_codes != [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]:
+if ack_codes != [1] * 15:
     raise SystemExit("ack exit codes wrong: %r" % ack_codes)
 
 # Round-5 R1: a corrupted numeric field in a type-valid state.json used to
