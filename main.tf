@@ -167,12 +167,15 @@ locals {
   # Policy key: the canonical hostname (operator-readable, public). The
   # server id deliberately left the name (issue #121): it is the alias →
   # netcup-account join key and policy names land in public logs/summaries.
-  # 020's sweep-post (apply mode) retires, in the same run, any unattached
-  # piercloud-anchor- policy whose name ENDS with -<hostname> or with the
-  # pre-change -<server_id> (one-time migration) — a suffix match, so a
-  # longer hostname sharing the suffix also matches (tracked separately).
-  # The attached
-  # live policy is never touched (D3, issues #101/#121).
+  # 020's sweep-post (apply mode) retires, in the same run, an unattached
+  # piercloud-anchor- policy ONLY when its name equals one of this server's
+  # two exact names: piercloud-anchor-<hostname> (below) or the pre-change
+  # piercloud-anchor-<hostname>-<server_id> (one-time migration). Exact
+  # equality, never a suffix (issue #200): a policy name is account-wide
+  # while the sweep's attachment check reads only this server's interface,
+  # so a suffix-sharing name from a sibling server would read as an orphan
+  # and be deleted. The attached live policy is never touched (D3, issues
+  # #101/#121).
   policy_name = "piercloud-anchor-${var.hostname}"
 
   # Cloudflare edge ranges (public constants — same class as the Keycloak

@@ -506,13 +506,22 @@ api_ok() { # $1 = status; 2xx (+404-as-gone when $2=gone-ok)
 policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
 
 list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
-  # Family scope (issue #121): the piercloud-anchor- prefix AND either the
-  # new hostname anchor (endswith -<hostname>) or the pre-change id anchor
-  # (endswith -<server id>, migration only). This is a SUFFIX match: a name
-  # under another (e.g. previous or longer) hostname that ends with
-  # -<hostname> also matches and, if unattached here, is swept in apply mode
-  # (tracked as its own issue). The attached-policy compare in
-  # cmd_sweep_post still protects the live policy.
+  # Family scope (issues #121, #200): EXACTLY two names, nothing else —
+  #   ${STEADY_PREFIX}${ANCHOR_HOSTNAME}               the new shape (the
+  #                                                   module's policy_name)
+  #   ${STEADY_PREFIX}${ANCHOR_HOSTNAME}-${SERVER_ID} the pre-#121 migration
+  #                                                   shape, this server's id
+  # Both are this server's own names. Policies are ACCOUNT-wide
+  # (/users/<id>/firewall-policies) while cmd_sweep_post's attachment check
+  # reads only THIS server's interface, so any name this filter returns but
+  # the interface does not carry reads as unattached and is detached+deleted
+  # in apply mode. A suffix match (the pre-#200 rule: startswith the prefix
+  # and endswith -<hostname> or -<server id>) therefore retired a SIBLING
+  # server's LIVE policy whenever that hostname ended with this one's —
+  # e.g. a policy for eu-a.pcad.it is matched by the -a.pcad.it suffix — and
+  # an apply run cut that server's firewall. Exact equality is the whole
+  # scope: no prefix wildcard, no suffix arm, and the migration arm carries
+  # THIS server's id, so another server's legacy name matches neither arm.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -525,9 +534,10 @@ list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-s
      elif has("firewallPolicy") then [.firewallPolicy]
      else [] end
      | map(select((.name // "") as $n
-           | ($n | startswith($p)) and (($n | endswith($h)) or ($n | endswith($s))))
+           | ($n == $own) or ($n == $legacy))
            | {id: .id, name: .name, description: (.description // "")})' \
-    --arg p "$STEADY_PREFIX" --arg h "-${ANCHOR_HOSTNAME}" --arg s "-${SERVER_ID}"
+    --arg own "${STEADY_PREFIX}${ANCHOR_HOSTNAME}" \
+    --arg legacy "${STEADY_PREFIX}${ANCHOR_HOSTNAME}-${SERVER_ID}"
 }
 
 list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only)
@@ -1373,10 +1383,11 @@ cmd_sweep_post() {
     log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that holds a token and resolves SERVER_ID; report-only modes do not delete)"
     return 0
   fi
-  # The steady-state family is anchored on the canonical hostname; an empty
-  # ANCHOR_HOSTNAME would degrade the scope to the legacy id suffix only.
-  # Fail closed — but only AFTER the no-token no-op above, so a
-  # device-timeout run stays a clean no-op.
+  # The steady-state family is the two EXACT names built from the canonical
+  # hostname (list_steady_policies, issue #200); an empty ANCHOR_HOSTNAME
+  # would build names that match nothing and silently stop retiring this
+  # server's orphans. Fail closed — but only AFTER the no-token no-op above,
+  # so a device-timeout run stays a clean no-op.
   [ -n "${ANCHOR_HOSTNAME:-}" ] || die "post-sweep: ANCHOR_HOSTNAME is required to scope the steady-state policy family — refusing to sweep blind"
   local list entry name desc age pid failures=0 swept=0
   list="$(list_tmp_policies)"
