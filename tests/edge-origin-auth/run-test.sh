@@ -195,9 +195,8 @@ sed 's#^\tlog_skip$#\tlog_skip\n\t@dash {\n\t\thost citest.status.piercloud.net\
 has "${WORK}/Caddyfile.dash-regressed" "reverse_proxy 127.0.0.1:${GATUS_PORT}" "regressed fixture 1 carries a :80 dashboard handler"
 hasnt "${WORK}/Caddyfile.dash-regressed" '@status' "regressed fixture 1 avoids the @status spelling"
 hard_die "${WORK}/Caddyfile.dash-regressed" "proxies something other than tang" "self-check refuses a :80 dashboard handler under another matcher"
-# Fixture 2: the same handler with a QUOTED upstream (port spelled the same
-# way, so the tang-only leg's exact literal is bypassed; the Gatus-port count
-# leg is what must catch it).
+# Fixture 2: the same handler with a QUOTED upstream — the tang-only leg must
+# catch it regardless of quoting (an exact-literal match would not).
 sed 's#^\tlog_skip$#\tlog_skip\n\t@dash {\n\t\thost citest.status.piercloud.net\n\t}\n\thandle @dash {\n\t\treverse_proxy "127.0.0.1:'"${GATUS_PORT}"'"\n\t}#' \
   "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.quoted-regressed"
 hard_die "${WORK}/Caddyfile.quoted-regressed" "proxies something other than tang" "self-check refuses a quoted :80 dashboard upstream"
@@ -251,6 +250,46 @@ sed 's|^\tlog_skip$|\tlog_skip\n\t# retired: @status + trusted_proxies client_ip
   "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.prose-mention"
 has "${WORK}/Caddyfile.prose-mention" '# retired: @status + trusted_proxies client_ip_headers' "fixture 12 mentions the directives in a comment"
 hard_ok "${WORK}/Caddyfile.prose-mention" "self-check ignores a prose mention of the retired directives"
+# Fixture 13: the render REFORMATTED so the ACME handler's closing brace sits
+# at column 0 and the dashboard handler follows it — pins the brace-depth scan
+# (a prefix scan stops at that brace and never sees the handler).
+awk -v gatus="${GATUS_PORT}" '
+  BEGIN { depth0 = 0 }
+  /^:80 \{/ { in80 = 1 }
+  in80 && $0 == "\t}" && !done { print "}"; print "@dash {"; print "\thost citest.status.piercloud.net"; print "}"; print "handle @dash {"; print "\treverse_proxy 127.0.0.1:" gatus; print "}"; done = 1; next }
+  { print }
+' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.reformatted"
+is "regressed fixture 13 has a nested brace at column 0" "yes" "$(grep -qE '^}$' "${WORK}/Caddyfile.reformatted" && echo yes || echo no)"
+is "regressed fixture 13 carries two Gatus upstreams" "2" "$(grep -c -F ":${GATUS_PORT}" "${WORK}/Caddyfile.reformatted")"
+hard_die "${WORK}/Caddyfile.reformatted" "proxies something other than tang" "self-check scans past a column-0 nested brace"
+# Fixture 14: the dashboard upstream moved OUT of the https site into a second
+# host-specific http:// site (the Gatus port still occurs exactly once, so only
+# the "inside the https site" leg can catch it).
+sed 's|^\t\treverse_proxy 127.0.0.1:'"${GATUS_PORT}"'$|\t\t# backend moved|' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.upstream-outside"
+{ cat "${WORK}/Caddyfile.upstream-outside"; printf '\nhttp://citest.status.piercloud.net {\n\treverse_proxy 127.0.0.1:%s\n}\n' "${GATUS_PORT}"; } > "${WORK}/Caddyfile.upstream-outside.tmp"
+mv "${WORK}/Caddyfile.upstream-outside.tmp" "${WORK}/Caddyfile.upstream-outside"
+is "fixture 14 keeps exactly one Gatus upstream" "1" "$(grep -c -F ":${GATUS_PORT}" "${WORK}/Caddyfile.upstream-outside")"
+hard_die "${WORK}/Caddyfile.upstream-outside" "outside the https:// dashboard site" "self-check requires the dashboard upstream inside the https site"
+# Fixture 15: no https:// dashboard site at all — the placement legs cannot run,
+# so the check must refuse rather than pass vacuously.
+awk '/^https:\/\// { on = 1; n = gsub(/{/, "{"); m = gsub(/}/, "}"); depth += n - m; next } on { n = gsub(/{/, "{"); m = gsub(/}/, "}"); depth += n - m; if (depth <= 0) { on = 0 }; next } { print }' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.no-https-block"
+hasnt "${WORK}/Caddyfile.no-https-block" '^https://' "regressed fixture 15 has no https site block"
+hard_die "${WORK}/Caddyfile.no-https-block" "has no https:// dashboard site block" "self-check refuses a render with no https dashboard site"
+# Fixture 16: a NEW :80 handler serving files (no reverse_proxy at all) — the
+# handler allowlist is the leg that must catch it.
+sed 's#^\tlog_skip$#\tlog_skip\n\thandle /dash* {\n\t\troot * /srv/dashboard\n\t\tfile_server\n\t}#' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.static-dash"
+has "${WORK}/Caddyfile.static-dash" 'file_server' "regressed fixture 16 serves files on :80"
+is "regressed fixture 16 keeps exactly one Gatus upstream" "1" "$(grep -c -F ":${GATUS_PORT}" "${WORK}/Caddyfile.static-dash")"
+hard_die "${WORK}/Caddyfile.static-dash" "unexpected" "self-check refuses an extra :80 handler (static dashboard)"
+# Fixture 17: the HSTS delete spelled in lower case (header names are
+# case-insensitive in Caddy).
+awk '{ print } $0 ~ /^\theader Strict-Transport-Security "max-age=15552000"$/ { print "\theader -strict-transport-security" }' \
+  "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.hsts-deleted-lc"
+has "${WORK}/Caddyfile.hsts-deleted-lc" 'header -strict-transport-security' "regressed fixture 17 deletes HSTS in lower case"
+hard_die "${WORK}/Caddyfile.hsts-deleted-lc" "deletes Strict-Transport-Security again" "self-check refuses a lower-case HSTS delete"
 
 not_edge_line="$(grep -m1 '@not_edge_peer' "${WORK}/Caddyfile.443" || true)"
 case "${not_edge_line}" in

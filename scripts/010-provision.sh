@@ -258,6 +258,10 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
   # route back on the plain-HTTP front).
   bad_up="$(printf '%s\n' "$http_block" | grep -E '^[[:space:]]*(reverse_proxy|to)([[:space:]]|$)' | grep -v -F ":${TANG_PORT}" || true)"
   [ -z "$bad_up" ] || die "serving Caddyfile $cfg proxies something other than tang on ${CADDY_HTTP_ADDR:-:80} ($bad_up) — the :80 dashboard handler is back; refusing to finish blind"
+  # :80 handlers are a closed set (the ACME challenge, the two tang paths, the
+  # catch-all abort): a new matcher is another way to serve content there.
+  bad_handle="$(printf '%s\n' "$http_block" | sed -n 's/^[[:space:]]*\(handle\(_path\)\?[[:space:]][^{]*\)[[:space:]]*{[[:space:]]*$/\1/p' | sed 's/[[:space:]]*$//' | grep -Evx 'handle( /\.well-known/acme-challenge/\*| /adv\*| /rec\*)?' || true)"
+  [ -z "$bad_handle" ] || die "serving Caddyfile $cfg carries an unexpected ${CADDY_HTTP_ADDR:-:80} handler ($bad_handle) — only the ACME challenge, the tang paths and the catch-all abort may live there; refusing to finish blind"
   # The Gatus upstream must exist exactly once, inside the https:// site: a
   # second reference (any spelling that carries the port) routes the dashboard
   # somewhere else, and a missing one means the dashboard lost its backend.
@@ -270,7 +274,7 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
   # deleted again after it.
   printf '%s\n' "$https_block" | grep -Fxq "$(printf '\theader Strict-Transport-Security "max-age=15552000"')" \
     || die "serving Caddyfile $cfg lacks the :443 site-level HSTS header (max-age=15552000) — the origin-hardening render did not converge; refusing to finish blind"
-  if printf '%s\n' "$https_block" | grep -Eq 'header[[:space:]]+[-!]Strict-Transport-Security'; then
+  if printf '%s\n' "$https_block" | grep -Eqi 'header[[:space:]]+[-!]strict-transport-security'; then
     die "serving Caddyfile $cfg deletes Strict-Transport-Security again after setting it — the hardening render did not converge; refusing to finish blind"
   fi
   return 0
