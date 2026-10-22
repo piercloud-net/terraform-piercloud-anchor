@@ -238,7 +238,7 @@ render_caddyfile() { # print the Caddyfile to stdout
 # :80 matrix, which CI runs and a dispatch does not. Callers skip it under
 # CADDY_SKIP_HTTPS (the harness render has no :443 site); tests/edge-origin-auth
 # executes this function (extracted, never a copy) against a hardened render
-# and one regressed fixture per leg.
+# and a regressed fixture for every leg that could silently regress.
 assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving one)
   local cfg="${1:-${CADDY_CONFIG}}" live http_block https_block bad_up gatus_hits
   [ -r "$cfg" ] && [ -s "$cfg" ] || die "cannot read the rendered Caddyfile $cfg — the origin-hardening check cannot run; refusing to finish blind"

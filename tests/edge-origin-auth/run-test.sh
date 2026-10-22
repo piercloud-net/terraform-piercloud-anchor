@@ -155,11 +155,12 @@ hasnt "${WORK}/Caddyfile.443" '@status' "render has no @status matcher"
 # ---- hardening self-check (extracted, never a copy) -----------------------
 # The converge self-check that runs on the box is the thing standing between a
 # regressed render and a green apply. Execute it here against the hardened
-# render and one regressed fixture per leg, so a render/matcher drift reddens
-# CI instead of every live run. The check is a text tripwire, not a boundary
-# (tests/bind-e2e is the behavioural tooth); these fixtures keep every leg
-# load-bearing, and each asserts the die MESSAGE so a fixture cannot be
-# refused by the wrong leg.
+# render and a regressed fixture for every leg that could silently regress, so
+# a render/matcher drift reddens CI instead of every live run. The check is a
+# text tripwire, not a boundary (tests/bind-e2e is the behavioural tooth);
+# these fixtures keep every leg load-bearing, and each asserts the die MESSAGE
+# so a fixture cannot be refused by the wrong leg. (The readable-file guard is
+# asserted directly; the wiring pins are asserted textually below.)
 is "exactly one BEGIN HARDENING CHECK marker" "1" "$(grep -c 'BEGIN HARDENING CHECK' "${PROVISION_SH}")"
 is "exactly one END HARDENING CHECK marker" "1" "$(grep -c 'END HARDENING CHECK' "${PROVISION_SH}")"
 hc_b="$(grep -n -m1 'BEGIN HARDENING CHECK' "${PROVISION_SH}" | cut -d: -f1)"
@@ -189,6 +190,10 @@ is "the self-check default is the serving Caddyfile" "1" "$(grep -cF 'local cfg=
 has "${PROVISION_SH}" 'if [ -z "${CADDY_SKIP_HTTPS:-}" ]; then' "the self-check stays behind the CADDY_SKIP_HTTPS harness guard"
 
 hard_ok "${WORK}/Caddyfile.443" "self-check accepts the hardened render"
+# Fixture 0: an empty file (a truncated install) — the readability guard, which
+# every other leg would otherwise read as "nothing to complain about".
+: > "${WORK}/Caddyfile.empty"
+hard_die "${WORK}/Caddyfile.empty" "cannot read the rendered Caddyfile" "self-check refuses an empty/truncated Caddyfile"
 # Fixture 1: a :80 dashboard handler under a DIFFERENT matcher name.
 sed 's#^\tlog_skip$#\tlog_skip\n\t@dash {\n\t\thost citest.status.piercloud.net\n\t}\n\thandle @dash {\n\t\treverse_proxy 127.0.0.1:'"${GATUS_PORT}"'\n\t}#' \
   "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.dash-regressed"
