@@ -229,17 +229,18 @@ render_caddyfile() { # print the Caddyfile to stdout
 
 # --- BEGIN HARDENING CHECK (tests/edge-origin-auth extracts this span; keep markers) ---
 # Origin-hardening converge assertion (issue #225): the SERVING Caddyfile must
-# carry the hardened shape — no :80 dashboard handler, no header-derived
-# client-IP trust, HSTS on the :443 site. Fail-loud on purpose, so a regressed
-# render fails the run instead of passing silently. It is a TEXT tripwire over
-# the serving file (comment lines excluded, so a prose mention neither hides
-# nor trips it), not a boundary: the behavioural tooth is tests/bind-e2e's
-# served peer/header + :80 matrix, which CI runs and a dispatch does not.
-# Callers skip it under CADDY_SKIP_HTTPS (the harness render has no :443 site);
-# tests/edge-origin-auth executes this function (extracted, never a copy)
-# against a hardened render and a regressed fixture per leg.
+# carry the hardened shape — the dashboard upstream only inside the https://
+# site, a tang-only :80 site, no header-derived client-IP trust, and the
+# site-level HSTS line. Fail-loud on purpose, so a regressed render fails the
+# run instead of passing silently. It is a TEXT tripwire over the serving file
+# (comment lines excluded, so a prose mention neither hides nor trips it), not
+# a boundary: the behavioural tooth is tests/bind-e2e's served peer/header +
+# :80 matrix, which CI runs and a dispatch does not. Callers skip it under
+# CADDY_SKIP_HTTPS (the harness render has no :443 site); tests/edge-origin-auth
+# executes this function (extracted, never a copy) against a hardened render
+# and one regressed fixture per leg.
 assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving one)
-  local cfg="${1:-${CADDY_CONFIG}}" live http_block
+  local cfg="${1:-${CADDY_CONFIG}}" live http_block https_block bad_up gatus_hits
   [ -r "$cfg" ] && [ -s "$cfg" ] || die "cannot read the rendered Caddyfile $cfg — the origin-hardening check cannot run; refusing to finish blind"
   # Direct configuration lines only: a comment mentioning a retired directive
   # (this render carries one for `client_ip`) must neither hide nor trip it.
@@ -248,17 +249,30 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
     docker logs caddy 2>&1 | tail -20 || true
     die "serving Caddyfile $cfg still carries the removed :80 dashboard handler and/or header-derived proxy trust — the origin-hardening render did not converge; refusing to finish blind"
   fi
-  # The :80 site must not proxy the dashboard under ANY matcher name (a
-  # renamed handler evades the @status grep above): the Gatus port must not
-  # appear as a :80 upstream.
-  http_block="$(printf '%s\n' "$live" | awk -v hdr="${CADDY_HTTP_ADDR:-:80} {" '$0 == hdr { on = 1 } on { print } on && /^}$/ { exit }')"
-  [ -n "$http_block" ] || die "serving Caddyfile $cfg has no ${CADDY_HTTP_ADDR:-:80} site block — the origin-hardening check cannot prove :80 is dashboard-free; refusing to finish blind"
-  if printf '%s\n' "$http_block" | grep -q "reverse_proxy 127.0.0.1:${GATUS_PORT}"; then
-    docker logs caddy 2>&1 | tail -20 || true
-    die "serving Caddyfile $cfg proxies the dashboard on ${CADDY_HTTP_ADDR:-:80} (reverse_proxy 127.0.0.1:${GATUS_PORT} in that site) — the :80 dashboard handler is back; refusing to finish blind"
+  # Brace-depth extraction (a nested block must not truncate the scan).
+  http_block="$(printf '%s\n' "$live" | awk -v hdr="${CADDY_HTTP_ADDR:-:80} {" '$0 == hdr { on = 1 } on { print; n = gsub(/{/, "{"); m = gsub(/}/, "}"); depth += n - m; if (depth <= 0) exit }')"
+  [ -n "$http_block" ] || die "serving Caddyfile $cfg has no ${CADDY_HTTP_ADDR:-:80} site block — the origin-hardening check cannot prove :80 is tang-only; refusing to finish blind"
+  https_block="$(printf '%s\n' "$live" | awk '/^https:\/\// { on = 1 } on { print; n = gsub(/{/, "{"); m = gsub(/}/, "}"); depth += n - m; if (depth <= 0) exit }')"
+  [ -n "$https_block" ] || die "serving Caddyfile $cfg has no https:// dashboard site block — the origin-hardening check cannot place the dashboard upstream; refusing to finish blind"
+  # :80 may proxy tang and nothing else (any other upstream is a dashboard
+  # route back on the plain-HTTP front).
+  bad_up="$(printf '%s\n' "$http_block" | grep -E '^[[:space:]]*(reverse_proxy|to)([[:space:]]|$)' | grep -v -F ":${TANG_PORT}" || true)"
+  [ -z "$bad_up" ] || die "serving Caddyfile $cfg proxies something other than tang on ${CADDY_HTTP_ADDR:-:80} ($bad_up) — the :80 dashboard handler is back; refusing to finish blind"
+  # The Gatus upstream must exist exactly once, inside the https:// site: a
+  # second reference (any spelling that carries the port) routes the dashboard
+  # somewhere else, and a missing one means the dashboard lost its backend.
+  gatus_hits="$(printf '%s\n' "$live" | grep -c -F ":${GATUS_PORT}" || true)"
+  [ "$gatus_hits" = "1" ] || die "serving Caddyfile $cfg references the Gatus port ${GATUS_PORT} ${gatus_hits} time(s); exactly one (inside the https:// dashboard site) is expected — another reference proxies the dashboard elsewhere; refusing to finish blind"
+  printf '%s\n' "$https_block" | grep -Fq ":${GATUS_PORT}" \
+    || die "serving Caddyfile $cfg carries its Gatus upstream outside the https:// dashboard site — the origin-hardening check cannot prove the dashboard is :443-only; refusing to finish blind"
+  # HSTS must be the site-level line (exactly one tab: a deeper indent means it
+  # sits inside a handle, where an abort path never sends it) and must not be
+  # deleted again after it.
+  printf '%s\n' "$https_block" | grep -Fxq "$(printf '\theader Strict-Transport-Security "max-age=15552000"')" \
+    || die "serving Caddyfile $cfg lacks the :443 site-level HSTS header (max-age=15552000) — the origin-hardening render did not converge; refusing to finish blind"
+  if printf '%s\n' "$https_block" | grep -Eq 'header[[:space:]]+[-!]Strict-Transport-Security'; then
+    die "serving Caddyfile $cfg deletes Strict-Transport-Security again after setting it — the hardening render did not converge; refusing to finish blind"
   fi
-  printf '%s\n' "$live" | grep -Fq 'header Strict-Transport-Security "max-age=15552000"' \
-    || die "serving Caddyfile $cfg lacks the :443 HSTS header (max-age=15552000) — the origin-hardening render did not converge; refusing to finish blind"
   return 0
 }
 # --- END HARDENING CHECK ---

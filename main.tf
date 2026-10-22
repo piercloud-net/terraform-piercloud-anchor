@@ -177,13 +177,12 @@ locals {
 
   # Cloudflare edge ranges (public constants — same class as the Keycloak
   # discovery URL baked into the workflow; source: the IP Ranges page
-  # linked from cloudflare.com). These feed the :80 firewall rule only. They
-  # are a leftover of the pre-A2 Cloudflare-fronted dashboard on :80: the
-  # render no longer serves a dashboard there (tang on :80 is main-box-only,
-  # ACME validators are CAs), so nothing the box serves depends on them — the
-  # firewall round decides whether they stay. The :443 gate uses the CloudFront
-  # ranges in cloudfront_ranges.tf, and the rendered Caddyfile carries no
-  # proxy-trust list.
+  # linked from cloudflare.com). Refresh here when they change. They are the
+  # Cloudflare half of the :80 firewall rule (main.tf below), i.e. the ACME
+  # HTTP-01 path the zone-side cache-bypass ceremony routes through the edge
+  # (docs/dr.md); tang's :80 path is main-box-only, and the dashboard is the
+  # :443 leg, whose peers are the CloudFront ranges in cloudfront_ranges.tf.
+  # The rendered Caddyfile carries no proxy-trust list (issue #225).
   cf_edge_cidrs = [
     "173.245.48.0/20",
     "103.21.244.0/22",
