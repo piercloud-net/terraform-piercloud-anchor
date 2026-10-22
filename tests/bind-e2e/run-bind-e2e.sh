@@ -4,8 +4,9 @@
 # Topology (mirrors production, loopback edition): mock tang on
 # 127.0.0.1:$MOCK_PORT (behind), real `caddy` on :$CADDY_PORT
 # (front, running the repo's REAL rendered Caddyfile — extracted from
-# scripts/010-provision.sh at runtime, never a copy), stub backend for
-# the dashboard vhost. Then, all THROUGH Caddy:
+# scripts/010-provision.sh at runtime, never a copy), stub backend (the
+# :80 dashboard handler is gone; the status host must abort there). Then,
+# all THROUGH Caddy:
 #   clevis luks bind  +  clevis luks list  +  clevis encrypt/decrypt  +
 #   clevis luks unlock -n (real dm-crypt open) on loopback LUKS volumes.
 # Negatives: unknown Host is aborted by Caddy; wrong thumbprint bind
@@ -134,23 +135,25 @@ eval "$(grep '^CLOUDFRONT_ORIGIN_CIDRS=' "${PROVISION_SH}")"
 export TENANT_USER TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
 export CADDY_CHALLENGE_DIR="${WORK}/acme-challenge"
 # Bare :port (like production :80): matches ANY Host with plain HTTP, so the
-# exact-Host @status matcher and the abort catch-all are exercised exactly
-# like prod. (http://127.0.0.1:port would pin Host matching to loopback and
-# bypass the matchers; bare IP:port makes Caddy serve internal-CA HTTPS.)
+# catch-all abort is exercised exactly like prod (:80 serves tang + ACME
+# only; the dashboard is :443-only). (http://127.0.0.1:port would pin Host
+# matching to loopback and bypass the matchers; bare IP:port makes Caddy
+# serve internal-CA HTTPS.)
 export CADDY_HTTP_ADDR=":${CADDY_PORT}" CADDY_SKIP_HTTPS=1
 export DASH_TLS_STANZA="	# harness: no :443 block (CADDY_SKIP_HTTPS); tang never touches :443."
-export STATUS_HOST="" STATUS_MATCH=""
+export STATUS_HOST=""
 caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.ci"
 [ "${STATUS_HOST}" = "citest.status.piercloud.net" ] || die "sanitize drift: STATUS_HOST=${STATUS_HOST}"
 grep -q "reverse_proxy 127.0.0.1:${MOCK_PORT}" "${WORK}/Caddyfile.ci" || die "render does not point /adv|/rec at the mock"
-grep -q "reverse_proxy 127.0.0.1:${STUB_PORT}" "${WORK}/Caddyfile.ci" || die "render does not point the status host at the stub"
-grep -q "host ${STATUS_HOST}" "${WORK}/Caddyfile.ci" || die "render lacks the exact-Host status matcher"
-log "CI Caddyfile rendered (status host: ${STATUS_HOST})"
+if grep -q "reverse_proxy 127.0.0.1:${STUB_PORT}" "${WORK}/Caddyfile.ci"; then die "render still proxies the dashboard on :80"; fi
+if grep -q "host ${STATUS_HOST}" "${WORK}/Caddyfile.ci"; then die "render still has an exact-Host dashboard matcher"; fi
+if grep -q '@status' "${WORK}/Caddyfile.ci"; then die "render still has an @status matcher"; fi
+log "CI Caddyfile rendered (:80 tang/ACME only; status host ${STATUS_HOST} unhandled)"
 # The shipped shape must still parse after the refactor: render it with
 # production addressing and validate (never served here).
 ( export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
-export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+export TENANT_USER=prodprobe STATUS_HOST=""
 export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
 export DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 caddy_status_names
@@ -177,7 +180,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/aop-ca.key" -out "${WORK}/ao
 openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin.key" -out "${WORK}/origin.crt" \
   -days 1 -nodes -subj "/CN=harness-origin" >/dev/null 2>&1 || die "openssl could not mint the harness origin pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
-  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export TENANT_USER=prodprobe STATUS_HOST=""
   export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
@@ -196,7 +199,7 @@ log "AOP render validates (real client_auth stanza compiled)"
 openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin-ca.key" -out "${WORK}/origin-ca.crt" \
   -days 1 -nodes -subj "/CN=harness-origin-ca" >/dev/null 2>&1 || die "openssl could not mint the harness origin-ca pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
-  export TENANT_USER=prodprobe STATUS_HOST="" STATUS_MATCH=""
+  export TENANT_USER=prodprobe STATUS_HOST=""
   export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" ORIGIN_CA_PAIR="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin-ca.crt" CADDY_ORIGIN_KEY="${WORK}/origin-ca.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
@@ -237,7 +240,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/gate.key" -out "${WORK}/gate
   -days 1 -nodes -subj "/CN=${GATE_HOST%:*}" -addext "subjectAltName=DNS:${GATE_HOST%:*}" >/dev/null 2>&1 \
   || die "openssl could not mint the gate pair"
 ( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
-  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
+  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}"
   export CLOUDFRONT_ORIGIN_CIDRS="127.0.0.3/32" CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
   export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
   caddy_status_names
@@ -289,7 +292,7 @@ assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
 # below uses a test-scoped range, and `caddy adapt` is CEL-blind, so the
 # presence tooth below is what keeps a leaked override from passing.
 ( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
-  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}" STATUS_MATCH=""
+  export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}"
   export CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
   export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
   caddy_status_names
@@ -443,9 +446,11 @@ log "PASS: provision /adv assertion accepts flattened + general advertisements a
 # Regression guard: the prodshape render above runs in a subshell precisely
 # so this still names the CI tenant (a clobbered name aborts here, by design).
 [ "${STATUS_HOST}" = "citest.status.piercloud.net" ] || die "harness tenant clobbered (got ${STATUS_HOST})"
-STUB_GOT="$(curl -sf -H "Host: ${STATUS_HOST}" "http://127.0.0.1:${CADDY_PORT}/api/v1/endpoints/statuses")" || die "status-host request failed"
-[ "${STUB_GOT}" = "gatus-stub-ok" ] || die "status-host routing broken (got: ${STUB_GOT})"
-log "PASS: exact-Host dashboard routing reaches the stub"
+rc=0
+STUB_GOT="$(curl -s -H "Host: ${STATUS_HOST}" "http://127.0.0.1:${CADDY_PORT}/api/v1/endpoints/statuses" 2>/dev/null)" || rc=$?
+[ "${rc}" = "52" ] || die "status Host on :80: want curl 52 (catch-all abort, no dashboard handler), got rc ${rc}"
+[ -z "${STUB_GOT}" ] || die "status Host on :80 reached the stub backend: ${STUB_GOT}"
+log "PASS: :80 has no dashboard handler (status Host aborted, stub unreachable)"
 rc=0
 curl -s -H "Host: evil.invalid" "http://127.0.0.1:${CADDY_PORT}/" -o /dev/null 2>/dev/null || rc=$?
 [ "${rc}" = "52" ] || die "unknown Host: want curl 52 (abort/empty-reply), got ${rc}"
