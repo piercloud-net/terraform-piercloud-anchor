@@ -155,6 +155,7 @@ LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 TABLE_ROW = re.compile(r"^\s*\|")
 HEADING = re.compile(r"^\s*#{1,6}\s")
 BRANCH_GLOB = re.compile(r"release/from-v\*")
+ABBREV = re.compile(r"(?:\be\.g|\bi\.e|\betc|\bvs|\bcf|\bapprox|(?:^|\s)[A-Z])\.$", re.I)
 
 
 def clauses(unit):
@@ -173,6 +174,9 @@ def clauses(unit):
         buf.append(char)
         if not ticks and not depth and char in ".!?;":
             after = index + 1
+            if char == "." and ABBREV.search("".join(buf)):
+                index += 1
+                continue
             if after >= len(unit) or unit[after].isspace():
                 out.append("".join(buf))
                 buf = []
@@ -224,7 +228,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=294
+MIN_CHECKS=296
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -733,12 +737,41 @@ import re
 import sys
 
 EXPR = re.compile(r"\$\{\{", re.S)
-FLOW_IF = re.compile(r"""[,\{]\s*(?:"if"|'if'|if)[ \t]*:[ \t]*([^,}]*)""")
+FLOW_IF = re.compile(r"""[,\{]\s*(?:"if"|'if'|if)[ \t]*:[ \t]*""")
 IF_KEY = re.compile(r"""^([ \t-]*)(?:"if"|'if'|if)[ \t]*:[ \t]*(.*)$""")
 BLOCK = re.compile(r"^[|>](?:[1-9][+-]?|[+-][1-9]?)?$")
 QUOTED = re.compile(r"'(?:[^']|'')*'")
 CONTEXT = re.compile(r"(?<![A-Za-z0-9_.])(vars|secrets)\b", re.I)
 LITERAL = re.compile(r"\s*\.\s*[A-Za-z_]")
+
+def flow_if_values(text):
+    """A flow-mapping `if:` value, ending at a comma/brace at depth zero so a
+    parenthesised argument (or a quoted string) may contain commas."""
+    values = []
+    for match in FLOW_IF.finditer(text):
+        index, depth, quoted = match.end(), 0, False
+        start = index
+        while index < len(text):
+            char = text[index]
+            if char == "'":
+                if quoted and index + 1 < len(text) and text[index + 1] == "'":
+                    index += 2
+                    continue
+                quoted = not quoted
+            elif quoted:
+                pass
+            elif char in "([{":
+                depth += 1
+            elif char in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and char in ",\n":
+                break
+            index += 1
+        values.append(text[start:index])
+    return values
+
 
 def expressions(text):
     """Every `${{ … }}` body, ending at the first `}}` that is outside a
@@ -793,7 +826,7 @@ for path in sys.argv[1:]:
         text = handle.read()
     exprs = expressions(text)
     exprs += if_values(text)
-    exprs += [m.group(1) for m in FLOW_IF.finditer(text)]
+    exprs += flow_if_values(text)
     for expr in exprs:
         flat = QUOTED.sub("''", expr)
         for m in CONTEXT.finditer(flat):
@@ -886,6 +919,10 @@ YML
 dr_quote_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-quote.yml" >/dev/null 2>&1 || dr_quote_rc=$?
 is "a literal }} inside a quoted string does not end the expression" "1" "$dr_quote_rc"
+printf '%s\n' "      - { name: x, if: format('{0}', vars[format('{0}', 'X')]) == 'x', run: echo hi }" >"${WORK}/dr-flow-comma.yml"
+dr_flow_comma_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-comma.yml" >/dev/null 2>&1 || dr_flow_comma_rc=$?
+is "a flow-map if: value may contain a comma and is still judged" "1" "$dr_flow_comma_rc"
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
@@ -920,6 +957,10 @@ printf '%s\n' 'The `v*` rule follows the platform note (see below. not verified 
 vs_unbal_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-unbalanced.md" >/dev/null 2>&1 || vs_unbal_rc=$?
 is "an unbalanced parenthesis cannot silence the split (no false green)" "1" "$vs_unbal_rc"
+printf '%s\n' 'The `v*` tags are published upstream, e.g. by the vendor and not verified in this repo.' >"${WORK}/vstar-abbrev.md"
+vs_abbrev_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-abbrev.md" >/dev/null 2>&1 || vs_abbrev_rc=$?
+is "an abbreviation does not end a claim unit (no false red)" "0" "$vs_abbrev_rc"
 
 # ---- #208 round 2: behavioural drivers for the config + incident steps -----
 # Both steps run against stub gh/curl on PATH; every call is logged, so the
