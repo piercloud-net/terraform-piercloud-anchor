@@ -130,7 +130,7 @@ out="$(run_pool "$aop_pem" "$mtls_pem")" || true
 is "pool: both sources land in one ordered pool" "AOP_TLS=yes MTLS_TLS=yes POOL=2 CLIENT_POOL_LEN=0" "$out"
 out="$(run_pool "" "")" || true
 case "$out" in
-  *WARN:*'pre-#202 state'*'AOP_TLS= MTLS_TLS='*) ok "pool: empty state warns and enforces nothing" ;;
+  *WARN:*'the :443 origin cannot require a client certificate'*'AOP_TLS= MTLS_TLS='*) ok "pool: empty state warns and enforces nothing" ;;
   *) bad "pool: empty state did not warn as expected (got '$out')" ;;
 esac
 out="$(run_pool "" "${mtls_pem}
@@ -242,7 +242,6 @@ sed -n "$((render_b + 1)),$((render_e - 1))p" "$PROVISION_SH" > "${WORK}/render.
   GATUS_PORT="8080"
   CADDY_SKIP_HTTPS=""
   STATUS_HOST="status.example.test"
-  CLOUDFRONT_ORIGIN_SECRET="harness-secret"
   MAIN_BOX_IPV4="192.0.2.10"
   CLOUDFRONT_ORIGIN_CIDRS="192.0.2.0/24"
   render_caddyfile
@@ -257,8 +256,8 @@ has "$PROVISION_SH" "alert (certificate required|bad certificate)" "the cert-les
 has "$PROVISION_SH" "-w '%{http_code}'" "the edge pull captures the HTTP status code"
 has "$PROVISION_SH" '[ "${edge_code}" = "200" ]' "the edge pull requires HTTP 200 (not exit 0)"
 hasnt "$PROVISION_SH" 'curl -sSf --max-time 20' "the edge pull no longer treats any exit-0 response as success"
-has "$PROVISION_SH" 'redeploy the previous release (the committed origin-mTLS CA ships in the release' "the mTLS rollback names the release redeploy, not the AOP secret (F5)"
-has "$PROVISION_SH" 're-add the repository secret and the distribution origin header FIRST, then revert the anchor, never the anchor alone' "the post-cutover rollback keeps the docs/dr.md ordering (header and secret first, anchor last)"
+has "$PROVISION_SH" 'a rollback is a redeploy of a release that carries this origin-mTLS gate' "the mTLS rollback names the release redeploy, not the AOP secret (F5)"
+has "$PROVISION_SH" 'pre-mTLS releases are never a valid target' "the rollback text names the mTLS floor (pre-mTLS releases never a valid target; #202)"
 has "$ROOT/docs/dr.md" 'never revert the anchor alone' "docs/dr.md states the same post-cutover ordering the runbook text cites"
 
 # ---- pipeline wiring ------------------------------------------------------

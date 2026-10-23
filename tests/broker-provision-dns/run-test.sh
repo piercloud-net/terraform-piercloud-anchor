@@ -410,7 +410,7 @@ contains "broker mint pins the broker audience" '"piercloud-broker"' "$(cat "$RE
 # never carry a standing secret.
 is "broker-dns lib blob hash (pin: update after a deliberate edit)" "c668738f19c28344ac0f591d4cc283e36d761a1292afc789ea897399f53f8862" "$(sha256sum "$LIB" | cut -d' ' -f1)"
 is "broker-report lib blob hash (pin: update after a deliberate edit)" "0cd7b5bb73ecd115bb1478776365a2ee6b0d3c739f45f466f5513acda1718533" "$(sha256sum "$REPORT_LIB" | cut -d' ' -f1)"
-is "bind-e2e script blob hash (pin: update after a deliberate edit)" "3489aeb616bf94b23126616d58621869a8df0978725f566217cb5bd46163d731" "$(sha256sum "$BIND_E2E" | cut -d' ' -f1)"
+is "bind-e2e script blob hash (pin: update after a deliberate edit)" "087d1dcd0694b495797531bd8beec306c668a38e0242f94b718795908b472c29" "$(sha256sum "$BIND_E2E" | cut -d' ' -f1)"
 
 # bind-e2e harness-dir teeth (r25 F3): a symlinked package directory is
 # not listed by `find -type d` but shadows the in-tree p521 module exactly
@@ -903,8 +903,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "53c15b47d8e0fbe89617bdd415f8ab97325cdc2607eee2a12dd958f3fdadd8ff" "$tests_digest_got"
-if [ "$tests_digest_got" != "53c15b47d8e0fbe89617bdd415f8ab97325cdc2607eee2a12dd958f3fdadd8ff" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "ea23c1297ac96fbc993aeafcd657019ea659963c0cbedcb160dc9b8fc97689ff" "$tests_digest_got"
+if [ "$tests_digest_got" != "ea23c1297ac96fbc993aeafcd657019ea659963c0cbedcb160dc9b8fc97689ff" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do

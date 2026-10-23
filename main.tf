@@ -91,8 +91,9 @@ resource "netcup_scp_user_firewall_policy" "tang" {
     # cloud; the main box still reaches :80 direct for clevis). :443 is the
     # CloudFront origin leg: only the published CLOUDFRONT_ORIGIN_FACING
     # ranges (local.cloudfront_origin_facing_cidrs) plus the main box are
-    # admitted — Caddy additionally requires the X-Piercloud-Origin secret
-    # header from those peers. :8080/:8081 never leave loopback (on-box
+    # admitted; Caddy admits them by raw peer address, and the CloudFront origin
+    # client certificate is verified at the TLS layer (#202). The retired shared
+    # origin header is not a gate. :8080/:8081 never leave loopback (on-box
     # bindings, not firewall rules).
     # Live 2026-09-08 (issue #61): the rixlhq/netcup provider models
     # `sources` as an order-significant List, but the SCP API echoes it

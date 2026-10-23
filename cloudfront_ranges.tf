@@ -1,10 +1,11 @@
 # CloudFront origin-facing ranges — the `:443` origin leg (call D).
 #
 # CloudFront is NOT Cloudflare AOP: the anchor's :443 admits only these
-# ranges (plus the main box), and Caddy enforces the
-# `X-Piercloud-Origin` secret header CloudFront injects (it overwrites
-# any client-supplied value). Neither control alone is auth; together
-# they keep the origin off the open internet.
+# ranges (plus the main box) by raw TCP peer, and the origin client
+# certificate is verified at the TLS layer (`client_auth require_and_verify`,
+# #202). The retired shared `X-Piercloud-Origin` header is not a gate;
+# CloudFront may still send it, and the anchor ignores it. The firewall
+# and the mTLS handshake together keep the origin off the open internet.
 #
 # This list is a MOVING TARGET (AWS publishes changes; no netcup-native
 # prefix-list object exists). Refresh with:
