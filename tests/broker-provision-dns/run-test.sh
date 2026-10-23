@@ -201,19 +201,19 @@ printf 'raise RuntimeError("planted yaml.py was imported")\n' > "$shdir/yaml.py"
 printf '%s' "$sp_base" > "$shdir/wf.yml"
 sh_ctl="$( (cd "$shdir" && PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import yaml') 2>&1 || true)"
 case "$sh_ctl" in
-  *"planted yaml.py was imported"*) ok "yaml shadow control: python without `-I` imports a planted cwd yaml.py (the shadow mutant)" ;;
-  *) bad "yaml shadow control: python without `-I` did not import the planted shadow ('$sh_ctl')" ;;
+  *"planted yaml.py was imported"*) ok 'yaml shadow control: python without -I imports a planted cwd yaml.py (the shadow mutant)' ;;
+  *) bad "yaml shadow control: python without -I did not import the planted shadow ('$sh_ctl')" ;;
 esac
 sh_sp="$( (cd "$shdir" && wf_spans wf.yml) || true)"
 case "$sh_sp" in
-  OK$'\t'*) ok "yaml shadow: the `-I` span parser ignores a planted cwd yaml.py (real PyYAML used)" ;;
+  OK$'\t'*) ok 'yaml shadow: the -I span parser ignores a planted cwd yaml.py (real PyYAML used)' ;;
   *) bad "yaml shadow: the span parser was shadowed or failed under a planted yaml.py ('$sh_sp')" ;;
 esac
 rm -rf "$shdir"
 # Every OTHER python call in this file must carry `-I` too: the only
 # invocation without `-I` left is the positive control above (it must import a
 # hostile module), so a new `python3 -B ...` without `-I` reds this count.
-is "yaml shadow: no python invocation without `-I` besides the control" "1" "$(grep -cE '^[^#]*python3 -B' "$0" || true)"
+is 'yaml shadow: no python invocation without -I besides the control' "1" "$(grep -cE '^[^#]*python3 -B' "$0" || true)"
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
