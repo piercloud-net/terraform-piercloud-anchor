@@ -29,6 +29,7 @@ All notable changes to this project will be documented in this file.
 - *(dns)* Anchor DNS goes through the pc-control broker; retire the direct-token writer (closes #189)
 - *(witness)* Ack the finding identity set, page on a new identity (closes #223)
 - *(edge)* Verify the CloudFront origin client certificate (closes #235)
+- *(edge)* Retire the shared origin header now that mTLS gates the edge (closes #202)
 
 ### 🐛 Bug Fixes
 
