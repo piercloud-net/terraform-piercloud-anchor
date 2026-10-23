@@ -50,7 +50,9 @@ The fixture is JSON:
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
       },                                   # request is SigV4-verified
-      "objects": [{"key": "...", "ago": 60}],
+      "objects": [{"key": "...", "ago": 60}],       # or "at": an absolute
+                                            # ISO stamp, stable across runs
+                                            # (two-run view teeth)
       "versions": [{"key": "...", "version_id": "v1", "is_latest": true,
                     "delete_marker": false, "ago": 60}],
       "uploads": [{"key": "...", "upload_id": "u1", "ago": 3600}]
@@ -94,6 +96,20 @@ def iso_from_ago(ago, now=None):
     # not straddle a second boundary).
     moment = (time.time() if now is None else now) - float(ago)
     return datetime.fromtimestamp(moment, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def stamp_for(entry, now=None):
+    """An entry's served timestamp: absolute `at` (stable across runs) or `ago`.
+
+    A fixture entry may carry either `ago` (seconds before serve time, so the
+    suite never does clock math) or `at` (an absolute ISO stamp). `at` exists
+    for the teeth that compare two runs: a relative stamp moves by a second or
+    two between them, which would look like a re-PUT to a delta's new-or-moved
+    merge rule and dirty the view the tooth is pinning.
+    """
+    if "at" in entry:
+        return str(entry["at"])
+    return iso_from_ago(entry["ago"], now)
 
 
 def encode_token(offset, start_after):
@@ -384,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<Contents><Key>%s</Key><LastModified>%s</LastModified>"
                 "<ETag>&quot;mock&quot;</ETag><Size>1</Size>"
                 "<StorageClass>STANDARD</StorageClass></Contents>"
-                % (xml_escape(obj["key"]), iso_from_ago(obj["ago"], now))
+                % (xml_escape(obj["key"]), stamp_for(obj, now))
             )
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
@@ -551,7 +567,7 @@ class Handler(BaseHTTPRequestHandler):
                     xml_escape(entry["key"]),
                     xml_escape(entry.get("version_id", "v")),
                     "true" if entry.get("is_latest") else "false",
-                    iso_from_ago(entry["ago"], now),
+                    stamp_for(entry, now),
                     extra,
                     tag,
                 )
@@ -616,7 +632,7 @@ class Handler(BaseHTTPRequestHandler):
             next_upload = page[-1].get("upload_id", "u") if truncated else ""
         rows = "".join(
             "<Upload><Key>%s</Key><UploadId>%s</UploadId><Initiated>%s</Initiated></Upload>"
-            % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), iso_from_ago(upload["ago"], now))
+            % (xml_escape(upload["key"]), xml_escape(upload.get("upload_id", "u")), stamp_for(upload, now))
             for upload in page
         )
         body = (
