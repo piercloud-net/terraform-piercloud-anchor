@@ -510,8 +510,14 @@ list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-s
   #   ${STEADY_PREFIX}${ANCHOR_HOSTNAME}               the new shape (the
   #                                                   module's policy_name)
   #   ${STEADY_PREFIX}${ANCHOR_HOSTNAME}-${SERVER_ID} the pre-#121 migration
-  #                                                   shape, this server's id
-  # Both are this server's own names. Policies are ACCOUNT-wide
+  #                                                   shape: the CURRENT
+  #                                                   hostname + this
+  #                                                   server's id
+  # Both are this server's own names. A pre-#121 policy minted under a FORMER
+  # hostname is deliberately NOT matched (the id suffix alone is the suffix
+  # class #200 removed); it is left in place — non-destructive, and a rename
+  # is rare enough that a lingering orphan is preferable to a sibling cut.
+  # Policies are ACCOUNT-wide
   # (/users/<id>/firewall-policies) while cmd_sweep_post's attachment check
   # reads only THIS server's interface, so any name this filter returns but
   # the interface does not carry reads as unattached and is detached+deleted
@@ -521,7 +527,8 @@ list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-s
   # e.g. a policy for eu-a.pcad.it is matched by the -a.pcad.it suffix — and
   # an apply run cut that server's firewall. Exact equality is the whole
   # scope: no prefix wildcard, no suffix arm, and the migration arm carries
-  # THIS server's id, so another server's legacy name matches neither arm.
+  # THIS server's id under the current hostname, so another server's legacy
+  # name matches neither arm.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"

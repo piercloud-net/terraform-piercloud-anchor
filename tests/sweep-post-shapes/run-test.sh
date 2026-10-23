@@ -40,7 +40,7 @@
 # feeds cmd_sweep_post the names the real list_steady_policies returns
 # (new shape + pre-change id-suffixed migration shape) and asserts the
 # attachment compare still protects the live policy in both; the filter
-# itself is covered by tests/policy-naming.
+# itself is also covered by tests/policy-naming.
 #
 # Issue #200 (exact names): the filter is no longer a stub here — the REAL
 # list_steady_policies runs over the raw /firewall-policies response, so
@@ -149,9 +149,9 @@ STEADY_LEGACY='[{"id":43,"name":"piercloud-anchor-anchor-01-pier-424242","descri
 # account-wide and unattached here, so the pre-#200 suffix filter returned it
 # and an apply-mode sweep detached+deleted another server's live policy.
 STEADY_FOREIGN='{"id":44,"name":"piercloud-anchor-staging-anchor-01-pier","description":""}'
-# Same idea through the pre-#121 id arm: it ends with THIS server's id, so the
-# old `endswith(-<server id>)` arm returned it too.
-STEADY_FOREIGN_LEGACY='{"id":46,"name":"piercloud-anchor-anchor-01-staging-pier-424242","description":""}'
+# A sibling's pre-#121 name carries the SIBLING's id (777), not ours; the
+# exact-name filter drops it either way.
+STEADY_FOREIGN_LEGACY='{"id":46,"name":"piercloud-anchor-anchor-01-staging-pier-777","description":""}'
 
 # The shipped STEADY_PREFIX (eval'd, not a copy).
 eval "$(grep -E '^STEADY_PREFIX=' "$SCRIPT")"
