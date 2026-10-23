@@ -393,7 +393,10 @@ openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${
   -out "${WORK}/aop-leaf.crt" >/dev/null 2>&1 || die "openssl could not sign the harness client leaf"
 # The edge fingerprint line exactly as 010's render emits it (evaluated from the
 # real printf, never a hand-typed copy), so a quoting drift fails here.
-fp_line="$(eval "$(grep -m1 -F 'header Pc-Edge-Client-Sha256' "${PROVISION_SH}")")"
+fp_arm="$(grep -m1 -F '*client_auth*) printf' "${PROVISION_SH}")"
+[ -n "${fp_arm}" ] || die "010 has no client_auth case arm emitting Pc-Edge-Client-Sha256"
+fp_body="${fp_arm#*) }"; fp_body="${fp_body% ;;}"
+fp_line="$(eval "${fp_body}")"
 [ "${fp_line}" = "$(printf '\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')" ] || die "010 Pc-Edge-Client-Sha256 line is not the placeholder form (got: ${fp_line})"
 # A second CA-signed client leaf from the same pool, for the distinct-value check.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${WORK}/aop-leaf2.key" >/dev/null 2>&1 || die "openssl could not mint the second harness client key"

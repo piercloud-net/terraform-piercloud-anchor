@@ -410,7 +410,7 @@ contains "broker mint pins the broker audience" '"piercloud-broker"' "$(cat "$RE
 # never carry a standing secret.
 is "broker-dns lib blob hash (pin: update after a deliberate edit)" "c668738f19c28344ac0f591d4cc283e36d761a1292afc789ea897399f53f8862" "$(sha256sum "$LIB" | cut -d' ' -f1)"
 is "broker-report lib blob hash (pin: update after a deliberate edit)" "0cd7b5bb73ecd115bb1478776365a2ee6b0d3c739f45f466f5513acda1718533" "$(sha256sum "$REPORT_LIB" | cut -d' ' -f1)"
-is "bind-e2e script blob hash (pin: update after a deliberate edit)" "c9ef6a1f3b55fcd43fc529cae6e7842f91f52700632508d804a56683c398cdd9" "$(sha256sum "$BIND_E2E" | cut -d' ' -f1)"
+is "bind-e2e script blob hash (pin: update after a deliberate edit)" "dfc697b5441e3cb97bd911f30626379b443383c41be074f1889e6af043d9cfa0" "$(sha256sum "$BIND_E2E" | cut -d' ' -f1)"
 
 # bind-e2e harness-dir teeth (r25 F3): a symlinked package directory is
 # not listed by `find -type d` but shadows the in-tree p521 module exactly
