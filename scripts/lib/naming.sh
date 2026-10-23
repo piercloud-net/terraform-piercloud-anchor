@@ -21,23 +21,35 @@
 # validate_tenant_username is deliberately strict and fails closed on the
 # LOWERCASED RAW value: the sanitizer maps `.pier`, `pier-`, `pier--carlo`
 # all to `pier`, so validating the sanitized value would be fail-open.
+# The shape is the DISPATCHER's grammar, ^[a-z0-9]{3,15}$ (provision.yml's
+# managed-input preflight, from pc-control registry.ValidateEnvName), not a
+# wider one of its own: an alias the dispatcher refuses must be refused here
+# too, on every call path (a 1-2 char or 16-20 char console hand-run alias was
+# accepted before #233's fold while the dispatcher refused it).
 # The reserved prefixes keep tenant names from masquerading as platform
-# labels and from colliding with the `pcu<random>` alias scheme.
+# labels and from colliding with the `pcu<random>` alias scheme. The nine
+# exact reserved names are the reserved tenant names mirrored here from
+# pc-control's registry; the registry's reserved set is larger than these nine.
+# The `provision.yml` managed-input preflight carried them alone before #203;
+# they live here so every caller of the canonical validator refuses them.
 
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
-    *[!a-z0-9]* | '')
-      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+    *[!a-z0-9]* | '' | ? | ??)
+      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{3,15}$ before normalization (letters/digits only, 3-15 chars — the pc-control environment/alias grammar).\n' "$1" >&2
       return 1 ;;
   esac
-  if [ "${#1}" -gt 20 ]; then
-    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+  if [ "${#1}" -gt 15 ]; then
+    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{3,15}$ before normalization (letters/digits only, 3-15 chars — the pc-control environment/alias grammar).\n' "$1" >&2
     return 1
   fi
   case "$1" in
     anchor* | status* | pcu* | platform*)
       printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
+      return 1 ;;
+    edge | console | ops | keys | unlock | bounce | mail | broker | www)
+      printf 'invalid TENANT_USER "%s": reserved platform name (the pc-control registry reserved set) — not a tenant.\n' "$1" >&2
       return 1 ;;
   esac
   return 0

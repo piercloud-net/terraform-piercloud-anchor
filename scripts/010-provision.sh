@@ -68,17 +68,20 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
-    *[!a-z0-9]* | '')
-      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+    *[!a-z0-9]* | '' | ? | ??)
+      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{3,15}$ before normalization (letters/digits only, 3-15 chars — the pc-control environment/alias grammar).\n' "$1" >&2
       return 1 ;;
   esac
-  if [ "${#1}" -gt 20 ]; then
-    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+  if [ "${#1}" -gt 15 ]; then
+    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{3,15}$ before normalization (letters/digits only, 3-15 chars — the pc-control environment/alias grammar).\n' "$1" >&2
     return 1
   fi
   case "$1" in
     anchor* | status* | pcu* | platform*)
       printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
+      return 1 ;;
+    edge | console | ops | keys | unlock | bounce | mail | broker | www)
+      printf 'invalid TENANT_USER "%s": reserved platform name (the pc-control registry reserved set) — not a tenant.\n' "$1" >&2
       return 1 ;;
   esac
   return 0
