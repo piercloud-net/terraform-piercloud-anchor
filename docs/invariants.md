@@ -126,8 +126,14 @@ as the repo-side controls.
 > two names: the repository secrets `EXTERNAL_WATCH_NTFY_TOPIC` and
 > `EXTERNAL_WATCH_NTFY_TOKEN` may exist at repository level. They are read by
 > `.github/workflows/external-watch.yml` only, and never by a managed run.
+> The same PR also ships the repository **variable** `EXTERNAL_WATCH_TENANTS`
+> (`alias`, `alias:puller` pairs: which anchors the watch probes). It carries
+> no secret material, so it sits outside invariant 4's secret scope, but it is
+> named here so the repository-level surface is complete: like the two
+> secrets, it is read by `.github/workflows/external-watch.yml` only and never
+> by a managed run.
 
-**Rationale.** The scheduled external watch selects no `environment:`, so it cannot read a tenant environment (tenant environments are also expected to be limited to `v*` tags by the platform, not verified in this repo — see `docs/usage.md`). Its push channel must therefore live at repository level. The names are distinct from every environment-scoped name, so GitHub's per-name fall-through cannot hand them to a managed anchor: no managed job references them. Enforced by: `tests/external-watch` (the names appear in no file under `.github/` or `scripts/` other than `external-watch.yml`, and are absent from the managed repo-scope list, which they need not join because nothing managed reads them). The harness runs from the PR checkout, so a PR can edit this pin; review of the harness diff is the control.
+**Rationale.** The scheduled external watch selects no `environment:`, so it cannot read a tenant environment (tenant environments are also expected to be limited to `v*` tags by the platform, not verified in this repo — see `docs/usage.md`). Its push channel must therefore live at repository level. The names are distinct from every environment-scoped name, so GitHub's per-name fall-through cannot hand them to a managed anchor: no managed job references them (the repo-level tenants variable is not a secret and likewise reaches only the watch). Enforced by: `tests/external-watch` (the two secret names and `EXTERNAL_WATCH_TENANTS` appear in no file under `.github/` or `scripts/` other than `external-watch.yml`, and are absent from the managed repo-scope list, which they need not join because nothing managed reads them). The harness runs from the PR checkout, so a PR can edit this pin; review of the harness diff is the control.
 
 ## S1 — every netcup use human-approved per run
 

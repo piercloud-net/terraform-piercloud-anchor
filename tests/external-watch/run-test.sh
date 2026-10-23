@@ -21,6 +21,12 @@
 #   - TENANT_USER unset degrades to the platform channel only;
 #   - #207: the per-tenant target parser (legacy fallback, flags, refusals,
 #     the probe_url override rule) and the matrix/incident/ntfy wiring.
+#   - #209: the backstop push channel binds the WATCH_ names to the
+#     EXTERNAL_WATCH_* secrets as exact lines in both steps; the permissions
+#     pins survive a quoted key and a blank line inside the block; the
+#     incident env declares exactly its five keys; the targets block runs with
+#     WATCH_TENANTS unset; the docs name EXTERNAL_WATCH_TENANTS and qualify
+#     every `v*` claim.
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +38,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=223
+MIN_CHECKS=236
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -278,10 +284,18 @@ if [ -n "$tstart" ] && [ -n "$tend" ]; then ok "targets markers present"; else b
 sed -n "$((tstart + 1)),$((tend - 1))p" "$WATCH" | sed 's/^          //' >"${WORK}/targets.sh"
 if bash -n "${WORK}/targets.sh"; then ok "targets block parses (bash -n)"; else bad "targets block fails bash -n"; fi
 
-targets() { # env: WATCH_TENANTS PROBE_OVERRIDE LEGACY_*; prints "0|matrix", "refused|reason|matrix" or "rc|output"
-  local out rc refused
-  out="$( ( cd "$WORK" && env -u GITHUB_OUTPUT \
-      WATCH_TENANTS="${WATCH_TENANTS-}" PROBE_OVERRIDE="${PROBE_OVERRIDE-}" \
+targets() { # env: WATCH_TENANTS [WATCH_TENANTS_UNSET=1] PROBE_OVERRIDE LEGACY_*; prints "0|matrix", "refused|reason|matrix" or "rc|output"
+  local out rc refused tenv
+  # WATCH_TENANTS_UNSET drives the block's own unset default
+  # (`WATCH_TENANTS="${WATCH_TENANTS-}"`, red-team r5 F2): Actions always sets
+  # the variable, so only `env -u` reaches that line.
+  if [ "${WATCH_TENANTS_UNSET:-}" = 1 ]; then
+    tenv=(-u WATCH_TENANTS)
+  else
+    tenv=("WATCH_TENANTS=${WATCH_TENANTS-}")
+  fi
+  out="$( ( cd "$WORK" && env -u GITHUB_OUTPUT "${tenv[@]}" \
+      PROBE_OVERRIDE="${PROBE_OVERRIDE-}" \
       LEGACY_PROBE_URL="${LEGACY_PROBE_URL-}" LEGACY_STATUS_PULLER="${LEGACY_STATUS_PULLER-}" \
       LEGACY_TENANT_USER="${LEGACY_TENANT_USER-}" GITHUB_OUTPUT="$WORK/gh_out" \
       LC_ALL="${TARGETS_LC_ALL-en_US.UTF-8}" \
@@ -304,6 +318,13 @@ r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=on LEGACY_PRO
 is "legacy: unset list = one legacy target" '0|[{"alias":"pier","label":"","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":true}]' "$r"
 r="$(WATCH_TENANTS=" , " LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=no targets)"
 is "legacy: blank list + puller off" '0|[{"alias":"pier","label":"","puller":"","probe_url":"","legacy":true}]' "$r"
+# Functional r5 F2 (#209): the unset-safe default is only reachable with the
+# variable absent; under the block's own `set -u` a bare `${WATCH_TENANTS}`
+# aborts the targets job (no matrix, every leg skipped).
+r="$(WATCH_TENANTS_UNSET=1 LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER=on LEGACY_PROBE_URL=https://pier.status.piercloud.net/ targets)"
+is "unset WATCH_TENANTS: the - default keeps the legacy target" '0|[{"alias":"pier","label":"","puller":"on","probe_url":"https://pier.status.piercloud.net/","legacy":true}]' "$r"
+r="$(WATCH_TENANTS_UNSET=1 LEGACY_TENANT_USER=zed PROBE_OVERRIDE=https://b.example/ targets)"
+has "unset WATCH_TENANTS: the override still applies" "$r" '"probe_url":"https://b.example/"'
 # Functional r3 F2: the legacy puller mapping (same accepted set as the puller).
 for pv in 1 true yes on; do
   r="$(WATCH_TENANTS="" LEGACY_TENANT_USER=pier LEGACY_STATUS_PULLER="$pv" targets)"
@@ -414,6 +435,17 @@ is "fail-fast stays off (a failed leg never cancels the other tenants)" "1" "$(g
 is "incident lookups read up to 100 open issues (leg + config)" "2" "$(grep -c 'gh issue list --label "$label" --state open --limit 100 --json number,title' "$WATCH")"
 is "repo fallback pairs the repo topic with the repo token (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="${REPO_NTFY_TOPIC:-}"; NTFY_TOKEN="${REPO_NTFY_TOKEN:-}"' "$WATCH")"
 is "watch-channel pair (leg + config)" "2" "$(grep -c 'NTFY_TOPIC="$WATCH_NTFY_TOPIC"; NTFY_TOKEN="${WATCH_NTFY_TOKEN:-}"' "$WATCH")"
+# Trust r5 F2 (#209): the amendment must also name the repository variable the
+# same PR ships; it is repository-level data feeding the watch, outside
+# invariant 4's secret scope but part of the same surface.
+amend="$(awk '/Scoped amendment/ && /push channel/{f=1} f && /^## /{exit} f' "${ROOT}/docs/invariants.md")"
+has "invariant 4 amendment names the repo variable EXTERNAL_WATCH_TENANTS" "$amend" 'EXTERNAL_WATCH_TENANTS'
+# Trust r5 F4 (#209): every `v*` deployment-policy claim carries the same
+# "not verified in this repo" qualifier as docs/invariants.md.
+for vf in .github/workflows/external-watch.yml docs/dr.md docs/invariants.md docs/usage.md; do
+  unq="$(grep -n '`v\*`' "${ROOT}/${vf}" | grep -vE 'not verified (in this repo|here)' || true)"
+  is "every v* claim in ${vf} is qualified" "" "$unq"
+done
 cfg="$(awk '/^  config:$/{f=1} /^  watch:$/{f=0} f' "$WATCH")"
 has "config job waits on targets" "$cfg" "needs: targets"
 is "config job always runs (exact line, no extra condition)" "1" "$(printf '%s\n' "$cfg" | grep -cx '    if: always()' || true)"
@@ -423,17 +455,22 @@ has "config job fails the run while refused" "$cfg" 'exit 1'
 has "targets job exports the refusal" "$wf" 'refused: ${{ steps.targets.outputs.refused }}'
 has "job name uses the label (legacy name unchanged)" "$wf" "name: probe \${{ matrix.target.label || 'the dashboard' }} from GitHub's network"
 # Invariant 4 carve-out (#208 round 1): the watch channel names are read by
-# external-watch.yml only, never by a managed run.
+# external-watch.yml only, never by a managed run. The amendment's "Enforced
+# by" line covers the repository variable too (#209).
 # Trust r3 F1: never vacuous — outside a git work tree the pin fails loudly.
-if (cd "$ROOT" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
-  ewn_rc=0
-  ewn="$(cd "$ROOT" && git grep -l 'EXTERNAL_WATCH_NTFY_' -- .github scripts ':!.github/workflows/external-watch.yml')" || ewn_rc=$?
+ewn_only() { # $1 grep pattern, $2 label
+  local ewn_rc=0 ewn
+  ewn="$(cd "$ROOT" && git grep -l "$1" -- .github scripts ':!.github/workflows/external-watch.yml')" || ewn_rc=$?
   # git grep: 0 = matches, 1 = none, anything else = error.
   case "$ewn_rc" in
-    1) ok "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml" ;;
-    0) bad "EXTERNAL_WATCH_NTFY_* read only by external-watch.yml (also in: ${ewn})" ;;
-    *) bad "EXTERNAL_WATCH_NTFY_* pin: git grep failed (rc ${ewn_rc})" ;;
+    1) ok "$2 read only by external-watch.yml" ;;
+    0) bad "$2 read only by external-watch.yml (also in: ${ewn})" ;;
+    *) bad "$2 pin: git grep failed (rc ${ewn_rc})" ;;
   esac
+}
+if (cd "$ROOT" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+  ewn_only 'EXTERNAL_WATCH_NTFY_' 'EXTERNAL_WATCH_NTFY_*'
+  ewn_only 'EXTERNAL_WATCH_TENANTS' 'EXTERNAL_WATCH_TENANTS'
   is "external-watch.yml itself is tracked (the pin scope is real)" "1" \
     "$(cd "$ROOT" && git ls-files -- .github/workflows/external-watch.yml | wc -l | tr -d ' ')"
 else
@@ -570,6 +607,15 @@ is "leg ntfy step fires on a failed probe (exact condition)" "        if: steps.
 pushbody="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&/^      - name:/{exit} f' "$WATCH")"
 has "leg ntfy push is guarded by if (a curl failure never fails the step)" "$pushbody" '          if curl -sS --fail "${NTFY_AUTH[@]}" \'
 has "leg ntfy failure is a warning, not a step failure" "$pushbody" $'          else\n            echo "::warning::ntfy push failed - the incident step still runs"\n          fi'
+# Red-team r5 F1 (#209): the backstop push channel must bind the WATCH_ names
+# to the EXTERNAL_WATCH_* secrets, in BOTH steps, as exact lines — rebinding
+# either to `secrets.NTFY_TOKEN` (or to the other channel's secret) has to red.
+for bl in 'WATCH_NTFY_TOPIC: ${{ secrets.EXTERNAL_WATCH_NTFY_TOPIC }}' 'WATCH_NTFY_TOKEN: ${{ secrets.EXTERNAL_WATCH_NTFY_TOKEN }}'; do
+  is "config step binds ${bl%%:*} to its own secret (exact line)" "1" \
+    "$(job_span config | grep -cxF -- "          ${bl}" || true)"
+  is "watch leg binds ${bl%%:*} to its own secret (exact line)" "1" \
+    "$(printf '%s\n' "$pushbody" | grep -cxF -- "          ${bl}" || true)"
+done
 
 # #208 round 3 (red-team F1): the step headers that decide whether the
 # incident path runs at all. A probe without continue-on-error stops the job
@@ -588,14 +634,38 @@ for bl in '          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' '          OK: ${{ s
   is "incident step binds: ${bl#"${bl%%[! ]*}"}" "1" "$(printf '%s\n' "$incstep" | grep -cxF -- "$bl" || true)"
 done
 is "incident step has no continue-on-error" "0" "$(printf '%s\n' "$incstep" | grep -c 'continue-on-error' || true)"
+# Red-team r5 F3 (#209): the exact-line pins above cannot see a duplicate key
+# written differently (quoted, re-spaced). Count the env block's keys: a
+# duplicate makes it 6 and this reds, whatever its spelling.
+incenv="$(printf '%s\n' "$incstep" | awk 'NR > 1 && /^        run:/{exit} NR > 1{print}')"
+env_key='^[[:space:]]*["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?[[:space:]]*:'
+is "incident step env declares exactly 5 keys (a duplicate cannot pass)" "5" \
+  "$(printf '%s\n' "$incenv" | grep -cE "$env_key" || true)"
 is "watch concurrency never cancels a running watcher" "  group: external-watch
   cancel-in-progress: false" "$(grep -A1 '^  group: external-watch$' "$WATCH")"
 is "legs run one at a time (ordered incident calls)" "1" "$(grep -cx '      max-parallel: 1' "$WATCH")"
 is "incident step exists exactly once" "1" "$(grep -c '^      - name: Incident state (issue = open while failing; auto-close on recovery)$' "$WATCH")"
-is "permissions block is exact (whole block, to the blank line)" "permissions:
+# Red-team r5 F2 (#209): YAML allows a quoted key, so the uniqueness pin
+# matches an optional quote and whitespace around the colon.
+perm_key='^[[:space:]]*["'"'"']?permissions["'"'"']?[[:space:]]*:'
+# Functional r5 F1 (#209): the extract ends at the first line that is neither
+# indented nor blank — a blank line does not close the top-level block (a
+# blank line followed by `  actions: write` is valid YAML and grants the scope).
+perm_block() {
+  awk -v k="$perm_key" '
+    $0 ~ k && !f { print; f=1; next }
+    f {
+      if ($0 !~ /^[[:space:]]/ && $0 !~ /^[[:space:]]*$/) exit
+      if ($0 ~ /^[[:space:]]*$/) { blank = blank "\n"; next }
+      if (blank != "") { printf "%s", blank; blank = "" }
+      print
+    }
+  ' "$WATCH"
+}
+is "permissions block is exact (whole block, to the first non-indented line)" "permissions:
   contents: read
-  issues: write" "$(awk '/^permissions:$/{f=1} f&&/^$/{exit} f' "$WATCH")"
-is "permissions block is unique (no job-level override)" "1" "$(grep -cE '^[[:space:]]*permissions:' "$WATCH")"
+  issues: write" "$(perm_block)"
+is "permissions block is unique (quoted key included, no job-level override)" "1" "$(grep -cE "$perm_key" "$WATCH" || true)"
 is "cron cadence is exact" '    - cron: "*/15 * * * *"' "$(grep -E '^[[:space:]]*- cron:' "$WATCH")"
 # Config incident label fallback: a missing/unattachable label still files it.
 TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 cdrive "$WORK/config.sh"
