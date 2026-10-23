@@ -139,27 +139,50 @@ if problems:
     sys.exit(1)
 PY
 
-# Reports every `v*` deployment-policy claim whose OWN SENTENCE lacks the
-# "not verified in this repo/here" qualifier. A decoy qualifier elsewhere on
-# the line or in the section does not count; wrapped lines are joined per
-# paragraph so a legal wrap does not red.
+# Reports every `v*` deployment-policy claim (backticked or bare) whose OWN
+# CLAIM UNIT lacks the "not verified in this repo/here" qualifier. A claim unit
+# is a paragraph (wrapped lines join), a markdown list item, a table row or a
+# heading, so a qualifier in the next item or row does not qualify this one.
+# A decoy qualifier in another sentence does not count either. The branch glob
+# `release/from-v*` is a ref pattern, not a claim.
 cat >"${WORK}/vstar.py" <<'PY'
 import re
 import sys
 
-CLAIM = "`v*`"
+CLAIM = re.compile(r"(?<![A-Za-z0-9_])v\*")
 QUALIFIER = re.compile(r"not verified (in this repo|here)")
-PARAGRAPH = re.compile(r"\n[ \t]*\n")
+LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
+TABLE_ROW = re.compile(r"^\s*\|")
+HEADING = re.compile(r"^\s*#{1,6}\s")
 SENTENCE = re.compile(r"(?<=[.!?])\s+")
+BRANCH_GLOB = re.compile(r"release/from-v\*")
+
+
+def units(path, text):
+    markdown = path.endswith(".md")
+    current = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            if current:
+                yield " ".join(current)
+                current = []
+            continue
+        starts = LIST_ITEM.match(raw) or TABLE_ROW.match(raw) or (markdown and HEADING.match(raw))
+        if starts and current:
+            yield " ".join(current)
+            current = []
+        current.append(raw.strip())
+    if current:
+        yield " ".join(current)
+
 
 problems = []
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
-    for paragraph in PARAGRAPH.split(text):
-        joined = " ".join(line.strip() for line in paragraph.splitlines())
-        for sentence in SENTENCE.split(joined):
-            if CLAIM in sentence and not QUALIFIER.search(sentence):
+    for unit in units(path, text):
+        for sentence in SENTENCE.split(BRANCH_GLOB.sub("release/from-vX", unit)):
+            if CLAIM.search(sentence) and not QUALIFIER.search(sentence):
                 problems.append("%s: %s" % (path, sentence.strip()[:200]))
 if problems:
     print("\n".join(problems))
@@ -168,7 +191,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=254
+MIN_CHECKS=279
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -598,9 +621,10 @@ is "each of those five names is really read by external-watch.yml" "0" \
 # new file holding the claim must be reviewed and added here, qualified or
 # not.
 vstar_rc=0
-vstar_files="$(cd "$ROOT" && git grep -l '`v\*`' -- docs README.md .github/workflows)" || vstar_rc=$?
+vstar_files="$(cd "$ROOT" && git grep -l -E '(^|[^A-Za-z0-9_])v[*]' -- '*.md' .github/workflows)" || vstar_rc=$?
 is "v* claim pin: the discovery grep ran (a git work tree is present)" "0" "$vstar_rc"
 is "v* claim files are the reviewed set (discovered, not hardcoded)" ".github/workflows/external-watch.yml
+docs/conventions.md
 docs/dr.md
 docs/invariants.md
 docs/usage.md" "$vstar_files"
@@ -666,6 +690,85 @@ is "repo-scope probe list is non-empty (the pin is not vacuous)" "1" "$([ "$ro_k
 is "repo-scope probes are literal secret/var reads" "$ro_keys" "$ro_lit"
 is "repo-scope step has no dynamic vars[]/secrets[] indexing" "0" \
   "$(printf '%s\n' "$scopestep" | grep -cE '(vars|secrets)\[' || true)"
+
+# Red-team r7 F2 (#232 fold): the Repo-scope pins look at ONE step, so a dynamic
+# read of a watch name in any other step passed (`vars[format(...)]` split into
+# fragments). Scan every tracked workflow and script: a `vars` or `secrets`
+# context inside `${{ }}` or an `if:` may only be a literal `.NAME` read.
+cat >"${WORK}/dynread.py" <<'PY'
+import re
+import sys
+
+EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+IF_VALUE = re.compile(r"^[ \t-]*if:[ \t]*(.+)$", re.M)
+QUOTED = re.compile(r"'(?:[^']|'')*'")
+CONTEXT = re.compile(r"(?<![A-Za-z0-9_.])(vars|secrets)\b")
+LITERAL = re.compile(r"\s*\.\s*[A-Za-z_]")
+
+legal = 0
+offenders = []
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    exprs = [m.group(1) for m in EXPR.finditer(text)]
+    exprs += [m.group(1) for m in IF_VALUE.finditer(text)]
+    for expr in exprs:
+        flat = QUOTED.sub("''", expr)
+        for m in CONTEXT.finditer(flat):
+            if LITERAL.match(flat, m.end()):
+                legal += 1
+            else:
+                offenders.append("%s: %s" % (path, expr.strip()[:200]))
+if offenders:
+    print("\n".join(offenders))
+print("files=%d legal=%d" % (len(sys.argv) - 1, legal), file=sys.stderr)
+sys.exit(1 if offenders else 0)
+PY
+dr_files="$(cd "$ROOT" && git ls-files -- .github scripts)"
+dr_rc=0
+# shellcheck disable=SC2086  # repo paths, never whitespace
+dr_out="$(cd "$ROOT" && python3 -I -B "${WORK}/dynread.py" $dr_files 2>"${WORK}/dr.err")" || dr_rc=$?
+is "every vars/secrets read in .github and scripts is a literal .NAME" "" "$dr_out"
+is "dynamic-read scan exits clean on the tracked tree" "0" "$dr_rc"
+is "dynamic-read scan covers every tracked .github/scripts file" "$(printf '%s\n' "$dr_files" | grep -c .)" "$(sed -n 's/^files=\([0-9]*\) .*/\1/p' "${WORK}/dr.err")"
+dr_legal="$(sed -n 's/.* legal=\([0-9]*\)$/\1/p' "${WORK}/dr.err")"
+is "the scan counts legal literal reads (not vacuous)" "1" "$([ "${dr_legal:-0}" -gt 0 ] && printf 1 || printf 0)"
+cat >"${WORK}/dr-split.yml" <<'YML'
+      - name: split read
+        run: echo "${{ vars[format('{0}{1}{2}', 'EXTER', 'NAL_WA', 'TCH_TENANTS')] }}"
+YML
+cat >"${WORK}/dr-dump.yml" <<'YML'
+        run: echo "${{ toJSON(vars) }}"
+YML
+cat >"${WORK}/dr-legal.yml" <<'YML'
+        if: vars.STATUS_PULLER != '' && secrets.NTFY_TOPIC != ''
+        run: echo "${{ format('{0}', github.sha) }}"
+YML
+dr_split_rc=0
+dr_split="$(python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-split.yml" 2>/dev/null)" || dr_split_rc=$?
+is "a split-fragment dynamic read is refused" "1" "$dr_split_rc"
+has "the split-fragment read is named" "$dr_split" 'vars[format('
+dr_dump_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-dump.yml" >/dev/null 2>&1 || dr_dump_rc=$?
+is "a whole-context dump (toJSON(vars)) is refused" "1" "$dr_dump_rc"
+dr_legal_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
+is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
+# Red-team r7 F3 (#232 fold): a list item or table row is its own claim unit,
+# so a qualifier in the NEXT item does not qualify this one, and a bare `v*`
+# (no backticks) is still a claim. The wrapped-prose case stays green.
+printf '%s\n' '- tenant tags carry `v*` tags' '- not verified in this repo' >"${WORK}/vstar-list.md"
+printf '%s\n' 'Tenant tags carry v* tags.' >"${WORK}/vstar-bare.md"
+printf '%s\n' 'Tenant tags carry `v*` tags, which' 'are not verified in this repo.' >"${WORK}/vstar-wrap.md"
+vs_list_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-list.md" >/dev/null 2>&1 || vs_list_rc=$?
+is "list items are separate claim units (a qualifier in the next item does not count)" "1" "$vs_list_rc"
+vs_bare_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-bare.md" >/dev/null 2>&1 || vs_bare_rc=$?
+is "a bare v* (no backticks) is a claim" "1" "$vs_bare_rc"
+vs_wrap_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-wrap.md" >/dev/null 2>&1 || vs_wrap_rc=$?
+is "a wrapped qualified sentence stays green" "0" "$vs_wrap_rc"
 
 # ---- #208 round 2: behavioural drivers for the config + incident steps -----
 # Both steps run against stub gh/curl on PATH; every call is logged, so the
@@ -811,6 +914,44 @@ is "config step assigns NTFY_TOPIC only in the two pairing branches" "2" "$(ntfy
 is "config step assigns NTFY_TOKEN only in the two pairing branches" "2" "$(ntfy_sets "$(cat "${WORK}/config.sh")" NTFY_TOKEN)"
 is "watch leg assigns NTFY_TOPIC only in the two pairing branches" "2" "$(ntfy_sets "$pushbody" NTFY_TOPIC)"
 is "watch leg assigns NTFY_TOKEN only in the two pairing branches" "2" "$(ntfy_sets "$pushbody" NTFY_TOKEN)"
+# Red-team r7 F1 (#232 fold): the count above sees only the textual `NAME=`,
+# so a rebind through `printf -v`, `read`, `export`, `declare`, `local`, `eval`
+# or `+=` after the pairing passes it. Layer 2 (textual): no such rebind of a
+# channel name in either body. Layer 1 (behavioural, below): drive both bodies
+# with the watch pair AND the repo pair set; the post must use the watch values.
+ntfy_rebinds() { # $1 body -> rebind count (comment lines ignored)
+  printf '%s\n' "$1" | grep -vE '^[[:space:]]*#' \
+    | grep -cE '(^|[^[:alnum:]_])(printf[[:space:]]+-v|read|readarray|mapfile|export|declare|typeset|local|readonly|eval|unset)([^[:alnum:]_]|$).*NTFY_(TOPIC|TOKEN)|(^|[^[:alnum:]_])NTFY_(TOPIC|TOKEN)[+]=' || true
+}
+is "rebind detector flags printf -v on a channel name" "1" "$(ntfy_rebinds 'printf -v NTFY_TOPIC "%s" "$x"')"
+is "rebind detector flags a += on a channel name" "1" "$(ntfy_rebinds 'NTFY_TOKEN+=x')"
+is "rebind detector ignores a comment that names a channel" "0" "$(ntfy_rebinds '# read NTFY_TOPIC here')"
+is "config step has no rebind verb on a channel name" "0" "$(ntfy_rebinds "$(cat "${WORK}/config.sh")")"
+is "watch leg has no rebind verb on a channel name" "0" "$(ntfy_rebinds "$pushbody")"
+hits() { printf '%s\n' "$D_LOG" | grep -cF -- "$1" || true; }
+ldrive() { WATCH_ALIAS=pier DETAIL=boom drive "$@"; }
+legrun="$(awk '/- name: ntfy push \(no-op until a topic is set\)/{f=1;next} f&&/^      - name:/{exit} f&&r{print} f&&/^        run: [|]$/{r=1}' "$WATCH" | sed 's/^          //')"
+printf '%s\n' "$legrun" >"${WORK}/leg.sh"
+if bash -n "${WORK}/leg.sh" && [ -s "${WORK}/leg.sh" ]; then ok "leg push body extracted + parses"; else bad "leg push body extracted + parses"; fi
+# (a) both pairs set: the watch pair wins; the repo pair never reaches a post.
+WATCH_NTFY_TOPIC=wt WATCH_NTFY_TOKEN=wk REPO_NTFY_TOPIC=rt REPO_NTFY_TOKEN=rk TARGETS_RESULT=success REFUSED=bad cdrive "$WORK/config.sh"
+is "config, both pairs set: watch topic+token only" "1:0:1:0" "$(hits 'https://ntfy.sh/wt'):$(hits 'https://ntfy.sh/rt'):$(hits 'Bearer wk'):$(hits 'Bearer rk')"
+WATCH_NTFY_TOPIC=wt WATCH_NTFY_TOKEN=wk REPO_NTFY_TOPIC=rt REPO_NTFY_TOKEN=rk ldrive "${WORK}/leg.sh"
+is "leg, both pairs set: exits 0" "0" "$D_RC"
+is "leg, both pairs set: watch topic+token only" "1:0:1:0" "$(hits 'https://ntfy.sh/wt'):$(hits 'https://ntfy.sh/rt'):$(hits 'Bearer wk'):$(hits 'Bearer rk')"
+# (b) watch topic with an empty watch token: no auth header, no repo values.
+WATCH_NTFY_TOPIC=wt WATCH_NTFY_TOKEN= REPO_NTFY_TOPIC=rt REPO_NTFY_TOKEN=rk TARGETS_RESULT=success REFUSED=bad cdrive "$WORK/config.sh"
+is "config, empty watch token: watch topic, no auth, no repo values" "1:0:0" "$(hits 'https://ntfy.sh/wt'):$(hits 'https://ntfy.sh/rt'):$(hits 'Bearer')"
+WATCH_NTFY_TOPIC=wt WATCH_NTFY_TOKEN= REPO_NTFY_TOPIC=rt REPO_NTFY_TOKEN=rk ldrive "${WORK}/leg.sh"
+is "leg, empty watch token: watch topic, no auth, no repo values" "1:0:0" "$(hits 'https://ntfy.sh/wt'):$(hits 'https://ntfy.sh/rt'):$(hits 'Bearer')"
+# (c) the documented fallback: watch pair unset, repo pair used (pinned above too).
+WATCH_NTFY_TOPIC= WATCH_NTFY_TOKEN= REPO_NTFY_TOPIC=rt REPO_NTFY_TOKEN=rk TARGETS_RESULT=success REFUSED=bad cdrive "$WORK/config.sh"
+is "config, watch pair unset: documented repo fallback" "1:1" "$(hits 'https://ntfy.sh/rt'):$(hits 'Bearer rk')"
+WATCH_NTFY_TOPIC= WATCH_NTFY_TOKEN= REPO_NTFY_TOPIC=rt REPO_NTFY_TOKEN=rk ldrive "${WORK}/leg.sh"
+is "leg, watch pair unset: documented repo fallback" "1:1" "$(hits 'https://ntfy.sh/rt'):$(hits 'Bearer rk')"
+# (d) no topic at all: no push.
+WATCH_NTFY_TOPIC= REPO_NTFY_TOPIC= ldrive "${WORK}/leg.sh"
+is "leg, no topic at all: no curl" "0" "$(calls '^curl ')"
 
 # #208 round 3 (red-team F1): the step headers that decide whether the
 # incident path runs at all. A probe without continue-on-error stops the job
