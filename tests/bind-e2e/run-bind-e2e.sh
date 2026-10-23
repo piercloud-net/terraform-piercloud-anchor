@@ -162,7 +162,7 @@ caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.prodshape" )
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --adapter caddyfile
 grep -q "@not_edge_peer" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the raw-peer origin gate"
-if grep -Eq 'X-Piercloud-Origin|CLOUDFRONT_ORIGIN_SECRET|header\(\{' "${WORK}/Caddyfile.prodshape"; then die "prodshape render carries the retired shared origin header (#202)"; fi
+if grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret' "${WORK}/Caddyfile.prodshape"; then die "prodshape render carries the retired shared origin header (#202)"; fi
 grep -q "192.0.2.99/32" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the main-box bypass"
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
@@ -277,15 +277,23 @@ for grp in site["handle"][0]["routes"]:
 if catchall is None:
     print("catch-all handle group not found")
     sys.exit(1)
-inner = [r["handle"][0] for r in catchall["handle"][0]["routes"]]
-kinds = ["abort" if h.get("handler") == "static_response" and h.get("abort") else h.get("handler") for h in inner]
-if kinds.count("abort") < 1 or "reverse_proxy" not in kinds:
-    print(f"gate handlers missing from the catch-all handle: {kinds}")
+routes = catchall["handle"][0]["routes"]
+kinds = ["abort" if r["handle"][0].get("handler") == "static_response" and r["handle"][0].get("abort") else r["handle"][0].get("handler") for r in routes]
+aborts = [r for r, k in zip(routes, kinds) if k == "abort"]
+# Exactly one abort, and it must be the @not_edge_peer raw-peer gate: an
+# unconditional abort (no matcher, or a matcher that is not the gate) would
+# pass a bare count and deny every request, or gate nothing at all.
+if len(aborts) != 1 or "reverse_proxy" not in kinds:
+    print(f"want exactly one abort and a reverse_proxy in the catch-all handle: {kinds}")
     sys.exit(1)
-if kinds.index("reverse_proxy") < max(i for i, k in enumerate(kinds) if k == "abort"):
+gate = [m.get("expression", {}) for m in aborts[0].get("match", []) if m.get("expression", {}).get("name") == "not_edge_peer" and "remote_ip" in m.get("expression", {}).get("expr", "")]
+if not gate:
+    print(f"the catch-all abort carries no @not_edge_peer remote_ip matcher: {aborts[0].get('match')}")
+    sys.exit(1)
+if kinds.index("reverse_proxy") < kinds.index("abort"):
     print(f"gate aborts after the reverse_proxy: {kinds}")
     sys.exit(1)
-print(f"adapted gate order OK: {kinds}")
+print(f"adapted gate order OK: {kinds}, matcher {gate[0]['name']}")
 PY
 }
 assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"

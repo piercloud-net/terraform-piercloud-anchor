@@ -150,6 +150,11 @@ hasnt "${WORK}/Caddyfile.443" 'trusted_proxies' "no trusted_proxies (header cann
 hasnt "${WORK}/Caddyfile.443" 'client_ip_headers' "no client_ip_headers (header is never admission)"
 has "${WORK}/Caddyfile.443" 'header Strict-Transport-Security "max-age=15552000"' "HSTS max-age=15552000 on the :443 site"
 hasnt "${WORK}/Caddyfile.443" 'includeSubDomains' "HSTS does not includeSubDomains"
+# Red-team F3: strict SNI/Host is pinned explicitly, never left to the Caddy
+# default, and never disabled (insecure_off would let an empty SNI select the
+# match-less TLS policy, which has no client_auth).
+has "${WORK}/Caddyfile.443" 'strict_sni_host on' "render pins strict SNI/Host matching explicitly (F3)"
+hasnt "${WORK}/Caddyfile.443" 'insecure_off' "render never disables strict SNI/Host (F3)"
 
 # :80 carries tang + ACME only — no dashboard handler (origin hardening).
 awk '/^:80 \{/{f=1} f{print} f&&/^}$/{exit}' "${WORK}/Caddyfile.443" > "${WORK}/http.block"
@@ -323,6 +328,27 @@ awk -v gate="${unauth_gate}" -v gate2="${T}${T}abort @unauthorized" -v anchor="$
   '{ print } $0 == anchor { print gate; print gate2 }' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.unauth-mutant"
 has "${WORK}/Caddyfile.unauth-mutant" 'abort @unauthorized' "mutation (d): the re-inserted header gate is present in the mutant"
 hard_die "${WORK}/Caddyfile.unauth-mutant" "retired shared origin header (#202)" "mutation (d): the self-check refuses a render that re-inserts @unauthorized"
+
+# Fixture 18 (red-team F1): a LOWER-case retired header matcher. Caddy
+# canonicalizes header names, so `header x-piercloud-origin` is the same header
+# as X-Piercloud-Origin; a case-sensitive tooth passes it and the regression ships.
+lc_gate="${T}${T}@lc header x-piercloud-origin probe-value"
+awk -v gate="${lc_gate}" -v anchor="${T}${T}abort @not_edge_peer" \
+  '{ print } $0 == anchor { print gate }' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.lc-header"
+has "${WORK}/Caddyfile.lc-header" 'header x-piercloud-origin' "fixture 18: the lower-case retired header matcher is in the fixture"
+hard_die "${WORK}/Caddyfile.lc-header" "retired shared origin header (#202)" "self-check refuses a lower-case header x-piercloud-origin matcher (F1)"
+# Fixture 19 (red-team F5): a LEGITIMATE CEL header matcher is not the retired
+# header and must never false-red the gate.
+acc_gate="${T}${T}@accept header({'Accept':'application/json'})"
+awk -v gate="${acc_gate}" -v anchor="${T}${T}abort @not_edge_peer" \
+  '{ print } $0 == anchor { print gate }' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.legit-header"
+has "${WORK}/Caddyfile.legit-header" "header({'Accept'" "fixture 19: a legitimate header({...}) matcher is in the fixture"
+hard_ok "${WORK}/Caddyfile.legit-header" "self-check accepts a legitimate header({'Accept':...}) matcher (F5: no false red)"
+# The teeth are the two retired names, case-insensitively, at both sites (the
+# in-function self-check and the post-render write gate), and no longer the
+# case-sensitive header({ alternative.
+is "010 teeth: two case-insensitive grep sites over the retired names" "2" "$(grep -cF "grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret'" "${PROVISION_SH}")"
+hasnt "${PROVISION_SH}" 'X-Piercloud-Origin|CLOUDFRONT_ORIGIN_SECRET|header\(\{' "the old case-sensitive teeth pattern (with header({) is gone (F1/F5)"
 
 # The gate must sit INSIDE the catch-all handle: Caddy adapts `abort` after
 # `handle`, so a site-level gate is dead code (tests/bind-e2e pins the

@@ -18,12 +18,14 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 > main-box IP, serving ACME challenges on TCP/80 and the dashboard on TCP/443
 > (never on `:80`) to the platform edge — the CloudFront origin-facing ranges
 > + the main box on TCP/443 are the dashboard leg; Caddy requires a CloudFront
-> client certificate signed by the committed origin-mTLS CA at the TLS
+> client certificate signed by the committed origin-mTLS CA
+> (`scripts/origin-mtls-ca.pem`; the trust pool is that CA only, since `CF_AOP_CA_PEM`
+> is refused beside it) at the TLS
 > handshake for every `:443` peer, the main box and loopback included
 > (`client_auth require_and_verify`, issue #202); the shared `X-Piercloud-Origin`
-> header is retired and is not a gate; a pre-mTLS release gated on that header
-> alone and is never a valid rollback target — plus probing the tenant's public endpoints
-> for availability (narrow firewall rules; no SSH inbound
+> header is retired in this release and is not a gate. A pre-mTLS release, that is
+> one gated on that header alone, is never a valid rollback target. The anchor also
+> probes the tenant's public endpoints for availability (narrow firewall rules; no SSH inbound
 > from the main box either). Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
 > per-event via SCP password-reset + re-dispatch; netcup console/rescue as

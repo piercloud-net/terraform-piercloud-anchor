@@ -132,6 +132,12 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# admin.disabled:true would refuse the reload, and publishing :2019"
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
+  printf '%s\n' "	# Strict SNI/Host is pinned, not left to the Caddy default: a :443 request"
+  printf '%s\n' "	# whose SNI does not match its Host is refused before any handler, and an"
+  printf '%s\n' "	# empty SNI never selects the match-less TLS policy (no client_auth)."
+  printf '%s\n' "	servers {"
+  printf '%s\n' "		strict_sni_host on"
+  printf '%s\n' "	}"
   printf '%s\n' "	# The :443 gate matches the raw TCP peer (remote_ip). Admission is"
   printf '%s\n' "	# never derived from CloudFront-Viewer-Address or any forwarded"
   printf '%s\n' "	# header: a distribution can set them. Do not switch the gate to"
@@ -244,8 +250,10 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
   local cfg="${1:-${CADDY_CONFIG}}" live http_block https_block bad_up gatus_hits
   [ -r "$cfg" ] && [ -s "$cfg" ] || die "cannot read the rendered Caddyfile $cfg — the origin-hardening check cannot run; refusing to finish blind"
   # #202 fail-closed tooth over the WHOLE file (comments included): the retired
-  # shared origin header and its matcher must never be rendered again.
-  if grep -Eq 'X-Piercloud-Origin|CLOUDFRONT_ORIGIN_SECRET|header\(\{' "$cfg"; then
+  # shared origin header must never be rendered again. Matched case-insensitively:
+  # Caddy canonicalizes header names, so a lowercase matcher is the same header.
+  # Only the two retired names are teeth (a legitimate header({...}) matcher is not).
+  if grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret' "$cfg"; then
     die "serving Caddyfile $cfg carries the retired shared origin header (#202) — refusing to finish blind"
   fi
   # Direct configuration lines only: a comment mentioning a retired directive
@@ -2985,7 +2993,8 @@ origin_ca_select_pair
 #
 # Two sources feed ONE pool file and ONE `client_auth require_and_verify`:
 #   - CF_AOP_CA_PEM     — the legacy Cloudflare Authenticated Origin Pulls
-#     bundle (retired at the A2 CloudFront cutover; expected UNSET);
+#     bundle (retired at the A2 CloudFront cutover; expected UNSET, and REFUSED
+#     while ORIGIN_MTLS_CA_PEM is set: it would widen the trust pool);
 #   - ORIGIN_MTLS_CA_PEM — the self-held origin-mTLS CA (issue #202), read from
 #     the committed `scripts/origin-mtls-ca.pem` by 020 and exported into this
 #     script. CloudFront presents an ACM client certificate signed by it.
@@ -2994,6 +3003,9 @@ origin_ca_select_pair
 AOP_TLS=""
 MTLS_TLS=""
 CLIENT_CA_POOL=""
+if [ -n "${CF_AOP_CA_PEM:-}" ] && [ -n "${ORIGIN_MTLS_CA_PEM:-}" ]; then
+  die "CF_AOP_CA_PEM is set alongside ORIGIN_MTLS_CA_PEM — it would widen the origin trust pool beyond the committed origin-mTLS CA (any Cloudflare-zone leaf would pass). Unset CF_AOP_CA_PEM: it only served the pre-A2 Cloudflare-edge rollback, which origin mTLS does not support (pre-mTLS releases are never a valid target; they reopen #202)"
+fi
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
@@ -3073,7 +3085,7 @@ install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
 # #202 fail-closed tooth: the retired shared origin header must never be rendered,
 # comments included. The render is text, so grep the whole file.
-if grep -Eq 'X-Piercloud-Origin|CLOUDFRONT_ORIGIN_SECRET|header\(\{' "$TMP_CADDY"; then
+if grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret' "$TMP_CADDY"; then
   rm -f "$TMP_CADDY"
   die "rendered Caddyfile carries the retired shared origin header (#202) — refusing to write it"
 fi
@@ -3383,17 +3395,19 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # (7 refused / 28 timeout) or a DNS problem (6): only a TLS-layer rejection
     # proves client_auth is enforcing — a dead :443 must not pass this probe.
     # Rollback wording follows the active pool source (review F5): the AOP
-    # secret hint is only true while CF_AOP_CA_PEM is the pool source. Under
-    # origin mTLS the committed CA ships in the release, so the rollback is a
-    # redeploy of the previous release (an older origin-mTLS release still gates
-    # on the retired header, so it works only while CloudFront still sends it).
+    # secret hint is only true while CF_AOP_CA_PEM is the pool source (it is
+    # refused alongside the origin-mTLS CA, so under origin mTLS it is never a
+    # rollback). One rollback floor, docs/dr.md: while the platform still sends the
+    # retired header, any release carrying the origin-mTLS gate (4d157dd or later)
+    # is a valid target; once the platform drops the header, the floor is this
+    # release. Pre-mTLS releases are never a valid target (they reopen #202).
     if [ -n "${MTLS_TLS}" ]; then
-      pool_rollback="redeploy a release that carries this origin-mTLS gate (the committed CA ships in the release). A release older than the #202 header retirement is a valid target only while the platform still sends the retired origin header; pre-mTLS releases are never a valid target (docs/dr.md)"
-      pool_retry="the committed origin-mTLS CA ships in the release, so a rollback is a redeploy of a release that carries this origin-mTLS gate (docs/dr.md)"
+      pool_rollback="While the platform still sends the retired header, any release carrying the origin-mTLS gate (4d157dd or later) is a valid rollback target. Once the platform drops the header, the floor is this release. Pre-mTLS releases are never a valid target (they reopen #202). Rollback floor: docs/dr.md"
+      pool_retry="redeploy a release carrying the origin-mTLS gate; the rollback floor is in docs/dr.md"
       pool_cause="the origin trust pool does not match CloudFront's client certificate"
     else
-      pool_rollback="roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply"
-      pool_retry="temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: AOP is retired for the :443 origin leg; delete CF_AOP_CA_PEM and do not re-enable"
+      pool_rollback="no supported rollback to the Cloudflare AOP pool: origin mTLS refuses CF_AOP_CA_PEM alongside the committed CA. Pre-mTLS releases are never a valid target (they reopen #202; docs/dr.md)"
+      pool_retry="unset CF_AOP_CA_PEM and re-dispatch: the origin-mTLS CA is the only supported client-auth pool (docs/dr.md)"
       pool_cause="the origin trust bundle does not match Cloudflare's client cert"
     fi
     neg_rc=0

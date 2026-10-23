@@ -127,7 +127,10 @@ is "pool: mTLS only enables client auth and leaves no residual pool" "AOP_TLS=ye
 out="$(run_pool "$aop_pem" "")" || true
 is "pool: AOP only keeps the legacy behaviour (no mTLS flag)" "AOP_TLS=yes MTLS_TLS= POOL=1 CLIENT_POOL_LEN=0" "$out"
 out="$(run_pool "$aop_pem" "$mtls_pem")" || true
-is "pool: both sources land in one ordered pool" "AOP_TLS=yes MTLS_TLS=yes POOL=2 CLIENT_POOL_LEN=0" "$out"
+case "$out" in
+  DIE:*'would widen the origin trust pool'*) ok "pool: CF_AOP_CA_PEM alongside the mTLS CA dies (it would widen the trust pool)" ;;
+  *) bad "pool: CF_AOP_CA_PEM alongside the mTLS CA was not refused (got '$out')" ;;
+esac
 out="$(run_pool "" "")" || true
 case "$out" in
   *WARN:*'the :443 origin cannot require a client certificate'*'AOP_TLS= MTLS_TLS='*) ok "pool: empty state warns and enforces nothing" ;;
@@ -173,7 +176,10 @@ esac
 # The combined AOP+mTLS pool may legitimately hold two CAs: the one-root rule
 # is for the mTLS value only, so the ordered two-source pool still assembles.
 out="$(run_pool "$aop_pem" "$mtls_pem")" || true
-is "pool: AOP plus the one mTLS root still assembles two CAs" "AOP_TLS=yes MTLS_TLS=yes POOL=2 CLIENT_POOL_LEN=0" "$out"
+case "$out" in
+  DIE:*'would widen the origin trust pool'*) ok "pool: the AOP root plus the one mTLS root is refused (no widened pool)" ;;
+  *) bad "pool: the AOP root plus the one mTLS root was not refused (got '$out')" ;;
+esac
 
 # ---- STATUS_HOST without any client-auth CA (review finding) ---------------
 out="$(STATUS_HOST=status.example.test run_pool "" "")" || true
@@ -256,8 +262,10 @@ has "$PROVISION_SH" "alert (certificate required|bad certificate)" "the cert-les
 has "$PROVISION_SH" "-w '%{http_code}'" "the edge pull captures the HTTP status code"
 has "$PROVISION_SH" '[ "${edge_code}" = "200" ]' "the edge pull requires HTTP 200 (not exit 0)"
 hasnt "$PROVISION_SH" 'curl -sSf --max-time 20' "the edge pull no longer treats any exit-0 response as success"
-has "$PROVISION_SH" 'a rollback is a redeploy of a release that carries this origin-mTLS gate' "the mTLS rollback names the release redeploy, not the AOP secret (F5)"
-has "$PROVISION_SH" 'pre-mTLS releases are never a valid target' "the rollback text names the mTLS floor (pre-mTLS releases never a valid target; #202)"
+# Trust M1: one rollback floor, pinned verbatim in the 010 hint AND docs/dr.md.
+ROLLBACK_FLOOR='While the platform still sends the retired header, any release carrying the origin-mTLS gate (4d157dd or later) is a valid rollback target. Once the platform drops the header, the floor is this release. Pre-mTLS releases are never a valid target (they reopen #202).'
+has "$PROVISION_SH" "$ROLLBACK_FLOOR" "the 010 rollback hint states the one rollback floor verbatim (trust M1)"
+has "$ROOT/docs/dr.md" "$ROLLBACK_FLOOR" "docs/dr.md states the same rollback floor verbatim (trust M1)"
 has "$ROOT/docs/dr.md" 'never revert the anchor alone' "docs/dr.md states the same post-cutover ordering the runbook text cites"
 
 # ---- pipeline wiring ------------------------------------------------------

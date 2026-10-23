@@ -158,7 +158,7 @@ Staged proof; the producers (slice `pc-status.json`, pc-control platform manifes
 - [ ] CF side first: zone-level AOP enabled with our own leaf cert uploaded; THEN `CF_AOP_CA_PEM` set and the anchor re-dispatched.
 - [ ] Run assertions: cert-less origin pull rejected; edge pull serves `200`.
 - [ ] Rollback order (only when rolling back): unset `CF_AOP_CA_PEM` + re-dispatch FIRST, disable the CF setting second (the reverse order black-holes every edge pull).
-- [ ] Rebuild caveat: a rebuild dispatched while `CF_AOP_CA_PEM` is still planted fails before DNS converges — recover by deleting the secret, converging DNS, then re-dispatching. A2: do NOT re-enable AOP (retired for the `:443` origin leg — CloudFront has no AOP); a pre-A2 rollback to the Cloudflare edge is a code-level revert (the A2 firewall, gate and nested naming ship together), not a `102` action — see dr.md.
+- [ ] Rebuild caveat: a rebuild dispatched while `CF_AOP_CA_PEM` is still planted fails before DNS converges — recover by deleting the secret, converging DNS, then re-dispatching. A2: do NOT re-enable AOP (retired for the `:443` origin leg — CloudFront has no AOP); a pre-A2 rollback to the Cloudflare edge is a code-level revert (the A2 firewall, gate and nested naming ship together), not a `102` action; on an origin-mTLS release it is not a supported rollback (it requires a pre-mTLS release, which reopens #202) — see dr.md.
 
 ### Naming (`anchor-01-<tenant>`, `<tenant>.status`)
 
