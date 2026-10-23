@@ -240,7 +240,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=295
+MIN_CHECKS=300
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -1092,7 +1092,13 @@ while [ "$#" -gt 0 ]; do
 done
 case "$url" in
   */api/v1/endpoints/statuses) body='[{"name":"a","group":"g"}]' ;;
-  *) body='<html><title>Gatus</title></html>'; code="${ROOT_CODE:-200}" ;;
+  *) body='<html><title>Gatus</title></html>'; code="${ROOT_CODE:-200}"
+     # EDGE_STUB_LAST (optional): the second root fetch gets no response at all.
+     if [ -n "${EDGE_STUB_LAST:-}" ]; then
+       n="$(cat "$EDGE_STUB_LAST" 2>/dev/null || echo 0)"
+       printf '%s' "$((n + 1))" >"$EDGE_STUB_LAST"
+       if [ "$n" -ge 1 ]; then code=000; hdr=""; fi
+     fi ;;
 esac
 [ -n "$out" ] && printf '%s' "$body" >"$out"
 [ -n "$hdr" ] && [ -n "${EDGE_STUB_HDR:-}" ] && printf '%b' "$EDGE_STUB_HDR" >"$hdr"
@@ -1106,7 +1112,7 @@ exec "${REAL_OPENSSL}" "\$@"
 STUB
 chmod +x "${WORK}/edge-bin/curl" "${WORK}/edge-bin/openssl"
 SHA_OK="$(printf '%064x' 1234567890)"
-HDR_OK="HTTP/2 200\r\npc-edge-client-sha256: ${SHA_OK}\r\nx-amz-cf-pop: FRA56-P2\r\n\r\n"
+HDR_OK="HTTP/2 200\r\npc-edge-client-sha256: ${SHA_OK}\r\nx-amz-cf-pop: FRA56-P2\r\nx-cache: Miss from cloudfront\r\n\r\n"
 HDR_BAD="HTTP/2 200\r\npc-edge-client-sha256: <b>not hex</b>\r\nx-amz-cf-pop: FRA56 P2\r\n\r\n"
 run_probe() { # $1 label, $2 root HTTP code, $3 stub header block (may be empty)
   local label="$1" code="$2" hdr="$3" rc=0
@@ -1120,6 +1126,8 @@ rc_ok="$(run_probe present 200 "$HDR_OK")"
 is "edge headers: OK verdict exits 0 with the headers" "0" "$rc_ok"
 has "edge headers: OK summary carries the verified fingerprint and PoP" "$(cat "${WORK}/sum-present")" "Pc-Edge-Client-Sha256: \`${SHA_OK}\`, x-amz-cf-pop: \`FRA56-P2\`"
 has "edge headers: OK verdict is logged" "$(cat "${WORK}/log-present")" "external-watch: OK"
+has "edge headers: OK summary records x-cache" "$(cat "${WORK}/sum-present")" 'x-cache: `Miss from cloudfront`'
+has "edge headers: the summary labels the values informational, unverified and tenant-controlled" "$(cat "${WORK}/sum-present")" "informational, unverified, may be cached, tenant-controlled"
 rc_absent="$(run_probe absent 200 "")"
 is "edge headers: absent headers keep the OK verdict" "0" "$rc_absent"
 has "edge headers: absent headers summarised as absent" "$(cat "${WORK}/sum-absent")" "Pc-Edge-Client-Sha256: \`absent\`, x-amz-cf-pop: \`absent\`"
@@ -1130,9 +1138,18 @@ lacks "edge headers: no raw markup reaches the summary" "$(cat "${WORK}/sum-malf
 rc_fail_p="$(run_probe fail-present 503 "$HDR_OK")"
 rc_fail_a="$(run_probe fail-absent 503 "")"
 is "edge headers: FAIL verdict exits 1 without the headers" "1" "$rc_fail_a"
-is "edge headers: a present header does not rescue a failing probe" "$rc_fail_a" "$rc_fail_p"
+is "edge headers: a present header does not mask a failing probe" "$rc_fail_a" "$rc_fail_p"
 has "edge headers: FAIL still writes the summary line" "$(cat "${WORK}/sum-fail-present")" "Pc-Edge-Client-Sha256: \`${SHA_OK}\`"
 has "edge headers: FAIL verdict is logged" "$(cat "${WORK}/log-fail-present")" "external-watch: FAIL"
+lacks "edge headers: a missing header file leaves no redirect error in the step log" "$(cat "${WORK}/log-absent")" "No such file"
+rc_retry=0
+rm -f "${WORK}/edge-last"
+PATH="${WORK}/edge-bin:${PATH}" PROBE_URL="https://probe.test/" STATUS_PULLER="" TENANT_USER="" \
+  MIN_CERT_DAYS=14 ATTEMPTS=2 RETRY_SLEEP=0 ROOT_CODE=503 EDGE_STUB_HDR="$HDR_OK" EDGE_STUB_LAST="${WORK}/edge-last" \
+  EDGE_STUB_CERT="${WORK}/edge-cert.pem" GITHUB_STEP_SUMMARY="${WORK}/sum-retry" \
+  GITHUB_OUTPUT="${WORK}/out-retry" bash -e "$PROBE" >"${WORK}/log-retry" 2>&1 || rc_retry=$?
+is "edge headers: a probe that fails on both attempts exits 1" "1" "$rc_retry"
+has "edge headers: a no-response last attempt keeps the values of the last response" "$(cat "${WORK}/sum-retry")" "Pc-Edge-Client-Sha256: \`${SHA_OK}\`, x-amz-cf-pop: \`FRA56-P2\`, x-cache: \`Miss from cloudfront\`"
 # Static teeth on the same step: the header is captured from the root fetch,
 # the value is pattern-checked, and the summary write can never fail the step.
 PROBE_TEXT="$(cat "$PROBE")"

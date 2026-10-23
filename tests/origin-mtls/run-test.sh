@@ -307,21 +307,30 @@ fp_render 0 yes "${WORK}/fp-0-aop.Caddyfile"
 fp_render 0 "" "${WORK}/fp-0-plain.Caddyfile"
 for branch in 1-aop 1-plain 0-aop 0-plain; do
   f="${WORK}/fp-${branch}.Caddyfile"
-  is "fp[${branch}]: the site-level fingerprint line appears exactly once" "1" "$(grep -cFx -- "$FP_LINE" "$f" || true)"
-  site="$(awk '/^https:\/\// { on = 1 } on { print } on && /^}/ { exit }' "$f")"
-  is "fp[${branch}]: the line sits inside the :443 site block (one tab, not in a handle)" "1" "$(printf '%s\n' "$site" | grep -cFx -- "$FP_LINE" || true)"
-  is "fp[${branch}]: the header name is rendered exactly once" "1" "$(grep -c 'Pc-Edge-Client-Sha256' "$f" || true)"
-  if grep -Eq 'Pc-Edge-Client-Sha256[^{]*[0-9a-fA-F]{64}' "$f"; then bad "fp[${branch}]: a literal hex value follows the header name"; else ok "fp[${branch}]: the header value is the placeholder, never a literal hex value"; fi
+  case "$branch" in
+    *-aop)
+      is "fp[${branch}]: the site-level fingerprint line appears exactly once" "1" "$(grep -cFx -- "$FP_LINE" "$f" || true)"
+      site="$(awk '/^https:\/\// { on = 1 } on { print } on && /^}/ { exit }' "$f")"
+      is "fp[${branch}]: the line sits inside the :443 site block (one tab, not in a handle)" "1" "$(printf '%s\n' "$site" | grep -cFx -- "$FP_LINE" || true)"
+      is "fp[${branch}]: the header name is rendered exactly once" "1" "$(grep -c 'Pc-Edge-Client-Sha256' "$f" || true)"
+      if grep -Eq 'Pc-Edge-Client-Sha256[^{]*[0-9a-fA-F]{64}' "$f"; then bad "fp[${branch}]: a literal hex value follows the header name"; else ok "fp[${branch}]: the header value is the placeholder, never a literal hex value"; fi
+      ;;
+    *-plain)
+      is "fp[${branch}]: no client auth, so the header is absent (never the SHA-256 of an empty certificate)" "0" "$(grep -c 'Pc-Edge-Client-Sha256' "$f" || true)"
+      ;;
+  esac
   if out="$(fp_assert "$f" 2>&1)"; then ok "fp[${branch}]: assert_caddyfile_hardened accepts the render"; else bad "fp[${branch}]: assert_caddyfile_hardened refused the render (got '${out}')"; fi
 done
 base="${WORK}/fp-1-aop.Caddyfile"
 grep -vFx -- "$FP_LINE" "$base" > "${WORK}/fp-mut-removed.Caddyfile" || true
 sed 's/^\theader Pc-Edge-Client-Sha256/\t\theader Pc-Edge-Client-Sha256/' "$base" > "${WORK}/fp-mut-deep.Caddyfile"
 sed "s/{http.request.tls.client.fingerprint}/$(printf 'a%.0s' {1..64})/" "$base" > "${WORK}/fp-mut-literal.Caddyfile"
+sed 's/^\theader Pc-Edge-Client-Sha256/\t# header Pc-Edge-Client-Sha256/' "$base" > "${WORK}/fp-mut-commented.Caddyfile"
+awk -v l="$FP_LINE" '{ print } /^https:\/\// { print l }' "${WORK}/fp-1-plain.Caddyfile" > "${WORK}/fp-mut-noauth.Caddyfile"
 is "mutation: the removed-line render no longer carries the header" "0" "$(grep -c 'Pc-Edge-Client-Sha256' "${WORK}/fp-mut-removed.Caddyfile" || true)"
 is "mutation: the deep-indent render carries the line one tab too deep" "1" "$(grep -cFx -- "$DEEP_FP_LINE" "${WORK}/fp-mut-deep.Caddyfile" || true)"
 if grep -Eq 'Pc-Edge-Client-Sha256[^{]*[0-9a-fA-F]{64}' "${WORK}/fp-mut-literal.Caddyfile"; then ok "mutation: a literal hex value is caught by the never-literal tooth"; else bad "mutation: the literal-value tooth does not see a substituted hex value"; fi
-for mut in removed deep literal; do
+for mut in removed deep literal commented noauth; do
   if out="$(fp_assert "${WORK}/fp-mut-${mut}.Caddyfile" 2>&1)"; then bad "mutation (${mut}): assert_caddyfile_hardened passes a broken fingerprint line"; else
     case "$out" in
       *'Pc-Edge-Client-Sha256'*) ok "mutation (${mut}): assert_caddyfile_hardened fails and names the header" ;;

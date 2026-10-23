@@ -194,7 +194,9 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "https://${STATUS_HOST} {"
     printf '%s\n' "	header -Server"
     printf '%s\n' "	header Strict-Transport-Security \"max-age=15552000\""
-    printf '%s\n' "	header Pc-Edge-Client-Sha256 \"{http.request.tls.client.fingerprint}\""
+    case "${DASH_TLS_STANZA}" in
+      *client_auth*) printf '%s\n' "	header Pc-Edge-Client-Sha256 \"{http.request.tls.client.fingerprint}\"" ;;
+    esac
     printf '%s\n' "${DASH_TLS_STANZA}"
     printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
     printf '%s\n' "	@dashtang path /adv* /rec*"
@@ -292,8 +294,17 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
   # The platform's rotation check reads the verified edge client-certificate
   # fingerprint from this site-level line (same one-tab rule as HSTS; a deeper
   # indent would sit inside a handle, where the abort paths never send it).
-  printf '%s\n' "$https_block" | grep -Fxq "$(printf '\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')" \
-    || die "serving Caddyfile $cfg lacks the :443 site-level Pc-Edge-Client-Sha256 header (placeholder {http.request.tls.client.fingerprint}) — the origin-hardening render did not converge; refusing to finish blind"
+  # Emitted only with client_auth require_and_verify in the same site: without
+  # a verified client leaf the placeholder is the SHA-256 of the empty string,
+  # a valid-looking value that must never be served.
+  if printf '%s\n' "$https_block" | grep -Eq '^[[:space:]]*client_auth[[:space:]]*\{'; then
+    printf '%s\n' "$https_block" | grep -Fxq "$(printf '\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')" \
+      || die "serving Caddyfile $cfg lacks the :443 site-level Pc-Edge-Client-Sha256 header (placeholder {http.request.tls.client.fingerprint}) — the origin-hardening render did not converge; refusing to finish blind"
+    printf '%s\n' "$https_block" | grep -Eq '^[[:space:]]*mode[[:space:]]+require_and_verify([[:space:]]|$)' \
+      || die "serving Caddyfile $cfg carries client_auth on :443 without mode require_and_verify beside Pc-Edge-Client-Sha256 — refusing to finish blind"
+  elif printf '%s\n' "$https_block" | grep -Fq 'Pc-Edge-Client-Sha256'; then
+    die "serving Caddyfile $cfg echoes Pc-Edge-Client-Sha256 on :443 without client_auth require_and_verify (the placeholder would be the SHA-256 of the empty string) — refusing to finish blind"
+  fi
   if printf '%s\n' "$https_block" | grep -Eqi 'header[[:space:]]+[-!]strict-transport-security'; then
     die "serving Caddyfile $cfg deletes Strict-Transport-Security again after setting it — the hardening render did not converge; refusing to finish blind"
   fi

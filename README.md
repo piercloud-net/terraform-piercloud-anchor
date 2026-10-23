@@ -85,6 +85,8 @@ The paragraphs below are the standing disclosure — quoted verbatim in the UI a
 
 Jurisdiction, honestly: FR box / DE anchor / IT operator — EIO or direct e-Evidence orders are delay plus two-compulsion cost, NOT prevention; rotation is forward security only.
 
+The platform also sets two response headers on the anchor's `:443` dashboard: HSTS and `Pc-Edge-Client-Sha256`, an echo of the verified edge client-certificate fingerprint for the platform's rotation check (a public certificate fingerprint, identical on every anchor, not an attestation, and removable by you; see [docs/usage.md](docs/usage.md)).
+
 ### Data: at rest, in transit, at runtime
 
 **Encrypted to your instance, unreadable at rest by the host, runtime confidentiality arriving via attested confidential computing — and an application-level encryption layer available on top for apps that want it.**
