@@ -219,8 +219,8 @@ is "c5c kept log" "1" "$(grep -c 'is attached — kept' "$WORK/out.c5c" || true)
 # list_steady_policies over the raw response: it must drop every foreign
 # entry before cmd_sweep_post ever sees them.
 FOREIGN_RESPONSE="[{\"id\":42,\"name\":\"piercloud-anchor-anchor-01-pier\",\"description\":\"\"},$STEADY_FOREIGN,$STEADY_FOREIGN_LEGACY,$STEADY_FOREIGN_ID]"
-# c10 apply: this server's live policy is kept and NEITHER foreign entry is
-# listed, let alone detached — the API response carries all three.
+# c10 apply: this server's live policy is kept and NONE of the three foreign
+# entries is listed, let alone detached — the API response carries all four.
 rc="$(RC_OF c10 "[]" '{"userPolicies":[42]}' "$FOREIGN_RESPONSE")"
 is "c10 rc" "0" "$rc"
 is "c10 actions (foreign untouched, live kept, nothing swept)" "" "$(ACTIONS c10)"
@@ -235,8 +235,9 @@ is "c10b rc" "0" "$rc"
 is "c10b actions (only the exact orphan retired)" "detach 45 delete 45" "$(ACTIONS c10b)"
 is "c10b foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier|a\.pcad\.it-424242' "$WORK/out.c10b" || true)"
 is "c10b id-suffix foreign not detached" "0" "$(printf '%s' "$(ACTIONS c10b)" | grep -cE '(detach|delete) 47' || true)"
-# c11 check mode: report-only, and the foreign policy is not even reported as
-# a would-be sweep — a check run must not advertise a sibling's policy.
+# c11 check mode: report-only, and none of the three foreign policies is even
+# reported as a would-be sweep — a check run must not advertise a sibling's
+# policy.
 rc="$(RC_OF c11 "[]" '{"userPolicies":[42]}' "$FOREIGN_ORPHAN_RESPONSE" check)"
 is "c11 rc" "0" "$rc"
 is "c11 actions (report-only mutates nothing)" "" "$(ACTIONS c11)"
