@@ -113,6 +113,10 @@ All notable changes to this project will be documented in this file.
 
 - *(witness)* Delta cursors + 6h sweeps + fast acceptance — witness in seconds (closes #153)
 
+### 🧪 Testing
+
+- *(dns)* Migrate the broker-provision-dns harness off the hand-rolled YAML tokenizer (closes #195)
+
 ### ⚙️ Miscellaneous Tasks
 
 - Relicense MIT -> Apache-2.0 ([#6](https://github.com/piercloud-net/terraform-piercloud-anchor/pull/6))
