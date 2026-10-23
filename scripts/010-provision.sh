@@ -3375,7 +3375,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # redeploy of the previous release (the shared header gate keeps the origin
     # reachable until the follow-up cutover).
     if [ -n "${MTLS_TLS}" ]; then
-      pool_rollback="redeploy the previous release (the committed origin-mTLS CA ships in the release; before the header cutover the header gate keeps the origin reachable, after it roll the distribution and the anchor back together)"
+      pool_rollback="redeploy the previous release (the committed origin-mTLS CA ships in the release; before the header cutover the header gate keeps the origin reachable — after it, re-add the repository secret and the distribution origin header FIRST, then revert the anchor, never the anchor alone: docs/dr.md)"
       pool_retry="the committed origin-mTLS CA is part of the release, so a rollback is a redeploy of the previous release (docs/dr.md)"
       pool_cause="the origin trust pool does not match CloudFront's client certificate"
     else
