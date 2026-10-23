@@ -3042,6 +3042,17 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
   else
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY}"
   fi
+elif [ -n "${AOP_TLS}" ]; then
+  # No origin pair on the box: Caddy still obtains the dashboard certificate
+  # automatically (HTTP-01), and the client-auth stanza MUST be emitted here
+  # too — without it the edge would be admitted on the shared header alone
+  # while this run's own trust-pool claim reads as enforced (review F1).
+  DASH_TLS_STANZA="	tls {
+		client_auth {
+			mode require_and_verify
+			trust_pool file ${CADDY_AOP_CA}
+		}
+	}"
 else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
@@ -3364,7 +3375,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # redeploy of the previous release (the shared header gate keeps the origin
     # reachable until the follow-up cutover).
     if [ -n "${MTLS_TLS}" ]; then
-      pool_rollback="roll back by redeploying the previous release (the committed origin-mTLS CA ships in the release; the header gate keeps the origin reachable)"
+      pool_rollback="redeploy the previous release (the committed origin-mTLS CA ships in the release; before the header cutover the header gate keeps the origin reachable, after it roll the distribution and the anchor back together)"
       pool_retry="the committed origin-mTLS CA is part of the release, so a rollback is a redeploy of the previous release (docs/dr.md)"
       pool_cause="the origin trust pool does not match CloudFront's client certificate"
     else

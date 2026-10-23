@@ -202,6 +202,26 @@ has "${WORK}/stanza.out" "mode require_and_verify" "F3: the compiled origin buil
 has "${WORK}/stanza.out" "trust_pool file /etc/caddy/aop-ca.pem" "F3: the compiled origin builder trusts the single pool file"
 has "${WORK}/stanza.out" "tls /etc/caddy/origin.crt /etc/caddy/origin.key {" "F3: the compiled builder keeps the origin certificate pair"
 is "F3: exactly one client_auth block is compiled" "1" "$(grep -c 'client_auth {' "${WORK}/stanza.out")"
+# F1 (#236 verify): with NO origin pair on the box the dashboard still gets
+# automatic HTTPS — the client-auth stanza must be emitted there too, or the
+# edge is admitted on the shared header alone.
+auto_out="$(
+  ORIGIN_TLS=0
+  AOP_TLS=yes
+  eval "$(grep -E '^CADDY_(ORIGIN_CRT|ORIGIN_KEY|AOP_CA)=' "$PROVISION_SH")"
+  # shellcheck disable=SC1090
+  source "${WORK}/stanza.src"
+  printf '%s\n' "${DASH_TLS_STANZA}"
+)"
+printf '%s\n' "$auto_out" > "${WORK}/stanza-auto.out"
+is "F1: the automatic-HTTPS branch still compiles one client_auth block" "1" \
+  "$(grep -c 'client_auth {' "${WORK}/stanza-auto.out")"
+has "${WORK}/stanza-auto.out" "mode require_and_verify" \
+  "F1: the automatic-HTTPS branch requires and verifies the client certificate"
+has "${WORK}/stanza-auto.out" "trust_pool file /etc/caddy/aop-ca.pem" \
+  "F1: the automatic-HTTPS branch trusts the same single pool file"
+hasnt "${WORK}/stanza-auto.out" "tls /etc/caddy/origin.crt" \
+  "F1: the automatic-HTTPS branch does not claim a pair it does not have"
 
 # ---- render stanza (real render span, real builder output) ----------------
 render_b="$(grep -n -m1 'BEGIN CADDY RENDER' "$PROVISION_SH" | cut -d: -f1)"
@@ -237,7 +257,7 @@ has "$PROVISION_SH" "alert (certificate required|bad certificate)" "the cert-les
 has "$PROVISION_SH" "-w '%{http_code}'" "the edge pull captures the HTTP status code"
 has "$PROVISION_SH" '[ "${edge_code}" = "200" ]' "the edge pull requires HTTP 200 (not exit 0)"
 hasnt "$PROVISION_SH" 'curl -sSf --max-time 20' "the edge pull no longer treats any exit-0 response as success"
-has "$PROVISION_SH" 'roll back by redeploying the previous release' "the mTLS rollback names the release redeploy, not the AOP secret (F5)"
+has "$PROVISION_SH" 'redeploy the previous release (the committed origin-mTLS CA ships in the release' "the mTLS rollback names the release redeploy, not the AOP secret (F5)"
 
 # ---- pipeline wiring ------------------------------------------------------
 has "$CI" "bash tests/origin-mtls/run-test.sh" "ci.yml runs this harness"
