@@ -1111,8 +1111,10 @@ esac
 # Dynamic-endpoints mode (issue #186): STATUS_PULLER=on moves every watched
 # HTTP row into the puller-owned fragment (single-owner rule, D1/D8/D10) —
 # `platform`, the slice row and the gate rows are seeded by the puller, and
-# tenant pairs live in the manifest. The legacy shape (switch unset) renders
-# exactly as before (standalone/template/BYOH; D10). Fail closed on a typo.
+# tenant pairs live in the manifest. The switch-unset shape renders the
+# `platform`/`main` + `GATUS_ENDPOINTS` rows as before (D10); the
+# standalone/template/BYOH lane it was named after is retired by b3b (#189).
+# Fail closed on a typo.
 case "${STATUS_PULLER:-}" in
   ''|0|false|no|off) PULLER_MODE=0 ;;
   1|true|yes|on)     PULLER_MODE=1 ;;
@@ -2781,9 +2783,10 @@ gatus_puller_disable() { # remove the puller artifacts + the puller-owned fragme
 # c0) Gatus dynamic-endpoints puller (optional; STATUS_PULLER=on)
 #    The fragment owns every watched HTTP row; on slice-managed anchors the
 #    puller re-renders it from the tenant + platform manifests on a timer
-#    (design issue #186, D1-D12). STATUS_PULLER unset = the legacy shape:
+#    (design issue #186, D1-D12). STATUS_PULLER unset = the switch-off shape:
 #    the config render keeps platform/main + GATUS_ENDPOINTS and no puller
-#    is installed (standalone/template/BYOH). The seed is written here (so
+#    is installed (the standalone/template/BYOH lane it was named after is
+#    retired by b3b, #189). The seed is written here (so
 #    Gatus starts with the shared rows) and never touched by 010 again.
 # ---------------------------------------------------------------------------
 case "$(gatus_puller_mode)" in
