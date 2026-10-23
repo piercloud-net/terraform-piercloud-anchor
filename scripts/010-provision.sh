@@ -68,17 +68,20 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
   case "$1" in
-    *[!a-z0-9]* | '')
-      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+    *[!a-z0-9]* | '' | ? | ??)
+      printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{3,15}$ before normalization (letters/digits only, 3-15 chars — the pc-control environment/alias grammar).\n' "$1" >&2
       return 1 ;;
   esac
-  if [ "${#1}" -gt 20 ]; then
-    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{1,20}$ before normalization (letters/digits only, 1-20 chars).\n' "$1" >&2
+  if [ "${#1}" -gt 15 ]; then
+    printf 'invalid TENANT_USER "%s": must match ^[a-z0-9]{3,15}$ before normalization (letters/digits only, 3-15 chars — the pc-control environment/alias grammar).\n' "$1" >&2
     return 1
   fi
   case "$1" in
     anchor* | status* | pcu* | platform*)
       printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
+      return 1 ;;
+    edge | console | ops | keys | unlock | bounce | mail | broker | www)
+      printf 'invalid TENANT_USER "%s": reserved platform name (the pc-control registry reserved set) — not a tenant.\n' "$1" >&2
       return 1 ;;
   esac
   return 0
@@ -564,6 +567,19 @@ origin_ca_cert_pem_ok() { # $1 = PEM text -> a bounded leaf-first certificate ch
 
 origin_ca_chain_blocks() { # $1 = PEM file -> count of real certificate blocks (line-anchored)
   grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" "$1" 2>/dev/null || true
+}
+
+origin_mtls_ca_single_root() { # $1 = PEM file -> exactly ONE certificate, a self-signed CA:TRUE root
+  # The origin-mTLS trust anchor is one root by contract. A second CA:TRUE
+  # block, or a non-CA leaf, that rode in with it would widen the pool the
+  # edge admits — so the block count, basicConstraints and the self-signature
+  # are all enforced here, not left to the harness.
+  local f="$1" n info
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -eq 1 ] || return 1
+  info="$(openssl x509 -in "$f" -noout -ext basicConstraints 2>/dev/null || true)"
+  grep -q 'CA:TRUE' <<<"$info" || return 1
+  openssl verify -check_ss_sig -CAfile "$f" "$f" >/dev/null 2>&1
 }
 
 origin_ca_block_der_exact() { # $1 = PEM file -> the FIRST block's body decodes to exactly the parsed DER (no trailing bytes)
@@ -1111,8 +1127,10 @@ esac
 # Dynamic-endpoints mode (issue #186): STATUS_PULLER=on moves every watched
 # HTTP row into the puller-owned fragment (single-owner rule, D1/D8/D10) —
 # `platform`, the slice row and the gate rows are seeded by the puller, and
-# tenant pairs live in the manifest. The legacy shape (switch unset) renders
-# exactly as before (standalone/template/BYOH; D10). Fail closed on a typo.
+# tenant pairs live in the manifest. The switch-unset shape renders the
+# `platform`/`main` + `GATUS_ENDPOINTS` rows as before (D10); the
+# standalone/template/BYOH lane it was named after is retired by b3b (#189).
+# Fail closed on a typo.
 case "${STATUS_PULLER:-}" in
   ''|0|false|no|off) PULLER_MODE=0 ;;
   1|true|yes|on)     PULLER_MODE=1 ;;
@@ -2781,9 +2799,10 @@ gatus_puller_disable() { # remove the puller artifacts + the puller-owned fragme
 # c0) Gatus dynamic-endpoints puller (optional; STATUS_PULLER=on)
 #    The fragment owns every watched HTTP row; on slice-managed anchors the
 #    puller re-renders it from the tenant + platform manifests on a timer
-#    (design issue #186, D1-D12). STATUS_PULLER unset = the legacy shape:
+#    (design issue #186, D1-D12). STATUS_PULLER unset = the switch-off shape:
 #    the config render keeps platform/main + GATUS_ENDPOINTS and no puller
-#    is installed (standalone/template/BYOH). The seed is written here (so
+#    is installed (the standalone/template/BYOH lane it was named after is
+#    retired by b3b, #189). The seed is written here (so
 #    Gatus starts with the shared rows) and never touched by 010 again.
 # ---------------------------------------------------------------------------
 case "$(gatus_puller_mode)" in
@@ -2958,20 +2977,63 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine; a key-bearing
-# bundle is refused below rather than written 644).
+# Client-auth trust pool (public cert material — world-readable is fine; a
+# key-bearing bundle is refused below rather than written 644).
+#
+# Two sources feed ONE pool file and ONE `client_auth require_and_verify`:
+#   - CF_AOP_CA_PEM     — the legacy Cloudflare Authenticated Origin Pulls
+#     bundle (retired at the A2 CloudFront cutover; expected UNSET);
+#   - ORIGIN_MTLS_CA_PEM — the self-held origin-mTLS CA (issue #202), read from
+#     the committed `scripts/origin-mtls-ca.pem` by 020 and exported into this
+#     script. CloudFront presents an ACM client certificate signed by it.
+# The pool file keeps its historical path (`aop-ca.pem`) so the container
+# mount, the stanza and the existing harnesses stay one code path.
 AOP_TLS=""
+MTLS_TLS=""
+CLIENT_CA_POOL=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
-  printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
+  CLIENT_CA_POOL="${CF_AOP_CA_PEM}"
+  log "legacy AOP client-auth bundle staged (retired at the A2 CloudFront cutover — this only keeps a pre-A2 rollback alive)"
+fi
+if [ -n "${ORIGIN_MTLS_CA_PEM:-}" ]; then
+  case "${ORIGIN_MTLS_CA_PEM}" in *"PRIVATE KEY"*) die "ORIGIN_MTLS_CA_PEM must be certificate-only (public trust anchor) — strip the private key";; esac
+  mtls_tmp="$(mktemp)"
+  printf '%s\n' "${ORIGIN_MTLS_CA_PEM}" >"${mtls_tmp}"
+  if ! origin_ca_cert_pem_ok "${ORIGIN_MTLS_CA_PEM}" || ! origin_ca_blocks_parse "${mtls_tmp}" || ! origin_mtls_ca_single_root "${mtls_tmp}"; then
+    rm -f "${mtls_tmp}"
+    die "ORIGIN_MTLS_CA_PEM is not a bounded PEM certificate (exactly one self-signed X.509 certificate with CA:TRUE, no trailing DER) — refusing to deploy it"
+  fi
+  rm -f "${mtls_tmp}"
+  if [ -n "${CLIENT_CA_POOL}" ]; then
+    CLIENT_CA_POOL="${CLIENT_CA_POOL}
+${ORIGIN_MTLS_CA_PEM}"
+  else
+    CLIENT_CA_POOL="${ORIGIN_MTLS_CA_PEM}"
+  fi
+  MTLS_TLS="yes"
+  log "origin-mTLS CA staged — CloudFront origin pulls must present a client certificate signed by it"
+fi
+if [ -n "${CLIENT_CA_POOL}" ]; then
+  pool_tmp="$(mktemp)"
+  printf '%s\n' "${CLIENT_CA_POOL}" >"${pool_tmp}"
+  if ! origin_ca_blocks_parse "${pool_tmp}"; then
+    rm -f "${pool_tmp}"
+    die "client-auth pool is not a bounded PEM certificate bundle (no trailing DER, every block parses as exactly one X.509 certificate) — refusing to deploy it"
+  fi
+  rm -f "${pool_tmp}"
+  printf '%s\n' "${CLIENT_CA_POOL}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
-  log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
+  log "client-auth pool deployed ($(origin_ca_chain_blocks "${CADDY_AOP_CA}") CA(s)) — origin pulls must present a client cert signed by a pool CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md; it is not a secret/variable change)"
+  if [ -n "${STATUS_HOST:-}" ]; then die "STATUS_HOST is set but no client-auth CA is configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM both unset) — the shared header is not an origin gate; refusing to serve the status edge"; fi
+  warn "no client-auth CA configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM unset) — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate; this is the pre-#202 state"
 fi
-CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
+CF_AOP_CA_PEM=""       # discard from memory (the file above is 644 on this box only)
+ORIGIN_MTLS_CA_PEM=""  # same
+CLIENT_CA_POOL=""       # same (the pool holds the same public CA material; cleared once written)
 if [ "${ORIGIN_TLS}" = "1" ]; then
   if [ -n "${AOP_TLS}" ]; then
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY} {
@@ -2983,6 +3045,17 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
   else
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY}"
   fi
+elif [ -n "${AOP_TLS}" ]; then
+  # No origin pair on the box: Caddy still obtains the dashboard certificate
+  # automatically (HTTP-01), and the client-auth stanza MUST be emitted here
+  # too — without it the edge would be admitted on the shared header alone
+  # while this run's own trust-pool claim reads as enforced (review F1).
+  DASH_TLS_STANZA="	tls {
+		client_auth {
+			mode require_and_verify
+			trust_pool file ${CADDY_AOP_CA}
+		}
+	}"
 else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
@@ -3299,24 +3372,37 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # handshake" (35/56 = TLS layer, the point of AOP) from "nothing answered"
     # (7 refused / 28 timeout) or a DNS problem (6): only a TLS-layer rejection
     # proves client_auth is enforcing — a dead :443 must not pass this probe.
+    # Rollback wording follows the active pool source (review F5): the AOP
+    # secret hint is only true while CF_AOP_CA_PEM is the pool source. Under
+    # origin mTLS the committed CA ships in the release, so the rollback is a
+    # redeploy of the previous release (the shared header gate keeps the origin
+    # reachable until the follow-up cutover).
+    if [ -n "${MTLS_TLS}" ]; then
+      pool_rollback="redeploy the previous release (the committed origin-mTLS CA ships in the release; before the header cutover the header gate keeps the origin reachable — after it, re-add the repository secret and the distribution origin header FIRST, then revert the anchor, never the anchor alone: docs/dr.md)"
+      pool_retry="the committed origin-mTLS CA is part of the release, so a rollback is a redeploy of the previous release (docs/dr.md)"
+      pool_cause="the origin trust pool does not match CloudFront's client certificate"
+    else
+      pool_rollback="roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply"
+      pool_retry="temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: AOP is retired for the :443 origin leg; delete CF_AOP_CA_PEM and do not re-enable"
+      pool_cause="the origin trust bundle does not match Cloudflare's client cert"
+    fi
     neg_rc=0
     neg_err=""
-    neg_err="$(curl -sk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>&1)" || neg_rc=$?
+    neg_err="$(curl -sSk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>&1)" || neg_rc=$?
     case "${neg_rc}" in
       0)
-        die "Caddy :443 answered a cert-less probe while AOP is deployed — client_auth is not enforcing; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply" ;;
+        die "Caddy :443 answered a cert-less probe while client auth is deployed — client_auth is not enforcing; ${pool_rollback}" ;;
       35|55|56)
-        # 35 = TLS connect error (handshake stage); 55/56 = send/recv failure —
-        # these are how curl surfaces a client-auth rejection (measured on curl
-        # 7.88/8.5/8.11/8.14/8.19/8.20 across TLS 1.2/1.3; 55 is real on the
-        # newer OpenSSL 3.5 builds). The OpenSSL 'alert' line is extra evidence
-        # when present, but a rejection must not fail on its absence.
+        # 35 = TLS connect error (handshake stage); 55/56 = send/recv failure.
+        # curl surfaces a client-auth rejection this way, but so can a dead or
+        # misconfigured :443. Only the client-auth alert text (certificate
+        # required / bad certificate) proves WHICH failure it was; anything else
+        # is ambiguous and fails closed.
         neg_hint="$(printf '%s' "${neg_err}" | tr '\n' ' ' | cut -c1-160)"
-        if printf '%s' "${neg_err}" | grep -qi 'alert'; then
-          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}, alert confirmed; OK under require_and_verify)"
+        if printf '%s' "${neg_err}" | grep -qiE 'alert (certificate required|bad certificate)'; then
+          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}, client-auth alert; OK under require_and_verify)"
         else
-          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}; OK under require_and_verify)"
-          warn "no OpenSSL 'alert' text in curl stderr (${neg_hint:-no stderr}) — confirm the rejection manually if this box was expected to serve cert-less"
+          die "Caddy :443 failed the cert-less probe without a client-auth TLS alert (curl exit ${neg_rc}; stderr: ${neg_hint:-none}) — cannot prove client_auth is enforcing; refusing to finish blind"
         fi ;;
       7|28)
         die "Caddy :443 did not answer the cert-less probe (curl exit ${neg_rc}: refused/timeout) — cannot prove client_auth is enforcing; check 'docker logs caddy' and that :443 is listening BEFORE touching AOP secrets; refusing to finish blind" ;;
@@ -3325,20 +3411,21 @@ if [ -n "${STATUS_HOST:-}" ]; then
     esac
     edge_ok=0
     edge_rc=0
+    edge_code=""
     for attempt in 1 2 3; do
       edge_rc=0
-      curl -sSf --max-time 20 "https://${STATUS_HOST}/" -o /dev/null || edge_rc=$?
-      if [ "${edge_rc}" -eq 0 ]; then edge_ok=1; break; fi
+      edge_code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://${STATUS_HOST}/")" || edge_rc=$?
+      if [ "${edge_rc}" -eq 0 ] && [ "${edge_code}" = "200" ]; then edge_ok=1; break; fi
       if [ "${attempt}" -lt 3 ]; then
-        log "edge pull attempt ${attempt}/3 failed (curl exit ${edge_rc}); retrying in 5s"
+        log "edge pull attempt ${attempt}/3 failed (curl exit ${edge_rc}, HTTP ${edge_code:-none}; 200 required); retrying in 5s"
         sleep 5
       fi
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. ${pool_retry}; once the platform records converge the edge pull recovers (docs/dr.md)"
       fi
-      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
+      die "edge pull through the public edge did not return HTTP 200 while client auth is deployed (curl exit ${edge_rc}, HTTP ${edge_code:-none}; 200 required) — ${pool_cause}, or the anchor has cut over to the A2 CloudFront origin. Roll back: ${pool_rollback}. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -3348,8 +3435,12 @@ if [ -n "${STATUS_HOST:-}" ]; then
       # has SERVED, which is the one-way marker's precondition.
       origin_ca_mark_active
     fi
-    log "edge pull through the public edge serves with AOP enforced (OK)"
-    log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
+    if [ -n "${MTLS_TLS}" ]; then
+      log "edge pull through the public edge serves with origin mTLS enforced (CloudFront client certificate verified; OK)"
+    else
+      log "edge pull through the public edge serves with AOP enforced (OK)"
+      log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
+    fi
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale
@@ -4150,6 +4241,61 @@ class Config(object):
         if not 300 <= self.sweep_seconds <= 7 * 86400:
             log("WARNING: RECORDING_WITNESS_SWEEP_SECONDS=%d is outside [300, 604800]; using the default 21600" % self.sweep_seconds)
             self.sweep_seconds = 6 * 3600
+        # The audit delta's bounded pre-cursor re-list (issue #228). The live
+        # shipper can upload an object HOURS after its own key timestamp (a
+        # B2 retry hold: a key stamped 12:26 landed at 18:56), so it sorts
+        # BELOW the delta cursor and a cursor tail can never list it - the
+        # witness then alerts session-start-missing/sequence-origin for a
+        # session whose `session.start` is in the bucket, until the 6 h sweep.
+        # A delta therefore re-lists this many seconds below the SESSION
+        # audit cursors - the flat one and the dated one. The heartbeat tail
+        # has no overlap on purpose: a late heartbeat key below the heartbeat
+        # cursor stays delta-invisible until the sweep, which is
+        # verdict-neutral because both heartbeat checks read the newest
+        # heartbeat object (max), not tail membership. The default is 24 h -
+        # the cited hold (6.5 h) plus margin, so
+        # the incident the fix was written for heals on the next delta with
+        # the shipped default instead of waiting for the 6 h sweep. The cost
+        # stays bounded: the re-list is page-budgeted and stops on the first
+        # page already at/above the bound, so an empty window is one page.
+        # Only the FLAT layout can use a window this wide - the dated layout
+        # lists at most the cursor day and the previous day, so the effective
+        # dated span is ~1 day whatever the knob (see `_delta_overlap_listings`
+        # and docs/recording-witness.md). 0 disables the overlap (the sweep
+        # stays the only bound). A NUMERIC out-of-range value clamps to the
+        # default with a warning; a NON-numeric value is a configuration error
+        # that fails the run (rc=2, state=error) before any listing - the same
+        # posture as the other numeric knobs, never a silent re-interpretation.
+        # The overlap is additive: it never moves a cursor, never gates a
+        # finding. The knob is an on-box env value the provisioner does not
+        # render, and the env file is re-rendered on every dispatch - so a
+        # hand edit lasts only until the next one: the shipped default is the
+        # durable answer for the cited hold, and a longer hold needs a
+        # code/default change, not an env-file edit.
+        self.delta_overlap = env_int("RECORDING_WITNESS_DELTA_OVERLAP_SECONDS", 24 * 3600)
+        if not 0 <= self.delta_overlap <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=%d is outside [0, 604800]; using the default 86400" % self.delta_overlap)
+            self.delta_overlap = 24 * 3600
+        # The delta's recordings-discovery cadence (issue #228, red-team F1).
+        # The recordings prefix is random-keyed, so the delta lists it whole -
+        # and that prefix only ever grows while Object Lock holds the tars, so
+        # a per-delta full listing is a cost that climbs forever and, once the
+        # prefix crosses DELTA_MAX_PAGES, would turn every 5-minute delta into
+        # a full sweep (list + versions for both prefixes, 288x/day). Discovery
+        # is therefore bounded by this interval: the whole prefix is listed at
+        # most once per interval, so a new random-keyed tar is discovered
+        # within this bound plus up to one delta period (default 900 s = 15 min;
+        # the gate is tested at a delta start, so add the ~5-minute timer period
+        # and the run time - roughly 15-30 min in practice) while the prefix fits
+        # DELTA_MAX_PAGES; above the page cap the listing defers again and the
+        # 6 h sweep is the only path. A quiet delta costs no recordings listing
+        # at all. 0 restores a list on every delta. Numeric out-of-range clamps
+        # to the default with a warning; a non-numeric value fails the run
+        # (rc=2, state=error) - the same posture as the overlap knob above.
+        self.recordings_list_seconds = env_int("RECORDING_WITNESS_RECORDINGS_LIST_SECONDS", 900)
+        if not 0 <= self.recordings_list_seconds <= 86400:
+            log("WARNING: RECORDING_WITNESS_RECORDINGS_LIST_SECONDS=%d is outside [0, 86400]; using the default 900" % self.recordings_list_seconds)
+            self.recordings_list_seconds = 900
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signatures, quiet_error = parse_quiet_signatures(env("RECORDING_WITNESS_QUIET_SIGNATURE"))
@@ -4358,7 +4504,7 @@ def signed_get(config, params):
         "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
-def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
+def list_objects(config, prefix, start_after="", max_pages=1000, until=None, above_bound_stop=False):
     """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
 
     `start_after` seeds the first page (exclusive, live-verified on B2); it is
@@ -4378,6 +4524,21 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
     entry-by-entry and is never an early-stop signal. `max_pages` bounds a
     delta tail; overflow raises DeltaTooLong so the run can fall back to an
     exact sweep instead of a truncated view.
+
+    `above_bound_stop` is the additive audit-overlap re-list's own priced
+    trade (issue #228): an ordered page whose FIRST key already sits at/above
+    the bound ends the stream, so a window below the bound that happens to
+    hold no key costs one page instead of paging through the whole
+    out-of-bound tail (the anchor #161 cost trap, here for a listing whose
+    result is additive). The correctness-source tails never set it - they
+    keep the strict FF2 rule above. The trade, stated honestly: a server that
+    returns the stream out of order can hand back a below-bound first key
+    that sorts after an in-bound key, so that in-window key is not visited on
+    this run. Its healing is SWEEP-BOUNDED, not immediate: the delta can stay
+    green on a key it never visited (the missed key may be exactly the drift
+    or recording finding that would have alerted), and the sweep later
+    surfaces it. The stop is a detection-latency trade priced against the
+    #161 per-run page cost; it defers a finding, it never fabricates one.
     """
     objects = {}
     token = ""
@@ -4436,7 +4597,7 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
             and ordered
             and bool(keys)
             and keys[-1] >= until
-            and (not truncated or keys[0] < until)
+            and (not truncated or keys[0] < until or above_bound_stop)
         )
         for key, last_modified in entries:
             if until is not None and key >= until:
@@ -5106,6 +5267,107 @@ def _delta_dated_listings(config, now, discovered_prefixes, flat_cursor, dated_c
     return plan, drift_prefixes
 
 
+def _audit_key_ts(audit_prefix, key):
+    """The ``<ts>`` stamp of a shaped flat or dated audit key, or ``None``.
+
+    Used by the delta's overlap re-list to derive its window from the CURSOR
+    (never from the wall clock): the cursor is the last key that was listed,
+    so its own timestamp is the only anchor that cannot drift with a clock
+    step or a midnight boundary.
+    """
+    relative = key[len(audit_prefix):] if key.startswith(audit_prefix) else key
+    basename, _day = strip_date_segment(relative)
+    if basename is None:
+        return None
+    match = SESSION_KEY_RE.match(basename) or NON_SESSION_KEY_RE.match(basename)
+    return match.group("ts") if match else None
+
+
+def _delta_overlap_listings(config, session_cursor, dated_cursor):
+    """Bounded pre-cursor re-list plan for a delta: ``[(label, prefix, after, until)]``.
+
+    A delta asks the bucket for keys **after** its cursor, but the shipper can
+    upload an object long after its own key timestamp (proven live on
+    2026-10-22: a session's keys are stamped ``20261022T1226xxZ`` while the
+    bucket's ``LastModified`` is 18:56-19:02Z - a 6.5 h B2 retry hold). Such
+    a key sorts BELOW the cursor, so no cursor tail can ever list it and the
+    witness keeps alerting ``session-start-missing``/``sequence-origin`` for
+    a session whose ``session.start`` is right there in the bucket; only the
+    sweep healed it. Re-listing a bounded window below the SESSION audit
+    cursors (flat and dated - never the heartbeat cursor, which the heartbeat
+    checks do not need because they read the newest heartbeat object) closes
+    that hole. The bound is the knob: an arrival older than the overlap is
+    still sweep-bounded (the sweep re-lists from scratch), so this narrows
+    the detection delay, it does not replace the sweep.
+
+    Both layouts are covered. The cursor's own ``<ts>`` is the anchor and its
+    own day the partition, so the window never depends on the wall clock. A
+    flat window needs no extra listing (flat keys sort across days); a dated
+    window that crosses midnight also lists the immediately previous day,
+    bounded to that one extra day - anything older stays sweep-bounded.
+    The knob accepts up to 7 d, but only the FLAT layout can deliver that: the
+    dated layout lists at most the cursor day plus the previous day, so its
+    effective span is ~1 day no matter how wide the knob is set (a day-by-day
+    re-list across a week would page every day of the week on every run - the
+    anchor #161 cost trap again). That is the documented, deliberate
+    behaviour, not a 7 d guarantee for the dated layout. The
+    caller lists each entry with its own page budget and merges the result
+    into a SEPARATE map (never into the cursor tails), because these keys are
+    legitimately at/below the cursor and must not trip the fail-closed
+    cursor-conformance check.
+    """
+    if config.delta_overlap <= 0:
+        return []
+    heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+    listings = []
+
+    def overlap_start(stamp):
+        try:
+            moment = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+            return moment - timedelta(seconds=config.delta_overlap)
+        except (ValueError, OverflowError):
+            return None
+
+    flat_ts = _audit_key_ts(config.audit_prefix, session_cursor) if session_cursor else None
+    flat_start = overlap_start(flat_ts) if flat_ts else None
+    if flat_start is not None:
+        listings.append((
+            "audit-overlap-flat",
+            config.audit_prefix,
+            config.audit_prefix + flat_start.strftime("%Y%m%dT%H%M%SZ"),
+            session_cursor))
+
+    dated_day = _audit_key_day(config.audit_prefix, dated_cursor) if dated_cursor else ""
+    dated_ts = _audit_key_ts(config.audit_prefix, dated_cursor) if dated_cursor else None
+    dated_start = overlap_start(dated_ts) if dated_ts else None
+    if dated_day and dated_start is not None:
+        start_day = dated_start.strftime("%Y%m%d")
+        day_prefix = config.audit_prefix + dated_day + "/"
+        day_bound = min(config.audit_prefix + dated_day + "T", heartbeat_stem)
+        if start_day == dated_day:
+            # Same day: resume inside the day at the overlap bound.
+            listings.append((
+                "audit-overlap-dated",
+                day_prefix,
+                day_prefix + dated_start.strftime("%Y%m%dT%H%M%SZ"),
+                dated_cursor))
+        elif start_day < dated_day:
+            # The window crosses midnight: the cursor's own day from its
+            # start, plus the immediately previous day (one extra day only).
+            if day_prefix < dated_cursor:
+                listings.append(("audit-overlap-dated", day_prefix, day_prefix, dated_cursor))
+            previous_day = (datetime.strptime(dated_day, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            previous_prefix = config.audit_prefix + previous_day + "/"
+            previous_bound = min(config.audit_prefix + previous_day + "T", heartbeat_stem)
+            previous_after = previous_prefix
+            if start_day == previous_day:
+                previous_after = previous_prefix + dated_start.strftime("%Y%m%dT%H%M%SZ")
+            if previous_after < previous_bound:
+                listings.append((
+                    "audit-overlap-dated-prev", previous_prefix, previous_after, previous_bound))
+    return [entry for entry in listings if entry[2] < entry[3]]
+
+
 def _delta_repair_sweep(config, observed, now):
     """Full sweep for a delta recovery (page overflow or cursor nonconformance).
 
@@ -5136,6 +5398,15 @@ def run_checks(config, now, plan):
     view_dirty = False
     new_audit = {}
     new_recordings = {}
+    now_epoch = int(now.timestamp())
+    # The recordings-discovery watermark (issue #228, red-team F1): a delta
+    # lists the whole random-keyed prefix at most once per
+    # `recordings_list_seconds`, so a per-run full listing cannot become an
+    # unbounded (and, past DELTA_MAX_PAGES, permanently sweeping) cost. Absent
+    # or 0 means "list now", so an upgraded box lists on its first delta.
+    recordings_listed_epoch = observed.get("recordings_listed_epoch") or 0
+    if isinstance(recordings_listed_epoch, bool) or not isinstance(recordings_listed_epoch, int):
+        recordings_listed_epoch = 0
     cursors = dict(observed.get("cursors")) if isinstance(observed.get("cursors"), dict) else {}
     if run_mode == "seed" and window_start is not None:
         window_text = utc_stamp(window_start)
@@ -5162,20 +5433,29 @@ def run_checks(config, now, plan):
         ]
         view_dirty = True
         cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+        recordings_listed_epoch = now_epoch
     elif run_mode == "seed":
         recording_objects = list_objects(config, config.recordings_prefix)
         uploads = list_uploads(config, config.recordings_prefix)
         hidden_objects = []
         view_dirty = True
         cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+        recordings_listed_epoch = now_epoch
     else:
         # Delta: the retained view plus the dual-layout audit tail (the flat
-        # discovery listing + bounded dated-day streams), the heartbeat tail
-        # and the recordings tail. Versions are sweep-only, so the retained
-        # hidden set is carried unchanged and a delete marker on an old key
-        # lands at the sweep bound. A delta listing that overflows its page
-        # bound abandons the delta and runs an exact sweep instead of reading
-        # a truncated view.
+        # discovery listing + bounded dated-day streams) over a bounded
+        # pre-cursor overlap re-list (late uploads, issue #228), the heartbeat
+        # tail and the random-keyed recordings prefix (bounded by
+        # `recordings_list_seconds`, because a key cursor cannot discover a
+        # UUID-keyed tar and a full list on every run is an ever-growing cost).
+        # Versions are sweep-only, so the retained hidden set is carried
+        # unchanged and a delete marker on an old key lands at the sweep bound.
+        # A delta listing that overflows its page bound abandons the delta and
+        # runs an exact sweep instead of reading a truncated view - EXCEPT a
+        # recordings-only overflow, which is deferred one discovery interval
+        # instead: that prefix grows forever, so degrading it to a sweep is
+        # precisely the 288x/day regression this bound exists to prevent, and
+        # the audit/heartbeat/session discovery in this run is unaffected.
         audit_objects = dict(view.get("audit_objects") or {})
         recording_objects = dict(view.get("recording_objects") or {})
         hidden_objects = list(view.get("hidden") or [])
@@ -5183,8 +5463,13 @@ def run_checks(config, now, plan):
         heartbeat_cursor = cursors.get("audit_heartbeat") or ""
         session_cursor = cursors.get("audit_session") or ""
         dated_cursor = cursors.get("audit_session_dated") or ""
-        recording_cursor = cursors.get("recordings") or ""
         heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+        # The bounded pre-cursor re-list (issue #228): keys the shipper
+        # uploaded late, below their own timestamp's cursor position. Kept in
+        # SEPARATE maps so the cursor-conformance check below never sees them
+        # (a legitimate overlap key is at/below the cursor by construction),
+        # and merged into the view only after that check passed.
+        overlap_audit = {}
         try:
             new_heartbeat = list_objects(
                 config, config.heartbeat_prefix, start_after=heartbeat_cursor, max_pages=DELTA_MAX_PAGES)
@@ -5207,14 +5492,56 @@ def run_checks(config, now, plan):
                 dated_listings[day] = (dated_plan[day], list_objects(
                     config, day_prefix, start_after=dated_plan[day],
                     until=day_bound, max_pages=DELTA_MAX_PAGES))
-            new_recordings = list_objects(
-                config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
+            for _label, overlap_prefix, overlap_after, overlap_until in _delta_overlap_listings(
+                    config, session_cursor, dated_cursor):
+                overlap_audit.update(list_objects(
+                    config, overlap_prefix, start_after=overlap_after,
+                    until=overlap_until, max_pages=DELTA_MAX_PAGES, above_bound_stop=True))
+            # Recordings are random-keyed (`recordings/<sid>.tar` carries no
+            # timestamp), so a key cursor on that prefix is a design error: a
+            # new tar whose UUID sorts below the stored cursor would stay
+            # invisible until the sweep. The only correct discovery is the
+            # whole prefix, bounded by `recordings_list_seconds`: listing it
+            # on every 5-minute delta is a cost that grows with the bucket
+            # forever, and once the prefix crosses DELTA_MAX_PAGES it would
+            # turn every delta into a full sweep. So the prefix is listed only
+            # when the persisted watermark is older than the interval (a
+            # delta inside the interval keeps the retained view unchanged),
+            # and a page overflow DEFERS the discovery one interval instead of
+            # abandoning the delta. The stored `recordings` cursor stays a
+            # compatibility high-water mark that no longer gates discovery.
+            # Only entries new to the view or with a moved LastModified enter
+            # the merge, so re-reading the prefix does not dirty the sidecar on
+            # a quiet run.
+            listed_recordings = {}
+            if config.recordings_list_seconds <= 0 \
+                    or now_epoch - recordings_listed_epoch >= config.recordings_list_seconds:
+                try:
+                    listed_recordings = list_objects(
+                        config, config.recordings_prefix, max_pages=DELTA_MAX_PAGES)
+                except DeltaTooLong as exc:
+                    # A recordings-only overflow must never degrade the run to
+                    # a sweep (that is the 288x/day cost this bound exists to
+                    # avoid). Defer the discovery one interval, pin the
+                    # watermark so the retry is after the interval rather than
+                    # every run, and let the audit/heartbeat/session delta in
+                    # this run proceed normally.
+                    recordings_listed_epoch = now_epoch
+                    log("WARNING: recordings listing exceeded the page cap (%s); "
+                        "recordings discovery deferred (%ds)" % (
+                            clip(exc, 120), config.recordings_list_seconds))
+                else:
+                    new_recordings = {
+                        key: moment for key, moment in listed_recordings.items()
+                        if recording_objects.get(key) != moment}
+                    recordings_listed_epoch = now_epoch
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
             plan["performed_sweep"] = True
             audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
             new_audit = {}
             new_recordings = {}
+            recordings_listed_epoch = now_epoch
             run_mode = "sweep"
             window_text = None
             view_dirty = True
@@ -5248,17 +5575,13 @@ def run_checks(config, now, plan):
                             break
                     if violation:
                         break
-            if not violation:
-                for key in new_recordings:
-                    if recording_cursor and key <= recording_cursor:
-                        violation = "recordings delta returned %s at or below its cursor" % clip(key, 120)
-                        break
             if violation:
                 log("WARNING: %s; repairing with a full sweep" % violation)
                 plan["performed_sweep"] = True
                 audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
                 new_audit = {}
                 new_recordings = {}
+                recordings_listed_epoch = now_epoch
                 run_mode = "sweep"
                 window_text = None
                 view_dirty = True
@@ -5276,6 +5599,16 @@ def run_checks(config, now, plan):
                     new_audit[prefix] = now
                 audit_objects.update(new_audit)
                 recording_objects.update(new_recordings)
+                # The overlap keys land here, after the fail-closed check: a
+                # pre-cursor key is exactly what the re-list is FOR, so it is
+                # never a conformance violation. Only keys that actually
+                # change the retained view are merged (the window is normally
+                # already known, so a quiet delta stays view-clean), and the
+                # merge keeps them for the NEXT run's classification too.
+                overlap_new = {
+                    key: moment for key, moment in overlap_audit.items()
+                    if audit_objects.get(key) != moment}
+                audit_objects.update(overlap_new)
                 # Same grammar + future filter as _cursors_from_listings: an
                 # unshaped key returned by a tail (an acceptance probe,
                 # drift), or a shaped key dated in the future (sorting above
@@ -5296,7 +5629,7 @@ def run_checks(config, now, plan):
                                 and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance):
                             dated_new.append(key)
                 recording_new = [
-                    key for key in new_recordings
+                    key for key in listed_recordings
                     if is_recording_key(key, config.recordings_prefix)]
                 if heartbeat_new:
                     cursors["audit_heartbeat"] = max(heartbeat_new)
@@ -5305,8 +5638,13 @@ def run_checks(config, now, plan):
                 if dated_new:
                     cursors["audit_session_dated"] = max(dated_new)
                 if recording_new:
-                    cursors["recordings"] = max(recording_new)
-                view_dirty = bool(new_audit or new_recordings)
+                    # A high-water mark never moves backwards: the full-prefix
+                    # listing can no longer return the previous max (a deleted
+                    # tar), and re-reading the prefix must not lower it.
+                    newest = max(recording_new)
+                    if newest > (cursors.get("recordings") or ""):
+                        cursors["recordings"] = newest
+                view_dirty = bool(new_audit or new_recordings or overlap_new)
     # Overlapping watched prefixes report one marker twice (same key + version
     # id in both listings); count each hidden version once.
     hidden_by_version = {}
@@ -5330,6 +5668,8 @@ def run_checks(config, now, plan):
         # was validated when each key first entered it, so a delta does not
         # re-parse the whole retained map.
         for key, last_modified in new_audit.items():
+            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+        for key, last_modified in overlap_audit.items():
             age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
         for key, last_modified in new_recordings.items():
             age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
@@ -5777,6 +6117,7 @@ def run_checks(config, now, plan):
         "mode": run_mode,
         "window_start": window_text,
         "cursors": cursors,
+        "recordings_listed_epoch": recordings_listed_epoch,
         "boundaries": boundaries_out,
         "dirty": view_dirty,
         "audit_objects": audit_objects if view_dirty else None,
@@ -6116,6 +6457,13 @@ def observed_problem(observed, record_run_seq, config=None, now=None):
             return "observed.%s is invalid: %r" % (name, value)
     if not isinstance(observed.get("sweep_failed"), bool):
         return "observed.sweep_failed is invalid: %r" % (observed.get("sweep_failed"),)
+    # The recordings-discovery watermark (issue #228). Absent is valid (legacy
+    # state, and "list now" semantics); a present value must be a plain epoch
+    # second, never a bool, a negative or a string.
+    listed_epoch = observed.get("recordings_listed_epoch")
+    if listed_epoch is not None and (
+            isinstance(listed_epoch, bool) or not isinstance(listed_epoch, int) or listed_epoch < 0):
+        return "observed.recordings_listed_epoch is invalid: %r" % (listed_epoch,)
     coverage = observed.get("coverage")
     if not isinstance(coverage, dict):
         return "observed.coverage is not a JSON object"
@@ -6230,6 +6578,9 @@ def build_observed(previous_observed, payload, now_epoch, run_seq, config):
                 mode == "delta" and bool(legacy_coverage.get("compact_blind"))),
         },
         "cursors": payload.get("cursors") or legacy.get("cursors") or {},
+        "recordings_listed_epoch": int(
+            payload.get("recordings_listed_epoch")
+            or legacy.get("recordings_listed_epoch", 0) or 0),
         "sweep_boundaries": payload.get("boundaries") or [],
     }
     if mode == "sweep":

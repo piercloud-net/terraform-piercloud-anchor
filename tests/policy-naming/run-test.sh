@@ -13,10 +13,13 @@
 #   tmp, legacy shape   piercloud-tmp-<server_id>-<run_id> — matched ONLY
 #                       for THIS server (startswith the id prefix).
 #   tmp, other server   never matched: never swept, never logged.
-#   steady, family      piercloud-anchor- prefix AND (endswith the new
-#                       -<hostname> anchor OR the pre-change -<server_id>
-#                       migration anchor). Another hostname or another
-#                       server's legacy name is out of scope.
+#   steady, family      EXACTLY this server's two names (issue #200):
+#                       piercloud-anchor-<hostname> (new) and the
+#                       pre-#121 piercloud-anchor-<hostname>-<server_id>
+#                       (migration). No prefix/suffix wildcard: a longer
+#                       hostname that merely ENDS with this one's (e.g.
+#                       eu-a.pcad.it vs a.pcad.it), another server's id,
+#                       and a bare prefix are all never matched.
 #   names               OWN_NAME carries no server id; TMP_PREFIX is gone
 #                       (it would be an unused variable after the rename).
 #
@@ -30,6 +33,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
+MIN_CHECKS=23
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -55,9 +59,9 @@ for fn in list_tmp_policies list_steady_policies; do
   grep -q "^$fn() {" "$WORK/functions.sh" || { echo "FAIL could not extract $fn"; exit 1; }
 done
 
-RC_OF() { # $1 label, $2 fixture, $3 real function
+RC_OF() { # $1 label, $2 fixture, $3 real function, [$4 ANCHOR_HOSTNAME]
   local rc=0
-  STUB_POLICIES="$2" ANCHOR_HOSTNAME=anchor-01-pier SERVER_ID=424242 SCP_USER_ID=1 \
+  STUB_POLICIES="$2" ANCHOR_HOSTNAME="${4:-anchor-01-pier}" SERVER_ID=424242 SCP_USER_ID=1 \
   STEADY_PREFIX="$STEADY_PREFIX" OWN_NAME="$OWN_NAME" \
   bash -c 'set -euo pipefail; source "$1"; "$2"' _ "$WORK/functions.sh" "$3" \
     > "$WORK/out.$1" 2>&1 || rc=$?
@@ -89,7 +93,15 @@ rc="$(RC_OF t1 "$TMP_FIXTURE" list_tmp_policies)"
 is "t1 rc" "0" "$rc"
 is "t1 tmp scope (new + legacy this-server only)" '["1","2"]' "$(IDS t1)"
 
-# ---- steady scope: new name + legacy migration name, nothing else --------
+# ---- steady scope: exact names only (issue #200) -------------------------
+# Fixtures 18 (a longer hostname that ENDS with -anchor-01-pier) and 19
+# (a bare piercloud-anchor-<server id>) are the #200 teeth: this server owns
+# neither, yet the pre-#200 suffix rule returned both (endswith -<hostname>
+# / endswith -<server id>), so an apply-mode sweep would have detached and
+# deleted a policy it does not own — for 19, the id arm alone was enough.
+# 13/15/17/20 are kept as never-matched controls (another hostname, another
+# server's legacy name, the bare prefix, a name that merely extends the
+# canonical one).
 STEADY_FIXTURE='[
  {"id":"11","name":"piercloud-anchor-anchor-01-pier","description":""},
  {"id":"12","name":"piercloud-anchor-anchor-01-pier-424242","description":""},
@@ -97,11 +109,41 @@ STEADY_FIXTURE='[
  {"id":"14","name":"piercloud-anchor-other-01-777","description":""},
  {"id":"15","name":"piercloud-anchor-anchor-01-pier-777","description":""},
  {"id":"16","name":"piercloud-tmp-12345","description":""},
- {"id":"17","name":"piercloud-anchor-","description":""}
+ {"id":"17","name":"piercloud-anchor-","description":""},
+ {"id":"18","name":"piercloud-anchor-staging-anchor-01-pier","description":""},
+ {"id":"19","name":"piercloud-anchor-424242","description":""},
+ {"id":"20","name":"piercloud-anchor-anchor-01-pier-424242-extra","description":""}
 ]'
 rc="$(RC_OF s1 "$STEADY_FIXTURE" list_steady_policies)"
 is "s1 rc" "0" "$rc"
-is "s1 steady scope (new + migration only)" '["11","12"]' "$(IDS s1)"
+is "s1 steady scope (exact new + exact migration only)" '["11","12"]' "$(IDS s1)"
+
+# ---- #200: a longer hostname sharing the suffix is a FOREIGN policy ------
+# The issue's own example: configured host a.pcad.it, sibling eu-a.pcad.it.
+# Both the new-shape and the migration-shape sibling names must be absent.
+PCAD_FIXTURE='[
+ {"id":"31","name":"piercloud-anchor-a.pcad.it","description":""},
+ {"id":"32","name":"piercloud-anchor-eu-a.pcad.it","description":""},
+ {"id":"33","name":"piercloud-anchor-a.pcad.it-424242","description":""},
+ {"id":"34","name":"piercloud-anchor-eu-a.pcad.it-424242","description":""},
+ {"id":"35","name":"piercloud-anchor-eu-a.pcad.it-777","description":""}
+]'
+rc="$(RC_OF s1b "$PCAD_FIXTURE" list_steady_policies a.pcad.it)"
+is "s1b rc" "0" "$rc"
+is "s1b sibling hostname sharing the suffix never matched" '["31","33"]' "$(IDS s1b)"
+
+# ---- #200: no prefix/suffix arm survives in the shipped filter -----------
+# Structural pin: the filter is two equalities against pre-built exact names.
+for arm in 'startswith($p)' 'endswith($h)' 'endswith($s)'; do
+  if grep -qF "$arm" "$SCRIPT"; then
+    bad "steady filter must not carry the $arm arm (suffix match retired by #200)"
+  else
+    ok "steady filter has no $arm arm"
+  fi
+done
+grep -qF '($n == $own) or ($n == $legacy)' "$SCRIPT" \
+  && ok "steady filter matches the two exact names" \
+  || bad "steady filter must match exactly \$own / \$legacy"
 
 # ---- envelope tolerance survives the filter rewrite ----------------------
 rc="$(RC_OF s2 '{"firewallPolicies":[{"id":"21","name":"piercloud-anchor-anchor-01-pier","description":""},{"id":"22","name":"piercloud-anchor-someone-else","description":""}]}' list_steady_policies)"
@@ -245,4 +287,8 @@ else
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
+if [ "$pass" -lt "$MIN_CHECKS" ]; then
+  printf 'FAIL check-count floor: %s < %s\n' "$pass" "$MIN_CHECKS"
+  fail=$((fail + 1))
+fi
 [ "$fail" -eq 0 ]

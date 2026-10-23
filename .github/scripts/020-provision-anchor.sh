@@ -248,18 +248,21 @@ MODE="${MODE:-}"
 # cmd_sweep_post keeps its own no-token branch as defense in depth.
 # "No token" means neither the step env nor a non-empty $GITHUB_ENV handoff
 # line (the source scp_token_refresh adopts) holds one; a handoff token falls
-# through to the guards (fail closed), and so does a $GITHUB_ENV that exists
-# but cannot be read or searched (grep rc != 1). A path that cannot even be
-# stat'ed (a parent denies search) reads as absent -> no-op; unreachable on
-# runners, where the runner user owns the per-step file. Defense in depth: each step
-# gets a fresh empty $GITHUB_ENV from the runner, so at entry this clause is
-# not expected to match in production. The refresh-token file is not consulted: the
-# workflow writes the access-token line before it exports the refresh file
-# (provision.yml device-flow poll), so a refresh file never exists alone.
+# through to the guards (fail closed), and so does ANY $GITHUB_ENV that cannot
+# be read or searched: grep rc 2 (unreadable, a directory, or a path that does
+# not exist) counts as HELD — there is no fail-open path left (issue #199: the
+# old `-e` gate turned an unstat-able path into the clean no-op). LC_ALL=C is
+# deliberate: the byte after `=` may be an invalid UTF-8 sequence, which a
+# UTF-8 locale's `.` does not match, and the token is still held.
+# Defense in depth: each step gets a fresh empty $GITHUB_ENV from the runner,
+# so at entry this clause is not expected to match in production. The
+# refresh-token file is not consulted: the workflow writes the access-token
+# line before it exports the refresh file (provision.yml device-flow poll), so
+# a refresh file never exists alone.
 handoff_token_held=0
-if [ -n "${GITHUB_ENV:-}" ] && [ -e "$GITHUB_ENV" ]; then
+if [ -n "${GITHUB_ENV:-}" ]; then
   handoff_rc=0
-  grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV" 2>/dev/null || handoff_rc=$?
+  LC_ALL=C grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV" 2>/dev/null || handoff_rc=$?
   [ "$handoff_rc" -eq 1 ] || handoff_token_held=1
 fi
 if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ] \
@@ -348,7 +351,7 @@ scp_token_refresh() {
   # parent's copy can be the consumed one. Every writer overwrites the whole
   # refresh-token file, so its content is the newest value; the access-token
   # appends are append-only, so the LAST line in $GITHUB_ENV is the newest.
-  local f_at f_rt
+  local f_at f_rt genv_rc
   if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ] && [ -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
     f_rt="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
     if [ -n "$f_rt" ]; then
@@ -356,8 +359,18 @@ scp_token_refresh() {
       export NETCUP_SCP_REFRESH_TOKEN
     fi
   fi
-  if [ -n "${GITHUB_ENV:-}" ] && [ -f "$GITHUB_ENV" ]; then
-    f_at="$(grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    genv_rc=0
+    # LC_ALL=C: the token's first byte may be an invalid UTF-8 sequence, which
+    # a UTF-8 locale could make grep skip past (issue #199).
+    f_at="$(LC_ALL=C grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)" || genv_rc=$?
+    # Never swallow an unreadable $GITHUB_ENV (issue #199): grep rc 2 means the
+    # newest access token may exist and cannot be seen, so adopting nothing
+    # would replay the 401 with a possibly-consumed token. Fail loudly. rc 1
+    # (no such line yet) is the normal "nothing to adopt" case.
+    if [ "$genv_rc" -ne 0 ] && [ "$genv_rc" -ne 1 ]; then
+      die "cannot read \$GITHUB_ENV ($GITHUB_ENV) — refusing to refresh blind (fail closed, issue #199)"
+    fi
     # Adoption is UNCONDITIONAL: a non-empty handoff value can only have
     # been appended by a refresh in THIS step — every step gets a fresh empty
     # $GITHUB_ENV from the runner (reviewer-verified against the runner
@@ -506,13 +519,29 @@ api_ok() { # $1 = status; 2xx (+404-as-gone when $2=gone-ok)
 policies_path() { printf '/api/v1/users/%s/firewall-policies' "$SCP_USER_ID"; }
 
 list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-state policy family
-  # Family scope (issue #121): the piercloud-anchor- prefix AND either the
-  # new hostname anchor (endswith -<hostname>) or the pre-change id anchor
-  # (endswith -<server id>, migration only). This is a SUFFIX match: a name
-  # under another (e.g. previous or longer) hostname that ends with
-  # -<hostname> also matches and, if unattached here, is swept in apply mode
-  # (tracked as its own issue). The attached-policy compare in
-  # cmd_sweep_post still protects the live policy.
+  # Family scope (issues #121, #200): EXACTLY two names, nothing else —
+  #   ${STEADY_PREFIX}${ANCHOR_HOSTNAME}               the new shape (the
+  #                                                   module's policy_name)
+  #   ${STEADY_PREFIX}${ANCHOR_HOSTNAME}-${SERVER_ID} the pre-#121 migration
+  #                                                   shape: the CURRENT
+  #                                                   hostname + this
+  #                                                   server's id
+  # Both are this server's own names. A pre-#121 policy minted under a FORMER
+  # hostname is deliberately NOT matched (the id suffix alone is the suffix
+  # class #200 removed); it is left in place — non-destructive, and a rename
+  # is rare enough that a lingering orphan is preferable to a sibling cut.
+  # Policies are ACCOUNT-wide
+  # (/users/<id>/firewall-policies) while cmd_sweep_post's attachment check
+  # reads only THIS server's interface, so any name this filter returns but
+  # the interface does not carry reads as unattached and is detached+deleted
+  # in apply mode. A suffix match (the pre-#200 rule: startswith the prefix
+  # and endswith -<hostname> or -<server id>) therefore retired a SIBLING
+  # server's LIVE policy whenever that hostname ended with this one's —
+  # e.g. a policy for eu-a.pcad.it is matched by the -a.pcad.it suffix — and
+  # an apply run cut that server's firewall. Exact equality is the whole
+  # scope: no prefix wildcard, no suffix arm, and the migration arm carries
+  # THIS server's id under the current hostname, so another server's legacy
+  # name matches neither arm.
   local resp
   api_call GET "$(policies_path)" "" resp
   api_ok "$HTTP_STATUS" || die "list policies failed (HTTP $HTTP_STATUS): $(printf '%s' "$resp" | head -c 500)"
@@ -525,9 +554,10 @@ list_steady_policies() { # -> [{id,name,description}] for THIS server's steady-s
      elif has("firewallPolicy") then [.firewallPolicy]
      else [] end
      | map(select((.name // "") as $n
-           | ($n | startswith($p)) and (($n | endswith($h)) or ($n | endswith($s))))
+           | ($n == $own) or ($n == $legacy))
            | {id: .id, name: .name, description: (.description // "")})' \
-    --arg p "$STEADY_PREFIX" --arg h "-${ANCHOR_HOSTNAME}" --arg s "-${SERVER_ID}"
+    --arg own "${STEADY_PREFIX}${ANCHOR_HOSTNAME}" \
+    --arg legacy "${STEADY_PREFIX}${ANCHOR_HOSTNAME}-${SERVER_ID}"
 }
 
 list_tmp_policies() { # -> compact JSON array [{id,name,description}] (ours only)
@@ -939,7 +969,17 @@ cmd_provision() {
   # Monitor config rides in as env (single-quote escaped): the tenant converges
   # monitors from a phone via an environment or repo secret + re-dispatch — no key, no console.
   q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
-  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_ROLE='$(q "${ANCHOR_ROLE:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' STATUS_PULLER='$(q "${STATUS_PULLER:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")' CLOUDFRONT_ORIGIN_SECRET='$(q "${CLOUDFRONT_ORIGIN_SECRET:-}")' MAIN_BOX_IPV4='$(q "${MAIN_BOX_IPV4:-}")' RECORDING_WITNESS_ENDPOINT='$(q "${RECORDING_WITNESS_ENDPOINT:-}")' RECORDING_WITNESS_BUCKET='$(q "${RECORDING_WITNESS_BUCKET:-}")' RECORDING_WITNESS_AUDIT_PREFIX='$(q "${RECORDING_WITNESS_AUDIT_PREFIX:-}")' RECORDING_WITNESS_RECORDINGS_PREFIX='$(q "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}")' RECORDING_WITNESS_KEY_ID='$(q "${RECORDING_WITNESS_KEY_ID:-}")' RECORDING_WITNESS_KEY='$(q "${RECORDING_WITNESS_KEY:-}")' RECORDING_WITNESS_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_SIGNATURE='$(q "${RECORDING_WITNESS_QUIET_SIGNATURE:-}")' RECORDING_WITNESS_ACK_IDENTITIES='$(q "${RECORDING_WITNESS_ACK_IDENTITIES:-}")' RECORDING_WITNESS_COLD_START_SECONDS='$(q "${RECORDING_WITNESS_COLD_START_SECONDS:-}")' RECORDING_WITNESS_SWEEP_SECONDS='$(q "${RECORDING_WITNESS_SWEEP_SECONDS:-}")';";
+  # Origin-mTLS CA (issue #202): PUBLIC trust anchor, committed at
+  # scripts/origin-mtls-ca.pem and piped to the box with the rest of the env.
+  # A missing or empty file is a hard stop: an anchor that carries this release
+  # must enforce the client certificate, so the shared header alone is refused.
+  ORIGIN_MTLS_CA_PEM=""
+  if [ -s scripts/origin-mtls-ca.pem ]; then
+    ORIGIN_MTLS_CA_PEM="$(cat scripts/origin-mtls-ca.pem)"
+  else
+    die "scripts/origin-mtls-ca.pem is missing or empty — refusing to provision an anchor without the origin-mTLS trust anchor"
+  fi
+  ENV_PREFIX="export TENANT_USER='$(q "${TENANT_USER:-}")' ANCHOR_ROLE='$(q "${ANCHOR_ROLE:-}")' ANCHOR_HOSTNAME='$(q "${ANCHOR_HOSTNAME:-}")' STATUS_HOST='$(q "${STATUS_HOST:-}")' GATUS_ENDPOINTS='$(q "${GATUS_ENDPOINTS:-}")' STATUS_PULLER='$(q "${STATUS_PULLER:-}")' NTFY_TOPIC='$(q "${NTFY_TOPIC:-}")' NTFY_TOKEN='$(q "${NTFY_TOKEN:-}")' ORIGIN_CA_CERT_PEM='$(q "${ORIGIN_CA_CERT_PEM:-}")' ORIGIN_MTLS_CA_PEM='$(q "${ORIGIN_MTLS_CA_PEM:-}")' CF_AOP_CA_PEM='$(q "${CF_AOP_CA_PEM:-}")' CLOUDFRONT_ORIGIN_SECRET='$(q "${CLOUDFRONT_ORIGIN_SECRET:-}")' MAIN_BOX_IPV4='$(q "${MAIN_BOX_IPV4:-}")' RECORDING_WITNESS_ENDPOINT='$(q "${RECORDING_WITNESS_ENDPOINT:-}")' RECORDING_WITNESS_BUCKET='$(q "${RECORDING_WITNESS_BUCKET:-}")' RECORDING_WITNESS_AUDIT_PREFIX='$(q "${RECORDING_WITNESS_AUDIT_PREFIX:-}")' RECORDING_WITNESS_RECORDINGS_PREFIX='$(q "${RECORDING_WITNESS_RECORDINGS_PREFIX:-}")' RECORDING_WITNESS_KEY_ID='$(q "${RECORDING_WITNESS_KEY_ID:-}")' RECORDING_WITNESS_KEY='$(q "${RECORDING_WITNESS_KEY:-}")' RECORDING_WITNESS_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS='$(q "${RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS:-}")' RECORDING_WITNESS_QUIET_SIGNATURE='$(q "${RECORDING_WITNESS_QUIET_SIGNATURE:-}")' RECORDING_WITNESS_ACK_IDENTITIES='$(q "${RECORDING_WITNESS_ACK_IDENTITIES:-}")' RECORDING_WITNESS_COLD_START_SECONDS='$(q "${RECORDING_WITNESS_COLD_START_SECONDS:-}")' RECORDING_WITNESS_SWEEP_SECONDS='$(q "${RECORDING_WITNESS_SWEEP_SECONDS:-}")';";
   if [ "$ROTATE" -eq 1 ]; then
     warn "--rotate requested: forwarded to the on-box script; on-box key rotation (dot-out old keys per netcup rotation procedure) is pending — re-run converges idempotently today"
   fi
@@ -1373,10 +1413,11 @@ cmd_sweep_post() {
     log "post-sweep: no token held (approval never completed) — nothing created by this run; sweep skipped (stale tmp/orphan policies are retired only by a later apply-mode run that holds a token and resolves SERVER_ID; report-only modes do not delete)"
     return 0
   fi
-  # The steady-state family is anchored on the canonical hostname; an empty
-  # ANCHOR_HOSTNAME would degrade the scope to the legacy id suffix only.
-  # Fail closed — but only AFTER the no-token no-op above, so a
-  # device-timeout run stays a clean no-op.
+  # The steady-state family is the two EXACT names built from the canonical
+  # hostname (list_steady_policies, issue #200); an empty ANCHOR_HOSTNAME
+  # would build names that match nothing and silently stop retiring this
+  # server's orphans. Fail closed — but only AFTER the no-token no-op above,
+  # so a device-timeout run stays a clean no-op.
   [ -n "${ANCHOR_HOSTNAME:-}" ] || die "post-sweep: ANCHOR_HOSTNAME is required to scope the steady-state policy family — refusing to sweep blind"
   local list entry name desc age pid failures=0 swept=0
   list="$(list_tmp_policies)"

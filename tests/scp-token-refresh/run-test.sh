@@ -11,6 +11,12 @@
 #   1. 401 → refresh → retry once → 2xx, and the retry carries the NEW token
 #   2. no refresh token → 401 stays 401, exactly one request (fail loud)
 #   3. refresh refused / unusable → 401 stays 401, exactly one request
+#
+# Issue #199 (PR #197 lens rounds) closes the harness gaps around the handoff
+# file: an unreadable / unstat-able $GITHUB_ENV fails the refresh LOUDLY
+# instead of adopting nothing (cases 9-11), and the handoff grep runs LC_ALL=C
+# so a token whose first byte is invalid UTF-8 still counts as held under a
+# UTF-8 locale (case 12). Cred-free, offline.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,8 +26,17 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
-bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+skipped=0
+# Check-count floor (external-watch pattern): a silently skipped case cannot
+# shrink this harness. Raise it with every case you add.
+MIN_CHECKS=51
+ok()   { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad()  { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+# skip N LABEL: a skipped block crediting N checks (the count it WOULD have
+# run). Issue #233 F3: crediting one per block reds the floor on any legitimate
+# skip (sweep 184 < 186 as root; scp-token-refresh 45 < 48), because a block
+# carries 2-4 checks. The credit is explicit and loud.
+skip() { skipped=$((skipped + $1)); printf 'SKIP %s\n' "$2"; }
 is()  { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
@@ -109,11 +124,16 @@ run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB
   # file let case 1's FAKE tokens leak into case 2 (which then adopted them)
   # — a harness artifact that previously forced a production "never
   # resurrect" guard. One file per case: hermetic, no cross-case adoption.
-  : > "$WORK/genv.$1"; : > "$WORK/rtok.$1"
+  # GENV_OVERRIDE=<path> hands the case a $GITHUB_ENV the harness must NOT
+  # seed (an unreadable file, a directory, a path that does not exist).
+  local genv="${GENV_OVERRIDE:-$WORK/genv.$1}"
+  CASE_RC=0
+  if [ -z "${GENV_OVERRIDE:-}" ]; then : > "$WORK/genv.$1"; fi
+  : > "$WORK/rtok.$1"
   if [ -n "${4:-}" ]; then printf '%s\n' "$4" > "$WORK/genv.$1"; fi
   if [ -n "${5:-}" ]; then printf '%s' "$5" > "$WORK/rtok.$1"; fi
   STUB_MODE="$2" \
-  GITHUB_ENV="$WORK/genv.$1" \
+  GITHUB_ENV="$genv" \
   NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.$1" \
   STUB_CALLS="$WORK/calls.$1" STUB_SEEN="$WORK/seen.$1" \
   STUB_REFRESHED="$WORK/refreshed.$1" STUB_REFRESH_BODY="$WORK/refreshbody.$1" \
@@ -128,7 +148,7 @@ run_case() { # $1 label, $2 mode, $3 refresh token ("" = unset), [$4 seed GITHUB
     out=""
     api_call GET "/api/v1/test" "" out
     printf "HTTP_STATUS=%s\nOUT=%s\n" "$HTTP_STATUS" "$out"
-  ' _ "$WORK/functions.sh" > "$WORK/result.$1" 2>&1 || true
+  ' _ "$WORK/functions.sh" > "$WORK/result.$1" 2>&1 || CASE_RC=$?
   HTTP_STATUS="$(sed -n 's/^HTTP_STATUS=//p' "$WORK/result.$1")"
   OUT="$(sed -n 's/^OUT=//p' "$WORK/result.$1")"
   CALLS=0; REFRESHED=0; SEEN=""
@@ -288,5 +308,86 @@ is "case8 no forged NETCUP_API_BASE in env"      "0"  "$(grep -c '^NETCUP_API_BA
 is "case8 RT file NOT rewritten"                 "RT0" "$(cat "$WORK/rtok.c8")"
 is "case8 loud guard error"                      "1"  "$(grep -c 'injection guard' "$WORK/inj.err.c8" || true)"
 
-printf '\n%s passed, %s failed\n' "$pass" "$fail"
+# ---- cases 9-11: an unreadable $GITHUB_ENV fails the refresh LOUDLY --------
+# Issue #199 (r3 functional, r4 F1): `grep … || true` adopted nothing, so the
+# caller replayed the 401 with a possibly-consumed token and nothing said so.
+# A $GITHUB_ENV the refresh cannot READ (grep rc 2: a directory, a path that
+# does not exist, an unreadable file) must abort instead. rc 1 (no handoff
+# line) stays the normal "nothing to adopt" case.
+mkdir -p "$WORK/genv.c9"                       # a directory: grep rc 2
+GENV_OVERRIDE="$WORK/genv.c9" run_case c9 401-then-200 "RT1"
+unset GENV_OVERRIDE
+is "case9 rc != 0 (refused, not swallowed)" "1" "$([ "$CASE_RC" -ne 0 ] && echo 1 || echo 0)"
+is "case9 single request (no blind replay)" "1" "$CALLS"
+is "case9 no refresh sent"                  "0" "$REFRESHED"
+is "case9 loud refusal names \$GITHUB_ENV"  "1" "$(grep -cF -- 'cannot read $GITHUB_ENV' "$WORK/result.c9" || true)"
+GENV_OVERRIDE="$WORK/absent-dir/absent.env" run_case c10 401-then-200 "RT1"
+unset GENV_OVERRIDE
+is "case10 rc != 0 (unstat-able path)" "1" "$([ "$CASE_RC" -ne 0 ] && echo 1 || echo 0)"
+is "case10 single request"             "1" "$CALLS"
+is "case10 loud refusal"               "1" "$(grep -cF -- 'cannot read $GITHUB_ENV' "$WORK/result.c10" || true)"
+if [ "$(id -u)" -eq 0 ]; then
+  skip 4 "case11 (root reads a mode-000 file; case9/10 cover the unreadable class)"
+else
+  : > "$WORK/genv.c11"
+  printf 'NETCUP_SCP_ACCESS_TOKEN=AT9\n' > "$WORK/genv.c11"
+  chmod 000 "$WORK/genv.c11"
+  GENV_OVERRIDE="$WORK/genv.c11" run_case c11 401-then-200 "RT1"
+  unset GENV_OVERRIDE
+  is "case11 rc != 0 (unreadable regular file)" "1" "$([ "$CASE_RC" -ne 0 ] && echo 1 || echo 0)"
+  is "case11 single request"                    "1" "$CALLS"
+  is "case11 no refresh sent"                   "0" "$REFRESHED"
+  is "case11 loud refusal"                      "1" "$(grep -cF -- 'cannot read $GITHUB_ENV' "$WORK/result.c11" || true)"
+  chmod 600 "$WORK/genv.c11"
+fi
+
+# ---- case 12: the handoff grep is LC_ALL=C --------------------------------
+# Issue #199 (r4 F3): under a UTF-8 locale a `.` does not match a byte that is
+# not valid UTF-8, so a handoff token whose FIRST byte is 0xff read as absent
+# and the refresh adopted nothing. LC_ALL=C pins the byte semantics.
+UTF8_LOCALE=""
+for cand in en_US.utf8 en_US.UTF-8 C.utf8 C.UTF-8; do
+  if locale -a 2>/dev/null | grep -qx "$cand"; then UTF8_LOCALE="$cand"; break; fi
+done
+if [ -z "$UTF8_LOCALE" ]; then
+  skip 1 "case12 (invalid-UTF-8 first byte: no UTF-8 locale installed)"
+else
+  : > "$WORK/rtok.c12"
+  printf 'NETCUP_SCP_ACCESS_TOKEN=\377A\n' > "$WORK/genv.c12"
+  printf '\377A\n' > "$WORK/expect.c12"   # sed adds the line's newline
+  env -i PATH="$WORK/bin:$PATH" LANG="$UTF8_LOCALE" \
+    GITHUB_ENV="$WORK/genv.c12" \
+    NETCUP_SCP_REFRESH_TOKEN_FILE="$WORK/rtok.c12" \
+    NETCUP_SCP_ACCESS_TOKEN="AT1" NETCUP_SCP_REFRESH_TOKEN="" \
+    bash -c '
+      set -euo pipefail
+      source "$1"
+      rc=0
+      scp_token_refresh || rc=$?
+      printf "RC=%s\n" "$rc"
+      printf "AT="; printf "%s" "$NETCUP_SCP_ACCESS_TOKEN"; printf "\n"
+    ' _ "$WORK/functions.sh" > "$WORK/adopt.c12" 2>&1 || true
+  sed -n 's/^AT=//p' "$WORK/adopt.c12" > "$WORK/adopted.c12"
+  if cmp -s "$WORK/adopted.c12" "$WORK/expect.c12"; then
+    ok "case12 invalid-UTF-8 first byte still adopted under $UTF8_LOCALE (LC_ALL=C)"
+  else
+    bad "case12 handoff not adopted under $UTF8_LOCALE: $(od -An -tx1 "$WORK/adopted.c12" | tr -s ' ')"
+  fi
+fi
+
+# --- the skip credit is per CHECK, not per block (issue #233 F3) -----------
+# case11 carries FOUR checks and case12 one, so the old one-per-block credit
+# would red the floor on a host where either block is legitimately skipped.
+# floor_verdict is the harness's own comparison; both directions are pinned.
+floor_verdict() { # $1 observed pass count, $2 credited skips -> red|green
+  if [ "$1" -lt "$((MIN_CHECKS - $2))" ]; then printf 'red'; else printf 'green'; fi
+}
+is "skip credit: case11's 4 checks credited 4 stay green" "green" "$(floor_verdict "$((MIN_CHECKS - 4))" 4)"
+is "skip credit: case11's 4 checks credited 1 red (the pre-fix arithmetic)" "red" "$(floor_verdict "$((MIN_CHECKS - 4))" 1)"
+
+printf '\n%s passed, %s failed (%s skipped)\n' "$pass" "$fail" "$skipped"
+if [ "$pass" -lt "$((MIN_CHECKS - skipped))" ]; then
+  printf 'FAIL check-count floor: %s < %s (%s pinned minus %s skipped)\n' "$pass" "$((MIN_CHECKS - skipped))" "$MIN_CHECKS" "$skipped"
+  fail=$((fail + 1))
+fi
 [ "$fail" -eq 0 ]

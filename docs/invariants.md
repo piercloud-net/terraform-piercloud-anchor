@@ -17,10 +17,12 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 > cross-box interactions are answering clevis's TCP/80 challenges from the
 > main-box IP, serving ACME challenges on TCP/80 and the dashboard on TCP/443
 > (never on `:80`) to the platform edge — the CloudFront origin-facing ranges
-> + the main box on TCP/443 are the dashboard leg, and Caddy additionally
+> + the main box on TCP/443 are the dashboard leg; on an anchor that carries this release, Caddy requires a CloudFront
+> client certificate signed by the committed origin-mTLS CA at the TLS
+> handshake (`client_auth require_and_verify`, issue #202) **and** still
 > requires the X-Piercloud-Origin secret header from every `:443` peer except
-> the main box and loopback `127.0.0.1/32`/`::1/128` (the on-box probes) —
-> call D) — plus probing the tenant's public endpoints
+> the main box and loopback `127.0.0.1/32`/`::1/128` (the on-box probes) until
+> the header-retirement cutover lands — call D); an anchor that does not yet carry this release gates on the header alone — plus probing the tenant's public endpoints
 > for availability (narrow firewall rules; no SSH inbound
 > from the main box either). Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
@@ -148,7 +150,7 @@ as the repo-side controls.
 > per-run device-flow approval from any browser; the ephemeral token dies
 > with the runner (TF 1.11 ephemeral values, never state).
 
-**Rationale.** A standing credential in repo secrets is an account-wide blast radius that outlives attention (token-rotation ambiguity, forgotten taps). Per-run approval dissolves the whole class: stopping taps is a legitimate expiry, not an outage (tangd is autonomous; the passphrase keyslot keeps every boot recoverable). Under S1, `mode=check` is hygiene, not load-bearing — there is nothing to keep alive.
+**Rationale.** A standing credential in secrets is an account-wide blast radius that outlives attention (token-rotation ambiguity, forgotten taps). Per-run approval dissolves the whole class: stopping taps is a legitimate expiry, not an outage (tangd is autonomous; the passphrase keyslot keeps every boot recoverable). Under S1, `mode=check` is hygiene, not load-bearing — there is nothing to keep alive.
 
 ## C-A — no sovereignty-downgrade fallback, ever
 
