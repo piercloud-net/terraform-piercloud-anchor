@@ -7699,9 +7699,11 @@ fi
 # /usr/bin/env`) and asserts the same two entries. Residual, disclosed: the leg
 # is graded only where the BUS PROBE SUCCEEDS - an absent binary, no reachable
 # bus, a wedged bus or a probe unit the bus refuses all skip (each labelled with
-# its own diagnosed reason, systemd's words included) - and on a skip a wrong
-# model would still pass. The exact-bytes pin above is what catches a mangled
-# render in CI, on every host.
+# its own diagnosed reason - the exit code, a timeout note or the absent-binary
+# note, plus whatever systemd printed on that path where it printed anything;
+# two of those four paths print no systemd words) - and on a skip a wrong model
+# would still pass. The exact-bytes pin above is what catches a mangled render
+# in CI, on every host.
 RECORDING_WITNESS_QUIET_SIGNATURE="sha256:$(printf '%064d' 0),sha256:$(printf '%064d' 1)" \
   recording_witness_install
 list_line="$(grep '^RECORDING_WITNESS_QUIET_SIGNATURE=' "${RECORDING_WITNESS_ENV_FILE}" | head -n1)"
@@ -7730,10 +7732,14 @@ fi
 # unit or a wedged bus would be reported as a skip and read as a pass, on
 # exactly the host class the leg exists for. So probe the bus FIRST (a trivial
 # unit), and only where that succeeds is the EnvironmentFile leg graded - there
-# a failure is a real finding, not an environment limitation. Where no bus is
-# reachable - or the bus refuses the probe unit - the leg skips with the
-# diagnosed reason (the exit code plus systemd's own first stderr line, never a
-# bare "skipped"), and the exact-bytes pin above remains the CI-side tooth.
+# a failure is a real finding, not an environment limitation. Where systemd-run
+# is absent, no bus is reachable, the bus is wedged, or the bus refuses the
+# probe unit, the leg skips with the reason it has - never a bare "skipped": an
+# exit code plus whatever systemd printed on that path for a probe that failed
+# that way (first non-empty stderr line, bounded to 120 chars, empty-safe), its
+# own timeout note for the wedge (the rc=124 path returns before the read, so it
+# quotes nothing), and nothing to quote when the binary is absent. The
+# exact-bytes pin above remains the CI-side tooth.
 # Either path emits exactly one check, so the floor is stable.
 bus_rc=0
 bus_note="systemd-run is absent"
@@ -7745,9 +7751,10 @@ if command -v systemd-run >/dev/null 2>&1; then
     bus_note="the user bus probe timed out after 15s (a wedged bus)"
   elif [ "${bus_rc}" -ne 0 ]; then
     # The exit code alone does not separate "no bus" from "a bus refused this
-    # unit" (both are rc=1), so surface what systemd actually said. First
-    # non-empty stderr line, bounded: the transient unit name is the only
-    # content, and it carries nothing sensitive.
+    # unit" (both are rc=1), so surface what systemd said on THIS path: the
+    # first non-empty stderr line, bounded to 120 chars (empty-safe when the
+    # failure printed nothing). The probe passes no EnvironmentFile= and no
+    # --setenv, so the line carries no environment value.
     bus_err="$(grep -m1 -v '^[[:space:]]*$' "${WORK}/systemd-bus.err" 2>/dev/null | cut -c1-120 || true)"
     bus_note="the user bus probe failed (systemd-run exited ${bus_rc}${bus_err:+: ${bus_err}})"
   fi
