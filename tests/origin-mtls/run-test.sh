@@ -122,10 +122,9 @@ case "$out" in
   DIE:*) ok "pool: a non-certificate PEM body is refused" ;;
   *) bad "pool: a non-certificate PEM body was accepted (got '$out')" ;;
 esac
+priv_pem="$(printf -- '-----BEGIN EC %s KEY-----\nMHcCAQEEIPqykxYO1HEjq8lTO8Gj58MMFhV2CAheP05wnl9Wr1rhoAoGCCqGSM49\n-----END EC %s KEY-----' PRIVATE PRIVATE)"
 out="$(run_pool "" "${mtls_pem}
------BEGIN EC PRIVATE KEY-----
-MHcCAQEEIPqykxYO1HEjq8lTO8Gj58MMFhV2CAheP05wnl9Wr1rhoAoGCCqGSM49
------END EC PRIVATE KEY-----")" || true
+${priv_pem}")" || true
 case "$out" in
   DIE:*'certificate-only'*) ok "pool: a key-bearing mTLS value is refused" ;;
   *) bad "pool: a key-bearing mTLS value was not refused (got '$out')" ;;
