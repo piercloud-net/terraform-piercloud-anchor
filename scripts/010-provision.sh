@@ -194,6 +194,7 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "https://${STATUS_HOST} {"
     printf '%s\n' "	header -Server"
     printf '%s\n' "	header Strict-Transport-Security \"max-age=15552000\""
+    printf '%s\n' "	header Pc-Edge-Client-Sha256 \"{http.request.tls.client.fingerprint}\""
     printf '%s\n' "${DASH_TLS_STANZA}"
     printf '%s\n' "	# Tang paths are never served on the dashboard vhost."
     printf '%s\n' "	@dashtang path /adv* /rec*"
@@ -288,6 +289,11 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
   # deleted again after it.
   printf '%s\n' "$https_block" | grep -Fxq "$(printf '\theader Strict-Transport-Security "max-age=15552000"')" \
     || die "serving Caddyfile $cfg lacks the :443 site-level HSTS header (max-age=15552000) — the origin-hardening render did not converge; refusing to finish blind"
+  # The platform's rotation check reads the verified edge client-certificate
+  # fingerprint from this site-level line (same one-tab rule as HSTS; a deeper
+  # indent would sit inside a handle, where the abort paths never send it).
+  printf '%s\n' "$https_block" | grep -Fxq "$(printf '\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')" \
+    || die "serving Caddyfile $cfg lacks the :443 site-level Pc-Edge-Client-Sha256 header (placeholder {http.request.tls.client.fingerprint}) — the origin-hardening render did not converge; refusing to finish blind"
   if printf '%s\n' "$https_block" | grep -Eqi 'header[[:space:]]+[-!]strict-transport-security'; then
     die "serving Caddyfile $cfg deletes Strict-Transport-Security again after setting it — the hardening render did not converge; refusing to finish blind"
   fi

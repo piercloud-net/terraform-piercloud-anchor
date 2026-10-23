@@ -272,11 +272,25 @@ jobs:
           URL="${PROBE_URL:-https://status-pier.piercloud.net/}"
           base="${URL%/}"
           host="$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+          # Informational only (never read by $fail or the exit code): the
+          # origin-mTLS echo of the verified edge client certificate and the
+          # CloudFront PoP, for the platform's rotation check. A value that
+          # does not match its pattern is shown as "absent" (never echoed
+          # raw into the public step summary).
+          header_value() {
+            local v
+            v="$(tr -d '\r' <"$1" 2>/dev/null | awk -F': *' -v n="$2" 'tolower($1) == n { v = $2 } END { print v }' || true)"
+            if printf '%s' "$v" | grep -Eq "$3"; then printf '%s' "$v"; else printf 'absent'; fi
+          }
+          edge_sha="absent"
+          edge_pop="absent"
           fail=""
           for attempt in $(seq 1 "$ATTEMPTS"); do
             fail=""
             work="$(mktemp -d)"
-            code="$(curl -sS -o "$work/body" -w '%{http_code}' --max-time 20 "$base/" 2>"$work/err" || true)"
+            code="$(curl -sS -D "$work/root.hdr" -o "$work/body" -w '%{http_code}' --max-time 20 "$base/" 2>"$work/err" || true)"
+            edge_sha="$(header_value "$work/root.hdr" pc-edge-client-sha256 '^[0-9a-f]{64}$')"
+            edge_pop="$(header_value "$work/root.hdr" x-amz-cf-pop '^[A-Za-z0-9-]{1,32}$')"
             if [ "$code" != "200" ]; then
               fail="HTTP ${code:-<no-response>}"
               [ -s "$work/err" ] && fail="$fail ($(head -n1 "$work/err"))"
@@ -411,6 +425,9 @@ jobs:
             echo "attempt ${attempt}/${ATTEMPTS} failed: ${fail}"
             [ "$attempt" -lt "$ATTEMPTS" ] && sleep "$RETRY_SLEEP"
           done
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### external-watch: edge headers — Pc-Edge-Client-Sha256: `%s`, x-amz-cf-pop: `%s`\n' "$edge_sha" "$edge_pop" >> "$GITHUB_STEP_SUMMARY" || true
+          fi
           if [ -z "$fail" ]; then
             echo "external-watch: OK — ${base} served Gatus data and the edge certificate is valid >= ${MIN_CERT_DAYS}d"
             if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; fi
