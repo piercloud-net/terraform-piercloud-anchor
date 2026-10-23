@@ -154,8 +154,35 @@ QUALIFIER = re.compile(r"not verified (in this repo|here)")
 LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 TABLE_ROW = re.compile(r"^\s*\|")
 HEADING = re.compile(r"^\s*#{1,6}\s")
-SENTENCE = re.compile(r"(?<=[.!?;])\s+")
 BRANCH_GLOB = re.compile(r"release/from-v\*")
+
+
+def clauses(unit):
+    """Split a claim unit into sentences, without cutting inside a code span
+    or a parenthesised aside (a `;` there is punctuation, not a new claim)."""
+    out, buf, ticks, depth = [], [], 0, 0
+    index = 0
+    while index < len(unit):
+        char = unit[index]
+        if char == "`":
+            ticks ^= 1
+        elif not ticks and char == "(":
+            depth += 1
+        elif not ticks and char == ")" and depth:
+            depth -= 1
+        buf.append(char)
+        if not ticks and not depth and char in ".!?;":
+            after = index + 1
+            if after >= len(unit) or unit[after].isspace():
+                out.append("".join(buf))
+                buf = []
+                while after < len(unit) and unit[after].isspace():
+                    after += 1
+                index = after - 1
+        index += 1
+    if buf:
+        out.append("".join(buf))
+    return out
 
 
 def units(path, text):
@@ -181,7 +208,7 @@ for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
     for unit in units(path, text):
-        for sentence in SENTENCE.split(BRANCH_GLOB.sub("release/from-vX", unit)):
+        for sentence in clauses(BRANCH_GLOB.sub("release/from-vX", unit)):
             if CLAIM.search(sentence) and not QUALIFIER.search(sentence):
                 problems.append("%s: %s" % (path, sentence.strip()[:200]))
 if problems:
@@ -191,7 +218,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=284
+MIN_CHECKS=290
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -700,8 +727,8 @@ import re
 import sys
 
 EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
-IF_KEY = re.compile(r"^([ \t-]*)if:[ \t]*(.*)$")
-BLOCK = {">", ">-", ">+", "|", "|-", "|+"}
+IF_KEY = re.compile(r"""^([ \t-]*)(?:"if"|'if'|if)[ \t]*:[ \t]*(.*)$""")
+BLOCK = re.compile(r"^[|>](?:[1-9][+-]?|[+-][1-9]?)?$")
 QUOTED = re.compile(r"'(?:[^']|'')*'")
 CONTEXT = re.compile(r"(?<![A-Za-z0-9_.])(vars|secrets)\b")
 LITERAL = re.compile(r"\s*\.\s*[A-Za-z_]")
@@ -716,15 +743,19 @@ def if_values(text):
         if not match:
             continue
         indent, rest = len(match.group(1)), match.group(2).strip()
-        if rest in BLOCK:
-            block = []
-            for later in lines[index + 1:]:
-                if later.strip() and (len(later) - len(later.lstrip())) <= indent:
-                    break
+        block = []
+        for later in lines[index + 1:]:
+            if later.strip() and (len(later) - len(later.lstrip())) <= indent:
+                break
+            if later.strip():
                 block.append(later.strip())
+        if BLOCK.match(rest):
             values.append(" ".join(block))
+        elif rest:
+            # a plain scalar may continue on the following, more-indented lines
+            values.append(" ".join([rest] + block))
         else:
-            values.append(rest)
+            values.append(" ".join(block))
     return values
 
 
@@ -783,6 +814,36 @@ dr_folded_rc=0
 dr_folded="$(python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-folded.yml" 2>/dev/null)" || dr_folded_rc=$?
 is "a folded if: block scalar is judged, not just its first line" "1" "$dr_folded_rc"
 has "the folded-if read is named" "$dr_folded" "vars[format("
+cat >"${WORK}/dr-multi.yml" <<'YML'
+        if: github.event_name == 'push' &&
+          vars[format('{0}', 'X')] == 'x'
+        run: echo hi
+YML
+dr_multi_rc=0
+dr_multi="$(python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-multi.yml" 2>/dev/null)" || dr_multi_rc=$?
+is "a plain multi-line if: continuation is judged" "1" "$dr_multi_rc"
+cat >"${WORK}/dr-quoted.yml" <<'YML'
+        "if": vars[format('{0}', 'X')] == 'x'
+        run: echo hi
+YML
+dr_quoted_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-quoted.yml" >/dev/null 2>&1 || dr_quoted_rc=$?
+is "a quoted if: key is judged" "1" "$dr_quoted_rc"
+cat >"${WORK}/dr-space.yml" <<'YML'
+        if : vars[format('{0}', 'X')] == 'x'
+        run: echo hi
+YML
+dr_space_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-space.yml" >/dev/null 2>&1 || dr_space_rc=$?
+is "an if key with a space before the colon is judged" "1" "$dr_space_rc"
+cat >"${WORK}/dr-indent.yml" <<'YML'
+        if: >2-
+          vars[format('{0}', 'X')] == 'x'
+        run: echo hi
+YML
+dr_indent_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-indent.yml" >/dev/null 2>&1 || dr_indent_rc=$?
+is "a block scalar with an indentation indicator is judged" "1" "$dr_indent_rc"
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
@@ -805,6 +866,14 @@ printf '%s\n' 'Tenant tags carry `v*` tags; not verified in this repo.' >"${WORK
 vs_semi_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-semi.md" >/dev/null 2>&1 || vs_semi_rc=$?
 is "a semicolon starts a new claim unit (the qualifier cannot be borrowed)" "1" "$vs_semi_rc"
+printf '%s\n' 'The gate (`ref; see docs`) is expected by the platform, not verified in this repo.' >"${WORK}/vstar-code.md"
+vs_code_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-code.md" >/dev/null 2>&1 || vs_code_rc=$?
+is "a semicolon inside a code span does not split the claim unit" "0" "$vs_code_rc"
+printf '%s\n' 'The gate (ref; see docs) is expected by the platform, not verified in this repo.' >"${WORK}/vstar-paren.md"
+vs_paren_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-paren.md" >/dev/null 2>&1 || vs_paren_rc=$?
+is "a semicolon inside a parenthesised aside does not split the claim unit" "0" "$vs_paren_rc"
 
 # ---- #208 round 2: behavioural drivers for the config + incident steps -----
 # Both steps run against stub gh/curl on PATH; every call is logged, so the
