@@ -154,7 +154,7 @@ QUALIFIER = re.compile(r"not verified (in this repo|here)")
 LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 TABLE_ROW = re.compile(r"^\s*\|")
 HEADING = re.compile(r"^\s*#{1,6}\s")
-SENTENCE = re.compile(r"(?<=[.!?])\s+")
+SENTENCE = re.compile(r"(?<=[.!?;])\s+")
 BRANCH_GLOB = re.compile(r"release/from-v\*")
 
 
@@ -191,7 +191,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=279
+MIN_CHECKS=284
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -700,10 +700,33 @@ import re
 import sys
 
 EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
-IF_VALUE = re.compile(r"^[ \t-]*if:[ \t]*(.+)$", re.M)
+IF_KEY = re.compile(r"^([ \t-]*)if:[ \t]*(.*)$")
+BLOCK = {">", ">-", ">+", "|", "|-", "|+"}
 QUOTED = re.compile(r"'(?:[^']|'')*'")
 CONTEXT = re.compile(r"(?<![A-Za-z0-9_.])(vars|secrets)\b")
 LITERAL = re.compile(r"\s*\.\s*[A-Za-z_]")
+
+def if_values(text):
+    """Every `if:` value, including a folded block scalar whose condition
+    lives on the following, more-indented lines."""
+    values = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = IF_KEY.match(line)
+        if not match:
+            continue
+        indent, rest = len(match.group(1)), match.group(2).strip()
+        if rest in BLOCK:
+            block = []
+            for later in lines[index + 1:]:
+                if later.strip() and (len(later) - len(later.lstrip())) <= indent:
+                    break
+                block.append(later.strip())
+            values.append(" ".join(block))
+        else:
+            values.append(rest)
+    return values
+
 
 legal = 0
 offenders = []
@@ -711,7 +734,7 @@ for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
     exprs = [m.group(1) for m in EXPR.finditer(text)]
-    exprs += [m.group(1) for m in IF_VALUE.finditer(text)]
+    exprs += if_values(text)
     for expr in exprs:
         flat = QUOTED.sub("''", expr)
         for m in CONTEXT.finditer(flat):
@@ -751,6 +774,15 @@ has "the split-fragment read is named" "$dr_split" 'vars[format('
 dr_dump_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-dump.yml" >/dev/null 2>&1 || dr_dump_rc=$?
 is "a whole-context dump (toJSON(vars)) is refused" "1" "$dr_dump_rc"
+cat >"${WORK}/dr-folded.yml" <<'YML'
+        if: >-
+          vars[format('{0}', 'X')] == 'x'
+        run: echo hi
+YML
+dr_folded_rc=0
+dr_folded="$(python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-folded.yml" 2>/dev/null)" || dr_folded_rc=$?
+is "a folded if: block scalar is judged, not just its first line" "1" "$dr_folded_rc"
+has "the folded-if read is named" "$dr_folded" "vars[format("
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
@@ -769,6 +801,10 @@ is "a bare v* (no backticks) is a claim" "1" "$vs_bare_rc"
 vs_wrap_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-wrap.md" >/dev/null 2>&1 || vs_wrap_rc=$?
 is "a wrapped qualified sentence stays green" "0" "$vs_wrap_rc"
+printf '%s\n' 'Tenant tags carry `v*` tags; not verified in this repo.' >"${WORK}/vstar-semi.md"
+vs_semi_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-semi.md" >/dev/null 2>&1 || vs_semi_rc=$?
+is "a semicolon starts a new claim unit (the qualifier cannot be borrowed)" "1" "$vs_semi_rc"
 
 # ---- #208 round 2: behavioural drivers for the config + incident steps -----
 # Both steps run against stub gh/curl on PATH; every call is logged, so the
@@ -919,12 +955,16 @@ is "watch leg assigns NTFY_TOKEN only in the two pairing branches" "2" "$(ntfy_s
 # or `+=` after the pairing passes it. Layer 2 (textual): no such rebind of a
 # channel name in either body. Layer 1 (behavioural, below): drive both bodies
 # with the watch pair AND the repo pair set; the post must use the watch values.
-ntfy_rebinds() { # $1 body -> rebind count (comment lines ignored)
+ntfy_rebinds() { # $1 body -> rebind count (comments dropped, continuations joined)
   printf '%s\n' "$1" | grep -vE '^[[:space:]]*#' \
-    | grep -cE '(^|[^[:alnum:]_])(printf[[:space:]]+-v|read|readarray|mapfile|export|declare|typeset|local|readonly|eval|unset)([^[:alnum:]_]|$).*NTFY_(TOPIC|TOKEN)|(^|[^[:alnum:]_])NTFY_(TOPIC|TOKEN)[+]=' || true
+    | sed -e ':a' -e '/\\[[:space:]]*$/{N; s/\\[[:space:]]*\n/ /; ta}' \
+    | grep -cE '(^|[^[:alnum:]_])(printf[[:space:]]+-v|read|readarray|mapfile|export|declare|typeset|local|readonly|eval|unset)([^[:alnum:]_]|$).*NTFY_(TOPIC|TOKEN)|(^|[^[:alnum:]_])NTFY_(TOPIC|TOKEN)(\+|:)=' || true
 }
 is "rebind detector flags printf -v on a channel name" "1" "$(ntfy_rebinds 'printf -v NTFY_TOPIC "%s" "$x"')"
 is "rebind detector flags a += on a channel name" "1" "$(ntfy_rebinds 'NTFY_TOKEN+=x')"
+is "rebind detector flags a := on a channel name" "1" "$(ntfy_rebinds 'NTFY_TOKEN:=x')"
+is "rebind detector joins a line continuation" "1" \
+  "$(ntfy_rebinds "$(printf 'printf -v \\\nNTFY_TOPIC "%s" x')")"
 is "rebind detector ignores a comment that names a channel" "0" "$(ntfy_rebinds '# read NTFY_TOPIC here')"
 is "config step has no rebind verb on a channel name" "0" "$(ntfy_rebinds "$(cat "${WORK}/config.sh")")"
 is "watch leg has no rebind verb on a channel name" "0" "$(ntfy_rebinds "$pushbody")"
