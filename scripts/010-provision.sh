@@ -3406,8 +3406,12 @@ if [ -n "${STATUS_HOST:-}" ]; then
       pool_retry="redeploy a release carrying the origin-mTLS gate; the rollback floor is in docs/dr.md"
       pool_cause="the origin trust pool does not match CloudFront's client certificate"
     else
+      # Unreachable in production: 020 always forwards the committed
+      # origin-mTLS CA (MTLS_TLS=yes) and a CF_AOP_CA_PEM beside it dies at
+      # pool assembly above. Kept for the harnesses that drive this span with
+      # an AOP-only pool; the text must still be true if it ever prints.
       pool_rollback="no supported rollback to the Cloudflare AOP pool: origin mTLS refuses CF_AOP_CA_PEM alongside the committed CA. Pre-mTLS releases are never a valid target (they reopen #202; docs/dr.md)"
-      pool_retry="unset CF_AOP_CA_PEM and re-dispatch: the origin-mTLS CA is the only supported client-auth pool (docs/dr.md)"
+      pool_retry="the origin-mTLS CA is the only supported client-auth pool: provision with the committed CA and without CF_AOP_CA_PEM (docs/dr.md)"
       pool_cause="the origin trust bundle does not match Cloudflare's client cert"
     fi
     neg_rc=0
