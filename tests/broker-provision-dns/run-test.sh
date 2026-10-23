@@ -17,7 +17,7 @@
 # exactly-one-job-key counts catch a form the stripper does not recognise.
 # The workflow `on:`/`permissions:` spans and the LF/BOM check are
 # parser-based (PyYAML compose / a Python byte predicate), not hand-rolled
-# scanners (#195): both run under an isolated interpreter (`python3 -I`), so
+# scanners (#195): both run under a separate interpreter (`python3 -I`), so
 # an in-tree `yaml.py` cannot shadow the installed package, and the span
 # parser refuses a PyYAML whose major is not 6 (fail closed, never skip).
 set -euo pipefail
@@ -52,13 +52,13 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # end mark, so every child — an indent-2 trigger, a flow entry, a column-0
 # block-sequence entry, a block-scalar body — is inside the hashed bytes.
 # A file that does not parse, a missing/duplicate key, or a multi-document
-# file fails closed. Python runs with -I/-B (isolated: neither the cwd/'' nor
+# file fails closed. Python runs with -I/-B (`-I`: neither the cwd/'' nor
 # PYTHONPATH nor the user site is on sys.path, so an in-tree module cannot
 # shadow the parser) plus PYTHONDONTWRITEBYTECODE so the harness never writes
 # an in-tree __pycache__.
 # Parser dependency guard (#195): the span computation is a REAL YAML parse,
 # so the harness refuses to run without PyYAML 6.x — a loud hard failure, not
-# a skip and not a fallback to a tokenizer. `-I` (isolated mode: implies -E
+# a skip and not a fallback to a tokenizer. `-I` (separate mode: implies -E
 # and -s) keeps the cwd (`''`), PYTHONPATH and user site-packages off
 # sys.path, so an in-tree `yaml.py` cannot shadow the installed package.
 # Disclosed residual: the guard pins the MAJOR only (ubuntu-latest ships
@@ -191,9 +191,9 @@ rm -f "$spf"
 # the marks it reports, so every span pin then describes the attacker's tree
 # instead of the file's real bytes — a shadow can drop a trigger key, move the
 # reported span end, or blank bytes in the parse input, and the pins never see
-# the real content. The parser now runs isolated (`-I`), so the planted module
+# the real content. The parser now runs under `-I`, so the planted module
 # is NOT imported. The positive control below runs the same import WITHOUT
-# isolation from the same cwd, so dropping `-I` from wf_spans reds this tooth
+# `-I` from the same cwd, so dropping `-I` from wf_spans reds this tooth
 # instead of silently restoring the shadow route. The shadow raises, so it
 # cannot be mistaken for the real package.
 shdir="$(mktemp -d)"
@@ -201,19 +201,19 @@ printf 'raise RuntimeError("planted yaml.py was imported")\n' > "$shdir/yaml.py"
 printf '%s' "$sp_base" > "$shdir/wf.yml"
 sh_ctl="$( (cd "$shdir" && PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import yaml') 2>&1 || true)"
 case "$sh_ctl" in
-  *"planted yaml.py was imported"*) ok "yaml shadow control: un-isolated python imports a planted cwd yaml.py (the shadow mutant)" ;;
-  *) bad "yaml shadow control: un-isolated python did not import the planted shadow ('$sh_ctl')" ;;
+  *"planted yaml.py was imported"*) ok "yaml shadow control: python without `-I` imports a planted cwd yaml.py (the shadow mutant)" ;;
+  *) bad "yaml shadow control: python without `-I` did not import the planted shadow ('$sh_ctl')" ;;
 esac
 sh_sp="$( (cd "$shdir" && wf_spans wf.yml) || true)"
 case "$sh_sp" in
-  OK$'\t'*) ok "yaml shadow: the isolated span parser ignores a planted cwd yaml.py (real PyYAML used)" ;;
+  OK$'\t'*) ok "yaml shadow: the `-I` span parser ignores a planted cwd yaml.py (real PyYAML used)" ;;
   *) bad "yaml shadow: the span parser was shadowed or failed under a planted yaml.py ('$sh_sp')" ;;
 esac
 rm -rf "$shdir"
-# Every OTHER python call in this file must be isolated too: the only
-# un-isolated invocation left is the positive control above (it must import a
+# Every OTHER python call in this file must carry `-I` too: the only
+# invocation without `-I` left is the positive control above (it must import a
 # hostile module), so a new `python3 -B ...` without `-I` reds this count.
-is "yaml shadow: no un-isolated python invocation besides the control" "1" "$(grep -cE '^[^#]*python3 -B' "$0" || true)"
+is "yaml shadow: no python invocation without `-I` besides the control" "1" "$(grep -cE '^[^#]*python3 -B' "$0" || true)"
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
