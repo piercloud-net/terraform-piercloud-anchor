@@ -479,7 +479,7 @@ is "exactly one write_anchor_dns token in the job" "1" "$(printf '%s\n' "$JOB_LI
 # checkout identity (`repository:`/`ref:` under `with:` would source an
 # attacker's broker-dns.sh), a job-env injection (LD_PRELOAD), or any other
 # added/edited line in the job. Any deliberate job edit updates this pin.
-is "anchor-dns job blob hash (pin: update after a deliberate edit)" "a6334e45c3a174abd93ff125f34b71a39d6e353263a7d330d450ae2f6834e45d" "$(printf '%s\n' "$JOB_RAW" | sha256sum | cut -d' ' -f1)"
+is "anchor-dns job blob hash (pin: update after a deliberate edit)" "7e0b5d0df4ac0a12da01b080560382781bd87c7f31c53b1ac13bde29e021378b" "$(printf '%s\n' "$JOB_RAW" | sha256sum | cut -d' ' -f1)"
 for v in LD_PRELOAD LD_LIBRARY_PATH; do
   lacks_word "job does not set $v" "$v" "$JOB"
 done

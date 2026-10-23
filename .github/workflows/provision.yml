@@ -802,7 +802,7 @@ jobs:
           # any netcup use; the on-box render validates again (defense in depth).
           case "${ANCHOR_ROLE:-}" in
             ''|tenant|operator) ;;
-            *) echo "::error::ANCHOR_ROLE repo variable must be empty, 'tenant', or 'operator' — refusing to run."; exit 1 ;;
+            *) echo "::error::ANCHOR_ROLE must be empty, 'tenant', or 'operator' — refusing to run."; exit 1 ;;
           esac
           . scripts/lib/naming.sh
           . .github/scripts/lib/anchor-ip.sh
@@ -824,8 +824,8 @@ jobs:
           [ -n "$SAN" ] || { echo "::error::TENANT_USER sanitizes to empty — set a username with letters/digits."; exit 1; }
           HOSTNAME="$(derive_anchor_hostname "$SAN")"
           STATUS_HOST="$(derive_status_host "$SAN").piercloud.net"
-          # Vendor variables are trusted less than they look: a newline in the
-          # repo variable survives the sanitize sed (line-oriented) and would
+          # Vendor variables are trusted less than they look: a newline in a
+          # variable survives the sanitize sed (line-oriented) and would
           # forge an extra $GITHUB_ENV line. Reject before the write.
           guard_line "ANCHOR_HOSTNAME" "$HOSTNAME"
           echo "ANCHOR_HOSTNAME=$HOSTNAME" >> "$GITHUB_ENV"
@@ -1323,10 +1323,14 @@ jobs:
           BOOTSTRAP_ROOT_PASSWORD: ${{ env.BOOTSTRAP_ROOT_PASSWORD }}
           TENANT_USER: ${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
           ANCHOR_ROLE: ${{ vars.ANCHOR_ROLE }}
-          # STATUS_PULLER (issue #186): repo VARIABLE, unset = legacy shape
+          # STATUS_PULLER (issue #186): VARIABLE (the anchor's environment on
+          # a managed run, #204), unset = legacy shape
           # (platform/main + GATUS_ENDPOINTS in config.yaml). On a
           # slice-managed anchor set it and the on-box render drops the pairs
           # with a loud dispatch-time log (D10); they move to the manifest.
+          # GATUS_ENDPOINTS is read in that same run whenever the switch is
+          # unset: it lives on the anchor's environment too, never at
+          # repository level (the banner refuses a managed dispatch then).
           STATUS_PULLER: ${{ vars.STATUS_PULLER }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -1334,10 +1338,10 @@ jobs:
           # Operator-plane dashboard-TLS material (set at template time — the
           # tenant pastes nothing, bootstrap stays 1 secret): the per-anchor
           # Origin CA certificate chain (leaf-first) arrives via the cert-only
-          # repo VARIABLE
-          # (public material — never key material; the key is generated on
+          # VARIABLE (the anchor's environment on a managed run; public
+          # material — never key material; the key is generated on
           # the box); CF_AOP_CA_PEM stays the legacy zone-AOP client-auth
-          # bundle (repo secret; A2 retires it — expected unset post-cutover).
+          # bundle (secret; A2 retires it — expected unset post-cutover).
           # Deployed material for Caddy's :443, NOT a standing API token.
           ORIGIN_CA_CERT_PEM: ${{ vars.ORIGIN_CA_CERT_PEM }}
           CF_AOP_CA_PEM: ${{ secrets.CF_AOP_CA_PEM }}
@@ -1389,7 +1393,7 @@ jobs:
           # Mask FIRST, before any use (secret values are auto-masked; the
           # explicit masks cover every expansion path, multiline PEMs
           # included). Guarded: masking an empty value warns without masking.
-          # ORIGIN_CA_CERT_PEM is public cert-only material (repo variable) —
+          # ORIGIN_CA_CERT_PEM is public cert-only material (variable) —
           # deliberately NOT masked.
           if [ -n "${{ secrets.CF_AOP_CA_PEM }}" ]; then echo "::add-mask::${{ secrets.CF_AOP_CA_PEM }}"; fi
           # CloudFront origin secret: masked at first receipt before any use
@@ -1691,7 +1695,7 @@ jobs:
       BROKER_URL: https://broker.piercloud.net
       ANCHOR_REF: ${{ inputs.anchor_ref }}
       # Resolved target — the device-flow job's validated output, never the
-      # raw repo secret: API-derived, and an explicit ANCHOR_IPV4 can only
+      # raw secret: API-derived, and an explicit ANCHOR_IPV4 can only
       # have selected among the resolved server's own addresses (the
       # producer, resolve_anchor_ipv4, fails closed on any mismatch).
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}

@@ -23,29 +23,29 @@ In the netcup SCP (web UI, TOTP 2FA), order a small VPS — the [VPS pico G11s](
 
 **Server-ready email:** "Ihr vServer bei netcup ist bereitgestellt" (from donotreply@netcup.de) carries the hostname, IP, username, and root password — ignore the password entirely. Keep the email for the printed SSH fingerprints to verify the host key on first contact. Note the preconfigured firewall: the "netcup Mail Block" policy blocks SMTP both ways — remove it in SCP → Firewall only if you want SMTP alerts from the anchor.
 
-Collect these as you go — each feeds one repo secret in §2. Where they go (phone path, primary): open the repo → `…` (top right) → Settings → Secrets and variables → Actions → **Secrets** tab → Repository secrets. Everything you paste goes there (the Variables tab holds operator pre-sets — `TENANT_USER` — nothing to touch; the DNS provider variables are no longer consumed (b3b broker cutover; deletion read back with that slice)). Always repository level — never Environment secrets/variables (the workflow's one Environment, `anchor`, is only a deployment-approval gate and holds no values).
+Collect these as you go — each feeds one value in §2. Where they go (phone path, primary): the anchor's own GitHub environment — open the repo → `…` (top right) → Settings → Environments → your anchor's environment (the operator or the platform lifecycle writes these values there). Never repository level: a repository-level copy of a managed name makes the banner refuse the dispatch (§2). The DNS provider variables are no longer consumed (b3b broker cutover; deletion read back with that slice).
 
-- **customer number** (same value on both account emails) → `CUSTOMER_NUMBER` — the ONE required secret (provider credential only; the SCP user id resolves itself from your approval token — override via `SCP_USER_ID` repo secret only if yours differs)
-- nothing else to enter: your username, hostname, anchor IP, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers apart from the managed `tenant` + `anchor_ref` inputs (§3)
+- **customer number** (same value on both account emails) → `TENANT_CUSTOMER_NUMBER` on the anchor's environment — the ONE required secret (provider credential only; the SCP user id resolves itself from your approval token — override via the `SCP_USER_ID` secret only if yours differs)
+- nothing else to enter: your hostname, anchor IP, DNS, and default monitor (your homepage) are pre-set or derived — dispatch takes no identifiers apart from the managed `tenant` + `anchor_ref` inputs (§3)
 
-Create them here: [👉 Repo → Settings → Secrets → New repository secret](../../../settings/secrets/actions/new) (one per value above).
+Create them here: [👉 Repo → Settings → Environments](../../../settings/environments) (one per value above).
 
 Secrets set? Dispatch now: [👉 Actions → provision.yml → Run workflow](../../../actions/workflows/provision.yml) (`mode` preselects `apply`).
 
 Single anchor t:1 is the product (a twin anchor at a different provider is a T2 opt-in via `extra_tang_urls` — see [dr.md](dr.md)).
 
-## 2. Repo from template + repo secrets (C-E visibility rule)
+## 2. Repo from template + anchor values (C-E visibility rule)
 
-"Use this template" → your repo. **No stored netcup API tokens of any kind (S1)** — every run authenticates via your per-run approval below (the one-run A1 root password is the single exception: write-only, locked out + deleted after use). What lives in the repo are identifiers only (anchor IP, customer number) plus your monitor targets: values are write-only and log-masked. Your username lives in the pre-set `TENANT_USER` variable — nothing to enter. Set once via the taps above, or CLI (secrets prompt so nothing touches shell history). Laptop/CLI path (power users) — phone users can skip this block, it sets the same values as the taps above:
+"Use this template" → your repo. **No stored netcup API tokens of any kind (S1)** — every run authenticates via your per-run approval below (the one-run A1 root password is the single exception: write-only, locked out + deleted after use). What lives there are identifiers only (anchor IP, customer number) plus your monitor targets: values are write-only and log-masked. Your username is the managed `tenant` input — nothing to enter. Set once via the taps above, or CLI (secrets prompt so nothing touches shell history). Laptop/CLI path (power users) — phone users can skip this block, it sets the same values as the taps above:
 
 <details>
 <summary>CLI equivalents</summary>
 
 ```bash
-# secrets (write-only) — just the first line:
-gh secret set CUSTOMER_NUMBER  # username on both account emails (the ONE required secret)
+# secrets (write-only) — just the first line (<tenant> = the anchor's environment):
+gh secret set --env <tenant> TENANT_CUSTOMER_NUMBER  # username on both account emails (the ONE required secret)
 # later, when exploring: extra monitor targets + push (see §8)
-gh secret set GATUS_ENDPOINTS         # e.g. blog=https://blog.example.com
+gh secret set --env <tenant> GATUS_ENDPOINTS         # e.g. blog=https://blog.example.com
 ```
 
 </details>
@@ -69,7 +69,7 @@ Managed-run residuals (disclosed):
 
 ## 3. Dispatch and approve (S1)
 
-Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Managed tenants dispatch with `tenant` + `anchor_ref`: since b3b (#189) anchor DNS writes through the pc-control broker, so a ref-less or tenant-less `apply` is refused at the preflight before anything is provisioned — the template/static-lane apply is retired until a broker binding for it ships. Apart from those two managed inputs the dispatch takes only the mode (plus action flags) — no identifiers: your username already lives in the repo's `TENANT_USER` variable, and everything sensitive resolves from repo secrets inside the run.
+Actions → [`provision.yml`](../.github/workflows/provision.yml) → `mode=apply`, from any browser. Managed tenants dispatch with `tenant` + `anchor_ref`: since b3b (#189) anchor DNS writes through the pc-control broker, so a ref-less or tenant-less `apply` is refused at the preflight before anything is provisioned — the template/static-lane apply is retired until a broker binding for it ships. Apart from those two managed inputs the dispatch takes only the mode (plus action flags) — no identifiers: the alias is the `tenant` input and everything sensitive resolves from the anchor's environment inside the run.
 
 Only the URL + code (+ alias, action, pinned commit and review link) are ever printed — `curl -sS`, no `-v`, no `TF_LOG`. The short-lived netcup `device_code` is masked at birth inside the single job/step that mints and polls it, so it never crosses a job boundary; the runner redacts it from every later log line ("masked at birth" means redaction, not absence). The card carries the action, the pinned commit and the review link. The `user_code` stays public by design: it is the approval surface (never printed beyond the card, never stored, dead in 600s, and useless without your own netcup session). The access and refresh tokens stay masked and never cross jobs.
 

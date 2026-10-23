@@ -135,7 +135,7 @@ as the repo-side controls.
 > per-run device-flow approval from any browser; the ephemeral token dies
 > with the runner (TF 1.11 ephemeral values, never state).
 
-**Rationale.** A standing credential in repo secrets is an account-wide blast radius that outlives attention (token-rotation ambiguity, forgotten taps). Per-run approval dissolves the whole class: stopping taps is a legitimate expiry, not an outage (tangd is autonomous; the passphrase keyslot keeps every boot recoverable). Under S1, `mode=check` is hygiene, not load-bearing — there is nothing to keep alive.
+**Rationale.** A standing credential in secrets is an account-wide blast radius that outlives attention (token-rotation ambiguity, forgotten taps). Per-run approval dissolves the whole class: stopping taps is a legitimate expiry, not an outage (tangd is autonomous; the passphrase keyslot keeps every boot recoverable). Under S1, `mode=check` is hygiene, not load-bearing — there is nothing to keep alive.
 
 ## C-A — no sovereignty-downgrade fallback, ever
 
