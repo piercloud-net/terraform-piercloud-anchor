@@ -17,7 +17,9 @@
 # exactly-one-job-key counts catch a form the stripper does not recognise.
 # The workflow `on:`/`permissions:` spans and the LF/BOM check are
 # parser-based (PyYAML compose / a Python byte predicate), not hand-rolled
-# scanners (#195).
+# scanners (#195): both run under an isolated interpreter (`python3 -I`), so
+# an in-tree `yaml.py` cannot shadow the installed package, and the span
+# parser refuses a PyYAML whose major is not 6 (fail closed, never skip).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -50,10 +52,25 @@ lacks_word() { # $1 label, $2 word, $3 haystack -- word-boundary absence
 # end mark, so every child — an indent-2 trigger, a flow entry, a column-0
 # block-sequence entry, a block-scalar body — is inside the hashed bytes.
 # A file that does not parse, a missing/duplicate key, or a multi-document
-# file fails closed. Python runs with -B/PYTHONDONTWRITEBYTECODE so the
-# harness never writes an in-tree __pycache__.
+# file fails closed. Python runs with -I/-B (isolated: neither the cwd/'' nor
+# PYTHONPATH nor the user site is on sys.path, so an in-tree module cannot
+# shadow the parser) plus PYTHONDONTWRITEBYTECODE so the harness never writes
+# an in-tree __pycache__.
+# Parser dependency guard (#195): the span computation is a REAL YAML parse,
+# so the harness refuses to run without PyYAML 6.x — a loud hard failure, not
+# a skip and not a fallback to a tokenizer. `-I` (isolated mode: implies -E
+# and -s) keeps the cwd (`''`), PYTHONPATH and user site-packages off
+# sys.path, so an in-tree `yaml.py` cannot shadow the installed package.
+# Disclosed residual: the guard pins the MAJOR only (ubuntu-latest ships
+# PyYAML 6.0.x), so a behaviour change inside major 6 is not caught here.
+if py_yaml_ver="$(PYTHONDONTWRITEBYTECODE=1 python3 -I -B -c 'import yaml; print(yaml.__version__); raise SystemExit(0 if yaml.__version__.split(".")[0] == "6" else 1)' 2>/dev/null)"; then
+  ok "PyYAML 6.x available for the span parser (found $py_yaml_ver)"
+else
+  bad "PyYAML 6.x is required — the workflow span parser is a real YAML parse, there is no tokenizer fallback (found '${py_yaml_ver:-no importable PyYAML}')"
+  exit 1
+fi
 wf_spans() { # $1 workflow file -- "ERR<TAB>reason" or "OK<TAB>on#<TAB>on_start<TAB>on_last<TAB>perm#<TAB>perm_start<TAB>perm_last"
-  PYTHONDONTWRITEBYTECODE=1 python3 -B - "$1" <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$1" <<'PY'
 import sys
 import yaml
 
@@ -168,6 +185,35 @@ sp_case ERR "yaml span: alias value with relocated bytes fails closed" $'name: x
 spf="$(mktemp)"; printf '%s' $'name: x\non: [push]\non: [pull_request_target]\n' > "$spf"
 is "yaml span: duplicate on: key count (fail-closed input)" "2" "$(wf_spans "$spf" | cut -f2)"
 rm -f "$spf"
+# Import-shadow tooth (#195, r37 HIGH): `python3 -B -` puts the cwd first on
+# sys.path and this harness cd's to the repo root, so a planted in-tree
+# `yaml.py` shadows the installed package. A shadow owns the composed tree and
+# the marks it reports, so every span pin then describes the attacker's tree
+# instead of the file's real bytes — a shadow can drop a trigger key, move the
+# reported span end, or blank bytes in the parse input, and the pins never see
+# the real content. The parser now runs isolated (`-I`), so the planted module
+# is NOT imported. The positive control below runs the same import WITHOUT
+# isolation from the same cwd, so dropping `-I` from wf_spans reds this tooth
+# instead of silently restoring the shadow route. The shadow raises, so it
+# cannot be mistaken for the real package.
+shdir="$(mktemp -d)"
+printf 'raise RuntimeError("planted yaml.py was imported")\n' > "$shdir/yaml.py"
+printf '%s' "$sp_base" > "$shdir/wf.yml"
+sh_ctl="$( (cd "$shdir" && PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import yaml') 2>&1 || true)"
+case "$sh_ctl" in
+  *"planted yaml.py was imported"*) ok "yaml shadow control: un-isolated python imports a planted cwd yaml.py (the shadow mutant)" ;;
+  *) bad "yaml shadow control: un-isolated python did not import the planted shadow ('$sh_ctl')" ;;
+esac
+sh_sp="$( (cd "$shdir" && wf_spans wf.yml) || true)"
+case "$sh_sp" in
+  OK$'\t'*) ok "yaml shadow: the isolated span parser ignores a planted cwd yaml.py (real PyYAML used)" ;;
+  *) bad "yaml shadow: the span parser was shadowed or failed under a planted yaml.py ('$sh_sp')" ;;
+esac
+rm -rf "$shdir"
+# Every OTHER python call in this file must be isolated too: the only
+# un-isolated invocation left is the positive control above (it must import a
+# hostile module), so a new `python3 -B ...` without `-I` reds this count.
+is "yaml shadow: no un-isolated python invocation besides the control" "1" "$(grep -cE '^[^#]*python3 -B' "$0" || true)"
 
 # Root-shape fail-closed (r24 red-team HIGH, r25 F2): every locator below
 # matches COLUMN-0 lines, but YAML allows the root mapping itself to be
@@ -950,10 +996,11 @@ if [ -z "$local_refs" ]; then ok "no workflow references .local (outside the sca
 # while every byte-oriented prefix misses the anchor (r32 red-team F1).
 # The in-tree workflows are LF-only and BOM-free. A real byte predicate
 # (Python, #195) rejects any U+FEFF byte sequence anywhere and any non-LF
-# line break over the exact workflow glob set; there is no shell scanner and
-# no scanner call site to pin.
+# line break over the exact workflow glob set; there is no shell scanner.
+# No files handed over is NOT a pass: an empty/disabled glob set would
+# otherwise scan nothing and report green (fail closed instead).
 wf_bytes_bad() { # $1.. files -- prints files with a BOM or a non-LF break
-  PYTHONDONTWRITEBYTECODE=1 python3 -B - "$@" <<'PYEOF'
+  PYTHONDONTWRITEBYTECODE=1 python3 -I -B - "$@" <<'PYEOF'
 import os
 import sys
 
@@ -964,7 +1011,11 @@ BREAKS = (
     (b"\xe2\x80\xa8", "LS"),
     (b"\xe2\x80\xa9", "PS"),
 )
-for path in sys.argv[1:]:
+paths = sys.argv[1:]
+if not paths:  # the scan set vanished: fail closed, never report a pass
+    print("(no files given: fail closed)")
+    raise SystemExit(0)
+for path in paths:
     if not os.path.isfile(path):  # an unmatched glob stays literal in the call
         continue
     data = open(path, "rb").read()
@@ -973,7 +1024,73 @@ for path in sys.argv[1:]:
         print("%s (%s)" % (path, ",".join(hits)))
 PYEOF
 }
-wf_break_bad="$(wf_bytes_bad .github/workflows/*.yml .github/workflows/*.yaml)"
+# Unit teeth for the predicate (r37 MEDIUM): the shell scanner's CR/NEL/LS/
+# PS/BOM/arity fixtures were dropped with it, so each byte arm, the per-file
+# arity and the fail-closed empty-args case are re-pinned here against the
+# real predicate. Dropping ANY arm reds its own case (proved by mutation).
+wbf="$(mktemp)"
+printf 'name: x\n' > "$wbf"
+is "workflow byte check: clean LF file passes" "" "$(wf_bytes_bad "$wbf")"
+for wbcase in CR NEL LS PS; do
+  case "$wbcase" in
+    CR)  printf 'name: x\r\n' > "$wbf" ;;
+    NEL) printf 'name: x\xc2\x85\n' > "$wbf" ;;
+    LS)  printf 'name: x\xe2\x80\xa8\n' > "$wbf" ;;
+    PS)  printf 'name: x\xe2\x80\xa9\n' > "$wbf" ;;
+  esac
+  is "workflow byte check: $wbcase fails closed" "$wbf ($wbcase)" "$(wf_bytes_bad "$wbf")"
+done
+printf '\xef\xbb\xbfname: x\n' > "$wbf"
+is "workflow byte check: BOM at offset 0 fails closed" "$wbf (BOM)" "$(wf_bytes_bad "$wbf")"
+printf 'env: [\n\xef\xbb\xbf&a push\n]\n' > "$wbf"
+is "workflow byte check: BOM mid-file fails closed" "$wbf (BOM)" "$(wf_bytes_bad "$wbf")"
+wbf2="$(mktemp)"; printf 'name: y\n' > "$wbf2"
+printf 'name: x\r\n' > "$wbf"
+is "workflow byte check: one bad file among two fails (bad last)" "$wbf (CR)" "$(wf_bytes_bad "$wbf2" "$wbf")"
+is "workflow byte check: one bad file among two fails (bad first)" "$wbf (CR)" "$(wf_bytes_bad "$wbf" "$wbf2")"
+printf 'name: x\r\n' > "$wbf2"
+is "workflow byte check: every listed file is reported" "$(printf '%s\n%s' "$wbf (CR)" "$wbf2 (CR)")" "$(wf_bytes_bad "$wbf" "$wbf2")"
+wbf_none="$(wf_bytes_bad)"
+if [ -n "$wbf_none" ]; then ok "workflow byte check: no files given fails closed"; else bad "workflow byte check: no files given passes (fail-open)"; fi
+rm -f "$wbf" "$wbf2"
+# The scan call site is pinned by a self-check in THIS file (r37 MEDIUM):
+# the target glob set and the verdict are held in READONLY variables, the
+# verdict is assigned exactly once, and the exact call line is pinned. An
+# inserted emptying/duplicate assignment reds the count check here, and a
+# later overwrite of any shape is a fatal assignment error in a
+# non-interactive shell. Every word of the glob string must expand to an
+# existing file, so a disabled glob (`set -f`) or an empty directory fails
+# closed instead of scanning nothing. HONEST RESIDUAL: this is a text pin in
+# the same file, so an edit that changes the code and its pin together is
+# review-only (the same joint-edit class as every other pin here).
+readonly wf_globs=".github/workflows/*.yml .github/workflows/*.yaml"
+wf_glob_expands_ok() { # $1 glob string -- 0 when it expands to a real file
+  local p n=0
+  # shellcheck disable=SC2086  # word splitting + glob expansion is the point
+  for p in $1; do if [ -f "$p" ]; then n=$((n + 1)); fi; done
+  [ "$n" -gt 0 ]
+}
+# shellcheck disable=SC2086
+wf_break_bad="$(wf_bytes_bad $wf_globs)"
+readonly wf_break_bad
+wf_assign_lines() { # $1 file -- any-shape assignment lines of the verdict
+  grep -nE '(^|[^[:alnum:]_])wf_break_bad(\+)?[[:space:]]*=' "$1" || true
+}
+is "byte-scan call site: exactly one verdict assignment (any shape)" "1" "$(wf_assign_lines "$0" | grep -c . || true)"
+is "byte-scan call site: exact call line" "1" "$(grep -cE '^wf_break_ba[d]="\$\(wf_bytes_bad \$wf_glob[s]\)"$' "$0" || true)"
+is "byte-scan call site: verdict is readonly" "1" "$(grep -cE '^readonly wf_break_ba[d]$' "$0" || true)"
+is "byte-scan call site: glob set is readonly" "1" "$(grep -cE '^readonly wf_glob[s]=' "$0" || true)"
+if wf_glob_expands_ok "$wf_globs"; then ok "byte-scan glob set expands to real workflow files"; else bad "byte-scan glob set does not expand to a file (glob disabled or empty: '$wf_globs')"; fi
+# Teeth for the self-check: an inserted emptying assignment is counted, a
+# shell `&&` is not an assignment (no false red on a legitimate edit), and a
+# disabled glob expansion fails closed.
+wbfa="$(mktemp)"
+printf 'wf_break_ba%s=""\n' 'd' > "$wbfa"
+is "byte-scan self-check: an inserted emptying assignment is counted" "1" "$(wf_assign_lines "$wbfa" | grep -c . || true)"
+printf 'run: make && make test\n' > "$wbfa"
+is "byte-scan self-check: shell && is not an assignment" "" "$(wf_assign_lines "$wbfa")"
+rm -f "$wbfa"
+if ( set -f; wf_glob_expands_ok "$wf_globs" ); then bad "byte-scan glob teeth: a disabled glob still passes (fail-open)"; else ok "byte-scan glob teeth: a disabled glob fails closed"; fi
 if [ -z "$wf_break_bad" ]; then ok "workflows are LF-only and BOM-free (no CR/NEL/LS/PS/U+FEFF — YAML vs grep parity)"; else bad "workflow contains a non-LF line break or a BOM (YAML vs grep differential): $wf_break_bad"; fi
 # A YAML merge key (`<<: *anchor`) can inject a mapping — including
 # `if: false` / `continue-on-error: true` — from an anchor defined elsewhere,
@@ -1221,7 +1338,7 @@ done
 # this block itself — is invisible here and relies on review plus the CI run
 # list. The floor is a MINIMUM (adding checks stays green); update it
 # deliberately when checks are removed.
-MIN_CHECKS=258
+MIN_CHECKS=281
 if [ "$pass" -lt "$MIN_CHECKS" ]; then bad "check floor: expected at least $MIN_CHECKS passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
