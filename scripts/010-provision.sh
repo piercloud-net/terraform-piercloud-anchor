@@ -4150,6 +4150,21 @@ class Config(object):
         if not 300 <= self.sweep_seconds <= 7 * 86400:
             log("WARNING: RECORDING_WITNESS_SWEEP_SECONDS=%d is outside [300, 604800]; using the default 21600" % self.sweep_seconds)
             self.sweep_seconds = 6 * 3600
+        # The audit delta's bounded pre-cursor re-list (issue #228). The live
+        # shipper can upload an object HOURS after its own key timestamp (a
+        # B2 retry hold: a key stamped 12:26 landed at 18:56), so it sorts
+        # BELOW the delta cursor and a cursor tail can never list it - the
+        # witness then alerts session-start-missing/sequence-origin for a
+        # session whose `session.start` is in the bucket, until the 6 h sweep.
+        # A delta therefore re-lists this many seconds below each audit
+        # cursor. 0 disables the overlap (the sweep stays the only bound);
+        # an out-of-range value falls back to the default with a warning - a
+        # bound typo must not take the witness down, and the overlap is
+        # additive (it never moves a cursor, never gates a finding).
+        self.delta_overlap = env_int("RECORDING_WITNESS_DELTA_OVERLAP_SECONDS", 6 * 3600)
+        if not 0 <= self.delta_overlap <= 7 * 86400:
+            log("WARNING: RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=%d is outside [0, 604800]; using the default 21600" % self.delta_overlap)
+            self.delta_overlap = 6 * 3600
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signatures, quiet_error = parse_quiet_signatures(env("RECORDING_WITNESS_QUIET_SIGNATURE"))
@@ -4358,7 +4373,7 @@ def signed_get(config, params):
         "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
-def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
+def list_objects(config, prefix, start_after="", max_pages=1000, until=None, above_bound_stop=False):
     """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
 
     `start_after` seeds the first page (exclusive, live-verified on B2); it is
@@ -4378,6 +4393,16 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
     entry-by-entry and is never an early-stop signal. `max_pages` bounds a
     delta tail; overflow raises DeltaTooLong so the run can fall back to an
     exact sweep instead of a truncated view.
+
+    `above_bound_stop` is the additive audit-overlap re-list's own priced
+    trade (issue #228): an ordered page whose FIRST key already sits at/above
+    the bound ends the stream, so a window below the bound that happens to
+    hold no key costs one page instead of paging through the whole
+    out-of-bound tail (the anchor #161 cost trap, here for a listing whose
+    result is additive). The correctness-source tails never set it - they
+    keep the strict FF2 rule above - and a below-cursor key missed on a
+    NONCONFORMANT ordered server is still healed by the sweep, never read as
+    green.
     """
     objects = {}
     token = ""
@@ -4436,7 +4461,7 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None):
             and ordered
             and bool(keys)
             and keys[-1] >= until
-            and (not truncated or keys[0] < until)
+            and (not truncated or keys[0] < until or above_bound_stop)
         )
         for key, last_modified in entries:
             if until is not None and key >= until:
@@ -5106,6 +5131,99 @@ def _delta_dated_listings(config, now, discovered_prefixes, flat_cursor, dated_c
     return plan, drift_prefixes
 
 
+def _audit_key_ts(audit_prefix, key):
+    """The ``<ts>`` stamp of a shaped flat or dated audit key, or ``None``.
+
+    Used by the delta's overlap re-list to derive its window from the CURSOR
+    (never from the wall clock): the cursor is the last key that was listed,
+    so its own timestamp is the only anchor that cannot drift with a clock
+    step or a midnight boundary.
+    """
+    relative = key[len(audit_prefix):] if key.startswith(audit_prefix) else key
+    basename, _day = strip_date_segment(relative)
+    if basename is None:
+        return None
+    match = SESSION_KEY_RE.match(basename) or NON_SESSION_KEY_RE.match(basename)
+    return match.group("ts") if match else None
+
+
+def _delta_overlap_listings(config, session_cursor, dated_cursor):
+    """Bounded pre-cursor re-list plan for a delta: ``[(label, prefix, after, until)]``.
+
+    A delta asks the bucket for keys **after** its cursor, but the shipper can
+    upload an object long after its own key timestamp (proven live on
+    2026-10-22: a session's keys are stamped ``20261022T1226xxZ`` while the
+    bucket's ``LastModified`` is 18:56-19:02Z - a 6.5 h B2 retry hold). Such
+    a key sorts BELOW the cursor, so no cursor tail can ever list it and the
+    witness keeps alerting ``session-start-missing``/``sequence-origin`` for
+    a session whose ``session.start`` is right there in the bucket; only the
+    sweep healed it. Re-listing a bounded window below each cursor closes
+    that hole. The bound is the knob: an arrival older than the overlap is
+    still sweep-bounded (the sweep re-lists from scratch), so this narrows
+    the detection delay, it does not replace the sweep.
+
+    Both layouts are covered. The cursor's own ``<ts>`` is the anchor and its
+    own day the partition, so the window never depends on the wall clock. A
+    flat window needs no extra listing (flat keys sort across days); a dated
+    window that crosses midnight also lists the immediately previous day,
+    bounded to that one extra day - anything older stays sweep-bounded. The
+    caller lists each entry with its own page budget and merges the result
+    into a SEPARATE map (never into the cursor tails), because these keys are
+    legitimately at/below the cursor and must not trip the fail-closed
+    cursor-conformance check.
+    """
+    if config.delta_overlap <= 0:
+        return []
+    heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+    listings = []
+
+    def overlap_start(stamp):
+        try:
+            moment = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+            return moment - timedelta(seconds=config.delta_overlap)
+        except (ValueError, OverflowError):
+            return None
+
+    flat_ts = _audit_key_ts(config.audit_prefix, session_cursor) if session_cursor else None
+    flat_start = overlap_start(flat_ts) if flat_ts else None
+    if flat_start is not None:
+        listings.append((
+            "audit-overlap-flat",
+            config.audit_prefix,
+            config.audit_prefix + flat_start.strftime("%Y%m%dT%H%M%SZ"),
+            session_cursor))
+
+    dated_day = _audit_key_day(config.audit_prefix, dated_cursor) if dated_cursor else ""
+    dated_ts = _audit_key_ts(config.audit_prefix, dated_cursor) if dated_cursor else None
+    dated_start = overlap_start(dated_ts) if dated_ts else None
+    if dated_day and dated_start is not None:
+        start_day = dated_start.strftime("%Y%m%d")
+        day_prefix = config.audit_prefix + dated_day + "/"
+        day_bound = min(config.audit_prefix + dated_day + "T", heartbeat_stem)
+        if start_day == dated_day:
+            # Same day: resume inside the day at the overlap bound.
+            listings.append((
+                "audit-overlap-dated",
+                day_prefix,
+                day_prefix + dated_start.strftime("%Y%m%dT%H%M%SZ"),
+                dated_cursor))
+        elif start_day < dated_day:
+            # The window crosses midnight: the cursor's own day from its
+            # start, plus the immediately previous day (one extra day only).
+            if day_prefix < dated_cursor:
+                listings.append(("audit-overlap-dated", day_prefix, day_prefix, dated_cursor))
+            previous_day = (datetime.strptime(dated_day, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            previous_prefix = config.audit_prefix + previous_day + "/"
+            previous_bound = min(config.audit_prefix + previous_day + "T", heartbeat_stem)
+            previous_after = previous_prefix
+            if start_day == previous_day:
+                previous_after = previous_prefix + dated_start.strftime("%Y%m%dT%H%M%SZ")
+            if previous_after < previous_bound:
+                listings.append((
+                    "audit-overlap-dated-prev", previous_prefix, previous_after, previous_bound))
+    return [entry for entry in listings if entry[2] < entry[3]]
+
+
 def _delta_repair_sweep(config, observed, now):
     """Full sweep for a delta recovery (page overflow or cursor nonconformance).
 
@@ -5170,12 +5288,14 @@ def run_checks(config, now, plan):
         cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
     else:
         # Delta: the retained view plus the dual-layout audit tail (the flat
-        # discovery listing + bounded dated-day streams), the heartbeat tail
-        # and the recordings tail. Versions are sweep-only, so the retained
-        # hidden set is carried unchanged and a delete marker on an old key
-        # lands at the sweep bound. A delta listing that overflows its page
-        # bound abandons the delta and runs an exact sweep instead of reading
-        # a truncated view.
+        # discovery listing + bounded dated-day streams) over a bounded
+        # pre-cursor overlap re-list (late uploads, issue #228), the heartbeat
+        # tail and the FULL recordings prefix (random-keyed tars cannot be
+        # discovered with a key cursor). Versions are sweep-only, so the
+        # retained hidden set is carried unchanged and a delete marker on an
+        # old key lands at the sweep bound. A delta listing that overflows
+        # its page bound abandons the delta and runs an exact sweep instead
+        # of reading a truncated view.
         audit_objects = dict(view.get("audit_objects") or {})
         recording_objects = dict(view.get("recording_objects") or {})
         hidden_objects = list(view.get("hidden") or [])
@@ -5183,8 +5303,13 @@ def run_checks(config, now, plan):
         heartbeat_cursor = cursors.get("audit_heartbeat") or ""
         session_cursor = cursors.get("audit_session") or ""
         dated_cursor = cursors.get("audit_session_dated") or ""
-        recording_cursor = cursors.get("recordings") or ""
         heartbeat_stem = config.heartbeat_prefix.rstrip("/")
+        # The bounded pre-cursor re-list (issue #228): keys the shipper
+        # uploaded late, below their own timestamp's cursor position. Kept in
+        # SEPARATE maps so the cursor-conformance check below never sees them
+        # (a legitimate overlap key is at/below the cursor by construction),
+        # and merged into the view only after that check passed.
+        overlap_audit = {}
         try:
             new_heartbeat = list_objects(
                 config, config.heartbeat_prefix, start_after=heartbeat_cursor, max_pages=DELTA_MAX_PAGES)
@@ -5207,8 +5332,25 @@ def run_checks(config, now, plan):
                 dated_listings[day] = (dated_plan[day], list_objects(
                     config, day_prefix, start_after=dated_plan[day],
                     until=day_bound, max_pages=DELTA_MAX_PAGES))
-            new_recordings = list_objects(
-                config, config.recordings_prefix, start_after=recording_cursor, max_pages=DELTA_MAX_PAGES)
+            for _label, overlap_prefix, overlap_after, overlap_until in _delta_overlap_listings(
+                    config, session_cursor, dated_cursor):
+                overlap_audit.update(list_objects(
+                    config, overlap_prefix, start_after=overlap_after,
+                    until=overlap_until, max_pages=DELTA_MAX_PAGES, above_bound_stop=True))
+            # Recordings are random-keyed (`recordings/<sid>.tar` carries no
+            # timestamp), so a key cursor on that prefix is a design error: a
+            # new tar whose UUID sorts below the stored cursor would stay
+            # invisible until the sweep. A delta therefore lists the whole
+            # recordings prefix (bounded: ~16 pages live) and the stored
+            # `recordings` cursor stays a compatibility high-water mark that
+            # no longer gates discovery. Only entries new to the view or with
+            # a moved LastModified enter the merge, so re-reading the prefix
+            # does not dirty the sidecar on a quiet run.
+            listed_recordings = list_objects(
+                config, config.recordings_prefix, max_pages=DELTA_MAX_PAGES)
+            new_recordings = {
+                key: moment for key, moment in listed_recordings.items()
+                if recording_objects.get(key) != moment}
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
             plan["performed_sweep"] = True
@@ -5248,11 +5390,6 @@ def run_checks(config, now, plan):
                             break
                     if violation:
                         break
-            if not violation:
-                for key in new_recordings:
-                    if recording_cursor and key <= recording_cursor:
-                        violation = "recordings delta returned %s at or below its cursor" % clip(key, 120)
-                        break
             if violation:
                 log("WARNING: %s; repairing with a full sweep" % violation)
                 plan["performed_sweep"] = True
@@ -5276,6 +5413,16 @@ def run_checks(config, now, plan):
                     new_audit[prefix] = now
                 audit_objects.update(new_audit)
                 recording_objects.update(new_recordings)
+                # The overlap keys land here, after the fail-closed check: a
+                # pre-cursor key is exactly what the re-list is FOR, so it is
+                # never a conformance violation. Only keys that actually
+                # change the retained view are merged (the window is normally
+                # already known, so a quiet delta stays view-clean), and the
+                # merge keeps them for the NEXT run's classification too.
+                overlap_new = {
+                    key: moment for key, moment in overlap_audit.items()
+                    if audit_objects.get(key) != moment}
+                audit_objects.update(overlap_new)
                 # Same grammar + future filter as _cursors_from_listings: an
                 # unshaped key returned by a tail (an acceptance probe,
                 # drift), or a shaped key dated in the future (sorting above
@@ -5296,7 +5443,7 @@ def run_checks(config, now, plan):
                                 and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance):
                             dated_new.append(key)
                 recording_new = [
-                    key for key in new_recordings
+                    key for key in listed_recordings
                     if is_recording_key(key, config.recordings_prefix)]
                 if heartbeat_new:
                     cursors["audit_heartbeat"] = max(heartbeat_new)
@@ -5305,8 +5452,13 @@ def run_checks(config, now, plan):
                 if dated_new:
                     cursors["audit_session_dated"] = max(dated_new)
                 if recording_new:
-                    cursors["recordings"] = max(recording_new)
-                view_dirty = bool(new_audit or new_recordings)
+                    # A high-water mark never moves backwards: the full-prefix
+                    # listing can no longer return the previous max (a deleted
+                    # tar), and re-reading the prefix must not lower it.
+                    newest = max(recording_new)
+                    if newest > (cursors.get("recordings") or ""):
+                        cursors["recordings"] = newest
+                view_dirty = bool(new_audit or new_recordings or overlap_new)
     # Overlapping watched prefixes report one marker twice (same key + version
     # id in both listings); count each hidden version once.
     hidden_by_version = {}
@@ -5330,6 +5482,8 @@ def run_checks(config, now, plan):
         # was validated when each key first entered it, so a delta does not
         # re-parse the whole retained map.
         for key, last_modified in new_audit.items():
+            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
+        for key, last_modified in overlap_audit.items():
             age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
         for key, last_modified in new_recordings.items():
             age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)

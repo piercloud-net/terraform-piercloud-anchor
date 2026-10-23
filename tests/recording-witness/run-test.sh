@@ -161,8 +161,9 @@
 #   (k) delta cursors + merged sweeps (issue #153): a warm sweep writes the
 #       high-water cursors and the view.json sidecar; a quiet run makes
 #       only the cursored tails (flat discovery + selected dated days +
-#       heartbeat + recordings) plus the full multipart family (no
-#       versions, no unfiltered object pages) and returns the byte-identical
+#       heartbeat), the bounded pre-cursor audit overlap, the FULL recordings
+#       prefix (random-keyed tars, issue #228) and the full multipart family
+#       (no versions, no unfiltered audit page) and returns the byte-identical
 #       verdict/signature; a replayed below-cursor key is caught at the forced
 #       sweep; a delete marker on an old key lands at the sweep bound; cursor
 #       loss, a foreign/out-of-prefix cursor and a mismatched view all take
@@ -171,7 +172,8 @@
 #       re-seeds and advances run_seq; the seed defers the first sweep and
 #       still reports the cold-start alert; range-split sweeps equal a serial
 #       sweep and use the persisted boundaries; delta tails follow pagination;
-#       a delta listing that returns a key at/below its cursor errors closed;
+#       a delta listing that returns a key at/below its cursor errors closed
+#       (the audit overlap is exempt: it is the pre-cursor re-list itself);
 #   (l) dual-layout audit keys (issue #159, phase 1): dated session and
 #       non-session keys classify; malformed/calendar-invalid day segments
 #       and date-impersonating segments are drift that never moves a cursor;
@@ -199,6 +201,20 @@
 #       cursor; an 18-digit range parses while a 19-digit end is drift; an
 #       event missing INSIDE a declared range is invisible list-only (the
 #       disclosed loss, pinned green).
+#   (n) late-arriving audit keys + random-keyed recordings (issue #228): the
+#       shipper can upload an object HOURS after its own key timestamp, so it
+#       sorts BELOW the delta cursor; a bounded pre-cursor overlap re-list
+#       (`RECORDING_WITNESS_DELTA_OVERLAP_SECONDS`, default 21600) heals
+#       session-start-missing/sequence-origin on the next delta, against the
+#       same state that still alerts with the knob at 0 and before the upload;
+#       a genuinely lost start still alerts; the overlap never trips the
+#       cursor-conformance check and its keys are merged into the view (so
+#       the next run still classifies them); a window crossing midnight lists
+#       the previous day from the bound and never a day below it; an overlap
+#       page overflow takes the repair sweep; the recordings prefix is listed
+#       in full (a below-cursor UUID is seen on the next delta, the stored
+#       cursor never lowers) and its page overflow also takes the repair
+#       sweep; an out-of-range knob warns and falls back to the default.
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -238,7 +254,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1049
+MIN_CHECKS=1100
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -284,6 +300,12 @@ fresh_stamp() { # current UTC in the witness's state.json format
 }
 audit_stamp() { # current UTC in the shipper key format, offset by $1 seconds
   python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y%m%dT%H%M%SZ"))' "$1"
+}
+at_stamp() { # current UTC as a mock-fixture absolute `at` stamp, offset by $1 seconds
+  # Relative `ago` stamps move a second or two between two runs, which a
+  # delta's new-or-moved merge rule reads as a re-PUT. Teeth that compare two
+  # runs write `at` instead so the served LastModified is byte-identical.
+  python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"
 }
 # Pin the replica to the pc-admin shipper grammar. The golden strings below
 # were generated from the real builder at cad0p/pc-admin @ 1b9946c
@@ -4440,11 +4462,12 @@ PY
 then ok "stale observed: the repair run performed a full unfiltered sweep"; else bad "stale observed repair sweep shape failed"; fi
 
 # ---- (f4) delta cursors + merged sweeps (issue #153) ---------------------
-# A warm sweep writes the three high-water cursors plus the view sidecar; a
-# quiet delta then lists only the cursors' tails plus the full multipart
-# family, never versions (sweep-only) and never an unfiltered object page.
-# The verdict/detail/signature must be identical to the sweep: the merge is
-# exact, only the listing surface shrinks.
+# A warm sweep writes the high-water cursors plus the view sidecar; a quiet
+# delta then lists only the cursors' tails, the bounded pre-cursor audit
+# overlap (late uploads, issue #228) and the FULL recordings prefix plus the
+# full multipart family, never versions (sweep-only) and never an
+# unfiltered audit page. The verdict/detail/signature must be identical to
+# the sweep: the merge is exact, only the listing surface shrinks.
 DELTA_HEARTBEAT_TS="$(audit_stamp -60)"
 DELTA_START_TS="$(audit_stamp -300)"
 DELTA_DATA_TS="$(audit_stamp -299)"
@@ -4498,6 +4521,8 @@ objects = 0
 uploads = 0
 versions = 0
 day_probes = 0
+flat_listings = 0
+recordings_lists = 0
 for entry in entries:
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
     note = entry.get("note", "")
@@ -4506,28 +4531,38 @@ for entry in entries:
         violations.append("quiet delta listed versions")
     elif note.startswith("list-type=2"):
         objects += 1
-        if not query.get("start-after"):
-            violations.append("quiet delta object listing without start-after: %s" % entry["path"])
         prefix = query.get("prefix", [""])[0]
+        # Exactly one object listing has no start-after: the FULL recordings
+        # prefix (random-keyed tars cannot be found with a key cursor, issue
+        # #228). Every other one is bounded by a cursor/bound.
+        if not query.get("start-after") and prefix != "recordings/":
+            violations.append("quiet delta object listing without start-after: %s" % entry["path"])
+        if prefix == "recordings/":
+            recordings_lists += 1
+        if prefix == "audit/" and query.get("start-after"):
+            flat_listings += 1
         if re.fullmatch(r"audit/[0-9]{8}/", prefix):
             day_probes += 1
     elif "uploads" in note:
         uploads += 1
     else:
         violations.append("quiet delta made an unexpected request: %s" % note)
-# The unseeded transition probe adds exactly one dated-day listing while the
-# dated cursor is empty (the flat-only fixture here); the heartbeat, flat
-# discovery and recordings tails stay.
-if len(entries) != 5 or objects != 4 or uploads != 1 or versions != 0 or day_probes != 1:
-    violations.append("quiet delta call shape: entries=%d objects=%d uploads=%d versions=%d day_probes=%d"
-                      % (len(entries), objects, uploads, versions, day_probes))
+# The shape of a quiet delta now: the heartbeat tail, the flat discovery tail,
+# the transition probe (the dated cursor is still empty in this flat-only
+# fixture), the bounded audit overlap, the FULL recordings prefix and the full
+# multipart family. Two `prefix=audit/` object listings: the cursor tail and
+# the pre-cursor overlap (issue #228).
+if len(entries) != 6 or objects != 5 or uploads != 1 or versions != 0 or day_probes != 1 \
+        or flat_listings != 2 or recordings_lists != 1:
+    violations.append("quiet delta call shape: entries=%d objects=%d uploads=%d versions=%d day_probes=%d flat=%d recordings=%d"
+                      % (len(entries), objects, uploads, versions, day_probes, flat_listings, recordings_lists))
 if violations:
     for violation in violations:
         print("VIOLATION " + violation)
     sys.exit(1)
-print("quiet delta shape: 3 cursored object tails + the transition probe + 1 full uploads, no versions")
+print("quiet delta shape: 2 cursored tails + the transition probe + the bounded audit overlap + the full recordings prefix + 1 full uploads, no versions")
 PY
-then ok "quiet delta: three cursored tails + transition probe + full uploads, no versions, no unfiltered pages"; else bad "quiet delta request shape failed"; fi
+then ok "quiet delta: two cursored tails + transition probe + bounded audit overlap + full recordings + full uploads, no versions"; else bad "quiet delta request shape failed"; fi
 cat "${WORK}/requests-delta-quiet.log" >>"${SAVED_REQUEST_LOG}"
 REQUEST_LOG="${SAVED_REQUEST_LOG}"
 
@@ -5740,12 +5775,21 @@ is "fallback latch: the latch cleared" "False" "$(state_field observed.sweep_fai
 # not re-seed, keeps the generation, advances run_seq and leaves the verdict
 # and finding signature byte-identical.
 idem_dir="${WORK}/state-idem"
+# Absolute `at` stamps on purpose: the delta now re-lists a bounded window
+# below the audit cursor plus the whole recordings prefix, and a relative
+# `ago` stamp moves a second or two between runs - which the new-or-moved
+# merge rule correctly reads as a re-PUT (a real re-upload IS new
+# information). These three runs therefore pin the stable-timestamp case: a
+# delta that sees no actual change must not dirty the view sidecar.
+IDEM_HB_AT="$(at_stamp -60)"
+IDEM_START_AT="$(at_stamp -300)"
+IDEM_TAR_AT="$(at_stamp -297)"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
-  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
-  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
-  {"key":"recordings/${SID}.tar","ago":297}],
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","at":"${IDEM_HB_AT}"},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","at":"${IDEM_START_AT}"},
+  {"key":"recordings/${SID}.tar","at":"${IDEM_TAR_AT}"}],
  "uploads":[]}
 JSON
 start_mock
@@ -6136,7 +6180,10 @@ esac
 # fallback). The explicit `until` bound stops at the crossing page (page 2:
 # 12 session keys then heartbeats) - the priced conformant-ordering trade -
 # while a truncated page entirely at/above the bound (FF2 above, the >50k
-# tooth below) keeps paginating.
+# tooth below) keeps paginating. Since issue #228 the audit delta also issues
+# ONE bounded overlap listing below the cursor; here its window is empty, so
+# the `above_bound_stop` trade ends it on its first page instead of paging
+# the out-of-bound tail: 2 discovery requests + 1 overlap request.
 bound_dir="${WORK}/state-session-bound"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
@@ -6207,22 +6254,24 @@ for raw in open(sys.argv[1], encoding="utf-8"):
         session_requests += 1
     elif prefix == "audit/heartbeat/":
         heartbeat_requests += 1
-if session_requests != 2:
-    raise SystemExit("session listing made %d requests (expected 2: the crossing page stops the tail)" % session_requests)
+if session_requests != 3:
+    raise SystemExit("session listing made %d requests (expected 3: the crossing page stops the discovery tail, plus the bounded overlap)" % session_requests)
 if heartbeat_requests != 50:
     raise SystemExit("heartbeat listing made %d requests (expected 50)" % heartbeat_requests)
 print("bounded")
 PY
 then
-  ok "#161 bound: the session listing stops at the crossing page (2 requests, never the heartbeat subtree)"
+  ok "#161 bound: the session listing stops at the crossing page (3 requests: discovery + the bounded overlap, never the heartbeat subtree)"
 else
-  bad "#161 bound: the session listing paged through the heartbeat subtree (expected 2 session requests)"
+  bad "#161 bound: the session listing paged through the heartbeat subtree (expected 3 session requests)"
 fi
 
-# R3: the recordings tail is key-ordered (<sid>.tar carries no timestamp), so
-# a NEW tar whose id sorts below the recordings cursor is invisible to the
-# fast run. This is the disclosed recordings-tail bound: a new orphan tar (no
-# audit events at all) is caught at the next sweep, not by the delta.
+# R3 (rewritten for issue #228): the recordings prefix is RANDOM-keyed
+# (`<sid>.tar` carries no timestamp), so a key cursor over it is a design
+# error: a new tar whose UUID sorts below the stored recordings cursor was
+# invisible to the fast run until the sweep. The delta now lists the whole
+# recordings prefix, so the below-cursor orphan tar is seen on the very next
+# delta - and the stored cursor never moves backwards over it.
 r3_dir="${WORK}/state-recordings-tail"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
@@ -6246,15 +6295,420 @@ fixture <<JSON
 JSON
 start_mock
 run_delta "${r3_dir}"
-is "recordings tail: the below-cursor tar is invisible to the delta (disclosed bound)" "ok" "${CASE_STATE}"
+is "recordings tail: the below-cursor tar is seen on the next delta (exit 1)" "1" "${CASE_RC}"
+is "recordings tail: the below-cursor tar alerts on the delta, not only at the sweep" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "recordings tail: delta detail names the below-cursor orphan tar" ;;
+  *) bad "recordings tail delta detail: ${CASE_DETAIL}" ;;
+esac
+is "recordings tail: the delta stayed a delta (the full recordings list is not a cursor violation)" \
+  "delta" "$(state_field observed.coverage.mode)"
+is "recordings tail: no repair record" "" "$(state_field repaired)"
+is "recordings tail: the below-cursor tar never lowers the stored cursor" \
+  "recordings/${SID}.tar" "$(state_field observed.cursors.recordings)"
 force_sweep_state "${r3_dir}"
 start_mock
 run_delta "${r3_dir}"
-is "recordings tail: the sweep catches the orphan tar" "alert" "${CASE_STATE}"
+is "recordings tail: the sweep still catches the orphan tar" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in
   *session-start-missing*) ok "recordings tail: sweep detail names session-start-missing" ;;
   *) bad "recordings tail sweep detail: ${CASE_DETAIL}" ;;
 esac
+
+# ---- #228: late-arriving audit keys + random-keyed recordings ------------
+# The live shipper can upload an object HOURS after its own key timestamp (a B2
+# retry hold, proven on the operator bucket 2026-10-22: keys stamped
+# 20261022T1226xxZ landed at 18:56-19:02Z). Such a key sorts BELOW the delta
+# cursor, so no cursor tail can ever list it and the witness kept alerting
+# session-start-missing/sequence-origin for a session whose session.start was
+# right there in the bucket - only the 6 h sweep healed it. A delta now
+# re-lists a bounded window below each audit cursor
+# (RECORDING_WITNESS_DELTA_OVERLAP_SECONDS, default 21600 = 6 h, 0 disables)
+# into a SEPARATE map merged after the cursor-conformance check, and lists the
+# whole recordings prefix instead of taking a key cursor over a random-keyed
+# namespace. These teeth pin both, plus the fail-closed edges.
+LATE_SID="7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a"
+LOST_SID="8b8b8b8b-8b8b-4b8b-8b8b-8b8b8b8b8b8b"
+LATE_DATA_TS="$(audit_stamp -300)"
+LATE_START_TS="$(audit_stamp -400)"
+# The real builder emits previous+1, so the single-seq floor is 1: the late
+# session is a start at seq 1 and a data event at seq 2 (the data-only shape
+# before the start lands alerts session-start-missing AND sequence-origin,
+# because a first observed seq of 2 is an origin violation).
+LATE_DATA="$(key session.data "${LATE_DATA_TS}" "${LATE_SID}" 2)"
+LATE_START="$(key session.start "${LATE_START_TS}" "${LATE_SID}" 1 shell)"
+LATE_HB2="audit/heartbeat/$(audit_stamp -30).json"
+LOST_DATA="$(key session.data "$(audit_stamp -200)" "${LOST_SID}" 2)"
+late_base_dir="${WORK}/state-228-late-base"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${LATE_DATA}","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${late_base_dir}"
+is "late audit key: the warm sweep alerts on the missing start" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "late audit key: warm detail names session-start-missing" ;;
+  *) bad "late audit key warm detail: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *sequence-origin*) ok "late audit key: warm detail names the sequence-origin the start heals" ;;
+  *) bad "late audit key warm detail lost sequence-origin: ${CASE_DETAIL}" ;;
+esac
+is "late audit key: the cursor sits on the data key" "${LATE_DATA}" \
+  "$(state_field observed.cursors.audit_session)"
+# A delta with the late start still absent from the bucket: the re-list finds
+# nothing to heal, so the same finding must survive (the control before the
+# late upload lands).
+start_mock
+run_delta "${late_base_dir}"
+is "late audit key: the delta before the re-list still alerts" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "late audit key: the pre-upload delta keeps session-start-missing" ;;
+  *) bad "late audit key pre-upload detail: ${CASE_DETAIL}" ;;
+esac
+is "late audit key: the pre-upload run is still a delta" "delta" "$(state_field observed.coverage.mode)"
+# The same state, both variants of the knob, so the only difference is the
+# overlap window itself.
+late_off_dir="${WORK}/state-228-late-off"
+late_fb_dir="${WORK}/state-228-late-fallback"
+cp -a "${late_base_dir}" "${late_off_dir}"
+cp -a "${late_base_dir}" "${late_fb_dir}"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${LATE_DATA}","ago":300},
+  {"key":"${LATE_START}","ago":120}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-228-late.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${late_base_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "late audit key: the late start heals the finding (exit 0)" "0" "${CASE_RC}"
+is "late audit key: the healed run is green" "ok" "${CASE_STATE}"
+is "late audit key: the healed run stays a delta (the overlap is not a cursor violation)" \
+  "delta" "$(state_field observed.coverage.mode)"
+is "late audit key: the healed run records no repair" "" "$(state_field repaired)"
+case "${CASE_DETAIL}" in
+  *sequence-origin*) bad "late audit key: the healed run still reports sequence-origin: ${CASE_DETAIL}" ;;
+  *) ok "late audit key: the healed run reports no sequence-origin" ;;
+esac
+case "${CASE_DETAIL}" in
+  *session-start-missing*) bad "late audit key: the healed run still reports session-start-missing: ${CASE_DETAIL}" ;;
+  *) ok "late audit key: the healed run reports no session-start-missing" ;;
+esac
+is "late audit key: the cursor never moves backwards onto the late key" "${LATE_DATA}" \
+  "$(state_field observed.cursors.audit_session)"
+if python3 - "${WORK}/requests-228-late.log" "${LATE_DATA}" "${LATE_START}" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+cursor, late = sys.argv[2], sys.argv[3]
+overlaps = []
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if not entry.get("note", "").startswith("list-type=2"):
+        continue
+    if query.get("prefix", [""])[0] != "audit/":
+        continue
+    after = query.get("start-after", [""])[0]
+    if after and after < cursor:
+        overlaps.append(after)
+if len(overlaps) != 1:
+    raise SystemExit("expected exactly one audit listing below the cursor (the overlap), got %r" % (overlaps,))
+if not (overlaps[0] <= late < cursor):
+    raise SystemExit("the overlap start %r does not cover the late key below the cursor" % (overlaps[0],))
+print("late audit key: one overlap listing below the cursor, covering the late key")
+PY
+then ok "late audit key: the delta re-listed the window below its cursor (exactly one overlap listing)"; else bad "late audit key: the audit overlap request shape is wrong"; fi
+cat "${WORK}/requests-228-late.log" >>"${SAVED_REQUEST_LOG}"
+# The overlap keys are merged into the persistent view: once the bucket no
+# longer serves the late key, the NEXT delta still classifies the session with
+# its start (a merge that died with the run would re-alert here).
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${LATE_DATA}","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${late_base_dir}"
+is "late audit key: the healed start survives in the view after the key is gone" "ok" "${CASE_STATE}"
+is "late audit key: that run is still a delta" "delta" "$(state_field observed.coverage.mode)"
+# A genuinely lost start (no start object anywhere) must still alert: the
+# overlap is a re-read, never a blanket exemption.
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"${LATE_DATA}","ago":300},
+  {"key":"${LATE_START}","ago":120},
+  {"key":"${LOST_DATA}","ago":200}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${late_base_dir}"
+is "genuine loss: a session with no start anywhere still alerts" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"${LOST_SID}"*) ok "genuine loss: detail names the still-lost session" ;;
+  *) bad "genuine loss detail: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "genuine loss: detail names session-start-missing" ;;
+  *) bad "genuine loss: detail lost session-start-missing: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *"${LATE_SID}"*) bad "genuine loss: the healed session re-alerted: ${CASE_DETAIL}" ;;
+  *) ok "genuine loss: the healed session stays green in the same run" ;;
+esac
+# Disabling the knob restores the pre-fix behaviour exactly: the same fixture
+# and the same warm state still alert and the view never learns the late key.
+# The fresh heartbeat forces this run to write the view, so the "never merged"
+# assertion below has teeth (an unwritten view would pass it trivially).
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${LATE_HB2}","ago":30},
+  {"key":"${LATE_DATA}","ago":300},
+  {"key":"${LATE_START}","ago":120}],
+ "uploads":[]}
+JSON
+start_mock
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=0" run_delta "${late_off_dir}"
+unset RECORDING_WITNESS_EXTRA_ENV
+is "overlap disabled: the same session alerts again (exit 1)" "1" "${CASE_RC}"
+is "overlap disabled: the delta cannot see the late start" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "overlap disabled: detail names session-start-missing" ;;
+  *) bad "overlap disabled detail: ${CASE_DETAIL}" ;;
+esac
+is "overlap disabled: the run is still a delta (no repair)" "delta" "$(state_field observed.coverage.mode)"
+if python3 - "${late_off_dir}/view.json" "${LATE_START}" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if sys.argv[2] in data.get("audit_objects", {}):
+    raise SystemExit("the disabled overlap still merged the late key into the view")
+print("overlap disabled: the view never learned the late key")
+PY
+then ok "overlap disabled: the late key is never merged into the view"; else bad "overlap disabled: the view learned the late key anyway"; fi
+# An out-of-range window falls back to the default with a warning (a cadence
+# typo must not take the witness down), so the late start still heals.
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${LATE_HB2}","ago":30},
+  {"key":"${LATE_DATA}","ago":300},
+  {"key":"${LATE_START}","ago":120}],
+ "uploads":[]}
+JSON
+start_mock
+RECORDING_WITNESS_EXTRA_ENV="RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=999999" run_delta "${late_fb_dir}"
+unset RECORDING_WITNESS_EXTRA_ENV
+is "overlap out of range: the run falls back to the default window and heals" "ok" "${CASE_STATE}"
+if grep -q 'RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=999999 is outside' "${WORK}/witness.out"; then
+  ok "overlap out of range: the fallback is warned"
+else
+  bad "overlap out of range: no bounded fallback warning"
+fi
+
+# Cross-midnight: the window is derived from the CURSOR (day and timestamp),
+# never from the wall clock. A dated cursor at 00:30 on day D re-lists day D
+# from its start and the previous day from the window bound; a day below the
+# window is never listed (the sweep stays its bound).
+XM_SID="9c9c9c9c-9c9c-4c9c-8c9c-9c9c9c9c9c9c"
+XM_HEARTBEAT="audit/heartbeat/${DELTA_HEARTBEAT_TS}.json"
+XM_CURSOR="$(dated_key user.login 20260927T003000Z "" 2)"
+XM_START="$(dated_key session.start 20260926T233000Z "${XM_SID}" 1 shell)"
+XM_DATA="$(dated_key session.data 20260927T001000Z "${XM_SID}" 2)"
+XM_BELOW="$(dated_key user.login 20260925T220000Z "" 3)"
+xm_dir="${WORK}/state-228-cross-midnight"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${XM_HEARTBEAT}","ago":60},
+  {"key":"${XM_CURSOR}","ago":30},
+  {"key":"${XM_DATA}","ago":300}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${xm_dir}"
+is "cross-midnight: the warm sweep has the dated cursor on day D" "${XM_CURSOR}" \
+  "$(state_field observed.cursors.audit_session_dated)"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) ok "cross-midnight: the warm sweep alerts on the missing start" ;;
+  *) bad "cross-midnight warm detail: ${CASE_DETAIL}" ;;
+esac
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"${XM_HEARTBEAT}","ago":60},
+  {"key":"${XM_CURSOR}","ago":30},
+  {"key":"${XM_DATA}","ago":300},
+  {"key":"${XM_START}","ago":1200},
+  {"key":"${XM_BELOW}","ago":120}],
+ "uploads":[]}
+JSON
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-228-cross-midnight.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${xm_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "cross-midnight: the previous-day late start is seen (no session-start-missing)" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *session-start-missing*) bad "cross-midnight: the previous-day start was not listed: ${CASE_DETAIL}" ;;
+  *) ok "cross-midnight: the previous-day start is classified (no session-start-missing)" ;;
+esac
+case "${CASE_DETAIL}" in
+  *recording-gap*) ok "cross-midnight: the session now gap-checks on its start instead" ;;
+  *) bad "cross-midnight: the session did not move to the gap check: ${CASE_DETAIL}" ;;
+esac
+is "cross-midnight: the run stays a delta" "delta" "$(state_field observed.coverage.mode)"
+if python3 - "${WORK}/requests-228-cross-midnight.log" "${XM_START}" <<'PY'
+import json
+import sys
+import urllib.parse
+
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+late = sys.argv[2]
+previous_day = []
+below_window = []
+for entry in entries:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["path"]).query)
+    if not entry.get("note", "").startswith("list-type=2"):
+        continue
+    prefix = query.get("prefix", [""])[0]
+    if prefix == "audit/20260926/":
+        previous_day.append(query.get("start-after", [""])[0])
+    if prefix == "audit/20260925/":
+        below_window.append(prefix)
+if len(previous_day) != 1:
+    raise SystemExit("expected exactly one previous-day listing, got %r" % (previous_day,))
+if not (previous_day[0] and previous_day[0] <= late):
+    raise SystemExit("the previous-day listing starts above the late key: %r" % (previous_day[0],))
+if below_window:
+    raise SystemExit("a day below the overlap window was listed: %r" % (below_window,))
+print("cross-midnight: previous day listed from the window bound, older day never listed")
+PY
+then ok "cross-midnight: the window lists D-1 from its bound and never a day below it"; else bad "cross-midnight: the overlap day selection is wrong"; fi
+cat "${WORK}/requests-228-cross-midnight.log" >>"${SAVED_REQUEST_LOG}"
+
+# Bound: the overlap is page-bounded, and an overflow takes the existing
+# repair sweep (never a truncated view, never a green delta).
+OVF_SID="a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1"
+ovf_dir="${WORK}/state-228-overlap-overflow"
+python3 - "${FIXTURE}" "${OVF_SID}" "${DELTA_HEARTBEAT_TS}" "${HARNESS_DIR}" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+fixture, sid, heartbeat, harness = sys.argv[1:5]
+sys.path.insert(0, harness)
+from shipper_keys import audit_key
+
+base = datetime.now(timezone.utc)
+objects = [{"key": "audit/heartbeat/%s.json" % heartbeat, "ago": 60}]
+keys = []
+# 60 session keys, all inside the 6 h window below the eventual cursor: with
+# page_size=1 the bounded overlap needs 59 pages > DELTA_MAX_PAGES, so the
+# delta must abandon itself and take the repair sweep.
+for seq in range(1, 61):
+    stamp = (base - timedelta(seconds=400 - seq)).strftime("%Y%m%dT%H%M%SZ")
+    kind = "session.start" if seq == 1 else "session.data"
+    objects.append({"key": audit_key(kind, stamp, sid, seq, "shell" if seq == 1 else "", flat=True), "ago": 400 - seq})
+    keys.append(objects[-1]["key"])
+json.dump({"bucket": "pc-admin-dr", "page_size": 1, "objects": objects, "uploads": []},
+          open(fixture, "w", encoding="utf-8"))
+with open(fixture + ".cursor", "w", encoding="utf-8") as handle:
+    handle.write(max(keys))
+PY
+OVF_CURSOR="$(cat "${FIXTURE}.cursor")"
+start_mock
+run_delta "${ovf_dir}"
+is "overlap bound: the warm sweep is green" "ok" "${CASE_STATE}"
+is "overlap bound: the cursor is the last session key" "${OVF_CURSOR}" \
+  "$(state_field observed.cursors.audit_session)"
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-228-overlap-overflow.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${ovf_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "overlap bound: an overlap page overflow falls back to the repair sweep" "sweep" \
+  "$(state_field observed.coverage.mode)"
+is "overlap bound: the fallback sweep is green (the sweep itself succeeds)" "ok" "${CASE_STATE}"
+if grep -q 'delta listing overflowed' "${WORK}/witness.out"; then
+  ok "overlap bound: the overflow warning names the fallback"
+else
+  bad "overlap bound: no overflow warning"
+fi
+if grep -q 'versions' "${WORK}/requests-228-overlap-overflow.log"; then
+  ok "overlap bound: the repair really swept (versions listed)"
+else
+  bad "overlap bound: the repair did not list versions"
+fi
+cat "${WORK}/requests-228-overlap-overflow.log" >>"${SAVED_REQUEST_LOG}"
+
+# The recordings prefix is random-keyed, so a full list is the only correct
+# discovery: its page bound is DELTA_MAX_PAGES (~16 pages live) and an
+# overflow takes the same repair sweep.
+REC_OVF_SID="b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2"
+rec_ovf_dir="${WORK}/state-228-recordings-overflow"
+python3 - "${FIXTURE}" "${REC_OVF_SID}" "${DELTA_HEARTBEAT_TS}" "${HARNESS_DIR}" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+fixture, sid, heartbeat, harness = sys.argv[1:5]
+sys.path.insert(0, harness)
+from shipper_keys import audit_key
+
+stamp = (datetime.now(timezone.utc) - timedelta(seconds=300)).strftime("%Y%m%dT%H%M%SZ")
+objects = [{"key": "audit/heartbeat/%s.json" % heartbeat, "ago": 60}]
+objects.append({"key": audit_key("session.start", stamp, sid, 1, "shell", flat=True), "ago": 300})
+objects.append({"key": "recordings/%s.tar" % sid, "ago": 60})
+# 54 more tars (young, so no orphan-tar finding): with page_size=1 the full
+# recordings listing needs 55 pages > DELTA_MAX_PAGES.
+for index in range(54):
+    objects.append({"key": "recordings/00000000-0000-4000-8000-%012d.tar" % (index + 1), "ago": 60})
+json.dump({"bucket": "pc-admin-dr", "page_size": 1, "objects": objects, "uploads": []},
+          open(fixture, "w", encoding="utf-8"))
+PY
+start_mock
+run_delta "${rec_ovf_dir}"
+is "recordings full list: the warm sweep is green" "ok" "${CASE_STATE}"
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-228-recordings-overflow.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${rec_ovf_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "recordings full list: a listing overflow falls back to the repair sweep" "sweep" \
+  "$(state_field observed.coverage.mode)"
+is "recordings full list: the fallback sweep is green" "ok" "${CASE_STATE}"
+if grep -q 'delta listing overflowed' "${WORK}/witness.out"; then
+  ok "recordings full list: the overflow warning names the fallback"
+else
+  bad "recordings full list: no overflow warning"
+fi
+if grep -q 'versions' "${WORK}/requests-228-recordings-overflow.log"; then
+  ok "recordings full list: the repair really swept (versions listed)"
+else
+  bad "recordings full list: the repair did not list versions"
+fi
+cat "${WORK}/requests-228-recordings-overflow.log" >>"${SAVED_REQUEST_LOG}"
 
 # ---- #159 dual-layout audit keys: date strip + bounded dated streams -----
 # The witness accepts the legacy flat `audit/<basename>` layout and the
@@ -6921,7 +7375,7 @@ REQUEST_LOG="${SAVED_REQUEST_LOG}"
 is "day selection: the delta stays green (the below-cursor day is not listed)" "ok" "${CASE_STATE}"
 is "day selection: the dated cursor advances only on its own day" \
   "${DL_SEL_D2_NEW}" "$(state_field observed.cursors.audit_session_dated)"
-if python3 - "${WORK}/requests-159-selection.log" <<'PY'
+if python3 - "${WORK}/requests-159-selection.log" "${DL_SEL_D2}" <<'PY'
 import json
 import sys
 import urllib.parse
@@ -6934,21 +7388,33 @@ for entry in entries:
         continue
     prefix = query.get("prefix", [""])[0]
     if prefix.startswith("audit/2026092"):
-        day_listings.append(prefix)
+        day_listings.append((prefix, query.get("start-after", [""])[0]))
 violations = []
-if day_listings.count("audit/20260927/") != 1:
-    violations.append("expected exactly one listing for the cursor day, got %r" % day_listings)
-if "audit/20260926/" in day_listings:
-    violations.append("the below-cursor day was re-listed: %r" % day_listings)
-if "audit/20260925/" in day_listings:
-    violations.append("the flat cursor day was re-listed: %r" % day_listings)
+# Since issue #228 the cursor's own day is listed TWICE on a delta: the tail
+# resumed AT the cursor and the bounded overlap resumed BELOW it (the window
+# below the cursor is where a late upload lands). Nothing else about the day
+# pin changes: no below-floor day is listed.
+cursor_day = [(prefix, after) for prefix, after in day_listings if prefix == "audit/20260927/"]
+if len(cursor_day) != 2:
+    violations.append("expected exactly two listings for the cursor day (tail + overlap), got %r" % (day_listings,))
+else:
+    tails = [after for _prefix, after in cursor_day if after == sys.argv[2]]
+    overlaps = [after for _prefix, after in cursor_day if after != sys.argv[2]]
+    if len(tails) != 1:
+        violations.append("the cursor-day tail is not resumed exactly once from the cursor: %r" % (day_listings,))
+    if len(overlaps) != 1 or not overlaps[0] or overlaps[0] >= sys.argv[2]:
+        violations.append("the cursor-day overlap is not a single listing BELOW the cursor: %r" % (day_listings,))
+if "audit/20260926/" in [prefix for prefix, _after in day_listings]:
+    violations.append("the below-cursor day was re-listed: %r" % (day_listings,))
+if "audit/20260925/" in [prefix for prefix, _after in day_listings]:
+    violations.append("the flat cursor day was re-listed: %r" % (day_listings,))
 if violations:
     for violation in violations:
         print("VIOLATION " + violation)
     sys.exit(1)
-print("day selection request pin: %r" % day_listings)
+print("day selection request pin: %r" % (day_listings,))
 PY
-then ok "day selection: only the dated cursor's own day is listed (request-count pin)"; else bad "day selection request-count pin failed"; fi
+then ok "day selection: only the dated cursor's own day is listed (tail + bounded overlap; request-count pin)"; else bad "day selection request-count pin failed"; fi
 force_sweep_state "${dl_sel_dir}"
 start_mock
 run_delta "${dl_sel_dir}"
