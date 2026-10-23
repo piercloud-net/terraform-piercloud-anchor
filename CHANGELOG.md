@@ -108,6 +108,7 @@ All notable changes to this project will be documented in this file.
 - *(verification)* /impl checklist + portable CfT PierCloud browser tooling (closes #116)
 - One line per paragraph in README + component READMEs (closes #112)
 - Fix the stale README anchors into docs/usage.md (closes #127)
+- One managed path for apply; fix the witness probe comments (closes #206, closes #215)
 
 ### ⚡ Performance
 
