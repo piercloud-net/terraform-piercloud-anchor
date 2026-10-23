@@ -44,8 +44,9 @@ concurrency:
 jobs:
   # Issue #207: one watch leg per tenant. A managed anchor keeps its values in
   # its own tenant environment; no job here selects an `environment:`, so the
-  # watch cannot read them (tenant environments are also expected to deploy
-  # from `v*` tags only — docs/usage.md). EXTERNAL_WATCH_TENANTS (repo variable)
+  # watch cannot read them (tenant environments are also expected to be
+  # limited to `v*` tags by the platform, not verified in this repo —
+  # docs/usage.md). EXTERNAL_WATCH_TENANTS (repo variable)
   # lists the watched tenants instead; unset = the single legacy target.
   targets:
     name: resolve the watched tenants
