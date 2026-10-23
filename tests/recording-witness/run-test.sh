@@ -219,7 +219,9 @@
 #       whole but at most once per `RECORDING_WITNESS_RECORDINGS_LIST_SECONDS`
 #       (default 900: a second delta inside the interval makes NO recordings
 #       listing, `0` lists on every delta; a below-cursor UUID is discovered
-#       within that bound, the stored
+#       at the next delta whose start is >= the interval later (so the bound
+#       plus one delta period, and above `DELTA_MAX_PAGES` only the sweep
+#       finds it), the stored
 #       cursor never lowers) and a recordings-only page overflow keeps
 #       `mode=delta` with a bounded deferral warning (no sweep, no versions,
 #       and the retry waits the interval); a numeric out-of-range knob warns
