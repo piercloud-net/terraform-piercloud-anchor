@@ -27,6 +27,16 @@
 #     device card, and leaves the operator run and a provisioned managed run
 #     alone.
 #
+# Issue #203 (PR #201 lens-round LOWs) adds: the false-red regression cases
+# (`run: ./script`, an unquoted date, `secrets.GITHUB_TOKEN`, a shell variable
+# spelled `vars` stay green while a real reference in the same place reds), the
+# structural pins (per-file `environment:` allowlist, device-flow's `needs:`/
+# no-`if:`, no `actions` permission scope, a single YAML document, an
+# unterminated expression), the nine exact reserved names asserted through the
+# canonical validator the binding step sources, and the positive over-block
+# assertion (a valid tenant passes the preflight and the binding validator).
+# A check-count floor fails the harness if a case silently disappears.
+#
 # Cred-free, offline: no network, no credentials.
 set -euo pipefail
 
@@ -42,6 +52,9 @@ export PYTHONDONTWRITEBYTECODE=1
 
 pass=0
 fail=0
+# Check-count floor (external-watch pattern): a silently skipped case cannot
+# shrink this harness. Raise it with every case you add.
+MIN_CHECKS=107
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 contains() { # $1 label, $2 needle, $3 haystack
@@ -59,16 +72,16 @@ fi
 
 # --- mutants ---------------------------------------------------------------
 # mutant LABEL FILE PYTHON-EXPR: copy the workflow dir, rewrite FILE with the
-# expression (s = file text), expect the pin to go red.
+# expression (s = file text, re = the re module), expect the pin to go red.
 mutant() {
   local label="$1" file="$2" expr="$3" dir="$WORK/m$((pass + fail))"
   mkdir -p "$dir"
   cp "$WFDIR"/*.yml "$dir"/
   python3 -I -B - "$dir/$file" "$expr" <<'PY'
-import sys
+import sys, re
 p, expr = sys.argv[1], sys.argv[2]
 s = open(p).read()
-t = eval(expr, {"s": s})
+t = eval(expr, {"s": s, "re": re})
 assert t != s, "mutation did not change the file"
 open(p, "w").write(t)
 PY
@@ -133,10 +146,10 @@ mutant_why() {
   mkdir -p "$dir"
   cp "$WFDIR"/*.yml "$dir"/
   python3 -I -B - "$dir/$file" "$expr" <<'PY'
-import sys
+import sys, re
 p, expr = sys.argv[1], sys.argv[2]
 s = open(p).read()
-t = eval(expr, {"s": s})
+t = eval(expr, {"s": s, "re": re})
 assert t != s, "mutation did not change the file"
 open(p, "w").write(t)
 PY
@@ -179,6 +192,49 @@ mutant_why "customer-number form in a job with no environment" provision.yml "$(
 mutant_why "device-flow environment in mapping form" provision.yml "s.replace(\"    environment: $TENV\\n    outputs:\\n      thumbprint:\", \"    environment:\\n      name: $TENV\\n    outputs:\\n      thumbprint:\", 1)" "ungated"
 mutant_why "device-flow environment, whitespace variant" provision.yml "s.replace(\"    environment: $TENV\\n    outputs:\\n      thumbprint:\", \"    environment: \${{  inputs.tenant != '' && inputs.tenant || 'anchor' }}\\n    outputs:\\n      thumbprint:\", 1)" "ungated"
 mutant_why "repo-scope step: a second run: key" provision.yml 's.replace("      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n", "      - name: Repo-scope check (managed runs read operator-plane values from their environment only)\n        run: exit 0\n", 1)' "duplicate mapping key"
+
+# --- PR #201 round 4 + issue #203: the narrow false-reds -------------------
+# The context scan is expression-scoped and the local-reference check reads
+# `uses:` values only, so these four legitimate shapes stay GREEN. Each one
+# red the pin before #203 (r1-r3 functional: `run: ./script`, an unquoted
+# date, `secrets.GITHUB_TOKEN`, and a shell variable spelled `vars`).
+green_case() { # $1 label, $2 file, $3 python-expr: the pin must stay GREEN
+  local label="$1" file="$2" expr="$3" dir="$WORK/g$((pass + fail))" out
+  mkdir -p "$dir"
+  cp "$WFDIR"/*.yml "$dir"/
+  python3 -I -B - "$dir/$file" "$expr" <<'PY'
+import sys, re
+p, expr = sys.argv[1], sys.argv[2]
+s = open(p).read()
+t = eval(expr, {"s": s, "re": re})
+assert t != s, "mutation did not change the file"
+open(p, "w").write(t)
+PY
+  if out="$(python3 -I -B "$CHECK" "$dir" 2>&1)"; then
+    ok "not a false red: $label"
+  else
+    bad "false red: $label ($(printf '%s' "$out" | head -n1))"
+  fi
+}
+green_case "a run: ./script line" release.yml 's.replace("jobs:\n", "jobs:\n  g1:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./script\n", 1)'
+green_case "an unquoted date value" release.yml 's.replace("jobs:\n", "jobs:\n  g2:\n    runs-on: ubuntu-latest\n    env:\n      D: 2024-01-01\n    steps:\n      - run: echo hi\n", 1)'
+green_case "secrets.GITHUB_TOKEN" release.yml 's.replace("jobs:\n", "jobs:\n  g3:\n    runs-on: ubuntu-latest\n    env:\n      G: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: echo hi\n", 1)'
+green_case "a shell variable spelled vars" release.yml 's.replace("jobs:\n", "jobs:\n  g4:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          vars=()\n          for vars in a; do echo \"$vars\"; done\n", 1)'
+# The narrowing is not a hole: a REAL reference in the same places is red.
+mutant_why "bare secret inside a run: block" release.yml 's.replace("jobs:\n", "jobs:\n  g5:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{ secrets.NTFY_TOPIC }}\"\n", 1)' "ungated 'secrets' reference"
+mutant_why "unterminated expression" ci.yml 's.replace("  TOFU_VERSION: \"1.12.2\"\n", "  TOFU_VERSION: \"${{ vars.ANCHOR_ROLE \"\n", 1)' "unterminated"
+
+# --- PR #201 round 4 (issue #203): the new structural pins ----------------
+# F-1: a static `environment:` other than the tenant expression selects a
+# shared environment for a managed run (the broker refuses the write; the pin
+# now refuses the class in-repo). F-2: the gate order. R-1: the `actions`
+# scope. R-3: a multi-document file.
+mutant_why "static environment: anchor on anchor-dns" provision.yml 're.sub(r"(?m)^(    # same tenant environment .*\n)    environment: .*\n", r"\1    environment: anchor\n", s, count=1)' "is not one of the pinned expressions"
+mutant_why "static environment on a new job" provision.yml 's + "\n  s1:\n    runs-on: ubuntu-latest\n    environment: anchor\n    steps:\n      - run: echo hi\n"' "is not one of the pinned expressions"
+mutant_why "device-flow needs replaced" provision.yml 's.replace("    needs: [visibility-banner]\n", "    needs: []\n", 1)' "needs: must be exactly"
+mutant_why "device-flow gains a benign if:" provision.yml 's.replace("    needs: [visibility-banner]\n", "    needs: [visibility-banner]\n    if: inputs.mode != '"'"'never'"'"'\n", 1)' "if: must be exactly"
+mutant_why "job-level actions: read" provision.yml 's.replace("    permissions:\n      contents: read\n      id-token: write\n", "    permissions:\n      contents: read\n      id-token: write\n      actions: read\n", 1)' 'the `actions` scope'
+mutant_why "multi-document workflow" provision.yml 's + "---\nx: 1\n"' "YAML documents"
 
 # --- operator-only is an explicit named list, checked structurally too ----
 # r1 red-team F1: a structural guess exempted a reusable callee with no
@@ -233,6 +289,46 @@ if out="$(run_binding envproof envproof 123456)"; then ok "provisioned managed r
 if out="$(run_binding '' '' '')"; then ok "operator run unaffected by the managed check"; else bad "operator run refused: $out"; fi
 if out="$(run_binding envproof other 123456)"; then bad "marker mismatch passes"; else ok "marker mismatch still refused"; fi
 
+# --- issue #203: the nine reserved names live in the canonical validator ---
+# Only `scripts/lib/naming.sh` may carry the list: the binding step sources
+# the lib (never a copy), so these cases red if the list is removed from the
+# canonical validator even though the provision.yml preflight still has it.
+for reserved in edge console ops keys unlock bounce mail broker www; do
+  if out="$(run_binding "$reserved" "$reserved" 123456)"; then
+    bad "canonical validator accepts the reserved name '$reserved'"
+  else
+    contains "canonical validator refuses the reserved name '$reserved'" "reserved platform name" "$out"
+  fi
+done
+# --- issue #203: the positive over-block assertion ------------------------
+# A VALID tenant name must pass the preflight AND the canonical binding
+# validator together (the pin may refuse the reserved shapes without
+# over-blocking real tenants). pc-control's grammar is 3-15 chars.
+python3 -I -B - "$PROV" "$WORK/preflight.sh" <<'PY'
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+steps = [s for s in wf["jobs"]["visibility-banner"]["steps"]
+         if s.get("name") == "Managed-input preflight (tenant/anchor_ref — fail closed before any gate)"]
+assert len(steps) == 1, len(steps)
+open(sys.argv[2], "w").write(steps[0]["run"])
+PY
+run_pair() { # $1 tenant: the real preflight then the real binding step
+  env -i PATH="$PATH" TENANT_INPUT="$1" ANCHOR_REF=envref MODE=check bash "$WORK/preflight.sh" 2>&1 \
+    || return 1
+  env -i PATH="$PATH" TENANT_INPUT="$1" MANAGED_TENANT="$1" CUSTOMER_NUMBER=123456 bash "$WORK/binding.sh" 2>&1
+}
+if out="$(run_pair envproof)"; then ok "valid tenant 'envproof' passes the preflight + the binding validator"; else bad "valid tenant 'envproof' refused: $(printf '%s' "$out" | head -n1)"; fi
+if out="$(run_pair abc)"; then ok "valid 3-char tenant 'abc' passes the preflight + the binding validator"; else bad "valid tenant 'abc' refused: $(printf '%s' "$out" | head -n1)"; fi
+if out="$(run_pair z9q8w7e6r5t4y3u)"; then ok "valid 15-char tenant passes the preflight + the binding validator"; else bad "valid 15-char tenant refused: $(printf '%s' "$out" | head -n1)"; fi
+# `pcuabc12345` is NOT a valid tenant name: pc-control's `pcu<random>` aliases
+# are platform labels, reserved by BOTH grammars (the preflight's `pcu*` arm
+# and the canonical validator's prefix rule). It is a negative control here.
+if out="$(run_pair pcuabc12345)"; then
+  bad "the reserved alias 'pcuabc12345' passes the preflight"
+else
+  contains "the reserved alias 'pcuabc12345' is refused by the reserved prefix" "reserved prefix" "$out"
+fi
+
 # --- behavior: the real repo-scope step (issue #204) ----------------------
 python3 -I -B - "$PROV" "$WORK/scope.sh" "$WORK/probes.txt" <<'PY'
 import sys, yaml
@@ -271,4 +367,8 @@ if out="$(run_scope envproof REPO_SCOPE_NTFY_TOPIC=)"; then bad "empty probe val
 if out="$(run_scope envproof REPO_SCOPE_NTFY_TOPIC=TRUE)"; then bad "non-boolean probe value passes"; else ok "non-boolean probe value refused"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
+if [ "$pass" -lt "$MIN_CHECKS" ]; then
+  printf 'FAIL check-count floor: %s < %s\n' "$pass" "$MIN_CHECKS"
+  fail=$((fail + 1))
+fi
 [ "$fail" -eq 0 ]

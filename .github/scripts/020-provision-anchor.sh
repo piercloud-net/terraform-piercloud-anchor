@@ -248,18 +248,21 @@ MODE="${MODE:-}"
 # cmd_sweep_post keeps its own no-token branch as defense in depth.
 # "No token" means neither the step env nor a non-empty $GITHUB_ENV handoff
 # line (the source scp_token_refresh adopts) holds one; a handoff token falls
-# through to the guards (fail closed), and so does a $GITHUB_ENV that exists
-# but cannot be read or searched (grep rc != 1). A path that cannot even be
-# stat'ed (a parent denies search) reads as absent -> no-op; unreachable on
-# runners, where the runner user owns the per-step file. Defense in depth: each step
-# gets a fresh empty $GITHUB_ENV from the runner, so at entry this clause is
-# not expected to match in production. The refresh-token file is not consulted: the
-# workflow writes the access-token line before it exports the refresh file
-# (provision.yml device-flow poll), so a refresh file never exists alone.
+# through to the guards (fail closed), and so does ANY $GITHUB_ENV that cannot
+# be read or searched: grep rc 2 (unreadable, a directory, or a path that does
+# not exist) counts as HELD — there is no fail-open path left (issue #199: the
+# old `-e` gate turned an unstat-able path into the clean no-op). LC_ALL=C is
+# deliberate: the byte after `=` may be an invalid UTF-8 sequence, which a
+# UTF-8 locale's `.` does not match, and the token is still held.
+# Defense in depth: each step gets a fresh empty $GITHUB_ENV from the runner,
+# so at entry this clause is not expected to match in production. The
+# refresh-token file is not consulted: the workflow writes the access-token
+# line before it exports the refresh file (provision.yml device-flow poll), so
+# a refresh file never exists alone.
 handoff_token_held=0
-if [ -n "${GITHUB_ENV:-}" ] && [ -e "$GITHUB_ENV" ]; then
+if [ -n "${GITHUB_ENV:-}" ]; then
   handoff_rc=0
-  grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV" 2>/dev/null || handoff_rc=$?
+  LC_ALL=C grep -aq '^NETCUP_SCP_ACCESS_TOKEN=.' "$GITHUB_ENV" 2>/dev/null || handoff_rc=$?
   [ "$handoff_rc" -eq 1 ] || handoff_token_held=1
 fi
 if [ "$CMD" = "sweep-post" ] && [ -z "${NETCUP_SCP_ACCESS_TOKEN:-}" ] \
@@ -348,7 +351,7 @@ scp_token_refresh() {
   # parent's copy can be the consumed one. Every writer overwrites the whole
   # refresh-token file, so its content is the newest value; the access-token
   # appends are append-only, so the LAST line in $GITHUB_ENV is the newest.
-  local f_at f_rt
+  local f_at f_rt genv_rc
   if [ -n "${NETCUP_SCP_REFRESH_TOKEN_FILE:-}" ] && [ -r "$NETCUP_SCP_REFRESH_TOKEN_FILE" ]; then
     f_rt="$(head -c 8192 "$NETCUP_SCP_REFRESH_TOKEN_FILE" | tr -d '\r\n')"
     if [ -n "$f_rt" ]; then
@@ -356,8 +359,18 @@ scp_token_refresh() {
       export NETCUP_SCP_REFRESH_TOKEN
     fi
   fi
-  if [ -n "${GITHUB_ENV:-}" ] && [ -f "$GITHUB_ENV" ]; then
-    f_at="$(grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" | tail -1 | cut -d= -f2- || true)"
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    genv_rc=0
+    # LC_ALL=C: the token's first byte may be an invalid UTF-8 sequence, which
+    # a UTF-8 locale could make grep skip past (issue #199).
+    f_at="$(LC_ALL=C grep -a '^NETCUP_SCP_ACCESS_TOKEN=' "$GITHUB_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)" || genv_rc=$?
+    # Never swallow an unreadable $GITHUB_ENV (issue #199): grep rc 2 means the
+    # newest access token may exist and cannot be seen, so adopting nothing
+    # would replay the 401 with a possibly-consumed token. Fail loudly. rc 1
+    # (no such line yet) is the normal "nothing to adopt" case.
+    if [ "$genv_rc" -ne 0 ] && [ "$genv_rc" -ne 1 ]; then
+      die "cannot read \$GITHUB_ENV ($GITHUB_ENV) — refusing to refresh blind (fail closed, issue #199)"
+    fi
     # Adoption is UNCONDITIONAL: a non-empty handoff value can only have
     # been appended by a refresh in THIS step — every step gets a fresh empty
     # $GITHUB_ENV from the runner (reviewer-verified against the runner

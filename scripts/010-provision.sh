@@ -80,6 +80,9 @@ validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail
     anchor* | status* | pcu* | platform*)
       printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
       return 1 ;;
+    edge | console | ops | keys | unlock | bounce | mail | broker | www)
+      printf 'invalid TENANT_USER "%s": reserved platform name (the pc-control registry reserved set) — not a tenant.\n' "$1" >&2
+      return 1 ;;
   esac
   return 0
 }

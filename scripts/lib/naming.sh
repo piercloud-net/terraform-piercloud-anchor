@@ -22,7 +22,10 @@
 # LOWERCASED RAW value: the sanitizer maps `.pier`, `pier-`, `pier--carlo`
 # all to `pier`, so validating the sanitized value would be fail-open.
 # The reserved prefixes keep tenant names from masquerading as platform
-# labels and from colliding with the `pcu<random>` alias scheme.
+# labels and from colliding with the `pcu<random>` alias scheme. The nine
+# exact reserved names are pc-control's registry reserved set (the
+# `provision.yml` managed-input preflight carried them alone before #203;
+# they live here so every caller of the canonical validator refuses them).
 
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)
@@ -38,6 +41,9 @@ validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail
   case "$1" in
     anchor* | status* | pcu* | platform*)
       printf 'invalid TENANT_USER "%s": reserved prefix — names starting with anchor/status/pcu/platform are platform labels, not tenants.\n' "$1" >&2
+      return 1 ;;
+    edge | console | ops | keys | unlock | bounce | mail | broker | www)
+      printf 'invalid TENANT_USER "%s": reserved platform name (the pc-control registry reserved set) — not a tenant.\n' "$1" >&2
       return 1 ;;
   esac
   return 0

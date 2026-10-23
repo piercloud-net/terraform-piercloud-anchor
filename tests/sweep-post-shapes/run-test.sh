@@ -64,7 +64,16 @@
 # file (so redirected stderr cannot hide it); curl is the only API transport
 # (_api_curl + token endpoint). Every case except the positive controls e7/e9
 # must leave it untouched (never reach an API helper); e7/e9 (token + valid
-# ids) must hit it. A PATH shim does not catch an absolute-path binary or ssh.
+# ids) must hit it. A PATH shim does not catch an absolute-path binary or ssh,
+# so every e2e case also runs inside `unshare -rn` where the kernel allows it
+# (skipped cleanly otherwise; issue #199).
+#
+# Issue #199 (follow-ups of the same rounds): e11b an unreadable regular-file
+# $GITHUB_ENV (skipped under root), e13 a one-character handoff token, e14 a
+# $GITHUB_ENV path that cannot be stat'ed (held, never the clean no-op), e15 an
+# `XNETCUP_SCP_ACCESS_TOKEN=x` line (not a handoff token), e16 no token with an
+# empty RUN_ID, e17 a handoff token whose first byte is invalid UTF-8 under a
+# UTF-8 locale.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -74,9 +83,13 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=166
-ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
-bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+skipped=0
+# Check-count floor (external-watch pattern): a silently skipped case cannot
+# shrink this harness. Raise it with every case you add.
+MIN_CHECKS=187
+ok()   { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad()  { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+skip() { skipped=$((skipped + 1)); printf 'SKIP %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
@@ -370,6 +383,16 @@ TRIP
 chmod +x "$WORK/tripwire/curl"
 # E2E sets the global rc (not printed): it is called in the main shell so
 # the tripwire assertion's pass/fail counters are not lost in a subshell.
+# Absolute-path binaries (issue #199, r2): a PATH shim cannot see /usr/bin/curl
+# or ssh, so every e2e case also runs inside an unprivileged network namespace
+# when the kernel and `unshare` allow it. Skipped cleanly where they do not.
+NETNS=()
+if command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; then
+  NETNS=(unshare -rn)
+  ok "e2e cases run inside \`unshare -rn\` (absolute-path binaries get no network)"
+else
+  skip "unshare -rn network-namespace backstop (not available here)"
+fi
 E2E() { # $1 label, $2 command, then VAR=value env assignments
   local l="$1" cmd="$2"
   shift 2
@@ -377,7 +400,7 @@ E2E() { # $1 label, $2 command, then VAR=value env assignments
   rm -f "$WORK/tripwire.hits"
   local want_net="${E2E_NET:-absent}"
   env -i PATH="$WORK/tripwire:$PATH" HOME="$WORK" RUN_ID=999 MODE=check "$@" \
-    bash "$SCRIPT" "$cmd" > "$WORK/e2e.$l" 2>&1 || rc=$?
+    ${NETNS[@]+"${NETNS[@]}"} bash "$SCRIPT" "$cmd" > "$WORK/e2e.$l" 2>&1 || rc=$?
   is "$l network tripwire $want_net" "$want_net" "$([ -e "$WORK/tripwire.hits" ] && echo present || echo absent)"
 }
 noop_case() { # $1 label, then env assignments: must be the clean no-op
@@ -417,7 +440,7 @@ E2E_NET=present E2E e9 sweep-post MODE=apply NETCUP_SCP_ACCESS_TOKEN=AT ANCHOR_H
 is "e9 apply + token + valid ids reaches the API (rc != 0)" "nonzero" "$([ "$rc" -ne 0 ] && echo nonzero || echo zero)"
 is "e9 no no-op line" "0" "$(grep -c 'no token held' "$WORK/e2e.e9" || true)"
 # e12: the no-token no-op holds in apply mode too (the destructive mode): a
-# no-op gated to report-only modes would regrow #196 there (r4 functional).
+# no-op gated to report-only modes would regrow #196 there.
 noop_case e12 MODE=apply NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
 # e10: an EMPTY handoff value is not a token -> still the clean no-op.
 printf 'NETCUP_SCP_ACCESS_TOKEN=\n' > "$WORK/github_env.e10"
@@ -433,9 +456,57 @@ E2E e6 sweep-pre NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
 is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"
 is "e6 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e6" || true)"
 
-printf '\n%s passed, %s failed\n' "$pass" "$fail"
-if [ "$pass" -lt "$MIN_CHECKS" ]; then
-  printf 'FAIL check-count floor: %s < %s\n' "$pass" "$MIN_CHECKS"
+# ---- issue #199 (PR #197 lens rounds): the token-held edges ---------------
+# e11b: an UNREADABLE regular file holding a token is HELD, not absent — the
+# case a mutant adding `&& [ -r "$GITHUB_ENV" ]` must fail. Root reads a
+# mode-000 file anyway, so skip there (e11's directory covers it).
+if [ "$(id -u)" -eq 0 ]; then
+  skip "e11b unreadable regular-file GITHUB_ENV (root reads mode 000)"
+else
+  printf 'NETCUP_SCP_ACCESS_TOKEN=AT\n' > "$WORK/github_env.e11b"
+  chmod 000 "$WORK/github_env.e11b"
+  E2E e11b sweep-post GITHUB_ENV="$WORK/github_env.e11b" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+  is "e11b unreadable GITHUB_ENV + empty SERVER_ID rc 1" "1" "$rc"
+  is "e11b guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e11b" || true)"
+  chmod 600 "$WORK/github_env.e11b"
+fi
+# e13: a ONE-character token is a token — the handoff pattern is `=.`, not
+# `=..` (a `=..` mutant must fail this).
+printf 'NETCUP_SCP_ACCESS_TOKEN=A\n' > "$WORK/github_env.e13"
+E2E e13 sweep-post GITHUB_ENV="$WORK/github_env.e13" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e13 one-char handoff token + empty SERVER_ID rc 1" "1" "$rc"
+is "e13 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e13" || true)"
+# e14: a $GITHUB_ENV path that cannot be stat'ed is still HELD (grep rc 2),
+# never the clean no-op — the dropped `-e` gate.
+E2E e14 sweep-post GITHUB_ENV="$WORK/absent-dir/absent.env" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e14 nonexistent GITHUB_ENV + empty SERVER_ID rc 1" "1" "$rc"
+is "e14 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e14" || true)"
+# e15: an `XNETCUP_SCP_ACCESS_TOKEN=x` line is NOT a handoff token (the `^`
+# anchor is pinned): still the clean no-op.
+printf 'XNETCUP_SCP_ACCESS_TOKEN=x\n' > "$WORK/github_env.e15"
+noop_case e15 GITHUB_ENV="$WORK/github_env.e15" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+# e16: no token with an EMPTY RUN_ID is still the clean no-op (no RUN_ID gate
+# was added to the clause).
+noop_case e16 RUN_ID= NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+# e17: a token whose FIRST byte is invalid UTF-8 is held under a UTF-8 locale:
+# the handoff grep must run LC_ALL=C. Pre-fix, `.` does not match the byte, the
+# handoff reads as absent and the run takes the clean no-op.
+UTF8_LOCALE=""
+for cand in en_US.utf8 en_US.UTF-8 C.utf8 C.UTF-8; do
+  if locale -a 2>/dev/null | grep -qx "$cand"; then UTF8_LOCALE="$cand"; break; fi
+done
+if [ -z "$UTF8_LOCALE" ]; then
+  skip "e17 invalid-UTF-8 first byte (no UTF-8 locale installed)"
+else
+  printf 'NETCUP_SCP_ACCESS_TOKEN=\377A\n' > "$WORK/github_env.e17"
+  E2E e17 sweep-post GITHUB_ENV="$WORK/github_env.e17" LANG="$UTF8_LOCALE" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+  is "e17 invalid-UTF-8 first byte + empty SERVER_ID rc 1" "1" "$rc"
+  is "e17 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e17" || true)"
+fi
+
+printf '\n%s passed, %s failed (%s skipped)\n' "$pass" "$fail" "$skipped"
+if [ "$pass" -lt "$((MIN_CHECKS - skipped))" ]; then
+  printf 'FAIL check-count floor: %s < %s (%s pinned minus %s skipped)\n' "$pass" "$((MIN_CHECKS - skipped))" "$MIN_CHECKS" "$skipped"
   fail=$((fail + 1))
 fi
 [ "$fail" -eq 0 ]

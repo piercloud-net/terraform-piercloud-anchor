@@ -16,8 +16,9 @@ expressions are removed as exact literals, and any remaining mention of the
 `secrets` or `vars` context (any case, any syntax: dot, index, toJSON) fails.
 
 A workflow may read the operator's values bare only if it is NAMED in
-OPERATOR_ONLY and its node graph still has no `environment` key, no `tenant`
-key and no `inputs.tenant` reference (any case). Any other file is checked in
+OPERATOR_ONLY and its node graph names no managed reach at all, in any case:
+no `environment` key, no `tenant` key, and none of the markers `inputs.tenant`,
+`inputs[`, `client_payload`, `outputs.tenant`. Any other file is checked in
 full. Every `uses:` value must be one of the exact USES_ALLOWED strings for
 its own file (a per-file map, so a mutable-tag action allowed in a release
 workflow cannot be added to provision.yml): a
@@ -26,11 +27,23 @@ this pin never scans its file, so a new one is a deliberate pin update. Any
 local `uses: ./...` also fails, and a `workflow_call` / `workflow_run` /
 `repository_dispatch` trigger fail closed anywhere: they let a managed run
 execute, or feed, a file the environment checks never see.
-Every node must carry a core YAML tag (a `!!binary` or custom tag would hide
-expression text from the scan). provision.yml must define the
+Every node must carry a core YAML tag; an unquoted date composes as the core
+`timestamp` tag and is accepted (its text is scanned like any other scalar),
+while a `!!binary` or custom tag fails closed (it would hide expression text
+from the scan). A file must compose to exactly ONE document: GitHub reads one
+and other parsers disagree on the rest, so a second document is reported by
+name instead of being scanned silently. provision.yml must define the
 `visibility-banner` job exactly once, and no `visibility-banner` key in any
 workflow may carry an `environment` key (the approval card is reviewed before
 the environment gate; a renamed or duplicated banner job fails too).
+
+PR #201 round 4 (red-team F-1/F-2/R-1/R-3): every `environment:` (job level and
+the workflow's own) is a per-file exact allowlist (ENVIRONMENT_ALLOWED), so a
+new job cannot name a static environment such as `anchor` (the broker refuses
+it, but the pin now refuses the class in-repo); device-flow's gate order is
+pinned whole (PINNED_JOBS: `needs:` exactly the banner job, no `if:` at all);
+and no job (or workflow) may grant the `actions` scope, whose API reads would
+reach a repository-level value a managed run must never see.
 
 Issue #204 (environment-scoped operator values): inside a job whose
 `environment:` is exactly the tenant expression (TENANT_ENV), the DIRECT_NAMES
@@ -65,13 +78,24 @@ isolation is GitHub's environment / secret scoping plus the workflow text on
 the executed ref. A change that edits both the workflow and this pin passes
 it, and so does one that drops the ci.yml run step and updates the
 broker-provision-dns blob-hash pins in the same PR (a review control).
+The `secrets` / `vars` context scan is expression-scoped: only text inside a
+`${{ ... }}` expression is judged, so a `run:` line, a shell variable spelled
+`vars`, an unquoted date or `run: ./script` is not a false red, while an
+unterminated `${{` opener fails closed (this scan and GitHub's parser would
+disagree about it).
+
 Residuals: the allowed forms are a set of literals, not bound per name (a
 gated name may use another name's gated form; a managed run still resolves
-empty); scripts are not scanned (reading repo variables through the API needs
-`actions: read`, which no job grants); a job outside TENANT_ENV (a static
-`environment:` or none) may use only the global forms: the shared names, the
-gated forms (empty for a managed run) and the TENANT_USER form (the tenant
-input for a managed run). PyYAML (YAML 1.1) is not GitHub's parser; a parse
+empty) — the per-name binding is disclosed, not closed; scripts are not
+scanned (reading repo variables through the API needs `actions: read`, which
+no job and no workflow grants, so the route needs a reviewed pin update);
+repository-level `MANAGED_TENANT` / `TENANT_CUSTOMER_NUMBER` are refused by
+the banner's repo-scope step, not by a repo-level name check (that check lives
+in the pc-lifecycle verify run and needs API credentials, so it is disclosed
+here rather than duplicated); a job outside TENANT_ENV may use only the global
+forms: the shared names, the run-scoped GITHUB_TOKEN, the gated forms (empty
+for a managed run) and the TENANT_USER form (the tenant input for a managed
+run). PyYAML (YAML 1.1) is not GitHub's parser; a parse
 difference that splits an expression leaves the context word in place and
 fails closed.
 
@@ -99,11 +123,10 @@ SHARED = [
 ]
 
 # Tenant-environment-only name: the lifecycle writes it on the tenant
-# environment. A repo-level value would become the per-name fallback for a
-# typo'd environment, so the repo-scope step refuses one (#204). Read bare.
-TENANT_ONLY = [
-    "${{ vars.MANAGED_TENANT }}",
-]  # allowed only inside a TENANT_ENV job (node_allowance)
+# environment, and a repo-level copy would become the per-name fallback for a
+# typo'd environment, so the repo-scope step refuses one (#204). Read bare,
+# and allowed only inside a TENANT_ENV job (node_allowance).
+TENANT_ONLY = ["${{ vars.MANAGED_TENANT }}"]
 
 # Workflows no managed run can select and that read operator values bare.
 # Explicit list, not a structural guess: a new file is checked in full.
@@ -129,8 +152,13 @@ USES_ALLOWED = {
 
 CORE_TAGS = {
     "tag:yaml.org,2002:" + t
-    for t in ("str", "int", "float", "bool", "null", "map", "seq")
+    for t in ("str", "int", "float", "bool", "null", "map", "seq", "timestamp")
 }
+
+# A per-run auto-secret: the runner mints it for every job, so no repository
+# value can fall through to a managed run. Read bare anywhere (a legitimately
+# spelled `secrets.GITHUB_TOKEN` was a false red while it was not listed).
+RUN_SCOPED = ["${{ secrets.GITHUB_TOKEN }}"]
 
 # Operator-plane and per-anchor names: a managed run resolves ''.
 GATED_NAMES = {
@@ -199,12 +227,56 @@ TENANT_USER_FORM = "${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER
 # inside a TENANT_ENV job (node_allowance): a job outside the banner's needs
 # closure would read a repository-level copy before the refusal (round 2).
 TENANT_CUSTOMER_FORM = "${{ inputs.tenant != '' && secrets.TENANT_CUSTOMER_NUMBER || inputs.tenant == '' && secrets.CUSTOMER_NUMBER || '' }}"
-ALLOWED = SHARED + GATED + [TENANT_USER_FORM]
+ALLOWED = SHARED + RUN_SCOPED + GATED + [TENANT_USER_FORM]
 
-# Any mention of either context as a word, in any case. Over-approximates on
-# prose by design: a comment inside a run: block that names the context fails
-# and must be reworded (say "secret values", "variables").
+# Every job-level and workflow-level `environment:` value per file, exactly. A
+# static environment (e.g. `environment: anchor`) is not the tenant
+# expression: a managed run would select it while the banner proved only the
+# tenant environment's scope (r4 red-team F-1; the broker refuses the write,
+# the pin now refuses the class in-repo). A mapping form is not an exact
+# literal, so it fails too. An unlisted file may select no environment.
+ENVIRONMENT_ALLOWED = {
+    "provision.yml": {TENANT_ENV},
+    "broker-report-selftest.yml": {"${{ inputs.environment }}"},
+}
+
+# Gate order, pinned whole for the job that first selects the tenant
+# environment (r4 red-team F-2): it must need the banner job exactly, and it
+# must carry no `if:` at all — any replacement condition (a status function or
+# not) could let the environment gate run before the banner refused.
+PINNED_JOBS = {
+    "device-flow": {"needs": ["visibility-banner"], "if": None},
+}
+
+# A job (or workflow) that grants the `actions` scope can read repository
+# variables and secret values through the API, i.e. around every expression
+# gate here (r4 red-team R-1). A scalar form (`read-all` / `write-all`) grants
+# it implicitly and fails closed.
+FORBIDDEN_PERMISSIONS = {"actions"}
+
+# Any mention of either context as a word, in any case, INSIDE a `${{ ... }}`
+# expression (expressions() below). Text outside an expression is shell/prose:
+# a script variable spelled `vars`, a `run: ./script` line and a comment are
+# not references.
 CONTEXT = re.compile(r"(?i)(?<![A-Za-z0-9_])(secrets|vars)(?![A-Za-z0-9_])")
+
+
+def expressions(value):
+    """(list of `${{ ... }}` texts, unterminated?) for one scalar value.
+
+    Only expression text is judged: an opener with no closer returns True so
+    the caller fails closed (this scan would not see what GitHub parses).
+    """
+    out, i = [], 0
+    while True:
+        start = value.find("${{", i)
+        if start < 0:
+            return out, False
+        end = value.find("}}", start + 3)
+        if end < 0:
+            return out, True
+        out.append(value[start : end + 2])
+        i = end + 2
 
 
 def scalars(node, seen):
@@ -438,6 +510,64 @@ def node_allowance(doc):
     return extra
 
 
+def environment_findings(path, doc):
+    """Every `environment:` under a job, and the workflow's own one, is pinned."""
+    findings = []
+    allowed = ENVIRONMENT_ALLOWED.get(os.path.basename(path), set())
+    for name, node in [("<workflow>", doc)] + list(jobs_of(doc)):
+        for value in mget(node, "environment"):
+            got = value.value if isinstance(value, yaml.ScalarNode) else None
+            if got is None or got not in allowed:
+                findings.append(
+                    "%s: %s environment: %r is not one of the pinned expressions %s"
+                    % (path, name, getattr(value, "value", value), sorted(allowed) or "(none for this file)")
+                )
+    return findings
+
+
+def job_pin_findings(path, doc):
+    """PINNED_JOBS: gate order for the jobs that select the tenant environment."""
+    findings = []
+    if os.path.basename(path) != "provision.yml":
+        return findings
+    for name, want in PINNED_JOBS.items():
+        jobs = [job for n, job in jobs_of(doc) if n == name]
+        if len(jobs) != 1:
+            findings.append("%s: pinned job %r must be defined exactly once (found %d)" % (path, name, len(jobs)))
+            continue
+        needs = []
+        for value in mget(jobs[0], "needs"):
+            lst = scalar_list(value)
+            needs.extend(lst if lst is not None else ["<non-scalar>"])
+        if needs != want["needs"]:
+            findings.append("%s: job %r needs: must be exactly %r (got %r)" % (path, name, want["needs"], needs))
+        conds = [c.value if isinstance(c, yaml.ScalarNode) else None for c in mget(jobs[0], "if")]
+        if conds != ([] if want["if"] is None else [want["if"]]):
+            findings.append("%s: job %r if: must be exactly %r (got %r)" % (path, name, want["if"], conds))
+    return findings
+
+
+def permission_findings(path, doc):
+    """No job, and no workflow, may grant the `actions` scope."""
+    findings = []
+    for name, node in [("<workflow>", doc)] + list(jobs_of(doc)):
+        for value in mget(node, "permissions"):
+            if not isinstance(value, yaml.MappingNode):
+                findings.append(
+                    "%s: %s permissions: must be a mapping that does not grant the `actions` scope (got %r)"
+                    % (path, name, getattr(value, "value", value))
+                )
+                continue
+            for key, _ in value.value:
+                scope = key.value.strip().lower() if isinstance(key, yaml.ScalarNode) else None
+                if scope is None or scope in FORBIDDEN_PERMISSIONS:
+                    findings.append(
+                        "%s: %s permissions: %r is refused — the `actions` scope (and any non-scalar key) can read repository variables through the API"
+                        % (path, name, getattr(key, "value", key))
+                    )
+    return findings
+
+
 def check_file(path):
     findings = []
     with open(path, "rb") as fh:
@@ -446,6 +576,11 @@ def check_file(path):
         docs = list(yaml.compose_all(raw.decode("utf-8"), Loader=yaml.SafeLoader))
     except (UnicodeDecodeError, yaml.YAMLError) as exc:
         return ["%s: does not parse (%s)" % (path, exc.__class__.__name__)]
+    if len(docs) != 1:
+        # Fail closed by name: GitHub reads one document and every other
+        # parser disagrees about the rest, so a second one is never scanned
+        # into a green.
+        return ["%s: %d YAML documents — a workflow must be exactly one (refusing)" % (path, len(docs))]
     nodes = []
     extra = {}
     try:
@@ -464,6 +599,9 @@ def check_file(path):
         if os.path.basename(path) == "provision.yml":
             extra.update(node_allowance(doc))
             findings.extend(scope_findings(path, doc))
+        findings.extend(environment_findings(path, doc))
+        findings.extend(job_pin_findings(path, doc))
+        findings.extend(permission_findings(path, doc))
         for n in all_nodes(doc, set()):
             if isinstance(n, yaml.MappingNode):
                 keys = [k.value for k, _ in n.value if isinstance(k, yaml.ScalarNode)]
@@ -478,15 +616,28 @@ def check_file(path):
             findings.append("%s: visibility-banner job must be defined exactly once (found %d)" % (path, len(banners)))
         allowed_uses = USES_ALLOWED.get(os.path.basename(path), set())
         for v in uses_values(doc, set()):
+            # A `uses:` value is the only place a local reference matters; the
+            # same text in a `run:` line (`run: ./script`) is a shell path.
+            if isinstance(v, yaml.ScalarNode) and (v.value.startswith("./") or v.value.startswith(".github/")):
+                findings.append("%s:%d: local workflow/action reference %r (not scanned by this pin)" % (path, v.start_mark.line + 1, v.value))
             if not isinstance(v, yaml.ScalarNode) or v.value not in allowed_uses:
                 findings.append("%s:%d: `uses:` value not in USES_ALLOWED: %r" % (path, v.start_mark.line + 1, getattr(v, "value", v)))
+    # A `${{` with no closer is a parse differential whatever the file and
+    # whichever branch below judges it: this scan would not see the text
+    # GitHub reads as an expression.
+    exprs_of = {}
+    for n in nodes:
+        exprs_of[id(n)] = expressions(n.value)
+        if exprs_of[id(n)][1]:
+            findings.append(
+                "%s:%d: unterminated `${{` expression: this scan cannot see what GitHub parses (fail closed)"
+                % (path, n.start_mark.line + 1)
+            )
     texts = [n.value.lower() for n in nodes]
     for n in nodes:
         t = n.value.strip().lower()
         if t in ("workflow_call", "workflow_run", "repository_dispatch"):
             findings.append("%s:%d: %s trigger (reusable/chained workflows are not pinned)" % (path, n.start_mark.line + 1, t))
-        if t.startswith("./") or t.startswith(".github/"):
-            findings.append("%s:%d: local workflow/action reference %r (not scanned by this pin)" % (path, n.start_mark.line + 1, n.value))
     reachable = any(t in ("environment", "tenant") for t in texts) or any(
         marker in t for t in texts for marker in ("inputs.tenant", "inputs[", "client_payload", "outputs.tenant")
     )
@@ -497,16 +648,17 @@ def check_file(path):
         # the operator's own values by construction.
         return findings
     for node in nodes:
-        rest = node.value
-        # Longest first: the probe and gated forms embed the bare form.
-        for form in sorted(set(ALLOWED + extra.get(id(node), [])), key=len, reverse=True):
-            rest = rest.replace(form, "")
-        for m in CONTEXT.finditer(rest):
-            line = node.start_mark.line + 1
-            findings.append(
-                "%s:%d: ungated '%s' reference: %r"
-                % (path, line, m.group(1), rest[max(0, m.start() - 30) : m.end() + 30].replace("\n", " "))
-            )
+        for expr in exprs_of[id(node)][0]:
+            rest = expr
+            # Longest first: the probe and gated forms embed the bare form.
+            for form in sorted(set(ALLOWED + extra.get(id(node), [])), key=len, reverse=True):
+                rest = rest.replace(form, "")
+            for m in CONTEXT.finditer(rest):
+                line = node.start_mark.line + 1
+                findings.append(
+                    "%s:%d: ungated '%s' reference: %r"
+                    % (path, line, m.group(1), rest[max(0, m.start() - 30) : m.end() + 30].replace("\n", " "))
+                )
     return findings
 
 
