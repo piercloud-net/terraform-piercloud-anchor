@@ -4193,7 +4193,10 @@ class Config(object):
         # a full sweep (list + versions for both prefixes, 288x/day). Discovery
         # is therefore bounded by this interval: the whole prefix is listed at
         # most once per interval, so a new random-keyed tar is discovered
-        # within this bound (default 900 s = 15 min, far below the 6 h sweep)
+        # within this bound plus up to one delta period (default 900 s = 15 min;
+        # the gate is tested at a delta start, so add the ~5-minute timer period
+        # and the run time) while the prefix fits DELTA_MAX_PAGES - above the page
+        # cap the listing defers again and the 6 h sweep is the only path
         # and a quiet delta costs no recordings listing at all. 0 restores a
         # list on every delta. Numeric out-of-range clamps to the default with
         # a warning; a non-numeric value fails the run (rc=2, state=error) -
