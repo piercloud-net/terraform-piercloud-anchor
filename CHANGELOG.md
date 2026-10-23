@@ -117,6 +117,7 @@ All notable changes to this project will be documented in this file.
 ### 🧪 Testing
 
 - *(dns)* Migrate the broker-provision-dns harness off the hand-rolled YAML tokenizer (closes #195)
+- *(managed,a1)* Close the #203/#199 follow-up lows (closes #203, closes #199)
 
 ### ⚙️ Miscellaneous Tasks
 
