@@ -155,7 +155,7 @@ LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 TABLE_ROW = re.compile(r"^\s*\|")
 HEADING = re.compile(r"^\s*#{1,6}\s")
 BRANCH_GLOB = re.compile(r"release/from-v\*")
-ABBREV = re.compile(r"(?:\be\.g|\bi\.e|\betc|\bvs|\bcf|\bapprox|(?:^|\s)[A-Z])\.$", re.I)
+ABBREV = re.compile(r"(?:\be\.g|\bi\.e|\betc|\bvs|\bcf|\bapprox)\.$", re.I)
 
 
 def clauses(unit):
@@ -190,8 +190,17 @@ def clauses(unit):
         # A unit with an unbalanced quote or parenthesis would suppress every
         # later split (a qualifier could then ride along with the claim).
         # Fall back to splitting everywhere: a malformed sentence is allowed
-        # to red, never to hide.
-        return [part for part in re.split(r"(?<=[.!?;])\s+", unit) if part]
+        # to red, never to hide. An abbreviation still does not end a clause.
+        parts, buffer = [], ""
+        for piece in re.split(r"(?<=[.!?;])\s+", unit):
+            buffer = (buffer + " " + piece).strip() if buffer else piece
+            if ABBREV.search(buffer):
+                continue
+            parts.append(buffer)
+            buffer = ""
+        if buffer:
+            parts.append(buffer)
+        return [part for part in parts if part]
     return out
 
 
@@ -228,7 +237,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=296
+MIN_CHECKS=299
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -749,17 +758,31 @@ def flow_if_values(text):
     parenthesised argument (or a quoted string) may contain commas."""
     values = []
     for match in FLOW_IF.finditer(text):
-        index, depth, quoted = match.end(), 0, False
+        index, depth, quoted, escaped = match.end(), 0, False, False
+        # a flow mapping may wrap: skip the separator whitespace (newlines too)
+        while index < len(text) and text[index].isspace() and text[index] != "\n":
+            index += 1
+        if index < len(text) and text[index] == "\n":
+            index += 1
+        while index < len(text) and text[index].isspace() and text[index] != "\n":
+            index += 1
         start = index
         while index < len(text):
             char = text[index]
-            if char == "'":
-                if quoted and index + 1 < len(text) and text[index + 1] == "'":
+            if char == '"' and not quoted and not escaped:
+                quoted = True
+            elif quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == "'":
+                if index + 1 < len(text) and text[index + 1] == "'":
                     index += 2
                     continue
                 quoted = not quoted
-            elif quoted:
-                pass
             elif char in "([{":
                 depth += 1
             elif char in ")]}":
@@ -828,7 +851,11 @@ for path in sys.argv[1:]:
     exprs += if_values(text)
     exprs += flow_if_values(text)
     for expr in exprs:
-        flat = QUOTED.sub("''", expr)
+        stripped = QUOTED.sub("''", expr)
+        # An unbalanced single-quote model (a YAML '' escape can open a new
+        # match) would blank real code: scan the raw text instead of a false
+        # negative.
+        flat = stripped if stripped.count("'") % 2 == 0 else expr
         for m in CONTEXT.finditer(flat):
             if LITERAL.match(flat, m.end()):
                 legal += 1
@@ -923,6 +950,14 @@ printf '%s\n' "      - { name: x, if: format('{0}', vars[format('{0}', 'X')]) ==
 dr_flow_comma_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-comma.yml" >/dev/null 2>&1 || dr_flow_comma_rc=$?
 is "a flow-map if: value may contain a comma and is still judged" "1" "$dr_flow_comma_rc"
+printf '%s\n' "      - { name: x, if:" "          vars[format('{0}', 'X')] == 'x', run: echo hi }" >"${WORK}/dr-flow-nextline.yml"
+dr_flow_next_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-nextline.yml" >/dev/null 2>&1 || dr_flow_next_rc=$?
+is "a flow-map if: value may start on the next line" "1" "$dr_flow_next_rc"
+printf '%s\n' '      - { name: x, if: format("a,b", vars[format(%s, %s)]) == %s, run: echo hi }' "'{0}'" "'X'" "'x'" >"${WORK}/dr-flow-dq.yml"
+dr_flow_dq_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-dq.yml" >/dev/null 2>&1 || dr_flow_dq_rc=$?
+is "a double-quoted flow value may contain a comma" "1" "$dr_flow_dq_rc"
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
@@ -961,6 +996,10 @@ printf '%s\n' 'The `v*` tags are published upstream, e.g. by the vendor and not 
 vs_abbrev_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-abbrev.md" >/dev/null 2>&1 || vs_abbrev_rc=$?
 is "an abbreviation does not end a claim unit (no false red)" "0" "$vs_abbrev_rc"
+printf '%s\n' 'Deploy the `v*` tag for option A. The platform is not verified here.' >"${WORK}/vstar-initial.md"
+vs_initial_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-initial.md" >/dev/null 2>&1 || vs_initial_rc=$?
+is "a single-letter sentence end is still a boundary (no borrowed qualifier)" "1" "$vs_initial_rc"
 
 # ---- #208 round 2: behavioural drivers for the config + incident steps -----
 # Both steps run against stub gh/curl on PATH; every call is logged, so the
