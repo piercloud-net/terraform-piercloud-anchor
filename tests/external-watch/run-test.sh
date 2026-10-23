@@ -237,7 +237,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=301
+MIN_CHECKS=303
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -742,15 +742,15 @@ is "repo-scope step has no dynamic vars[]/secrets[] indexing" "0" \
 # fragments). Scan every tracked workflow and script: a `vars` or `secrets`
 # context inside `${{ }}` or an `if:` may only be a literal `.NAME` read.
 #
-# This is a TEXT heuristic, not a YAML/expression parser. Disclosed limits, each
-# of which is a false-negative class rather than a red: (1) a `vars`/`secrets`
-# read hidden inside an expression string (e.g. `'{{ vars[...] }}'`) is ignored,
-# because string contents are not reads; (2) a value wrapped mid-token at depth
-# zero (a newline between `format(` and its argument, in a flow mapping) ends the
-# captured value; (3) a `#` inside a quoted string is kept, but a comment on the
-# same line after an unterminated quote may hide the rest of that line. The
-# tracked tree is asserted clean on every run, so a new limit shows up as a red
-# on the file that introduces it rather than as silence.
+# This is a TEXT heuristic, not a YAML/expression parser. Disclosed limits, all
+# false-negative classes rather than reds: (1) a `vars`/`secrets` token inside a
+# quoted *string literal* is not a read and is ignored (a YAML-quoted
+# `${{ vars[...] }}` is still judged, because the quotes are YAML's, not the
+# expression's); (2) a flow value wrapped at DEPTH ZERO (a newline outside any
+# parentheses) ends the captured value — a wrap inside parens does not; (3) a
+# YAML `''` escape inside a plain `if:` value decodes to a read this scan does
+# not unescape. The tracked tree is asserted clean on every run, so a new limit
+# shows up as a red on the file that introduces it rather than as silence.
 cat >"${WORK}/dynread.py" <<'PY'
 import re
 import sys
@@ -768,27 +768,25 @@ def flow_if_values(text):
     parenthesised argument (or a quoted string) may contain commas."""
     values = []
     for match in FLOW_IF.finditer(text):
-        index, depth, quoted, escaped = match.end(), 0, False, False
+        index, depth, quote, escaped = match.end(), 0, None, False
         # a flow mapping may wrap: skip the separator whitespace (newlines too)
         while index < len(text) and text[index].isspace():
             index += 1
         start = index
         while index < len(text):
             char = text[index]
-            if char == '"' and not quoted and not escaped:
-                quoted = True
-            elif quoted:
+            if quote:
                 if escaped:
                     escaped = False
-                elif char == "\\":
+                elif char == "\\" and quote == '"':
                     escaped = True
-                elif char == '"':
-                    quoted = False
-            elif char == "'":
-                if index + 1 < len(text) and text[index + 1] == "'":
-                    index += 2
-                    continue
-                quoted = not quoted
+                elif char == quote:
+                    if index + 1 < len(text) and text[index + 1] == quote:
+                        index += 2  # a doubled quote is an escape, not a close
+                        continue
+                    quote = None
+            elif char in "'\"":
+                quote = char
             elif char in "([{":
                 depth += 1
             elif char in ")]}":
@@ -796,6 +794,12 @@ def flow_if_values(text):
                     break
                 depth -= 1
             elif depth == 0 and char in ",\n":
+                break
+            elif (
+                depth == 0
+                and char == "#"
+                and (index == 0 or text[index - 1].isspace())
+            ):
                 break
             index += 1
         values.append(text[start:index])
@@ -876,7 +880,6 @@ offenders = []
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
-    text = strip_comments(text)
     exprs = expressions(text)
     exprs += if_values(text)
     exprs += flow_if_values(text)
@@ -992,6 +995,22 @@ printf '%s\n' "      - { name: x, if: \"a\" == 'a', run: echo hi }  # no secrets
 dr_comment_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-comment.yml" >/dev/null 2>&1 || dr_comment_rc=$?
 is "a YAML comment mentioning secrets does not red a valid workflow" "0" "$dr_comment_rc"
+cat >"${WORK}/dr-in-block.yml" <<'YML'
+      - name: x
+        run: |
+          echo "it works" # ${{ vars[format("{0}", "X")] }}
+YML
+dr_in_block_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-in-block.yml" >/dev/null 2>&1 || dr_in_block_rc=$?
+is "a dynamic read after a # inside a run block is still judged" "1" "$dr_in_block_rc"
+cat >"${WORK}/dr-flow-sq.yml" <<'YML'
+      - { name: x, if: 'a' == 'a', run: echo hi }
+      - name: Rotate secrets
+        run: echo ok
+YML
+dr_flow_sq_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-sq.yml" >/dev/null 2>&1 || dr_flow_sq_rc=$?
+is "a single-quoted flow value closes (no false red on the next line)" "0" "$dr_flow_sq_rc"
 printf '%s\n' "      - { name: x, if:" "" "          vars[format('{0}', 'X')] == 'x', run: echo hi }" >"${WORK}/dr-flow-blank.yml"
 dr_flow_blank_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-blank.yml" >/dev/null 2>&1 || dr_flow_blank_rc=$?
