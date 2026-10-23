@@ -2990,7 +2990,12 @@ if [ -n "${ORIGIN_MTLS_CA_PEM:-}" ]; then
     die "ORIGIN_MTLS_CA_PEM is not a bounded PEM certificate (one X.509 CA certificate expected, no trailing DER) — refusing to deploy it"
   fi
   rm -f "${mtls_tmp}"
-  CLIENT_CA_POOL="${CLIENT_CA_POOL}${CLIENT_CA_POOL:+$'\n'}${ORIGIN_MTLS_CA_PEM}"
+  if [ -n "${CLIENT_CA_POOL}" ]; then
+    CLIENT_CA_POOL="${CLIENT_CA_POOL}
+${ORIGIN_MTLS_CA_PEM}"
+  else
+    CLIENT_CA_POOL="${ORIGIN_MTLS_CA_PEM}"
+  fi
   MTLS_TLS="yes"
   log "origin-mTLS CA staged — CloudFront origin pulls must present a client certificate signed by it"
 fi
