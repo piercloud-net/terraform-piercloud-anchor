@@ -237,7 +237,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=303
+MIN_CHECKS=306
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -748,8 +748,7 @@ is "repo-scope step has no dynamic vars[]/secrets[] indexing" "0" \
 # `${{ vars[...] }}` is still judged, because the quotes are YAML's, not the
 # expression's); (2) a flow value wrapped at DEPTH ZERO (a newline outside any
 # parentheses) ends the captured value — a wrap inside parens does not; (3) a
-# YAML `''` escape inside a plain `if:` value decodes to a read this scan does
-# not unescape. The tracked tree is asserted clean on every run, so a new limit
+# single-quoted `if:` scalar whose `''` escapes hide a read is not unescaped. The tracked tree is asserted clean on every run, so a new limit
 # shows up as a red on the file that introduces it rather than as silence.
 cat >"${WORK}/dynread.py" <<'PY'
 import re
@@ -786,7 +785,9 @@ def flow_if_values(text):
                         continue
                     quote = None
             elif char in "'\"":
-                quote = char
+                previous = text[index - 1] if index else " "
+                if previous.isspace() or previous in "([{:,=!":
+                    quote = char
             elif char in "([{":
                 depth += 1
             elif char in ")]}":
@@ -804,29 +805,6 @@ def flow_if_values(text):
             index += 1
         values.append(text[start:index])
     return values
-
-
-def strip_comments(text):
-    """Drop YAML `#` comments (outside single/double quotes), keeping a `#`
-    that is part of a value."""
-    out, index, quote = [], 0, None
-    while index < len(text):
-        char = text[index]
-        if quote:
-            out.append(char)
-            if char == quote:
-                quote = None
-        elif char in "'\"":
-            quote = char
-            out.append(char)
-        elif char == "#" and (index == 0 or text[index - 1].isspace()):
-            while index < len(text) and text[index] != "\n":
-                index += 1
-            continue
-        else:
-            out.append(char)
-        index += 1
-    return "".join(out)
 
 
 def expressions(text):
@@ -868,8 +846,9 @@ def if_values(text):
         if BLOCK.match(rest):
             values.append(" ".join(block))
         elif rest:
-            # a plain scalar may continue on the following, more-indented lines
-            values.append(" ".join([rest] + block))
+            # a plain scalar may continue on the following, more-indented lines;
+            # a trailing YAML comment is not part of the value
+            values.append(re.sub(r"\s#.*$", "", " ".join([rest] + block)))
         else:
             values.append(" ".join(block))
     return values
@@ -880,7 +859,10 @@ offenders = []
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
-    exprs = expressions(text)
+    uncommented = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    exprs = expressions(uncommented)
     exprs += if_values(text)
     exprs += flow_if_values(text)
     for expr in exprs:
@@ -1015,6 +997,28 @@ printf '%s\n' "      - { name: x, if:" "" "          vars[format('{0}', 'X')] ==
 dr_flow_blank_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-blank.yml" >/dev/null 2>&1 || dr_flow_blank_rc=$?
 is "a flow-map if: value may follow a blank line" "1" "$dr_flow_blank_rc"
+cat >"${WORK}/dr-if-comment.yml" <<'YML'
+      - if: github.ref == 'refs/heads/main' # secrets are rotated by the operator
+        run: echo hi
+YML
+dr_if_comment_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-if-comment.yml" >/dev/null 2>&1 || dr_if_comment_rc=$?
+is "a trailing comment on a block if: does not red a valid workflow" "0" "$dr_if_comment_rc"
+cat >"${WORK}/dr-comment-line.yml" <<'YML'
+      # the old form was: echo "${{ vars[format('{0}', 'X')] }}"
+      - run: echo hi
+YML
+dr_comment_line_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-comment-line.yml" >/dev/null 2>&1 || dr_comment_line_rc=$?
+is "a commented-out expression does not red a valid workflow" "0" "$dr_comment_line_rc"
+cat >"${WORK}/dr-apostrophe.yml" <<'YML'
+      - { name: x, if: github.event.comment.body == don't, run: echo hi }
+      - name: Rotate secrets
+        run: echo ok
+YML
+dr_apos_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-apostrophe.yml" >/dev/null 2>&1 || dr_apos_rc=$?
+is "an apostrophe inside a flow value does not open a quote" "0" "$dr_apos_rc"
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
