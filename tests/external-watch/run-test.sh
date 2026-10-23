@@ -237,7 +237,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=299
+MIN_CHECKS=301
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -741,6 +741,16 @@ is "repo-scope step has no dynamic vars[]/secrets[] indexing" "0" \
 # read of a watch name in any other step passed (`vars[format(...)]` split into
 # fragments). Scan every tracked workflow and script: a `vars` or `secrets`
 # context inside `${{ }}` or an `if:` may only be a literal `.NAME` read.
+#
+# This is a TEXT heuristic, not a YAML/expression parser. Disclosed limits, each
+# of which is a false-negative class rather than a red: (1) a `vars`/`secrets`
+# read hidden inside an expression string (e.g. `'{{ vars[...] }}'`) is ignored,
+# because string contents are not reads; (2) a value wrapped mid-token at depth
+# zero (a newline between `format(` and its argument, in a flow mapping) ends the
+# captured value; (3) a `#` inside a quoted string is kept, but a comment on the
+# same line after an unterminated quote may hide the rest of that line. The
+# tracked tree is asserted clean on every run, so a new limit shows up as a red
+# on the file that introduces it rather than as silence.
 cat >"${WORK}/dynread.py" <<'PY'
 import re
 import sys
@@ -760,11 +770,7 @@ def flow_if_values(text):
     for match in FLOW_IF.finditer(text):
         index, depth, quoted, escaped = match.end(), 0, False, False
         # a flow mapping may wrap: skip the separator whitespace (newlines too)
-        while index < len(text) and text[index].isspace() and text[index] != "\n":
-            index += 1
-        if index < len(text) and text[index] == "\n":
-            index += 1
-        while index < len(text) and text[index].isspace() and text[index] != "\n":
+        while index < len(text) and text[index].isspace():
             index += 1
         start = index
         while index < len(text):
@@ -794,6 +800,29 @@ def flow_if_values(text):
             index += 1
         values.append(text[start:index])
     return values
+
+
+def strip_comments(text):
+    """Drop YAML `#` comments (outside single/double quotes), keeping a `#`
+    that is part of a value."""
+    out, index, quote = [], 0, None
+    while index < len(text):
+        char = text[index]
+        if quote:
+            out.append(char)
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+            out.append(char)
+        elif char == "#" and (index == 0 or text[index - 1].isspace()):
+            while index < len(text) and text[index] != "\n":
+                index += 1
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
 
 
 def expressions(text):
@@ -847,6 +876,7 @@ offenders = []
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
+    text = strip_comments(text)
     exprs = expressions(text)
     exprs += if_values(text)
     exprs += flow_if_values(text)
@@ -958,6 +988,14 @@ printf '%s\n' '      - { name: x, if: format("a,b", vars[format(%s, %s)]) == %s,
 dr_flow_dq_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-dq.yml" >/dev/null 2>&1 || dr_flow_dq_rc=$?
 is "a double-quoted flow value may contain a comma" "1" "$dr_flow_dq_rc"
+printf '%s\n' "      - { name: x, if: \"a\" == 'a', run: echo hi }  # no secrets here" >"${WORK}/dr-comment.yml"
+dr_comment_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-comment.yml" >/dev/null 2>&1 || dr_comment_rc=$?
+is "a YAML comment mentioning secrets does not red a valid workflow" "0" "$dr_comment_rc"
+printf '%s\n' "      - { name: x, if:" "" "          vars[format('{0}', 'X')] == 'x', run: echo hi }" >"${WORK}/dr-flow-blank.yml"
+dr_flow_blank_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow-blank.yml" >/dev/null 2>&1 || dr_flow_blank_rc=$?
+is "a flow-map if: value may follow a blank line" "1" "$dr_flow_blank_rc"
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
