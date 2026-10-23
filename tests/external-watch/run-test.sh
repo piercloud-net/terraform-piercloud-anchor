@@ -182,6 +182,12 @@ def clauses(unit):
         index += 1
     if buf:
         out.append("".join(buf))
+    if ticks or depth:
+        # A unit with an unbalanced quote or parenthesis would suppress every
+        # later split (a qualifier could then ride along with the claim).
+        # Fall back to splitting everywhere: a malformed sentence is allowed
+        # to red, never to hide.
+        return [part for part in re.split(r"(?<=[.!?;])\s+", unit) if part]
     return out
 
 
@@ -218,7 +224,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=290
+MIN_CHECKS=294
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -726,12 +732,33 @@ cat >"${WORK}/dynread.py" <<'PY'
 import re
 import sys
 
-EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+EXPR = re.compile(r"\$\{\{", re.S)
+FLOW_IF = re.compile(r"""[,\{]\s*(?:"if"|'if'|if)[ \t]*:[ \t]*([^,}]*)""")
 IF_KEY = re.compile(r"""^([ \t-]*)(?:"if"|'if'|if)[ \t]*:[ \t]*(.*)$""")
 BLOCK = re.compile(r"^[|>](?:[1-9][+-]?|[+-][1-9]?)?$")
 QUOTED = re.compile(r"'(?:[^']|'')*'")
-CONTEXT = re.compile(r"(?<![A-Za-z0-9_.])(vars|secrets)\b")
+CONTEXT = re.compile(r"(?<![A-Za-z0-9_.])(vars|secrets)\b", re.I)
 LITERAL = re.compile(r"\s*\.\s*[A-Za-z_]")
+
+def expressions(text):
+    """Every `${{ … }}` body, ending at the first `}}` that is outside a
+    single-quoted string (a literal `}}` in a string must not end it)."""
+    found = []
+    for match in EXPR.finditer(text):
+        index, quoted = match.end(), False
+        while index < len(text):
+            char = text[index]
+            if char == "'":
+                if quoted and index + 1 < len(text) and text[index + 1] == "'":
+                    index += 2
+                    continue
+                quoted = not quoted
+            elif not quoted and text.startswith("}}", index):
+                found.append(text[match.end():index])
+                break
+            index += 1
+    return found
+
 
 def if_values(text):
     """Every `if:` value, including a folded block scalar whose condition
@@ -764,8 +791,9 @@ offenders = []
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
-    exprs = [m.group(1) for m in EXPR.finditer(text)]
+    exprs = expressions(text)
     exprs += if_values(text)
+    exprs += [m.group(1) for m in FLOW_IF.finditer(text)]
     for expr in exprs:
         flat = QUOTED.sub("''", expr)
         for m in CONTEXT.finditer(flat):
@@ -844,6 +872,20 @@ YML
 dr_indent_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-indent.yml" >/dev/null 2>&1 || dr_indent_rc=$?
 is "a block scalar with an indentation indicator is judged" "1" "$dr_indent_rc"
+printf '%s\n' '      - if: VARS[format(%s, %s)] == %s' "'{0}'" "'X'" "'x'" >"${WORK}/dr-case.yml"
+dr_case_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-case.yml" >/dev/null 2>&1 || dr_case_rc=$?
+is "an upper-case VARS context is refused (expression contexts are case-insensitive here)" "1" "$dr_case_rc"
+printf '%s\n' "      - { name: x, if: vars[format('{0}', 'X')] == 'x', run: echo hi }" >"${WORK}/dr-flow.yml"
+dr_flow_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-flow.yml" >/dev/null 2>&1 || dr_flow_rc=$?
+is "an if: inside a flow mapping is judged" "1" "$dr_flow_rc"
+cat >"${WORK}/dr-quote.yml" <<'YML'
+        run: echo "${{ 'a }}' || vars[format('{0}', 'X')] }}"
+YML
+dr_quote_rc=0
+python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-quote.yml" >/dev/null 2>&1 || dr_quote_rc=$?
+is "a literal }} inside a quoted string does not end the expression" "1" "$dr_quote_rc"
 dr_legal_rc=0
 python3 -I -B "${WORK}/dynread.py" "${WORK}/dr-legal.yml" >/dev/null 2>&1 || dr_legal_rc=$?
 is "literal vars/secrets reads stay green" "0" "$dr_legal_rc"
@@ -866,14 +908,18 @@ printf '%s\n' 'Tenant tags carry `v*` tags; not verified in this repo.' >"${WORK
 vs_semi_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-semi.md" >/dev/null 2>&1 || vs_semi_rc=$?
 is "a semicolon starts a new claim unit (the qualifier cannot be borrowed)" "1" "$vs_semi_rc"
-printf '%s\n' 'The gate (`ref; see docs`) is expected by the platform, not verified in this repo.' >"${WORK}/vstar-code.md"
+printf '%s\n' 'The `v*` gate (`ref; see docs`) is expected by the platform, not verified in this repo.' >"${WORK}/vstar-code.md"
 vs_code_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-code.md" >/dev/null 2>&1 || vs_code_rc=$?
 is "a semicolon inside a code span does not split the claim unit" "0" "$vs_code_rc"
-printf '%s\n' 'The gate (ref; see docs) is expected by the platform, not verified in this repo.' >"${WORK}/vstar-paren.md"
+printf '%s\n' 'The `v*` gate (ref; see docs) is expected by the platform, not verified in this repo.' >"${WORK}/vstar-paren.md"
 vs_paren_rc=0
 python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-paren.md" >/dev/null 2>&1 || vs_paren_rc=$?
 is "a semicolon inside a parenthesised aside does not split the claim unit" "0" "$vs_paren_rc"
+printf '%s\n' 'The `v*` rule follows the platform note (see below. not verified in this repo.' >"${WORK}/vstar-unbalanced.md"
+vs_unbal_rc=0
+python3 -I -B "${WORK}/vstar.py" "${WORK}/vstar-unbalanced.md" >/dev/null 2>&1 || vs_unbal_rc=$?
+is "an unbalanced parenthesis cannot silence the split (no false green)" "1" "$vs_unbal_rc"
 
 # ---- #208 round 2: behavioural drivers for the config + incident steps -----
 # Both steps run against stub gh/curl on PATH; every call is logged, so the
