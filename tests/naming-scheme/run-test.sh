@@ -3,7 +3,9 @@
 #
 # Guards issue #105 (flat tenant-suffix names: anchor-01-<tenant>) and the A2
 # 2026-09-30 nested dashboard (`<tenant>.status.piercloud.net`):
-#   (a) scripts/lib/naming.sh derivations + the D2 fail-closed username policy;
+#   (a) scripts/lib/naming.sh derivations + the D2 fail-closed username policy
+#       (shape = the dispatcher grammar ^[a-z0-9]{3,15}$, plus the reserved
+#       prefixes and the nine reserved platform names);
 #   (b) the console-fallback copy embedded in scripts/010-provision.sh between
 #       the BEGIN/END NAMING markers must stay byte-identical to the lib;
 #   (c) no tracked .sh/.tf/.md/.yml may still carry the legacy
@@ -79,6 +81,14 @@ expect_fail 'pcu123'
 expect_fail 'platform'    # #134: the platform-health hostname is reserved
 expect_fail 'platformer'  # prefix reservation, not just the exact name
 expect_fail 'abcdefghijklmnopqrstu' # 21 chars
+# #233 F3: the canonical validator carries the DISPATCHER's grammar
+# (^[a-z0-9]{3,15}$, pc-control registry.ValidateEnvName) instead of a wider
+# 1-20 one, so a console hand-run path cannot accept an alias the managed
+# dispatcher refuses. Both boundaries are pinned here.
+expect_fail 'ab'                    # below the floor the dispatcher enforces
+expect_fail 'a'
+expect_fail 'abcdefghijklmnop'      # 16 chars: past the dispatcher ceiling
+expect_pass 'abcdefghijklmno'       # 15 chars: the dispatcher ceiling itself
 expect_fail ''                      # empty
 expect_pass 'pier'
 expect_pass 'citest'
