@@ -28,9 +28,10 @@
 # accepted before #233's fold while the dispatcher refused it).
 # The reserved prefixes keep tenant names from masquerading as platform
 # labels and from colliding with the `pcu<random>` alias scheme. The nine
-# exact reserved names are pc-control's registry reserved set (the
-# `provision.yml` managed-input preflight carried them alone before #203;
-# they live here so every caller of the canonical validator refuses them).
+# exact reserved names are the reserved tenant names mirrored here from
+# pc-control's registry; the registry's reserved set is larger than these nine.
+# The `provision.yml` managed-input preflight carried them alone before #203;
+# they live here so every caller of the canonical validator refuses them.
 
 # --- BEGIN NAMING ---
 validate_tenant_username() { # $1 = lowercased RAW tenant username; 0 ok, 1 fail (message names the value)

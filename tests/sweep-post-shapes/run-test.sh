@@ -500,7 +500,7 @@ for cand in en_US.utf8 en_US.UTF-8 C.utf8 C.UTF-8; do
   if locale -a 2>/dev/null | grep -qx "$cand"; then UTF8_LOCALE="$cand"; break; fi
 done
 if [ -z "$UTF8_LOCALE" ]; then
-  skip 2 "e17 invalid-UTF-8 first byte (no UTF-8 locale installed)"
+  skip 3 "e17 invalid-UTF-8 first byte (no UTF-8 locale installed)"
 else
   printf 'NETCUP_SCP_ACCESS_TOKEN=\377A\n' > "$WORK/github_env.e17"
   E2E e17 sweep-post GITHUB_ENV="$WORK/github_env.e17" LANG="$UTF8_LOCALE" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=

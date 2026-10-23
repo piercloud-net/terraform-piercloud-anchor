@@ -32,7 +32,8 @@
 # spelled `vars` stay green while a real reference in the same place reds), the
 # structural pins (per-file `environment:` allowlist, device-flow's `needs:`/
 # no-`if:`, no `actions` permission scope, a single YAML document, an
-# unterminated expression), the nine exact reserved names asserted through the
+# unterminated expression, a bare `if:` read judged as an expression at job and
+# step level), the nine exact reserved names asserted through the
 # canonical validator the binding step sources, and the positive over-block
 # assertion (a valid tenant passes the preflight and the binding validator).
 # A check-count floor fails the harness if a case silently disappears.
@@ -54,7 +55,7 @@ pass=0
 fail=0
 # Check-count floor (external-watch pattern): a silently skipped case cannot
 # shrink this harness. Raise it with every case you add.
-MIN_CHECKS=121
+MIN_CHECKS=135
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 contains() { # $1 label, $2 needle, $3 haystack
@@ -236,6 +237,25 @@ mutant_why "quoted }} hides a bare secret in format()" release.yml "s.replace(\"
 green_case "a quoted }} hiding no context word" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q3:\\n    runs-on: ubuntu-latest\\n    env:\\n      X: \${{ '}}' == '}}' }}\\n    steps:\\n      - run: echo hi\\n\", 1)"
 mutant_why "a string left open (odd quote count)" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q4:\\n    runs-on: ubuntu-latest\\n    env:\\n      X: \${{ 'vars.NTFY_TOPIC }}\\n    steps:\\n      - run: echo hi\\n\", 1)" "unterminated"
 mutant_why "a nested \${{ inside a running expression" ci.yml 's.replace("  TOFU_VERSION: \"1.12.2\"\n", "  TOFU_VERSION: \"${{ vars.ANCHOR_ROLE ${{ vars.X }} }}\"\n", 1)' "unterminated"
+
+# --- issue #203 (seeded verify F1): a bare `if:` value is an expression ----
+# GitHub evaluates the whole `if:` value as an expression, bare or wrapped, so a
+# bare `secrets.X` / `vars.X` read there is judged like the `${{ }}` form. A quoted
+# string containing the context word is not a read. Each red is for its own rule.
+mutant_why "bare secret in a job-level if:" release.yml 's.replace("jobs:\n", "jobs:\n  f1a:\n    runs-on: ubuntu-latest\n    if: secrets.LEAK_TOKEN != \x27\x27\n    steps:\n      - run: echo hi\n", 1)' "ungated 'secrets' reference"
+mutant_why "bare vars in a step-level if:" release.yml 's.replace("jobs:\n", "jobs:\n  f1b:\n    runs-on: ubuntu-latest\n    steps:\n      - if: vars.LEAK_X != \x27\x27\n        run: echo hi\n", 1)' "ungated 'vars' reference"
+mutant_why "the wrapped form in if: stays red" release.yml 's.replace("jobs:\n", "jobs:\n  f1c:\n    runs-on: ubuntu-latest\n    if: ${{ secrets.LEAK_TOKEN != \x27\x27 }}\n    steps:\n      - run: echo hi\n", 1)' "ungated 'secrets' reference"
+mutant_why "an upper-case If: key is still judged" release.yml 's.replace("jobs:\n", "jobs:\n  f1d:\n    runs-on: ubuntu-latest\n    If: secrets.LEAK_TOKEN != \x27\x27\n    steps:\n      - run: echo hi\n", 1)' "ungated 'secrets' reference"
+mutant_why "a quote does not hide a later bare read" release.yml 's.replace("jobs:\n", "jobs:\n  f1e:\n    runs-on: ubuntu-latest\n    if: contains(\x27a\x27, secrets.LEAK_TOKEN)\n    steps:\n      - run: echo hi\n", 1)' "ungated 'secrets' reference"
+mutant_why "a mixed wrapped and bare if: fails closed" release.yml 's.replace("jobs:\n", "jobs:\n  f1f:\n    runs-on: ubuntu-latest\n    if: ${{ true }} && secrets.LEAK_TOKEN\n    steps:\n      - run: echo hi\n", 1)' "not one expression"
+mutant_why "a non-scalar if: fails closed" release.yml 's.replace("jobs:\n", "jobs:\n  f1g:\n    runs-on: ubuntu-latest\n    if:\n      secrets.LEAK_TOKEN: x\n    steps:\n      - run: echo hi\n", 1)' "non-scalar"
+mutant_why "bare TENANT_USER in a tenant-environment job stays red (no bare allowance)" provision.yml 's + "\n  f1h:\n    runs-on: ubuntu-latest\n    needs: [visibility-banner]\n    environment: ${{ inputs.tenant != \x27\x27 && inputs.tenant || \x27anchor\x27 }}\n    if: vars.TENANT_USER == \x27x\x27\n    steps:\n      - run: echo hi\n"' "ungated 'vars' reference"
+mutant_why "wrapped TENANT_USER in a tenant-environment job stays red" provision.yml 's + "\n  f1k:\n    runs-on: ubuntu-latest\n    needs: [visibility-banner]\n    environment: ${{ inputs.tenant != \x27\x27 && inputs.tenant || \x27anchor\x27 }}\n    if: ${{ vars.TENANT_USER == \x27x\x27 }}\n    steps:\n      - run: echo hi\n"' "ungated 'vars' reference"
+mutant_why "bare secret in a job with no environment" provision.yml 's + "\n  f1i:\n    runs-on: ubuntu-latest\n    if: secrets.NTFY_TOPIC\n    steps:\n      - run: echo hi\n"' "ungated 'secrets' reference"
+green_case "a bare github.ref if: (job level)" release.yml 's.replace("jobs:\n", "jobs:\n  f1j:\n    runs-on: ubuntu-latest\n    if: github.ref == \x27refs/heads/main\x27\n    steps:\n      - run: echo hi\n", 1)'
+green_case "a quoted secrets. string inside contains()" release.yml 's.replace("jobs:\n", "jobs:\n  f1l:\n    runs-on: ubuntu-latest\n    if: contains(\x27secrets.foo\x27, github.ref)\n    steps:\n      - run: echo hi\n", 1)'
+green_case "a bare DIRECT secret in a tenant-environment job" provision.yml 's + "\n  f1m:\n    runs-on: ubuntu-latest\n    needs: [visibility-banner]\n    environment: ${{ inputs.tenant != \x27\x27 && inputs.tenant || \x27anchor\x27 }}\n    if: secrets.NTFY_TOPIC\n    steps:\n      - run: echo hi\n"'
+green_case "the allowed TENANT_USER_FORM as a bare if:" provision.yml 's + "\n  f1n:\n    runs-on: ubuntu-latest\n    if: inputs.tenant != \x27\x27 && inputs.tenant || vars.TENANT_USER\n    steps:\n      - run: echo hi\n"'
 
 # --- PR #201 round 4 (issue #203): the new structural pins ----------------
 # F-1: a static `environment:` other than the tenant expression selects a

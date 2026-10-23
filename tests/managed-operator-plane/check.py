@@ -78,9 +78,14 @@ isolation is GitHub's environment / secret scoping plus the workflow text on
 the executed ref. A change that edits both the workflow and this pin passes
 it, and so does one that drops the ci.yml run step and updates the
 broker-provision-dns blob-hash pins in the same PR (a review control).
-The `secrets` / `vars` context scan is expression-scoped: only text inside a
-`${{ ... }}` expression is judged, so a `run:` line, a shell variable spelled
-`vars`, an unquoted date or `run: ./script` is not a false red. The slice
+The `secrets` / `vars` context scan is expression-scoped: the whole value of
+every `if:` key (GitHub evaluates it as an expression, bare or wrapped) and the
+text inside a `${{ ... }}` expression are judged; a `run:` line, a shell variable
+spelled `vars`, an unquoted date or `run: ./script` is not a false red. A bare
+`if:` value is judged as `${{ value }}`, so `if: secrets.X != ''` reds exactly
+like `if: ${{ secrets.X != '' }}`; a quoted string such as
+`contains('secrets.foo', x)` is not a read (quoted literal bodies are stripped
+before the context word is searched). The slice
 follows the runner's lexer (actions/runner `TemplateReader.cs`: `'` toggles
 in-string, `''` is an escaped quote inside a string, and `}}` closes an
 expression only OUTSIDE a string), so a `}}` inside a quoted literal does not
@@ -277,7 +282,7 @@ PINNED_JOBS = {
 FORBIDDEN_PERMISSIONS = {"actions"}
 
 # Any mention of either context as a word, in any case, INSIDE a `${{ ... }}`
-# expression (expressions() below). Text outside an expression is shell/prose:
+# expression or a bare `if:` value (judge() below). Other text is shell/prose:
 # a script variable spelled `vars`, a `run: ./script` line and a comment are
 # not references.
 CONTEXT = re.compile(r"(?i)(?<![A-Za-z0-9_])(secrets|vars)(?![A-Za-z0-9_])")
@@ -332,6 +337,100 @@ def expressions(value):
             return out, True
         out.append(value[start : end + 2])
         i = end + 2
+
+
+def strip_literals(text):
+    """`text` with the body of every single-quoted literal removed.
+
+    Mirrors expression_end: a quote opens a string and `''` inside one is an
+    escaped quote. The context word in `contains('secrets.foo', x)` sits inside
+    a literal, so it is not a read. An unterminated string keeps its remainder
+    verbatim, so a word after an open quote is still judged (fail closed).
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] != "'":
+            out.append(text[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            if text[j] == "'":
+                if text.startswith("''", j):
+                    j += 2
+                    continue
+                break
+            j += 1
+        if j >= n:
+            out.append(text[i:])
+            break
+        out.append("''")
+        i = j + 1
+    return "".join(out)
+
+
+def wrap_if(value):
+    """A bare `if:` value as one `${{ ... }}` expression, or None.
+
+    GitHub evaluates `if:` as an expression, so the whole value is the body.
+    A value already wrapped as one expression is unwrapped first. A nested
+    opener, or a `}}` closing early outside a string, means this scan and
+    GitHub may disagree: None, so the caller fails closed.
+    """
+    s = value.strip()
+    if s.startswith("${{") and expression_end(s, 3) == len(s) - 2:
+        s = s[3:-2].strip()
+    if "${{" in s:
+        return None
+    wrapped = "${{ %s }}" % s
+    if expression_end(wrapped, 3) != len(wrapped) - 2:
+        return None
+    return wrapped
+
+
+def if_values(doc):
+    """Value node of every `if:` key (any case) of every mapping in the document."""
+    for n in all_nodes(doc, set()):
+        if isinstance(n, yaml.MappingNode):
+            for k, v in n.value:
+                if isinstance(k, yaml.ScalarNode) and k.value.strip().lower() == "if":
+                    yield v
+
+
+def judge(path, node, expr, allowed):
+    """Findings for one expression. Allowed forms are removed from the EXACT
+    source text first (so `|| 'x'` cannot be stripped into the empty-string
+    form), then literal bodies are stripped, then context words are searched.
+    """
+    rest = expr
+    # Longest first: the probe and gated forms embed the bare form.
+    for form in sorted(set(ALLOWED + allowed), key=len, reverse=True):
+        rest = rest.replace(form, "")
+    rest = strip_literals(rest)
+    out = []
+    for m in CONTEXT.finditer(rest):
+        out.append(
+            "%s:%d: ungated '%s' reference: %r"
+            % (path, node.start_mark.line + 1, m.group(1),
+               rest[max(0, m.start() - 30) : m.end() + 30].replace("\n", " "))
+        )
+    return out
+
+
+def if_findings(path, ifs, extra):
+    """Each `if:` value judged whole as an expression; refusals fail closed."""
+    findings = []
+    for v in ifs:
+        line = v.start_mark.line + 1
+        if not isinstance(v, yaml.ScalarNode):
+            findings.append("%s:%d: non-scalar `if:` value (refusing: fail closed)" % (path, line))
+            continue
+        wrapped = wrap_if(v.value)
+        if wrapped is None:
+            findings.append("%s:%d: `if:` value is not one expression (refusing: fail closed)" % (path, line))
+            continue
+        findings.extend(judge(path, v, wrapped, extra.get(id(v), [])))
+    return findings
 
 
 def scalars(node, seen):
@@ -725,18 +824,16 @@ def check_file(path):
         # A managed run can never execute this workflow: its references are
         # the operator's own values by construction.
         return findings
+    # A bare `if:` value is judged whole (if_findings); the `${{ }}` scan skips
+    # those nodes so no value is judged twice.
+    ifs = [v for doc in docs if doc is not None for v in if_values(doc)]
+    findings.extend(if_findings(path, ifs, extra))
+    if_ids = {id(v) for v in ifs}
     for node in nodes:
+        if id(node) in if_ids:
+            continue
         for expr in exprs_of[id(node)][0]:
-            rest = expr
-            # Longest first: the probe and gated forms embed the bare form.
-            for form in sorted(set(ALLOWED + extra.get(id(node), [])), key=len, reverse=True):
-                rest = rest.replace(form, "")
-            for m in CONTEXT.finditer(rest):
-                line = node.start_mark.line + 1
-                findings.append(
-                    "%s:%d: ungated '%s' reference: %r"
-                    % (path, line, m.group(1), rest[max(0, m.start() - 30) : m.end() + 30].replace("\n", " "))
-                )
+            findings.extend(judge(path, node, expr, extra.get(id(node), [])))
     return findings
 
 
