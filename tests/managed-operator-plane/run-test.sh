@@ -54,7 +54,7 @@ pass=0
 fail=0
 # Check-count floor (external-watch pattern): a silently skipped case cannot
 # shrink this harness. Raise it with every case you add.
-MIN_CHECKS=107
+MIN_CHECKS=121
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 contains() { # $1 label, $2 needle, $3 haystack
@@ -224,6 +224,19 @@ green_case "a shell variable spelled vars" release.yml 's.replace("jobs:\n", "jo
 mutant_why "bare secret inside a run: block" release.yml 's.replace("jobs:\n", "jobs:\n  g5:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{ secrets.NTFY_TOPIC }}\"\n", 1)' "ungated 'secrets' reference"
 mutant_why "unterminated expression" ci.yml 's.replace("  TOFU_VERSION: \"1.12.2\"\n", "  TOFU_VERSION: \"${{ vars.ANCHOR_ROLE \"\n", 1)' "unterminated"
 
+# --- the expression slice follows the runner's string lexer -----------------
+# actions/runner (TemplateReader.cs) closes an expression only at a `}}`
+# OUTSIDE a single-quoted string, and `''` is an escaped quote in-string. A
+# slice that stops at the first `}}` anywhere hides everything after a quoted
+# one: the finding's payload keeps its context word past the quote and the pin
+# stayed green (r5 trust/functional/red-team F1). Each shape below is red for
+# its own rule, and a benign quoted `}}` stays green (no over-refusal).
+mutant_why "quoted }} hides a bare vars reference" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q1:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - run: curl -s 'https://example.invalid/x?u=\${{ '}}' == 'x' && 1 || vars.TENANT_USER }}'\\n\", 1)" "ungated 'vars' reference"
+mutant_why "quoted }} hides a bare secret in format()" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q2:\\n    runs-on: ubuntu-latest\\n    env:\\n      T: \${{ format('}} {0}', secrets.NTFY_TOKEN) }}\\n    steps:\\n      - run: echo hi\\n\", 1)" "ungated 'secrets' reference"
+green_case "a quoted }} hiding no context word" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q3:\\n    runs-on: ubuntu-latest\\n    env:\\n      X: \${{ '}}' == '}}' }}\\n    steps:\\n      - run: echo hi\\n\", 1)"
+mutant_why "a string left open (odd quote count)" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q4:\\n    runs-on: ubuntu-latest\\n    env:\\n      X: \${{ 'vars.NTFY_TOPIC }}\\n    steps:\\n      - run: echo hi\\n\", 1)" "unterminated"
+mutant_why "a nested \${{ inside a running expression" ci.yml 's.replace("  TOFU_VERSION: \"1.12.2\"\n", "  TOFU_VERSION: \"${{ vars.ANCHOR_ROLE ${{ vars.X }} }}\"\n", 1)' "unterminated"
+
 # --- PR #201 round 4 (issue #203): the new structural pins ----------------
 # F-1: a static `environment:` other than the tenant expression selects a
 # shared environment for a managed run (the broker refuses the write; the pin
@@ -235,6 +248,20 @@ mutant_why "device-flow needs replaced" provision.yml 's.replace("    needs: [vi
 mutant_why "device-flow gains a benign if:" provision.yml 's.replace("    needs: [visibility-banner]\n", "    needs: [visibility-banner]\n    if: inputs.mode != '"'"'never'"'"'\n", 1)' "if: must be exactly"
 mutant_why "job-level actions: read" provision.yml 's.replace("    permissions:\n      contents: read\n      id-token: write\n", "    permissions:\n      contents: read\n      id-token: write\n      actions: read\n", 1)' 'the `actions` scope'
 mutant_why "multi-document workflow" provision.yml 's + "---\nx: 1\n"' "YAML documents"
+# F-4: the `environment:`/`permissions:`/`if:` locators match their KEY
+# case-insensitively, so a case variant is judged instead of skipped. GitHub's
+# schema is case-sensitive (a `Environment:` cannot execute), so this is
+# consistency with the file's own case-insensitive assumption, not an
+# allowance: the tenant-environment read allowance stays exact, so a
+# case-variant environment job still reds on its bare reads.
+mutant_why "case-variant Environment: anchor" provision.yml 's + "\n  s2:\n    runs-on: ubuntu-latest\n    Environment: anchor\n    steps:\n      - run: echo hi\n"' "is not one of the pinned expressions"
+mutant_why "case-variant job Permissions: actions" provision.yml 's.replace("    needs: [visibility-banner]\n", "    needs: [visibility-banner]\n    Permissions:\n      actions: read\n", 1)' 'the `actions` scope'
+mutant_why "case-variant If: always()" provision.yml 's.replace("    needs: [visibility-banner]\n", "    needs: [visibility-banner]\n    If: always()\n", 1)' "if: must be exactly"
+# F-7: a workflow with no workflow-level `permissions:` is not inspected at
+# all — it inherits the repository/org default token scopes, so `actions: read`
+# could be live with every other check green. Every committed workflow declares
+# one; dropping it reds the declaration rule (and nothing else).
+mutant_why "workflow-level permissions block removed" provision.yml 's.replace("permissions:\n  contents: read\n\njobs:\n", "jobs:\n", 1)' "must declare exactly one workflow-level"
 
 # --- operator-only is an explicit named list, checked structurally too ----
 # r1 red-team F1: a structural guess exempted a reusable callee with no
@@ -243,6 +270,8 @@ mutant_why "multi-document workflow" provision.yml 's + "---\nx: 1\n"' "YAML doc
 mkdir -p "$WORK/op"
 cat > "$WORK/op/callee.yml" <<'YML'
 on: workflow_dispatch
+permissions:
+  contents: read
 jobs:
   a:
     runs-on: ubuntu-latest
@@ -289,9 +318,16 @@ if out="$(run_binding envproof envproof 123456)"; then ok "provisioned managed r
 if out="$(run_binding '' '' '')"; then ok "operator run unaffected by the managed check"; else bad "operator run refused: $out"; fi
 if out="$(run_binding envproof other 123456)"; then bad "marker mismatch passes"; else ok "marker mismatch still refused"; fi
 
-# --- issue #203: the nine reserved names live in the canonical validator ---
-# Only `scripts/lib/naming.sh` may carry the list: the binding step sources
-# the lib (never a copy), so these cases red if the list is removed from the
+# --- issue #203/#233: the nine reserved names live in the canonical validator ---
+# The reserved list is pinned in ONE place by content equality: the block
+# between the `# --- BEGIN/END NAMING ---` markers in `scripts/lib/naming.sh`
+# must equal the block embedded in `scripts/010-provision.sh` (the console
+# fallback), asserted by tests/naming-scheme/run-test.sh section (b). The
+# copies in `provision.yml`'s managed-input preflight and in
+# `external-watch.yml`'s alias loop are behavioural only: no harness byte-
+# compares them, so edit all three lists together (nothing here reds a drift
+# between them — that residual is review-only). The binding step sources the
+# lib (never a copy), so these cases red if the list is removed from the
 # canonical validator even though the provision.yml preflight still has it.
 for reserved in edge console ops keys unlock bounce mail broker www; do
   if out="$(run_binding "$reserved" "$reserved" 123456)"; then
@@ -328,6 +364,23 @@ if out="$(run_pair pcuabc12345)"; then
 else
   contains "the reserved alias 'pcuabc12345' is refused by the reserved prefix" "reserved prefix" "$out"
 fi
+# --- issue #233 F3: the two grammars agree on the boundary -----------------
+# `naming.sh` used to enforce ^[a-z0-9]{1,20}$ while the dispatcher enforces
+# 3-15, so a console hand-run path accepted `ab` and 16-20-char aliases the
+# dispatcher refuses. The canonical validator now carries the dispatcher
+# grammar; these are the boundary cases, proven through the REAL binding step
+# (not the preflight, which would refuse first and hide the disagreement).
+LONG16="$(printf 'a%.0s' {1..16})"
+LONG15="$(printf 'a%.0s' {1..15})"
+for name in ab "$LONG16"; do
+  if out="$(run_binding "$name" "$name" 123456)"; then
+    bad "canonical validator accepts '$name' (the dispatcher's 3-15 grammar refuses it)"
+  else
+    contains "canonical validator refuses '$name' (dispatcher grammar)" "not a valid tenant name" "$out"
+  fi
+  if out="$(run_pair "$name")"; then bad "the preflight accepts '$name'"; else ok "the preflight refuses '$name' too (both grammars agree)"; fi
+done
+if out="$(run_binding "$LONG15" "$LONG15" 123456)"; then ok "canonical validator accepts a 15-char alias (top of the dispatcher grammar)"; else bad "15-char alias refused: $(printf '%s' "$out" | head -n1)"; fi
 
 # --- behavior: the real repo-scope step (issue #204) ----------------------
 python3 -I -B - "$PROV" "$WORK/scope.sh" "$WORK/probes.txt" <<'PY'

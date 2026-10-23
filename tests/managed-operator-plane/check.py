@@ -80,15 +80,37 @@ it, and so does one that drops the ci.yml run step and updates the
 broker-provision-dns blob-hash pins in the same PR (a review control).
 The `secrets` / `vars` context scan is expression-scoped: only text inside a
 `${{ ... }}` expression is judged, so a `run:` line, a shell variable spelled
-`vars`, an unquoted date or `run: ./script` is not a false red, while an
-unterminated `${{` opener fails closed (this scan and GitHub's parser would
-disagree about it).
+`vars`, an unquoted date or `run: ./script` is not a false red. The slice
+follows the runner's lexer (actions/runner `TemplateReader.cs`: `'` toggles
+in-string, `''` is an escaped quote inside a string, and `}}` closes an
+expression only OUTSIDE a string), so a `}}` inside a quoted literal does not
+end the expression and hide the rest: `${{ '}}' == 'x' && 1 ||
+secrets.NTFY_TOKEN }}` is judged whole. Anything where this scan and GitHub's
+parser would diverge fails closed — an opener whose `}}` is not found outside a
+string, a string left open to the end of the value (an odd quote count), and a
+second `${{` inside a running expression.
+
+The `environment:`, `permissions:` and `if:` pins match their KEY
+case-insensitively (`mget_ci`: GitHub's own schema is case-sensitive, so a
+`Environment:`/`Permissions:`/`If:` spelling cannot execute — judging it is
+consistency with this file's own assumption that case variants are reachable,
+never an allowance. A case variant gains no allowance: the tenant-environment
+read allowance stays exact, so a case-variant environment job reds on its bare
+reads). The pinned VALUES stay exact literals.
+
+Every workflow file must declare exactly one workflow-level `permissions:`
+mapping: `permission_findings` can only refuse the `actions` scope in a block
+that exists, so an undeclared workflow would inherit the repository/org
+default token scopes without any pin edit. All seven workflows declare one
+(the pin fails closed if a new file does not).
 
 Residuals: the allowed forms are a set of literals, not bound per name (a
 gated name may use another name's gated form; a managed run still resolves
 empty) — the per-name binding is disclosed, not closed; scripts are not
-scanned (reading repo variables through the API needs `actions: read`, which
-no job and no workflow grants, so the route needs a reviewed pin update);
+scanned — reading repo variables through the API needs `actions: read`, no
+declared `permissions:` block at job or workflow level may grant it, and every
+workflow must declare one, so the route needs a reviewed pin edit (both the
+scope refusal and the declaration);
 repository-level `MANAGED_TENANT` / `TENANT_CUSTOMER_NUMBER` are refused by
 the banner's repo-scope step, not by a repo-level name check (that check lives
 in the pc-lifecycle verify run and needs API credentials, so it is disclosed
@@ -261,19 +283,52 @@ FORBIDDEN_PERMISSIONS = {"actions"}
 CONTEXT = re.compile(r"(?i)(?<![A-Za-z0-9_])(secrets|vars)(?![A-Za-z0-9_])")
 
 
-def expressions(value):
-    """(list of `${{ ... }}` texts, unterminated?) for one scalar value.
+def expression_end(value, i):
+    """Index of the `}}` closing an expression whose body starts at i, or None.
 
-    Only expression text is judged: an opener with no closer returns True so
-    the caller fails closed (this scan would not see what GitHub parses).
+    Mirrors actions/runner's TemplateReader (TemplateReader.cs): a single quote
+    toggles in-string, `''` is an escaped quote INSIDE a string, and `}}` closes
+    the expression only when not in-string. A string left open, or a second
+    `${{` before the closer, means this scan and GitHub's parser disagree about
+    where the expression ends: returns None so the caller fails closed.
+    """
+    in_string = False
+    while i < len(value):
+        c = value[i]
+        if in_string:
+            if c == "'":
+                if value.startswith("''", i):
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if c == "'":
+            in_string = True
+            i += 1
+            continue
+        if value.startswith("}}", i):
+            return i
+        if value.startswith("${{", i):
+            return None
+        i += 1
+    return None
+
+
+def expressions(value):
+    """(list of `${{ ... }}` texts, divergence?) for one scalar value.
+
+    Only expression text is judged. Divergence is True when the slice cannot be
+    trusted — no `}}` outside a string, a string left open, or a nested `${{` —
+    so the caller fails closed (this scan would not see what GitHub parses).
     """
     out, i = [], 0
     while True:
         start = value.find("${{", i)
         if start < 0:
             return out, False
-        end = value.find("}}", start + 3)
-        if end < 0:
+        end = expression_end(value, start + 3)
+        if end is None:
             return out, True
         out.append(value[start : end + 2])
         i = end + 2
@@ -341,6 +396,19 @@ def mget(node, key):
     if not isinstance(node, yaml.MappingNode):
         return []
     return [v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == key]
+
+
+def mget_ci(node, key):
+    """mget with a case-insensitive KEY match (`environment`, `permissions`, `if`).
+
+    GitHub's schema is case-sensitive, so a case variant cannot execute. These
+    three locators match it anyway: a case variant must be judged, never
+    skipped. It gains no allowance — the tenant-environment read allowance is
+    matched exactly — so judging it only ever adds scrutiny (fail closed).
+    """
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    return [v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value.lower() == key]
 
 
 def jobs_of(doc):
@@ -515,7 +583,7 @@ def environment_findings(path, doc):
     findings = []
     allowed = ENVIRONMENT_ALLOWED.get(os.path.basename(path), set())
     for name, node in [("<workflow>", doc)] + list(jobs_of(doc)):
-        for value in mget(node, "environment"):
+        for value in mget_ci(node, "environment"):
             got = value.value if isinstance(value, yaml.ScalarNode) else None
             if got is None or got not in allowed:
                 findings.append(
@@ -541,17 +609,27 @@ def job_pin_findings(path, doc):
             needs.extend(lst if lst is not None else ["<non-scalar>"])
         if needs != want["needs"]:
             findings.append("%s: job %r needs: must be exactly %r (got %r)" % (path, name, want["needs"], needs))
-        conds = [c.value if isinstance(c, yaml.ScalarNode) else None for c in mget(jobs[0], "if")]
+        conds = [c.value if isinstance(c, yaml.ScalarNode) else None for c in mget_ci(jobs[0], "if")]
         if conds != ([] if want["if"] is None else [want["if"]]):
             findings.append("%s: job %r if: must be exactly %r (got %r)" % (path, name, want["if"], conds))
     return findings
 
 
 def permission_findings(path, doc):
-    """No job, and no workflow, may grant the `actions` scope."""
+    """No job, and no workflow, may grant the `actions` scope — and the workflow declares one."""
     findings = []
+    declared = mget_ci(doc, "permissions")
+    # A block this pin cannot see is a block it cannot refuse: a workflow with
+    # no workflow-level `permissions:` inherits the repository/org default token
+    # scopes, so `actions: read` could be live while every check here stays
+    # green. Every committed workflow declares one; a new file must too.
+    if len(declared) != 1 or not isinstance(declared[0], yaml.MappingNode):
+        findings.append(
+            "%s: <workflow> must declare exactly one workflow-level `permissions:` mapping (no block would inherit the repository default token scopes unscanned)"
+            % path
+        )
     for name, node in [("<workflow>", doc)] + list(jobs_of(doc)):
-        for value in mget(node, "permissions"):
+        for value in mget_ci(node, "permissions"):
             if not isinstance(value, yaml.MappingNode):
                 findings.append(
                     "%s: %s permissions: must be a mapping that does not grant the `actions` scope (got %r)"
