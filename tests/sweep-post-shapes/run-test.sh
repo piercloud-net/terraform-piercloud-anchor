@@ -45,11 +45,13 @@
 # Issue #200 (exact names): the filter is no longer a stub here — the REAL
 # list_steady_policies runs over the raw /firewall-policies response, so
 # cases c10/c10b/c11 pin the whole chain. STUB_STEADY is the API body; a
-# sibling server's policy whose name only SHARES this server's suffix
-# (piercloud-anchor-staging-anchor-01-pier, and the legacy
-# ...-staging-...-<this id> form) must be dropped by the filter and never
-# detached/deleted in any mode, while the live policy stays and a genuine
-# EXACT orphan is still retired in apply mode.
+# sibling server's policy whose name shares this server's HOSTNAME suffix
+# (piercloud-anchor-staging-anchor-01-pier), a sibling's legacy name that
+# carries the SIBLING's id (...-staging-pier-777), and a foreign name that
+# ends with THIS server's id (piercloud-anchor-a.pcad.it-424242 — the retired
+# `endswith(-<server id>)` arm's witness) must all be dropped by the filter
+# and never detached/deleted in any mode, while the live policy stays and a
+# genuine EXACT orphan is still retired in apply mode.
 #
 # Real cmd_sweep_post / policy_age / close_policy / sweep_* are exercised;
 # only the API boundary (list/detach/delete) and logging are stubbed — no
@@ -72,7 +74,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=163
+MIN_CHECKS=166
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -152,6 +154,12 @@ STEADY_FOREIGN='{"id":44,"name":"piercloud-anchor-staging-anchor-01-pier","descr
 # A sibling's pre-#121 name carries the SIBLING's id (777), not ours; the
 # exact-name filter drops it either way.
 STEADY_FOREIGN_LEGACY='{"id":46,"name":"piercloud-anchor-anchor-01-staging-pier-777","description":""}'
+# A foreign name that ENDS with THIS server's id (the issue's `eu-a.pcad.it`
+# vs `a.pcad.it` shape, carrying our id): only the retired
+# `endswith(-<server id>)` arm matched it, so it is that arm's end-to-end
+# witness — with this entry present an arm that still suffix-matches the id
+# detaches+deletes id 47, which reds c10/c10b/c11 below.
+STEADY_FOREIGN_ID='{"id":47,"name":"piercloud-anchor-a.pcad.it-424242","description":""}'
 
 # The shipped STEADY_PREFIX (eval'd, not a copy).
 eval "$(grep -E '^STEADY_PREFIX=' "$SCRIPT")"
@@ -203,33 +211,37 @@ is "c5c actions (legacy live kept)" "" "$(ACTIONS c5c)"
 is "c5c kept log" "1" "$(grep -c 'is attached — kept' "$WORK/out.c5c" || true)"
 
 # ---- #200: a suffix-sharing FOREIGN policy is never retired --------------
-# Same account, another server: both foreign names share this server's
-# hostname / server-id suffix, so the retired suffix filter returned them,
-# they read as unattached here (the attached list is THIS server's interface)
-# and apply-mode close_policy detached+deleted another server's live policy.
-# This block runs the REAL list_steady_policies over the raw response:
-# it must drop both foreign entries before cmd_sweep_post ever sees them.
-FOREIGN_RESPONSE="[{\"id\":42,\"name\":\"piercloud-anchor-anchor-01-pier\",\"description\":\"\"},$STEADY_FOREIGN,$STEADY_FOREIGN_LEGACY]"
+# Same account, another server: the foreign names share this server's
+# hostname suffix or the id suffix the old filter matched, so the retired
+# suffix filter returned them, they read as unattached here (the attached
+# list is THIS server's interface) and apply-mode close_policy
+# detached+deleted another server's live policy. This block runs the REAL
+# list_steady_policies over the raw response: it must drop every foreign
+# entry before cmd_sweep_post ever sees them.
+FOREIGN_RESPONSE="[{\"id\":42,\"name\":\"piercloud-anchor-anchor-01-pier\",\"description\":\"\"},$STEADY_FOREIGN,$STEADY_FOREIGN_LEGACY,$STEADY_FOREIGN_ID]"
 # c10 apply: this server's live policy is kept and NEITHER foreign entry is
 # listed, let alone detached — the API response carries all three.
 rc="$(RC_OF c10 "[]" '{"userPolicies":[42]}' "$FOREIGN_RESPONSE")"
 is "c10 rc" "0" "$rc"
 is "c10 actions (foreign untouched, live kept, nothing swept)" "" "$(ACTIONS c10)"
-is "c10 foreign name never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier' "$WORK/out.c10" || true)"
+is "c10 foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier|a\.pcad\.it-424242' "$WORK/out.c10" || true)"
+is "c10 id-suffix foreign not detached" "0" "$(printf '%s' "$(ACTIONS c10)" | grep -cE '(detach|delete) 47' || true)"
 is "c10 live kept" "1" "$(grep -c 'is attached — kept' "$WORK/out.c10" || true)"
 # c10b apply: a genuine EXACT orphan (legacy name, unattached) is retired in
 # the same response — the fix narrows scope, it does not stop sweeping.
-FOREIGN_ORPHAN_RESPONSE="[$STEADY_FOREIGN,{\"id\":45,\"name\":\"piercloud-anchor-anchor-01-pier-424242\",\"description\":\"\"},$STEADY_FOREIGN_LEGACY]"
+FOREIGN_ORPHAN_RESPONSE="[$STEADY_FOREIGN,{\"id\":45,\"name\":\"piercloud-anchor-anchor-01-pier-424242\",\"description\":\"\"},$STEADY_FOREIGN_LEGACY,$STEADY_FOREIGN_ID]"
 rc="$(RC_OF c10b "[]" '{"userPolicies":[]}' "$FOREIGN_ORPHAN_RESPONSE")"
 is "c10b rc" "0" "$rc"
 is "c10b actions (only the exact orphan retired)" "detach 45 delete 45" "$(ACTIONS c10b)"
-is "c10b foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier' "$WORK/out.c10b" || true)"
+is "c10b foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier|a\.pcad\.it-424242' "$WORK/out.c10b" || true)"
+is "c10b id-suffix foreign not detached" "0" "$(printf '%s' "$(ACTIONS c10b)" | grep -cE '(detach|delete) 47' || true)"
 # c11 check mode: report-only, and the foreign policy is not even reported as
 # a would-be sweep — a check run must not advertise a sibling's policy.
 rc="$(RC_OF c11 "[]" '{"userPolicies":[42]}' "$FOREIGN_ORPHAN_RESPONSE" check)"
 is "c11 rc" "0" "$rc"
 is "c11 actions (report-only mutates nothing)" "" "$(ACTIONS c11)"
-is "c11 foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier' "$WORK/out.c11" || true)"
+is "c11 foreign names never listed" "0" "$(grep -cE 'staging-anchor-01-pier|anchor-01-staging-pier|a\.pcad\.it-424242' "$WORK/out.c11" || true)"
+is "c11 id-suffix foreign not reported" "0" "$(grep -cE 'piercloud-anchor-a\.pcad\.it-424242' "$WORK/out.c11" || true)"
 is "c11 exact orphan still reported" "1" "$(grep -c "REPORT-ONLY.*piercloud-anchor-anchor-01-pier-424242" "$WORK/out.c11" || true)"
 
 # ---- case 6: tmp orphan (no parseable created_at) still retired in apply ----
