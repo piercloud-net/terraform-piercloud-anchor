@@ -68,12 +68,12 @@
 # so every e2e case also runs inside `unshare -rn` where the kernel allows it
 # (skipped cleanly otherwise; issue #199).
 #
-# Issue #199 (follow-ups of the same rounds): e11b an unreadable regular-file
-# $GITHUB_ENV (skipped under root), e13 a one-character handoff token, e14 a
-# $GITHUB_ENV path that cannot be stat'ed (held, never the clean no-op), e15 an
-# `XNETCUP_SCP_ACCESS_TOKEN=x` line (not a handoff token), e16 no token with an
-# empty RUN_ID, e17 a handoff token whose first byte is invalid UTF-8 under a
-# UTF-8 locale.
+# Issue #199 (follow-ups of the same rounds): e11b a $GITHUB_ENV that exists
+# but cannot be read (a symlink loop: privilege-independent), e13 a
+# one-character handoff token, e14 a $GITHUB_ENV path that cannot be stat'ed
+# (held, never the clean no-op), e15 an `XNETCUP_SCP_ACCESS_TOKEN=x` line (not
+# a handoff token), e16 no token with an empty RUN_ID, e17 a handoff token
+# whose first byte is invalid UTF-8 under a UTF-8 locale.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -86,10 +86,14 @@ fail=0
 skipped=0
 # Check-count floor (external-watch pattern): a silently skipped case cannot
 # shrink this harness. Raise it with every case you add.
-MIN_CHECKS=187
+MIN_CHECKS=189
 ok()   { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad()  { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
-skip() { skipped=$((skipped + 1)); printf 'SKIP %s\n' "$1"; }
+# skip N LABEL: a skipped block crediting N checks (the count it WOULD have
+# run). Issue #233 F3: crediting one per block reds the floor on any legitimate
+# skip, because a block carries 2-4 checks (sweep 184 < 186 as root;
+# scp-token-refresh 45 < 48). The credit is explicit and loud.
+skip() { skipped=$((skipped + $1)); printf 'SKIP %s\n' "$2"; }
 is()  { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
@@ -391,7 +395,7 @@ if command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; then
   NETNS=(unshare -rn)
   ok "e2e cases run inside \`unshare -rn\` (absolute-path binaries get no network)"
 else
-  skip "unshare -rn network-namespace backstop (not available here)"
+  skip 1 "unshare -rn network-namespace backstop (not available here)"
 fi
 E2E() { # $1 label, $2 command, then VAR=value env assignments
   local l="$1" cmd="$2"
@@ -457,19 +461,19 @@ is "e6 sweep-pre no token + no ids rc 1" "1" "$rc"
 is "e6 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e6" || true)"
 
 # ---- issue #199 (PR #197 lens rounds): the token-held edges ---------------
-# e11b: an UNREADABLE regular file holding a token is HELD, not absent — the
-# case a mutant adding `&& [ -r "$GITHUB_ENV" ]` must fail. Root reads a
-# mode-000 file anyway, so skip there (e11's directory covers it).
-if [ "$(id -u)" -eq 0 ]; then
-  skip "e11b unreadable regular-file GITHUB_ENV (root reads mode 000)"
-else
-  printf 'NETCUP_SCP_ACCESS_TOKEN=AT\n' > "$WORK/github_env.e11b"
-  chmod 000 "$WORK/github_env.e11b"
-  E2E e11b sweep-post GITHUB_ENV="$WORK/github_env.e11b" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
-  is "e11b unreadable GITHUB_ENV + empty SERVER_ID rc 1" "1" "$rc"
-  is "e11b guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e11b" || true)"
-  chmod 600 "$WORK/github_env.e11b"
-fi
+# e11b: a $GITHUB_ENV path that EXISTS but cannot be READ is HELD, not
+# absent — the case a mutant adding `&& [ -r "$GITHUB_ENV" ]` must fail. A
+# symlink loop (a link to itself) is that shape privilege-independently:
+# `[ -r ]` is false and grep returns rc 2 for root and non-root alike. A
+# mode-000 regular file does NOT give it: every e2e case runs inside
+# `unshare -rn`, where the process is uid 0 with CAP_DAC_OVERRIDE, so the
+# mode-000 file stays readable and the `[ -r ]` mutant survived (issue #233
+# F2). e11 (a directory) covers the grep-rc-2 class, e11b the stat-able but
+# unreadable one.
+ln -s "$WORK/github_env.e11b" "$WORK/github_env.e11b"
+E2E e11b sweep-post GITHUB_ENV="$WORK/github_env.e11b" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
+is "e11b unreadable GITHUB_ENV (symlink loop) + empty SERVER_ID rc 1" "1" "$rc"
+is "e11b guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e11b" || true)"
 # e13: a ONE-character token is a token — the handoff pattern is `=.`, not
 # `=..` (a `=..` mutant must fail this).
 printf 'NETCUP_SCP_ACCESS_TOKEN=A\n' > "$WORK/github_env.e13"
@@ -496,7 +500,7 @@ for cand in en_US.utf8 en_US.UTF-8 C.utf8 C.UTF-8; do
   if locale -a 2>/dev/null | grep -qx "$cand"; then UTF8_LOCALE="$cand"; break; fi
 done
 if [ -z "$UTF8_LOCALE" ]; then
-  skip "e17 invalid-UTF-8 first byte (no UTF-8 locale installed)"
+  skip 2 "e17 invalid-UTF-8 first byte (no UTF-8 locale installed)"
 else
   printf 'NETCUP_SCP_ACCESS_TOKEN=\377A\n' > "$WORK/github_env.e17"
   E2E e17 sweep-post GITHUB_ENV="$WORK/github_env.e17" LANG="$UTF8_LOCALE" NETCUP_SCP_ACCESS_TOKEN= SERVER_ID= SCP_USER_ID=
@@ -504,7 +508,19 @@ else
   is "e17 guard message" "1" "$(grep -c 'A1 FAIL: SERVER_ID is required' "$WORK/e2e.e17" || true)"
 fi
 
+# --- the skip credit is per CHECK, not per block (issue #233 F3) -----------
+# A skipped block credits the number of checks it would have run. The credit
+# is what keeps the floor meaningful, so both directions are pinned: the right
+# credit for a 2-check block stays green and the pre-fix one-per-block credit
+# reds. floor_verdict is the harness's own comparison.
+floor_verdict() { # $1 observed pass count, $2 credited skips -> red|green
+  if [ "$1" -lt "$((MIN_CHECKS - $2))" ]; then printf 'red'; else printf 'green'; fi
+}
+is "skip credit: a 2-check block credited 2 stays green" "green" "$(floor_verdict "$((MIN_CHECKS - 2))" 2)"
+is "skip credit: a 2-check block credited 1 reds (the pre-fix arithmetic)" "red" "$(floor_verdict "$((MIN_CHECKS - 2))" 1)"
+
 printf '\n%s passed, %s failed (%s skipped)\n' "$pass" "$fail" "$skipped"
+
 if [ "$pass" -lt "$((MIN_CHECKS - skipped))" ]; then
   printf 'FAIL check-count floor: %s < %s (%s pinned minus %s skipped)\n' "$pass" "$((MIN_CHECKS - skipped))" "$MIN_CHECKS" "$skipped"
   fail=$((fail + 1))

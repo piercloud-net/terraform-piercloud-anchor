@@ -29,10 +29,14 @@ fail=0
 skipped=0
 # Check-count floor (external-watch pattern): a silently skipped case cannot
 # shrink this harness. Raise it with every case you add.
-MIN_CHECKS=49
+MIN_CHECKS=51
 ok()   { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad()  { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
-skip() { skipped=$((skipped + 1)); printf 'SKIP %s\n' "$1"; }
+# skip N LABEL: a skipped block crediting N checks (the count it WOULD have
+# run). Issue #233 F3: crediting one per block reds the floor on any legitimate
+# skip (sweep 184 < 186 as root; scp-token-refresh 45 < 48), because a block
+# carries 2-4 checks. The credit is explicit and loud.
+skip() { skipped=$((skipped + $1)); printf 'SKIP %s\n' "$2"; }
 is()  { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
@@ -323,7 +327,7 @@ is "case10 rc != 0 (unstat-able path)" "1" "$([ "$CASE_RC" -ne 0 ] && echo 1 || 
 is "case10 single request"             "1" "$CALLS"
 is "case10 loud refusal"               "1" "$(grep -cF -- 'cannot read $GITHUB_ENV' "$WORK/result.c10" || true)"
 if [ "$(id -u)" -eq 0 ]; then
-  skip "case11 (root reads a mode-000 file; case9 covers the unreadable class)"
+  skip 4 "case11 (root reads a mode-000 file; case9/10 cover the unreadable class)"
 else
   : > "$WORK/genv.c11"
   printf 'NETCUP_SCP_ACCESS_TOKEN=AT9\n' > "$WORK/genv.c11"
@@ -346,7 +350,7 @@ for cand in en_US.utf8 en_US.UTF-8 C.utf8 C.UTF-8; do
   if locale -a 2>/dev/null | grep -qx "$cand"; then UTF8_LOCALE="$cand"; break; fi
 done
 if [ -z "$UTF8_LOCALE" ]; then
-  skip "case12 (invalid-UTF-8 first byte: no UTF-8 locale installed)"
+  skip 1 "case12 (invalid-UTF-8 first byte: no UTF-8 locale installed)"
 else
   : > "$WORK/rtok.c12"
   printf 'NETCUP_SCP_ACCESS_TOKEN=\377A\n' > "$WORK/genv.c12"
@@ -370,6 +374,16 @@ else
     bad "case12 handoff not adopted under $UTF8_LOCALE: $(od -An -tx1 "$WORK/adopted.c12" | tr -s ' ')"
   fi
 fi
+
+# --- the skip credit is per CHECK, not per block (issue #233 F3) -----------
+# case11 carries FOUR checks and case12 one, so the old one-per-block credit
+# would red the floor on a host where either block is legitimately skipped.
+# floor_verdict is the harness's own comparison; both directions are pinned.
+floor_verdict() { # $1 observed pass count, $2 credited skips -> red|green
+  if [ "$1" -lt "$((MIN_CHECKS - $2))" ]; then printf 'red'; else printf 'green'; fi
+}
+is "skip credit: case11's 4 checks credited 4 stay green" "green" "$(floor_verdict "$((MIN_CHECKS - 4))" 4)"
+is "skip credit: case11's 4 checks credited 1 red (the pre-fix arithmetic)" "red" "$(floor_verdict "$((MIN_CHECKS - 4))" 1)"
 
 printf '\n%s passed, %s failed (%s skipped)\n' "$pass" "$fail" "$skipped"
 if [ "$pass" -lt "$((MIN_CHECKS - skipped))" ]; then
