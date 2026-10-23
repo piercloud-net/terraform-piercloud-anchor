@@ -17,10 +17,12 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 > cross-box interactions are answering clevis's TCP/80 challenges from the
 > main-box IP, serving ACME challenges on TCP/80 and the dashboard on TCP/443
 > (never on `:80`) to the platform edge — the CloudFront origin-facing ranges
-> + the main box on TCP/443 are the dashboard leg, and Caddy additionally
+> + the main box on TCP/443 are the dashboard leg; Caddy requires a CloudFront
+> client certificate signed by the committed origin-mTLS CA at the TLS
+> handshake (`client_auth require_and_verify`, issue #202) **and** still
 > requires the X-Piercloud-Origin secret header from every `:443` peer except
-> the main box and loopback `127.0.0.1/32`/`::1/128` (the on-box probes) —
-> call D) — plus probing the tenant's public endpoints
+> the main box and loopback `127.0.0.1/32`/`::1/128` (the on-box probes) until
+> the header-retirement cutover lands — call D) — plus probing the tenant's public endpoints
 > for availability (narrow firewall rules; no SSH inbound
 > from the main box either). Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry

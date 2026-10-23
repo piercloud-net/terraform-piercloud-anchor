@@ -2961,20 +2961,56 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine; a key-bearing
-# bundle is refused below rather than written 644).
+# Client-auth trust pool (public cert material — world-readable is fine; a
+# key-bearing bundle is refused below rather than written 644).
+#
+# Two sources feed ONE pool file and ONE `client_auth require_and_verify`:
+#   - CF_AOP_CA_PEM     — the legacy Cloudflare Authenticated Origin Pulls
+#     bundle (retired at the A2 CloudFront cutover; expected UNSET);
+#   - ORIGIN_MTLS_CA_PEM — the self-held origin-mTLS CA (issue #202), read from
+#     the committed `scripts/origin-mtls-ca.pem` by 020 and exported into this
+#     script. CloudFront presents an ACM client certificate signed by it.
+# The pool file keeps its historical path (`aop-ca.pem`) so the container
+# mount, the stanza and the existing harnesses stay one code path.
 AOP_TLS=""
+MTLS_TLS=""
+CLIENT_CA_POOL=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
-  printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
+  CLIENT_CA_POOL="${CF_AOP_CA_PEM}"
+  log "legacy AOP client-auth bundle staged (retired at the A2 CloudFront cutover — this only keeps a pre-A2 rollback alive)"
+fi
+if [ -n "${ORIGIN_MTLS_CA_PEM:-}" ]; then
+  case "${ORIGIN_MTLS_CA_PEM}" in *"PRIVATE KEY"*) die "ORIGIN_MTLS_CA_PEM must be certificate-only (public trust anchor) — strip the private key";; esac
+  mtls_tmp="$(mktemp)"
+  printf '%s\n' "${ORIGIN_MTLS_CA_PEM}" >"${mtls_tmp}"
+  if ! origin_ca_cert_pem_ok "${ORIGIN_MTLS_CA_PEM}" || ! origin_ca_blocks_parse "${mtls_tmp}"; then
+    rm -f "${mtls_tmp}"
+    die "ORIGIN_MTLS_CA_PEM is not a bounded PEM certificate (one X.509 CA certificate expected, no trailing DER) — refusing to deploy it"
+  fi
+  rm -f "${mtls_tmp}"
+  CLIENT_CA_POOL="${CLIENT_CA_POOL}${CLIENT_CA_POOL:+$'\n'}${ORIGIN_MTLS_CA_PEM}"
+  MTLS_TLS="yes"
+  log "origin-mTLS CA staged — CloudFront origin pulls must present a client certificate signed by it"
+fi
+if [ -n "${CLIENT_CA_POOL}" ]; then
+  pool_tmp="$(mktemp)"
+  printf '%s\n' "${CLIENT_CA_POOL}" >"${pool_tmp}"
+  if ! origin_ca_blocks_parse "${pool_tmp}"; then
+    rm -f "${pool_tmp}"
+    die "client-auth pool is not a bounded PEM certificate bundle (no trailing DER, every block parses as exactly one X.509 certificate) — refusing to deploy it"
+  fi
+  rm -f "${pool_tmp}"
+  printf '%s\n' "${CLIENT_CA_POOL}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
-  log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
+  log "client-auth pool deployed ($(origin_ca_chain_blocks "${CADDY_AOP_CA}") CA(s)) — origin pulls must present a client cert signed by a pool CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md; it is not a secret/variable change)"
+  warn "no client-auth CA configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM unset) — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate; this is the pre-#202 state"
 fi
-CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
+CF_AOP_CA_PEM=""       # discard from memory (the file above is 644 on this box only)
+ORIGIN_MTLS_CA_PEM=""  # same
 if [ "${ORIGIN_TLS}" = "1" ]; then
   if [ -n "${AOP_TLS}" ]; then
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY} {
@@ -3351,8 +3387,12 @@ if [ -n "${STATUS_HOST:-}" ]; then
       # has SERVED, which is the one-way marker's precondition.
       origin_ca_mark_active
     fi
-    log "edge pull through the public edge serves with AOP enforced (OK)"
-    log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
+    if [ -n "${MTLS_TLS}" ]; then
+      log "edge pull through the public edge serves with origin mTLS enforced (CloudFront client certificate verified; OK)"
+    else
+      log "edge pull through the public edge serves with AOP enforced (OK)"
+      log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
+    fi
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale
