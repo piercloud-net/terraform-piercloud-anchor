@@ -165,9 +165,9 @@ done
 has "$SCRIPT" '^piercloud-tmp-[0-9]+\z' "tmp filter uses the anchored new shape"
 has "$SCRIPT" 'startswith($legacy)' "tmp filter keeps the legacy this-server shape"
 has "$SCRIPT" '--arg legacy "piercloud-tmp-${SERVER_ID}-"' "tmp legacy prefix is the server id prefix"
-has "$SCRIPT" 'endswith($h)' "steady filter uses the hostname anchor"
-has "$SCRIPT" 'endswith($s)' "steady filter uses the migration id anchor"
-has "$SCRIPT" '--arg h "-${ANCHOR_HOSTNAME}"' "steady hostname anchor wired"
+has "$SCRIPT" '($n == $own) or ($n == $legacy)' "steady filter matches two exact names (#200)"
+has "$SCRIPT" '--arg own "${STEADY_PREFIX}${ANCHOR_HOSTNAME}"' "steady hostname name wired"
+has "$SCRIPT" '--arg legacy "${STEADY_PREFIX}${ANCHOR_HOSTNAME}-${SERVER_ID}"' "steady migration name wired"
 before "sweep-post: hostname guard after the no-token no-op" \
   "$(first_line 'no token held (approval never completed)' "$SCRIPT")" \
   "$(first_line 'ANCHOR_HOSTNAME is required to scope' "$SCRIPT")"
