@@ -569,6 +569,19 @@ origin_ca_chain_blocks() { # $1 = PEM file -> count of real certificate blocks (
   grep -cE -- "^-----BEGIN CERTIFICATE-----[[:space:]]*$" "$1" 2>/dev/null || true
 }
 
+origin_mtls_ca_single_root() { # $1 = PEM file -> exactly ONE certificate, a self-signed CA:TRUE root
+  # The origin-mTLS trust anchor is one root by contract. A second CA:TRUE
+  # block, or a non-CA leaf, that rode in with it would widen the pool the
+  # edge admits — so the block count, basicConstraints and the self-signature
+  # are all enforced here, not left to the harness.
+  local f="$1" n info
+  n="$(origin_ca_chain_blocks "$f")"
+  [ "${n:-0}" -eq 1 ] || return 1
+  info="$(openssl x509 -in "$f" -noout -ext basicConstraints 2>/dev/null || true)"
+  grep -q 'CA:TRUE' <<<"$info" || return 1
+  openssl verify -check_ss_sig -CAfile "$f" "$f" >/dev/null 2>&1
+}
+
 origin_ca_block_der_exact() { # $1 = PEM file -> the FIRST block's body decodes to exactly the parsed DER (no trailing bytes)
   local f="$1" raw der
   # `openssl x509 -in` ignores bytes after the certificate DER, so a body of
@@ -2964,20 +2977,63 @@ fi
 # never selected again. The selection function lives in the origin-ca span
 # above (tests/origin-ca drives the real one).
 origin_ca_select_pair
-# AOP bundle (public cert material — world-readable is fine; a key-bearing
-# bundle is refused below rather than written 644).
+# Client-auth trust pool (public cert material — world-readable is fine; a
+# key-bearing bundle is refused below rather than written 644).
+#
+# Two sources feed ONE pool file and ONE `client_auth require_and_verify`:
+#   - CF_AOP_CA_PEM     — the legacy Cloudflare Authenticated Origin Pulls
+#     bundle (retired at the A2 CloudFront cutover; expected UNSET);
+#   - ORIGIN_MTLS_CA_PEM — the self-held origin-mTLS CA (issue #202), read from
+#     the committed `scripts/origin-mtls-ca.pem` by 020 and exported into this
+#     script. CloudFront presents an ACM client certificate signed by it.
+# The pool file keeps its historical path (`aop-ca.pem`) so the container
+# mount, the stanza and the existing harnesses stay one code path.
 AOP_TLS=""
+MTLS_TLS=""
+CLIENT_CA_POOL=""
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
-  printf '%s\n' "${CF_AOP_CA_PEM}" > "${CADDY_AOP_CA}"
+  CLIENT_CA_POOL="${CF_AOP_CA_PEM}"
+  log "legacy AOP client-auth bundle staged (retired at the A2 CloudFront cutover — this only keeps a pre-A2 rollback alive)"
+fi
+if [ -n "${ORIGIN_MTLS_CA_PEM:-}" ]; then
+  case "${ORIGIN_MTLS_CA_PEM}" in *"PRIVATE KEY"*) die "ORIGIN_MTLS_CA_PEM must be certificate-only (public trust anchor) — strip the private key";; esac
+  mtls_tmp="$(mktemp)"
+  printf '%s\n' "${ORIGIN_MTLS_CA_PEM}" >"${mtls_tmp}"
+  if ! origin_ca_cert_pem_ok "${ORIGIN_MTLS_CA_PEM}" || ! origin_ca_blocks_parse "${mtls_tmp}" || ! origin_mtls_ca_single_root "${mtls_tmp}"; then
+    rm -f "${mtls_tmp}"
+    die "ORIGIN_MTLS_CA_PEM is not a bounded PEM certificate (exactly one self-signed X.509 certificate with CA:TRUE, no trailing DER) — refusing to deploy it"
+  fi
+  rm -f "${mtls_tmp}"
+  if [ -n "${CLIENT_CA_POOL}" ]; then
+    CLIENT_CA_POOL="${CLIENT_CA_POOL}
+${ORIGIN_MTLS_CA_PEM}"
+  else
+    CLIENT_CA_POOL="${ORIGIN_MTLS_CA_PEM}"
+  fi
+  MTLS_TLS="yes"
+  log "origin-mTLS CA staged — CloudFront origin pulls must present a client certificate signed by it"
+fi
+if [ -n "${CLIENT_CA_POOL}" ]; then
+  pool_tmp="$(mktemp)"
+  printf '%s\n' "${CLIENT_CA_POOL}" >"${pool_tmp}"
+  if ! origin_ca_blocks_parse "${pool_tmp}"; then
+    rm -f "${pool_tmp}"
+    die "client-auth pool is not a bounded PEM certificate bundle (no trailing DER, every block parses as exactly one X.509 certificate) — refusing to deploy it"
+  fi
+  rm -f "${pool_tmp}"
+  printf '%s\n' "${CLIENT_CA_POOL}" > "${CADDY_AOP_CA}"
   chmod 644 "${CADDY_AOP_CA}"
   AOP_TLS="yes"
-  log "AOP client-auth bundle deployed — origin pulls must present a client cert signed by this CA (require_and_verify)"
+  log "client-auth pool deployed ($(origin_ca_chain_blocks "${CADDY_AOP_CA}") CA(s)) — origin pulls must present a client cert signed by a pool CA (require_and_verify)"
 else
-  warn "CF_AOP_CA_PEM unset — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate (A2: expected post-cutover; AOP is retired for the :443 origin leg — do not re-enable. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md; it is not a secret/variable change)"
+  if [ -n "${STATUS_HOST:-}" ]; then die "STATUS_HOST is set but no client-auth CA is configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM both unset) — the shared header is not an origin gate; refusing to serve the status edge"; fi
+  warn "no client-auth CA configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM unset) — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate; this is the pre-#202 state"
 fi
-CF_AOP_CA_PEM=""  # discard from memory (the file above is 644 on this box only)
+CF_AOP_CA_PEM=""       # discard from memory (the file above is 644 on this box only)
+ORIGIN_MTLS_CA_PEM=""  # same
+CLIENT_CA_POOL=""       # same (the pool holds the same public CA material; cleared once written)
 if [ "${ORIGIN_TLS}" = "1" ]; then
   if [ -n "${AOP_TLS}" ]; then
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY} {
@@ -2989,6 +3045,17 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
   else
     DASH_TLS_STANZA="	tls ${CADDY_ORIGIN_CRT} ${CADDY_ORIGIN_KEY}"
   fi
+elif [ -n "${AOP_TLS}" ]; then
+  # No origin pair on the box: Caddy still obtains the dashboard certificate
+  # automatically (HTTP-01), and the client-auth stanza MUST be emitted here
+  # too — without it the edge would be admitted on the shared header alone
+  # while this run's own trust-pool claim reads as enforced (review F1).
+  DASH_TLS_STANZA="	tls {
+		client_auth {
+			mode require_and_verify
+			trust_pool file ${CADDY_AOP_CA}
+		}
+	}"
 else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
@@ -3305,24 +3372,37 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # handshake" (35/56 = TLS layer, the point of AOP) from "nothing answered"
     # (7 refused / 28 timeout) or a DNS problem (6): only a TLS-layer rejection
     # proves client_auth is enforcing — a dead :443 must not pass this probe.
+    # Rollback wording follows the active pool source (review F5): the AOP
+    # secret hint is only true while CF_AOP_CA_PEM is the pool source. Under
+    # origin mTLS the committed CA ships in the release, so the rollback is a
+    # redeploy of the previous release (the shared header gate keeps the origin
+    # reachable until the follow-up cutover).
+    if [ -n "${MTLS_TLS}" ]; then
+      pool_rollback="redeploy the previous release (the committed origin-mTLS CA ships in the release; before the header cutover the header gate keeps the origin reachable — after it, re-add the repository secret and the distribution origin header FIRST, then revert the anchor, never the anchor alone: docs/dr.md)"
+      pool_retry="the committed origin-mTLS CA is part of the release, so a rollback is a redeploy of the previous release (docs/dr.md)"
+      pool_cause="the origin trust pool does not match CloudFront's client certificate"
+    else
+      pool_rollback="roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply"
+      pool_retry="temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: AOP is retired for the :443 origin leg; delete CF_AOP_CA_PEM and do not re-enable"
+      pool_cause="the origin trust bundle does not match Cloudflare's client cert"
+    fi
     neg_rc=0
     neg_err=""
-    neg_err="$(curl -sk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>&1)" || neg_rc=$?
+    neg_err="$(curl -sSk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>&1)" || neg_rc=$?
     case "${neg_rc}" in
       0)
-        die "Caddy :443 answered a cert-less probe while AOP is deployed — client_auth is not enforcing; roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply" ;;
+        die "Caddy :443 answered a cert-less probe while client auth is deployed — client_auth is not enforcing; ${pool_rollback}" ;;
       35|55|56)
-        # 35 = TLS connect error (handshake stage); 55/56 = send/recv failure —
-        # these are how curl surfaces a client-auth rejection (measured on curl
-        # 7.88/8.5/8.11/8.14/8.19/8.20 across TLS 1.2/1.3; 55 is real on the
-        # newer OpenSSL 3.5 builds). The OpenSSL 'alert' line is extra evidence
-        # when present, but a rejection must not fail on its absence.
+        # 35 = TLS connect error (handshake stage); 55/56 = send/recv failure.
+        # curl surfaces a client-auth rejection this way, but so can a dead or
+        # misconfigured :443. Only the client-auth alert text (certificate
+        # required / bad certificate) proves WHICH failure it was; anything else
+        # is ambiguous and fails closed.
         neg_hint="$(printf '%s' "${neg_err}" | tr '\n' ' ' | cut -c1-160)"
-        if printf '%s' "${neg_err}" | grep -qi 'alert'; then
-          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}, alert confirmed; OK under require_and_verify)"
+        if printf '%s' "${neg_err}" | grep -qiE 'alert (certificate required|bad certificate)'; then
+          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}, client-auth alert; OK under require_and_verify)"
         else
-          log "Caddy :443 rejected the cert-less probe at the TLS layer (curl exit ${neg_rc}; OK under require_and_verify)"
-          warn "no OpenSSL 'alert' text in curl stderr (${neg_hint:-no stderr}) — confirm the rejection manually if this box was expected to serve cert-less"
+          die "Caddy :443 failed the cert-less probe without a client-auth TLS alert (curl exit ${neg_rc}; stderr: ${neg_hint:-none}) — cannot prove client_auth is enforcing; refusing to finish blind"
         fi ;;
       7|28)
         die "Caddy :443 did not answer the cert-less probe (curl exit ${neg_rc}: refused/timeout) — cannot prove client_auth is enforcing; check 'docker logs caddy' and that :443 is listening BEFORE touching AOP secrets; refusing to finish blind" ;;
@@ -3331,20 +3411,21 @@ if [ -n "${STATUS_HOST:-}" ]; then
     esac
     edge_ok=0
     edge_rc=0
+    edge_code=""
     for attempt in 1 2 3; do
       edge_rc=0
-      curl -sSf --max-time 20 "https://${STATUS_HOST}/" -o /dev/null || edge_rc=$?
-      if [ "${edge_rc}" -eq 0 ]; then edge_ok=1; break; fi
+      edge_code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://${STATUS_HOST}/")" || edge_rc=$?
+      if [ "${edge_rc}" -eq 0 ] && [ "${edge_code}" = "200" ]; then edge_ok=1; break; fi
       if [ "${attempt}" -lt 3 ]; then
-        log "edge pull attempt ${attempt}/3 failed (curl exit ${edge_rc}); retrying in 5s"
+        log "edge pull attempt ${attempt}/3 failed (curl exit ${edge_rc}, HTTP ${edge_code:-none}; 200 required); retrying in 5s"
         sleep 5
       fi
     done
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
-        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. Temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: the :443 origin leg is CloudFront — AOP is retired for it; delete CF_AOP_CA_PEM and do not re-enable (a pre-A2 rollback to the Cloudflare edge is a code-level revert — docs/dr.md)"
+        die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. ${pool_retry}; once the platform records converge the edge pull recovers (docs/dr.md)"
       fi
-      die "edge pull through the public edge failed while AOP is deployed (curl exit ${edge_rc}) — the origin trust bundle does not match Cloudflare's client cert, or the anchor has cut over to the A2 CloudFront origin (Cloudflare is no longer admitted on :443 and AOP is retired there — delete CF_AOP_CA_PEM and re-dispatch). Roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply. A pre-A2 Cloudflare-edge rollback is a code-level revert (the A2 firewall, gate and nested naming ship together) — see docs/dr.md, not a 102 action. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
+      die "edge pull through the public edge did not return HTTP 200 while client auth is deployed (curl exit ${edge_rc}, HTTP ${edge_code:-none}; 200 required) — ${pool_cause}, or the anchor has cut over to the A2 CloudFront origin. Roll back: ${pool_rollback}. If this is a first-time/DR dispatch, the dashboard's edge record (the explicit per-tenant dashboard CNAME / the platform status wildcard) may not exist yet or may still point at the old box (edge 521/522) — this run's anchor-dns job writes it after this probe, see docs/dr.md"
     fi
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Under require_and_verify a cert-less s_client cannot retrieve the
@@ -3354,8 +3435,12 @@ if [ -n "${STATUS_HOST:-}" ]; then
       # has SERVED, which is the one-way marker's precondition.
       origin_ca_mark_active
     fi
-    log "edge pull through the public edge serves with AOP enforced (OK)"
-    log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
+    if [ -n "${MTLS_TLS}" ]; then
+      log "edge pull through the public edge serves with origin mTLS enforced (CloudFront client certificate verified; OK)"
+    else
+      log "edge pull through the public edge serves with AOP enforced (OK)"
+      log "A2 edge not proven this run (AOP mode — pre-A2 state; cut over by deleting CF_AOP_CA_PEM and re-dispatching, docs/dr.md)"
+    fi
   elif curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null; then
     if [ "${ORIGIN_CA_PAIR}" = "1" ]; then
       # Prove the SERVED leaf is the installed per-anchor cert (guards a stale

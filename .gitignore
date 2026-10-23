@@ -27,6 +27,9 @@ override.tf.json
 
 # Secrets never belong in this repo
 *.pem
+# The origin-mTLS CA is PUBLIC trust-anchor material (issue #202) and is
+# committed on purpose; every other *.pem stays ignored.
+!scripts/origin-mtls-ca.pem
 *.key
 .env
 
