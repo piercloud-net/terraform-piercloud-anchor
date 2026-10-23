@@ -30,6 +30,9 @@
 #     EXTERNAL_WATCH_TENANTS in the amendment's own paragraph, list the five
 #     other repo-level names it does not cover, and qualify every `v*` claim
 #     in its own sentence.
+#   - the probe's edge-header summary (Pc-Edge-Client-Sha256 and x-amz-cf-pop)
+#     is informational: a malformed value shows as absent, and no header value
+#     changes the verdict or the exit code (the REAL probe step is run).
 set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -237,7 +240,7 @@ PY
 
 pass=0
 fail=0
-MIN_CHECKS=279
+MIN_CHECKS=300
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -1037,6 +1040,122 @@ TARGETS_RESULT=success REFUSED="bad" GH_CREATE_FAIL_LABEL=1 cdrive "$WORK/config
 is "config label failure: retried without the label" "2" "$(calls '^gh issue create')"
 is "config label failure: run still fails" "1" "$D_RC"
 is "no driver run failed on repo resolution (#211)" "0" "$REPO_MISSES"
+
+# ---- edge headers: informational summary, never the verdict ----------------
+# The probe echoes the origin-mTLS fingerprint and the CloudFront PoP into the
+# step summary. The REAL probe script is extracted from the workflow and run
+# under `bash -e` (GitHub's default shell) with a PATH-stubbed curl, and an
+# openssl whose s_client prints a self-signed fixture leaf so the real
+# `openssl x509 -checkend` still runs. Proves: the summary line is written for
+# OK and FAIL alike, a malformed value is shown as absent, and no header value
+# changes the exit code.
+PROBE="${WORK}/probe.sh"
+cat >"${WORK}/probe-extract.py" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = yaml.safe_load(handle)
+for job in document["jobs"].values():
+    for step in job.get("steps", []):
+        if step.get("id") == "probe":
+            with open(sys.argv[2], "w", encoding="utf-8") as out:
+                out.write(step["run"])
+            sys.exit(0)
+sys.exit(1)
+PY
+if python3 -I -B "${WORK}/probe-extract.py" "$WATCH" "$PROBE" && [ -s "$PROBE" ]; then
+  ok "probe step extracted from the workflow"
+else
+  bad "probe step not found in the workflow"
+  exit 1
+fi
+mkdir -p "${WORK}/edge-bin"
+REAL_OPENSSL="$(command -v openssl)"
+"$REAL_OPENSSL" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 \
+  -subj /CN=external-watch-fixture -keyout "${WORK}/edge-key.pem" -out "${WORK}/edge-cert.pem" >/dev/null 2>&1
+cat >"${WORK}/edge-bin/curl" <<'STUB'
+#!/usr/bin/env bash
+# Stub: -D gets $EDGE_STUB_HDR (nothing when empty), the body is picked by
+# URL, and -w prints ROOT_CODE for the dashboard root (200 otherwise).
+out="" hdr="" want_code=0 url="" code=200
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) hdr="$2"; shift 2 ;;
+    -w) want_code=1; shift 2 ;;
+    --max-time|--proto|--max-redirs|--max-filesize) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  */api/v1/endpoints/statuses) body='[{"name":"a","group":"g"}]' ;;
+  *) body='<html><title>Gatus</title></html>'; code="${ROOT_CODE:-200}"
+     # EDGE_STUB_LAST (optional): the second root fetch gets no response at all.
+     if [ -n "${EDGE_STUB_LAST:-}" ]; then
+       n="$(cat "$EDGE_STUB_LAST" 2>/dev/null || echo 0)"
+       printf '%s' "$((n + 1))" >"$EDGE_STUB_LAST"
+       if [ "$n" -ge 1 ]; then code=000; hdr=""; fi
+     fi ;;
+esac
+[ -n "$out" ] && printf '%s' "$body" >"$out"
+[ -n "$hdr" ] && [ -n "${EDGE_STUB_HDR:-}" ] && printf '%b' "$EDGE_STUB_HDR" >"$hdr"
+[ "$want_code" = 1 ] && printf '%s' "$code"
+exit 0
+STUB
+cat >"${WORK}/edge-bin/openssl" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = s_client ]; then cat "\$EDGE_STUB_CERT"; exit 0; fi
+exec "${REAL_OPENSSL}" "\$@"
+STUB
+chmod +x "${WORK}/edge-bin/curl" "${WORK}/edge-bin/openssl"
+SHA_OK="$(printf '%064x' 1234567890)"
+HDR_OK="HTTP/2 200\r\npc-edge-client-sha256: ${SHA_OK}\r\nx-amz-cf-pop: FRA56-P2\r\nx-cache: Miss from cloudfront\r\n\r\n"
+HDR_BAD="HTTP/2 200\r\npc-edge-client-sha256: <b>not hex</b>\r\nx-amz-cf-pop: FRA56 P2\r\n\r\n"
+run_probe() { # $1 label, $2 root HTTP code, $3 stub header block (may be empty)
+  local label="$1" code="$2" hdr="$3" rc=0
+  PATH="${WORK}/edge-bin:${PATH}" PROBE_URL="https://probe.test/" STATUS_PULLER="" TENANT_USER="" \
+    MIN_CERT_DAYS=14 ATTEMPTS=1 RETRY_SLEEP=0 ROOT_CODE="$code" EDGE_STUB_HDR="$hdr" \
+    EDGE_STUB_CERT="${WORK}/edge-cert.pem" GITHUB_STEP_SUMMARY="${WORK}/sum-${label}" \
+    GITHUB_OUTPUT="${WORK}/out-${label}" bash -e "$PROBE" >"${WORK}/log-${label}" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+rc_ok="$(run_probe present 200 "$HDR_OK")"
+is "edge headers: OK verdict exits 0 with the headers" "0" "$rc_ok"
+has "edge headers: OK summary carries the verified fingerprint and PoP" "$(cat "${WORK}/sum-present")" "Pc-Edge-Client-Sha256: \`${SHA_OK}\`, x-amz-cf-pop: \`FRA56-P2\`"
+has "edge headers: OK verdict is logged" "$(cat "${WORK}/log-present")" "external-watch: OK"
+has "edge headers: OK summary records x-cache" "$(cat "${WORK}/sum-present")" 'x-cache: `Miss from cloudfront`'
+has "edge headers: the summary labels the values informational, unverified and tenant-controlled" "$(cat "${WORK}/sum-present")" "informational, unverified, may be cached, tenant-controlled"
+rc_absent="$(run_probe absent 200 "")"
+is "edge headers: absent headers keep the OK verdict" "0" "$rc_absent"
+has "edge headers: absent headers summarised as absent" "$(cat "${WORK}/sum-absent")" "Pc-Edge-Client-Sha256: \`absent\`, x-amz-cf-pop: \`absent\`"
+rc_bad="$(run_probe malformed 200 "$HDR_BAD")"
+is "edge headers: malformed values keep the OK verdict" "0" "$rc_bad"
+has "edge headers: malformed values shown as absent" "$(cat "${WORK}/sum-malformed")" "Pc-Edge-Client-Sha256: \`absent\`, x-amz-cf-pop: \`absent\`"
+lacks "edge headers: no raw markup reaches the summary" "$(cat "${WORK}/sum-malformed")" "<b>"
+rc_fail_p="$(run_probe fail-present 503 "$HDR_OK")"
+rc_fail_a="$(run_probe fail-absent 503 "")"
+is "edge headers: FAIL verdict exits 1 without the headers" "1" "$rc_fail_a"
+is "edge headers: a present header does not mask a failing probe" "$rc_fail_a" "$rc_fail_p"
+has "edge headers: FAIL still writes the summary line" "$(cat "${WORK}/sum-fail-present")" "Pc-Edge-Client-Sha256: \`${SHA_OK}\`"
+has "edge headers: FAIL verdict is logged" "$(cat "${WORK}/log-fail-present")" "external-watch: FAIL"
+lacks "edge headers: a missing header file leaves no redirect error in the step log" "$(cat "${WORK}/log-absent")" "No such file"
+rc_retry=0
+rm -f "${WORK}/edge-last"
+PATH="${WORK}/edge-bin:${PATH}" PROBE_URL="https://probe.test/" STATUS_PULLER="" TENANT_USER="" \
+  MIN_CERT_DAYS=14 ATTEMPTS=2 RETRY_SLEEP=0 ROOT_CODE=503 EDGE_STUB_HDR="$HDR_OK" EDGE_STUB_LAST="${WORK}/edge-last" \
+  EDGE_STUB_CERT="${WORK}/edge-cert.pem" GITHUB_STEP_SUMMARY="${WORK}/sum-retry" \
+  GITHUB_OUTPUT="${WORK}/out-retry" bash -e "$PROBE" >"${WORK}/log-retry" 2>&1 || rc_retry=$?
+is "edge headers: a probe that fails on both attempts exits 1" "1" "$rc_retry"
+has "edge headers: a no-response last attempt keeps the values of the last response" "$(cat "${WORK}/sum-retry")" "Pc-Edge-Client-Sha256: \`${SHA_OK}\`, x-amz-cf-pop: \`FRA56-P2\`, x-cache: \`Miss from cloudfront\`"
+# Static teeth on the same step: the header is captured from the root fetch,
+# the value is pattern-checked, and the summary write can never fail the step.
+PROBE_TEXT="$(cat "$PROBE")"
+has "edge headers: root fetch captures the response headers" "$PROBE_TEXT" 'curl -sS -D "$work/root.hdr"'
+has "edge headers: fingerprint is pattern-checked as lowercase SHA-256 hex" "$PROBE_TEXT" "'^[0-9a-f]{64}\$'"
+has "edge headers: summary write cannot fail the step" "$PROBE_TEXT" '>> "$GITHUB_STEP_SUMMARY" || true'
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/external-watch/run-test.sh"

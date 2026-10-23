@@ -256,6 +256,90 @@ has "${WORK}/Caddyfile" "client_auth" "render: the dashboard site asks for a cli
 is "render: exactly one trust_pool file backs the pool" "1" "$(grep -c 'trust_pool file' "${WORK}/Caddyfile")"
 is "render: the client-auth mode is require_and_verify" "1" "$(grep -c 'mode require_and_verify' "${WORK}/Caddyfile")"
 
+# ---- edge client-fingerprint header (Pc-Edge-Client-Sha256) ----------------
+# The platform's rotation check reads this header from the :443 dashboard, so
+# it must be the placeholder (Caddy substitutes the verified leaf's SHA-256 per
+# request), at the site level (one tab, outside any handle), in EVERY TLS
+# branch. A literal hex value would forge the echo: it is teethed as well.
+FP_LINE="$(printf '\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')"
+DEEP_FP_LINE="$(printf '\t\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')"
+# shellcheck disable=SC2034  # the render inputs are read by the sourced render span
+fp_render() { # $1 = ORIGIN_TLS, $2 = AOP_TLS, $3 = output file
+  (
+    # shellcheck disable=SC1090
+    source "${WORK}/render.src"
+    ORIGIN_TLS="$1"
+    AOP_TLS="$2"
+    eval "$(grep -E '^CADDY_(ORIGIN_CRT|ORIGIN_KEY|AOP_CA)=' "$PROVISION_SH")"
+    # shellcheck disable=SC1090
+    source "${WORK}/stanza.src"
+    CADDY_HTTP_ADDR=":80"
+    CADDY_CHALLENGE_DIR="${WORK}/acme"
+    TANG_PORT="8081"
+    GATUS_PORT="8080"
+    CADDY_SKIP_HTTPS=""
+    STATUS_HOST="status.example.test"
+    MAIN_BOX_IPV4="192.0.2.10"
+    CLOUDFRONT_ORIGIN_CIDRS="192.0.2.0/24"
+    render_caddyfile
+  ) > "$3"
+}
+extract_fn assert_caddyfile_hardened > "${WORK}/assert.src"
+[ -s "${WORK}/assert.src" ] || { bad "could not extract assert_caddyfile_hardened from ${PROVISION_SH}"; printf '\n%s passed, %s failed\n' "$pass" "$fail"; exit 1; }
+fp_assert() { # $1 = Caddyfile; the REAL hardening check, offline (die -> exit 1)
+  (
+    die() { printf 'DIE:%s\n' "$*"; exit 1; }
+    log() { :; }
+    # shellcheck disable=SC2034 # read by the sourced assert_caddyfile_hardened
+    CADDY_HTTP_ADDR=":80"
+    # shellcheck disable=SC2034 # read by the sourced assert_caddyfile_hardened
+    TANG_PORT="8081"
+    # shellcheck disable=SC2034 # read by the sourced assert_caddyfile_hardened
+    GATUS_PORT="8080"
+    # shellcheck disable=SC1090
+    source "${WORK}/assert.src"
+    assert_caddyfile_hardened "$1"
+  )
+}
+fp_render 1 yes "${WORK}/fp-1-aop.Caddyfile"
+fp_render 1 "" "${WORK}/fp-1-plain.Caddyfile"
+fp_render 0 yes "${WORK}/fp-0-aop.Caddyfile"
+fp_render 0 "" "${WORK}/fp-0-plain.Caddyfile"
+for branch in 1-aop 1-plain 0-aop 0-plain; do
+  f="${WORK}/fp-${branch}.Caddyfile"
+  case "$branch" in
+    *-aop)
+      is "fp[${branch}]: the site-level fingerprint line appears exactly once" "1" "$(grep -cFx -- "$FP_LINE" "$f" || true)"
+      site="$(awk '/^https:\/\// { on = 1 } on { print } on && /^}/ { exit }' "$f")"
+      is "fp[${branch}]: the line sits inside the :443 site block (one tab, not in a handle)" "1" "$(printf '%s\n' "$site" | grep -cFx -- "$FP_LINE" || true)"
+      is "fp[${branch}]: the header name is rendered exactly once" "1" "$(grep -c 'Pc-Edge-Client-Sha256' "$f" || true)"
+      if grep -Eq 'Pc-Edge-Client-Sha256[^{]*[0-9a-fA-F]{64}' "$f"; then bad "fp[${branch}]: a literal hex value follows the header name"; else ok "fp[${branch}]: the header value is the placeholder, never a literal hex value"; fi
+      ;;
+    *-plain)
+      is "fp[${branch}]: no client auth, so the header is absent (never the SHA-256 of an empty certificate)" "0" "$(grep -c 'Pc-Edge-Client-Sha256' "$f" || true)"
+      ;;
+  esac
+  if out="$(fp_assert "$f" 2>&1)"; then ok "fp[${branch}]: assert_caddyfile_hardened accepts the render"; else bad "fp[${branch}]: assert_caddyfile_hardened refused the render (got '${out}')"; fi
+done
+base="${WORK}/fp-1-aop.Caddyfile"
+grep -vFx -- "$FP_LINE" "$base" > "${WORK}/fp-mut-removed.Caddyfile" || true
+sed 's/^\theader Pc-Edge-Client-Sha256/\t\theader Pc-Edge-Client-Sha256/' "$base" > "${WORK}/fp-mut-deep.Caddyfile"
+sed "s/{http.request.tls.client.fingerprint}/$(printf 'a%.0s' {1..64})/" "$base" > "${WORK}/fp-mut-literal.Caddyfile"
+sed 's/^\theader Pc-Edge-Client-Sha256/\t# header Pc-Edge-Client-Sha256/' "$base" > "${WORK}/fp-mut-commented.Caddyfile"
+awk -v l="$FP_LINE" '{ print } /^https:\/\// { print l }' "${WORK}/fp-1-plain.Caddyfile" > "${WORK}/fp-mut-noauth.Caddyfile"
+is "mutation: the removed-line render no longer carries the header" "0" "$(grep -c 'Pc-Edge-Client-Sha256' "${WORK}/fp-mut-removed.Caddyfile" || true)"
+is "mutation: the deep-indent render carries the line one tab too deep" "1" "$(grep -cFx -- "$DEEP_FP_LINE" "${WORK}/fp-mut-deep.Caddyfile" || true)"
+if grep -Eq 'Pc-Edge-Client-Sha256[^{]*[0-9a-fA-F]{64}' "${WORK}/fp-mut-literal.Caddyfile"; then ok "mutation: a literal hex value is caught by the never-literal tooth"; else bad "mutation: the literal-value tooth does not see a substituted hex value"; fi
+for mut in removed deep literal commented noauth; do
+  if out="$(fp_assert "${WORK}/fp-mut-${mut}.Caddyfile" 2>&1)"; then bad "mutation (${mut}): assert_caddyfile_hardened passes a broken fingerprint line"; else
+    case "$out" in
+      *'Pc-Edge-Client-Sha256'*) ok "mutation (${mut}): assert_caddyfile_hardened fails and names the header" ;;
+      *) bad "mutation (${mut}): refused, but not for the fingerprint line (got '${out}')" ;;
+    esac
+  fi
+done
+if grep -Eq 'Pc-Edge-Client-Sha256[^{]*[0-9a-fA-F]{64}' "$PROVISION_SH"; then bad "010 carries a literal hex value next to the fingerprint header"; else ok "010 never writes a literal hex value next to the fingerprint header"; fi
+
 # ---- live-probe contract (F5, F12): pinned text of the edge checks --------
 has "$PROVISION_SH" 'curl -sSk --max-time 10 --resolve' "the cert-less probe reports curl errors (-S) and stays -k"
 has "$PROVISION_SH" "alert (certificate required|bad certificate)" "the cert-less probe accepts only a client-auth TLS alert"

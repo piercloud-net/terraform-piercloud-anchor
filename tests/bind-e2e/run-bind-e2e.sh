@@ -391,6 +391,21 @@ printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedK
 openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${WORK}/aop-ca.key" \
   -CAcreateserial -CAserial "${WORK}/aop-ca.srl" -days 1 -sha256 -extfile "${WORK}/aop-leaf.ext" \
   -out "${WORK}/aop-leaf.crt" >/dev/null 2>&1 || die "openssl could not sign the harness client leaf"
+# The edge fingerprint line exactly as 010's render emits it (evaluated from the
+# real printf, never a hand-typed copy), so a quoting drift fails here.
+fp_arm="$(grep -m1 -F '*client_auth*) printf' "${PROVISION_SH}")"
+[ -n "${fp_arm}" ] || die "010 has no client_auth case arm emitting Pc-Edge-Client-Sha256"
+fp_body="${fp_arm#*) }"; fp_body="${fp_body% ;;}"
+fp_line="$(eval "${fp_body}")"
+[ "${fp_line}" = "$(printf '\theader Pc-Edge-Client-Sha256 "{http.request.tls.client.fingerprint}"')" ] || die "010 Pc-Edge-Client-Sha256 line is not the placeholder form (got: ${fp_line})"
+# A second CA-signed client leaf from the same pool, for the distinct-value check.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${WORK}/aop-leaf2.key" >/dev/null 2>&1 || die "openssl could not mint the second harness client key"
+chmod 600 "${WORK}/aop-leaf2.key"
+openssl req -new -key "${WORK}/aop-leaf2.key" -subj "/CN=aop-client-2" \
+  -out "${WORK}/aop-leaf2.csr" >/dev/null 2>&1 || die "openssl could not build the second client CSR"
+openssl x509 -req -in "${WORK}/aop-leaf2.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${WORK}/aop-ca.key" \
+  -CAcreateserial -CAserial "${WORK}/aop-ca.srl" -days 1 -sha256 -extfile "${WORK}/aop-leaf.ext" \
+  -out "${WORK}/aop-leaf2.crt" >/dev/null 2>&1 || die "openssl could not sign the second client leaf"
 ( export ORIGIN_TLS="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # shellcheck disable=SC1090
@@ -398,6 +413,7 @@ openssl x509 -req -in "${WORK}/aop-leaf.csr" -CA "${WORK}/aop-ca.pem" -CAkey "${
   {
     printf '{\n\tadmin off\n\tauto_https disable_redirects\n}\n\n'
     printf 'https://%s {\n' "${AOP_SNI}"
+    printf '%s\n' "${fp_line}"
     printf '%s\n' "${DASH_TLS_STANZA}"
     printf '\trespond "gatus-stub-ok" 200\n}\n'
   } > "${WORK}/Caddyfile.aopsrv" )
@@ -419,6 +435,23 @@ curl -skf --max-time 10 --cert "${WORK}/aop-leaf.crt" --key "${WORK}/aop-leaf.ke
   || die "leaf-signed client was rejected by the AOP vhost"
 grep -q "gatus-stub-ok" "${WORK}/aop-pos.body" || die "leaf-signed client did not reach the stub backend (got: $(head -c 120 "${WORK}/aop-pos.body"))"
 log "PASS: leaf-signed client accepted end-to-end through the AOP vhost"
+# The served header IS the verified client leaf's DER SHA-256 (lowercase hex, no
+# separators: what Caddy's {http.request.tls.client.fingerprint} emits), and a
+# second leaf from the same pool gets its OWN value. The cert-less rejection is
+# the aop_neg_rc check above.
+aop_served_fp() { # $1 = client leaf basename; prints the served header value
+  curl -sk --max-time 10 --cert "${WORK}/$1.crt" --key "${WORK}/$1.key" -D - -o /dev/null \
+    --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" 2>/dev/null \
+    | tr -d '\r' | awk -F': ' 'tolower($1) == "pc-edge-client-sha256" { print $2 }'
+}
+fp_leaf1_got="$(aop_served_fp aop-leaf || true)"
+fp_leaf1_want="$(openssl x509 -in "${WORK}/aop-leaf.crt" -outform DER | sha256sum | cut -d' ' -f1)"
+[ -n "${fp_leaf1_got}" ] && [ "${fp_leaf1_got}" = "${fp_leaf1_want}" ] || die "served Pc-Edge-Client-Sha256 (${fp_leaf1_got:-absent}) is not the SHA-256 of the verified client leaf DER (${fp_leaf1_want})"
+fp_leaf2_got="$(aop_served_fp aop-leaf2 || true)"
+fp_leaf2_want="$(openssl x509 -in "${WORK}/aop-leaf2.crt" -outform DER | sha256sum | cut -d' ' -f1)"
+[ -n "${fp_leaf2_got}" ] && [ "${fp_leaf2_got}" = "${fp_leaf2_want}" ] || die "second leaf: served Pc-Edge-Client-Sha256 (${fp_leaf2_got:-absent}) is not its DER SHA-256 (${fp_leaf2_want})"
+[ "${fp_leaf1_got}" != "${fp_leaf2_got}" ] || die "two leaves from the same pool served the same fingerprint — the header does not identify the leaf"
+log "PASS: Pc-Edge-Client-Sha256 = sha256(client leaf DER) for two pool leaves, distinct per leaf"
 # Retired header and out-of-pool client certificates, at the TLS layer (#202):
 # the shared header is not an admission signal, so a cert-less request that
 # still carries it dies in the handshake, and a client cert not issued by the
