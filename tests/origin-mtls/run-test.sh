@@ -259,6 +259,7 @@ has "$PROVISION_SH" '[ "${edge_code}" = "200" ]' "the edge pull requires HTTP 20
 hasnt "$PROVISION_SH" 'curl -sSf --max-time 20' "the edge pull no longer treats any exit-0 response as success"
 has "$PROVISION_SH" 'redeploy the previous release (the committed origin-mTLS CA ships in the release' "the mTLS rollback names the release redeploy, not the AOP secret (F5)"
 has "$PROVISION_SH" 're-add the repository secret and the distribution origin header FIRST, then revert the anchor, never the anchor alone' "the post-cutover rollback keeps the docs/dr.md ordering (header and secret first, anchor last)"
+has "$ROOT/docs/dr.md" 'never revert the anchor alone' "docs/dr.md states the same post-cutover ordering the runbook text cites"
 
 # ---- pipeline wiring ------------------------------------------------------
 has "$CI" "bash tests/origin-mtls/run-test.sh" "ci.yml runs this harness"
