@@ -129,9 +129,16 @@ as the repo-side controls.
 > The same PR also ships the repository **variable** `EXTERNAL_WATCH_TENANTS`
 > (`alias`, `alias:puller` pairs: which anchors the watch probes). It carries
 > no secret material, so it sits outside invariant 4's secret scope, but it is
-> named here so the repository-level surface is complete: like the two
-> secrets, it is read by `.github/workflows/external-watch.yml` only and never
-> by a managed run.
+> named here because it belongs to the same carve-out: like the two secrets,
+> it is read by `.github/workflows/external-watch.yml` only and never by a
+> managed run. This names the carve-out surface, not every repository-level
+> name the watch reads: the legacy single-target path also reads the
+> repository variables `STATUS_PROBE_URL`, `STATUS_PULLER` and `TENANT_USER`,
+> and the push path falls back to the repository secrets `NTFY_TOPIC` and
+> `NTFY_TOKEN`. Those five stay outside this carve-out — `NTFY_TOPIC` /
+> `NTFY_TOKEN` are already invariant 4 names (they sit on the repo-scope
+> probe list), and the three variables are the watch's pre-existing legacy
+> single-target inputs, unchanged by this amendment.
 
 **Rationale.** The scheduled external watch selects no `environment:`, so it cannot read a tenant environment (tenant environments are also expected to be limited to `v*` tags by the platform, not verified in this repo — see `docs/usage.md`). Its push channel must therefore live at repository level. The names are distinct from every environment-scoped name, so GitHub's per-name fall-through cannot hand them to a managed anchor: no managed job references them (the repo-level tenants variable is not a secret and likewise reaches only the watch). Enforced by: `tests/external-watch` (the two secret names and `EXTERNAL_WATCH_TENANTS` appear in no file under `.github/` or `scripts/` other than `external-watch.yml`, and are absent from the managed repo-scope list, which they need not join because nothing managed reads them). The harness runs from the PR checkout, so a PR can edit this pin; review of the harness diff is the control.
 
