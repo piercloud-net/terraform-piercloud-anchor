@@ -79,6 +79,7 @@ All notable changes to this project will be documented in this file.
 - *(provision)* Stage a checksummed patched provider for plan/apply (closes #219)
 - *(edge)* Remove the dead client-IP trust + the ungated :80 dashboard, add HSTS (closes #225)
 - *(a1)* Match exact steady-state policy names (closes #200)
+- *(witness)* See late-arriving audit keys and random-keyed recordings (closes #228)
 
 ### 💼 Other
 
