@@ -28,6 +28,7 @@ All notable changes to this project will be documented in this file.
 - *(broker)* Write anchor DNS records + DNS-01 challenges through the pc-control broker (closes #185)
 - *(dns)* Anchor DNS goes through the pc-control broker; retire the direct-token writer (closes #189)
 - *(witness)* Ack the finding identity set, page on a new identity (closes #223)
+- *(edge)* Verify the CloudFront origin client certificate (closes #235)
 
 ### 🐛 Bug Fixes
 
