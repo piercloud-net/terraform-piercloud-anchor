@@ -4156,15 +4156,52 @@ class Config(object):
         # BELOW the delta cursor and a cursor tail can never list it - the
         # witness then alerts session-start-missing/sequence-origin for a
         # session whose `session.start` is in the bucket, until the 6 h sweep.
-        # A delta therefore re-lists this many seconds below each audit
-        # cursor. 0 disables the overlap (the sweep stays the only bound);
-        # an out-of-range value falls back to the default with a warning - a
-        # bound typo must not take the witness down, and the overlap is
-        # additive (it never moves a cursor, never gates a finding).
-        self.delta_overlap = env_int("RECORDING_WITNESS_DELTA_OVERLAP_SECONDS", 6 * 3600)
+        # A delta therefore re-lists this many seconds below the SESSION
+        # audit cursors - the flat one and the dated one. The heartbeat tail
+        # has no overlap on purpose: a late heartbeat key below the heartbeat
+        # cursor stays delta-invisible until the sweep, which is
+        # verdict-neutral because both heartbeat checks read the newest
+        # heartbeat object (max), not tail membership. The default is 24 h -
+        # the cited hold (6.5 h) plus margin, so
+        # the incident the fix was written for heals on the next delta with
+        # the shipped default instead of waiting for the 6 h sweep. The cost
+        # stays bounded: the re-list is page-budgeted and stops on the first
+        # page already at/above the bound, so an empty window is one page.
+        # Only the FLAT layout can use a window this wide - the dated layout
+        # lists at most the cursor day and the previous day, so the effective
+        # dated span is ~1 day whatever the knob (see `_delta_overlap_listings`
+        # and docs/recording-witness.md). 0 disables the overlap (the sweep
+        # stays the only bound). A NUMERIC out-of-range value clamps to the
+        # default with a warning; a NON-numeric value is a configuration error
+        # that fails the run (rc=2, state=error) before any listing - the same
+        # posture as the other numeric knobs, never a silent re-interpretation.
+        # The overlap is additive: it never moves a cursor, never gates a
+        # finding. The knob is an on-box env value the provisioner does not
+        # render, and the env file is re-rendered on every dispatch - so a
+        # hand edit lasts only until the next one: the shipped default is the
+        # durable answer for the cited hold, and a longer hold needs a
+        # code/default change, not an env-file edit.
+        self.delta_overlap = env_int("RECORDING_WITNESS_DELTA_OVERLAP_SECONDS", 24 * 3600)
         if not 0 <= self.delta_overlap <= 7 * 86400:
-            log("WARNING: RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=%d is outside [0, 604800]; using the default 21600" % self.delta_overlap)
-            self.delta_overlap = 6 * 3600
+            log("WARNING: RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=%d is outside [0, 604800]; using the default 86400" % self.delta_overlap)
+            self.delta_overlap = 24 * 3600
+        # The delta's recordings-discovery cadence (issue #228, red-team F1).
+        # The recordings prefix is random-keyed, so the delta lists it whole -
+        # and that prefix only ever grows while Object Lock holds the tars, so
+        # a per-delta full listing is a cost that climbs forever and, once the
+        # prefix crosses DELTA_MAX_PAGES, would turn every 5-minute delta into
+        # a full sweep (list + versions for both prefixes, 288x/day). Discovery
+        # is therefore bounded by this interval: the whole prefix is listed at
+        # most once per interval, so a new random-keyed tar is discovered
+        # within this bound (default 900 s = 15 min, far below the 6 h sweep)
+        # and a quiet delta costs no recordings listing at all. 0 restores a
+        # list on every delta. Numeric out-of-range clamps to the default with
+        # a warning; a non-numeric value fails the run (rc=2, state=error) -
+        # the same posture as the overlap knob above.
+        self.recordings_list_seconds = env_int("RECORDING_WITNESS_RECORDINGS_LIST_SECONDS", 900)
+        if not 0 <= self.recordings_list_seconds <= 86400:
+            log("WARNING: RECORDING_WITNESS_RECORDINGS_LIST_SECONDS=%d is outside [0, 86400]; using the default 900" % self.recordings_list_seconds)
+            self.recordings_list_seconds = 900
         self.renotify = env_window("RECORDING_WITNESS_RENOTIFY_SECONDS", 1800)
         self.quiet_renotify = env_window("RECORDING_WITNESS_QUIET_RENOTIFY_SECONDS", 86400)
         self.quiet_signatures, quiet_error = parse_quiet_signatures(env("RECORDING_WITNESS_QUIET_SIGNATURE"))
@@ -4400,9 +4437,14 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
     hold no key costs one page instead of paging through the whole
     out-of-bound tail (the anchor #161 cost trap, here for a listing whose
     result is additive). The correctness-source tails never set it - they
-    keep the strict FF2 rule above - and a below-cursor key missed on a
-    NONCONFORMANT ordered server is still healed by the sweep, never read as
-    green.
+    keep the strict FF2 rule above. The trade, stated honestly: a server that
+    returns the stream out of order can hand back a below-bound first key
+    that sorts after an in-bound key, so that in-window key is not visited on
+    this run. Its healing is SWEEP-BOUNDED, not immediate: the delta can stay
+    green on a key it never visited (the missed key may be exactly the drift
+    or recording finding that would have alerted), and the sweep later
+    surfaces it. The stop is a detection-latency trade priced against the
+    #161 per-run page cost; it defers a finding, it never fabricates one.
     """
     objects = {}
     token = ""
@@ -5157,7 +5199,9 @@ def _delta_overlap_listings(config, session_cursor, dated_cursor):
     a key sorts BELOW the cursor, so no cursor tail can ever list it and the
     witness keeps alerting ``session-start-missing``/``sequence-origin`` for
     a session whose ``session.start`` is right there in the bucket; only the
-    sweep healed it. Re-listing a bounded window below each cursor closes
+    sweep healed it. Re-listing a bounded window below the SESSION audit
+    cursors (flat and dated - never the heartbeat cursor, which the heartbeat
+    checks do not need because they read the newest heartbeat object) closes
     that hole. The bound is the knob: an arrival older than the overlap is
     still sweep-bounded (the sweep re-lists from scratch), so this narrows
     the detection delay, it does not replace the sweep.
@@ -5166,7 +5210,13 @@ def _delta_overlap_listings(config, session_cursor, dated_cursor):
     own day the partition, so the window never depends on the wall clock. A
     flat window needs no extra listing (flat keys sort across days); a dated
     window that crosses midnight also lists the immediately previous day,
-    bounded to that one extra day - anything older stays sweep-bounded. The
+    bounded to that one extra day - anything older stays sweep-bounded.
+    The knob accepts up to 7 d, but only the FLAT layout can deliver that: the
+    dated layout lists at most the cursor day plus the previous day, so its
+    effective span is ~1 day no matter how wide the knob is set (a day-by-day
+    re-list across a week would page every day of the week on every run - the
+    anchor #161 cost trap again). That is the documented, deliberate
+    behaviour, not a 7 d guarantee for the dated layout. The
     caller lists each entry with its own page budget and merges the result
     into a SEPARATE map (never into the cursor tails), because these keys are
     legitimately at/below the cursor and must not trip the fail-closed
@@ -5254,6 +5304,15 @@ def run_checks(config, now, plan):
     view_dirty = False
     new_audit = {}
     new_recordings = {}
+    now_epoch = int(now.timestamp())
+    # The recordings-discovery watermark (issue #228, red-team F1): a delta
+    # lists the whole random-keyed prefix at most once per
+    # `recordings_list_seconds`, so a per-run full listing cannot become an
+    # unbounded (and, past DELTA_MAX_PAGES, permanently sweeping) cost. Absent
+    # or 0 means "list now", so an upgraded box lists on its first delta.
+    recordings_listed_epoch = observed.get("recordings_listed_epoch") or 0
+    if isinstance(recordings_listed_epoch, bool) or not isinstance(recordings_listed_epoch, int):
+        recordings_listed_epoch = 0
     cursors = dict(observed.get("cursors")) if isinstance(observed.get("cursors"), dict) else {}
     if run_mode == "seed" and window_start is not None:
         window_text = utc_stamp(window_start)
@@ -5280,22 +5339,29 @@ def run_checks(config, now, plan):
         ]
         view_dirty = True
         cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+        recordings_listed_epoch = now_epoch
     elif run_mode == "seed":
         recording_objects = list_objects(config, config.recordings_prefix)
         uploads = list_uploads(config, config.recordings_prefix)
         hidden_objects = []
         view_dirty = True
         cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+        recordings_listed_epoch = now_epoch
     else:
         # Delta: the retained view plus the dual-layout audit tail (the flat
         # discovery listing + bounded dated-day streams) over a bounded
         # pre-cursor overlap re-list (late uploads, issue #228), the heartbeat
-        # tail and the FULL recordings prefix (random-keyed tars cannot be
-        # discovered with a key cursor). Versions are sweep-only, so the
-        # retained hidden set is carried unchanged and a delete marker on an
-        # old key lands at the sweep bound. A delta listing that overflows
-        # its page bound abandons the delta and runs an exact sweep instead
-        # of reading a truncated view.
+        # tail and the random-keyed recordings prefix (bounded by
+        # `recordings_list_seconds`, because a key cursor cannot discover a
+        # UUID-keyed tar and a full list on every run is an ever-growing cost).
+        # Versions are sweep-only, so the retained hidden set is carried
+        # unchanged and a delete marker on an old key lands at the sweep bound.
+        # A delta listing that overflows its page bound abandons the delta and
+        # runs an exact sweep instead of reading a truncated view - EXCEPT a
+        # recordings-only overflow, which is deferred one discovery interval
+        # instead: that prefix grows forever, so degrading it to a sweep is
+        # precisely the 288x/day regression this bound exists to prevent, and
+        # the audit/heartbeat/session discovery in this run is unaffected.
         audit_objects = dict(view.get("audit_objects") or {})
         recording_objects = dict(view.get("recording_objects") or {})
         hidden_objects = list(view.get("hidden") or [])
@@ -5340,23 +5406,48 @@ def run_checks(config, now, plan):
             # Recordings are random-keyed (`recordings/<sid>.tar` carries no
             # timestamp), so a key cursor on that prefix is a design error: a
             # new tar whose UUID sorts below the stored cursor would stay
-            # invisible until the sweep. A delta therefore lists the whole
-            # recordings prefix (bounded: ~16 pages live) and the stored
-            # `recordings` cursor stays a compatibility high-water mark that
-            # no longer gates discovery. Only entries new to the view or with
-            # a moved LastModified enter the merge, so re-reading the prefix
-            # does not dirty the sidecar on a quiet run.
-            listed_recordings = list_objects(
-                config, config.recordings_prefix, max_pages=DELTA_MAX_PAGES)
-            new_recordings = {
-                key: moment for key, moment in listed_recordings.items()
-                if recording_objects.get(key) != moment}
+            # invisible until the sweep. The only correct discovery is the
+            # whole prefix, bounded by `recordings_list_seconds`: listing it
+            # on every 5-minute delta is a cost that grows with the bucket
+            # forever, and once the prefix crosses DELTA_MAX_PAGES it would
+            # turn every delta into a full sweep. So the prefix is listed only
+            # when the persisted watermark is older than the interval (a
+            # delta inside the interval keeps the retained view unchanged),
+            # and a page overflow DEFERS the discovery one interval instead of
+            # abandoning the delta. The stored `recordings` cursor stays a
+            # compatibility high-water mark that no longer gates discovery.
+            # Only entries new to the view or with a moved LastModified enter
+            # the merge, so re-reading the prefix does not dirty the sidecar on
+            # a quiet run.
+            listed_recordings = {}
+            if config.recordings_list_seconds <= 0 \
+                    or now_epoch - recordings_listed_epoch >= config.recordings_list_seconds:
+                try:
+                    listed_recordings = list_objects(
+                        config, config.recordings_prefix, max_pages=DELTA_MAX_PAGES)
+                except DeltaTooLong as exc:
+                    # A recordings-only overflow must never degrade the run to
+                    # a sweep (that is the 288x/day cost this bound exists to
+                    # avoid). Defer the discovery one interval, pin the
+                    # watermark so the retry is after the interval rather than
+                    # every run, and let the audit/heartbeat/session delta in
+                    # this run proceed normally.
+                    recordings_listed_epoch = now_epoch
+                    log("WARNING: recordings listing exceeded the page cap (%s); "
+                        "recordings discovery deferred (%ds)" % (
+                            clip(exc, 120), config.recordings_list_seconds))
+                else:
+                    new_recordings = {
+                        key: moment for key, moment in listed_recordings.items()
+                        if recording_objects.get(key) != moment}
+                    recordings_listed_epoch = now_epoch
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
             plan["performed_sweep"] = True
             audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
             new_audit = {}
             new_recordings = {}
+            recordings_listed_epoch = now_epoch
             run_mode = "sweep"
             window_text = None
             view_dirty = True
@@ -5396,6 +5487,7 @@ def run_checks(config, now, plan):
                 audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
                 new_audit = {}
                 new_recordings = {}
+                recordings_listed_epoch = now_epoch
                 run_mode = "sweep"
                 window_text = None
                 view_dirty = True
@@ -5931,6 +6023,7 @@ def run_checks(config, now, plan):
         "mode": run_mode,
         "window_start": window_text,
         "cursors": cursors,
+        "recordings_listed_epoch": recordings_listed_epoch,
         "boundaries": boundaries_out,
         "dirty": view_dirty,
         "audit_objects": audit_objects if view_dirty else None,
@@ -6270,6 +6363,13 @@ def observed_problem(observed, record_run_seq, config=None, now=None):
             return "observed.%s is invalid: %r" % (name, value)
     if not isinstance(observed.get("sweep_failed"), bool):
         return "observed.sweep_failed is invalid: %r" % (observed.get("sweep_failed"),)
+    # The recordings-discovery watermark (issue #228). Absent is valid (legacy
+    # state, and "list now" semantics); a present value must be a plain epoch
+    # second, never a bool, a negative or a string.
+    listed_epoch = observed.get("recordings_listed_epoch")
+    if listed_epoch is not None and (
+            isinstance(listed_epoch, bool) or not isinstance(listed_epoch, int) or listed_epoch < 0):
+        return "observed.recordings_listed_epoch is invalid: %r" % (listed_epoch,)
     coverage = observed.get("coverage")
     if not isinstance(coverage, dict):
         return "observed.coverage is not a JSON object"
@@ -6384,6 +6484,9 @@ def build_observed(previous_observed, payload, now_epoch, run_seq, config):
                 mode == "delta" and bool(legacy_coverage.get("compact_blind"))),
         },
         "cursors": payload.get("cursors") or legacy.get("cursors") or {},
+        "recordings_listed_epoch": int(
+            payload.get("recordings_listed_epoch")
+            or legacy.get("recordings_listed_epoch", 0) or 0),
         "sweep_boundaries": payload.get("boundaries") or [],
     }
     if mode == "sweep":
