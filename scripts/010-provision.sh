@@ -45,8 +45,8 @@ CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
 # Keep in sync with local.cloudfront_origin_facing_cidrs in
 # cloudfront_ranges.tf — tests/edge-origin-auth asserts the two lists are
 # identical. CloudFront is not Cloudflare AOP: the :443 leg is gated by
-# these ranges (firewall) plus the X-Piercloud-Origin secret header
-# (Caddy); neither control alone is auth.
+# these ranges (firewall) plus the raw-peer gate (Caddy); the origin client
+# certificate verified at the TLS layer is the authentication (#202).
 CLOUDFRONT_ORIGIN_CIDRS="130.176.88.0/21 54.239.134.0/23 52.82.134.0/23 130.176.86.0/23 130.176.140.0/22 130.176.0.0/18 54.239.204.0/22 130.176.160.0/19 70.132.0.0/18 15.158.0.0/16 130.176.136.0/23 54.239.170.0/23 130.176.96.0/19 54.182.184.0/22 204.246.166.0/24 130.176.64.0/21 54.182.172.0/22 205.251.218.0/24 130.176.144.0/20 54.182.176.0/21 130.176.78.0/23 54.182.248.0/22 64.252.128.0/18 54.182.154.0/23 64.252.64.0/18 54.182.144.0/21 54.182.224.0/21 130.176.128.0/21 52.46.0.0/18 3.172.64.0/18 52.82.128.0/23 18.68.0.0/16 54.182.156.0/22 54.182.160.0/21 54.182.240.0/21 130.176.192.0/19 130.176.76.0/24 54.239.208.0/21 54.182.188.0/23 24.110.128.0/17 3.172.0.0/18 130.176.80.0/22 54.182.128.0/20 130.176.72.0/22 13.124.199.0/24 3.29.57.0/26 2600:9000:1000::/36 2600:9000:5200::/40 2600:9000:6000::/36 2406:da11:438:2300::/56 2406:da1e:705:1600::/56 2406:da1c:8d8c:4600::/56 2406:da14:17bd:2f00::/56 2406:da12:4b:c200::/56 2406:da16:c01:c200::/56 2406:da1a:6df:6c00::/56 2406:da1b:e7c:ad00::/56 2406:da18:9fa:1b00::/56 2406:da1c:787:2b00::/56 2406:da19:e19:4a00::/56 2406:da1f:396:9100::/56 2406:da10:847f:a100::/56 2406:da12:8b2e:9c00::/56 2406:da14:80bb:ea00::/56 2600:1f11:e79:a800::/56 2600:1f1a:4568:b500::/56 2a05:d014:1362:b000::/56 2a05:d019:80b:e300::/56 2a05:d016:9ed:de00::/56 2a05:d01a:8a9:be00::/56 2a05:d011:531:1800::/56 2a05:d018:1a3a:2d00::/56 2a05:d01c:343:c300::/56 2a05:d012:581:b400::/56 2a05:d025:e59:fb00::/56 2600:1f17:4356:f100::/56 2600:1f1e:a7:2300::/56 2600:1f18:7530:7200::/56 2600:1f16:1923:3000::/56 2600:1f1c:da:600::/56 2600:1f13:417:4d00::/56"
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -132,6 +132,12 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	# admin.disabled:true would refuse the reload, and publishing :2019"
   printf '%s\n' "	# would expose control — loopback is neither."
   printf '%s\n' "	admin 127.0.0.1:2019"
+  printf '%s\n' "	# Strict SNI/Host is pinned, not left to the Caddy default: a :443 request"
+  printf '%s\n' "	# whose SNI does not match its Host is refused before any handler, and an"
+  printf '%s\n' "	# empty SNI never selects the match-less TLS policy (no client_auth)."
+  printf '%s\n' "	servers {"
+  printf '%s\n' "		strict_sni_host on"
+  printf '%s\n' "	}"
   printf '%s\n' "	# The :443 gate matches the raw TCP peer (remote_ip). Admission is"
   printf '%s\n' "	# never derived from CloudFront-Viewer-Address or any forwarded"
   printf '%s\n' "	# header: a distribution can set them. Do not switch the gate to"
@@ -160,7 +166,7 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "		# plugin, which would break the pinned-build call (queued: issue #56)."
   printf '%s\n' "		# Flood protection"
   printf '%s\n' "		# rests on the firewall allowlist (main /32 + edge ranges) plus the"
-  printf '%s\n' "		# CloudFront origin gate on :443 when the edge is live (docs/dr.md)."
+  printf '%s\n' "		# :443 origin gate (raw peer + origin mTLS) when the edge is live (docs/dr.md)."
   printf '%s\n' "		reverse_proxy 127.0.0.1:${TANG_PORT}"
   printf '%s\n' "	}"
   printf '%s\n' "	handle {"
@@ -168,18 +174,16 @@ render_caddyfile() { # print the Caddyfile to stdout
   printf '%s\n' "	}"
   printf '%s\n' "}"
   if [ -n "${STATUS_HOST:-}" ] && [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
-    # CloudFront origin auth is mandatory for the :443 dashboard block (call
-    # D): fail closed rather than render an unauthenticated origin. The
-    # secret is interpolated into a CEL matcher, so restrict its charset.
-    [ -n "${CLOUDFRONT_ORIGIN_SECRET:-}" ] || die "CLOUDFRONT_ORIGIN_SECRET is not set — the :443 dashboard block requires the CloudFront origin secret (set the org secret, then re-dispatch)."
-    case "${CLOUDFRONT_ORIGIN_SECRET}" in *[!A-Za-z0-9._-]*) die "CLOUDFRONT_ORIGIN_SECRET must match [A-Za-z0-9._-]+ (Caddyfile interpolation safety)." ;; esac
+    # Origin admission (#202): the :443 block is admitted by the raw-peer gate
+    # below and authenticated by the origin client certificate at the TLS layer
+    # (DASH_TLS_STANZA). The retired shared origin header is never read or rendered.
     [ -n "${MAIN_BOX_IPV4:-}" ] || die "MAIN_BOX_IPV4 is not set — the :443 dashboard block needs the main-box bypass address."
     # Bare single-line IPv4, octets 0-255, no leading zeros, no stray
     # whitespace: variables.tf validates the same address for the firewall
     # variable via cidrhost, and Caddy's netip rejects leading zeros — reject
     # both here rather than fail later at `caddy validate` (a trailing
     # newline splits the rendered CEL matcher). A console hand-run sets this
-    # secret without terraform, so the two peers must not drift.
+    # value without terraform, so the two peers must not drift.
     case "${MAIN_BOX_IPV4}" in *[!0-9.]*) die "MAIN_BOX_IPV4 must be digits and dots only (no whitespace or newlines)." ;; esac
     printf '%s' "${MAIN_BOX_IPV4}" | awk -F. 'NF != 4 || NR > 1 {exit 1} {for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]{1,3}$/ || $i ~ /^0[0-9]/ || $i + 0 > 255) exit 1}' || die "MAIN_BOX_IPV4 is not a bare IPv4 (a.b.c.d, octets 0-255, no leading zeros)."
     [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS is empty — refusing to render a gate that admits no CloudFront peer."
@@ -197,25 +201,25 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "		abort"
     printf '%s\n' "	}"
     printf '%s\n' "	handle {"
-    printf '%s\n' "		# CloudFront origin gate (call D): CloudFront is not AOP. Only"
-    printf '%s\n' "		# CloudFront origin-facing peers (or the main box / loopback) may"
-    printf '%s\n' "		# reach the dashboard, and CloudFront peers must carry the secret"
-    printf '%s\n' "		# header it injects (it overwrites client-supplied values). The"
-    printf '%s\n' "		# firewall admits the same peer set; this is the in-Caddy second"
-    printf '%s\n' "		# factor. INSIDE the catch-all handle on purpose: Caddy 2.11.4"
+    printf '%s\n' "		# Origin admission (#202): the raw TCP peer (remote_ip, never client_ip"
+    printf '%s\n' "		# or a forwarded or viewer-address header) must be a CloudFront origin-"
+    printf '%s\n' "		# facing address, the main box, or loopback. The origin client certificate"
+    printf '%s\n' "		# is verified at the TLS layer (client_auth require_and_verify, tls stanza"
+    printf '%s\n' "		# above) before any HTTP byte is read, so it applies to EVERY peer,"
+    printf '%s\n' "		# loopback and main box included. The retired shared origin header gate"
+    printf '%s\n' "		# is gone: CloudFront may still send that header, and nothing reads it."
+    printf '%s\n' "		# INSIDE the catch-all handle on purpose: Caddy 2.11.4"
     printf '%s\n' "		# adapts \`abort\` AFTER \`handle\`, so a site-level gate would sit"
     printf '%s\n' "		# behind this handle and never run (tests/bind-e2e pins the"
     printf '%s\n' "		# adapted route order; tests/edge-origin-auth pins the text)."
-    printf '%s\n' "		# Loopback (127.0.0.1/32 and ::1/128) is exempt: the on-box"
-    printf '%s\n' "		# probes below reach the dashboard via --resolve …:127.0.0.1,"
-    printf '%s\n' "		# and only local processes can source from loopback."
+    printf '%s\n' "		# Loopback (127.0.0.1/32 and ::1/128) passes the peer gate only: the"
+    printf '%s\n' "		# on-box probes reach the dashboard via --resolve …:127.0.0.1, and only"
+    printf '%s\n' "		# local processes can source from loopback. It does not pass the TLS layer."
     printf '%s\n' "		@not_edge_peer \`!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32'))\`"
     printf '%s\n' "		abort @not_edge_peer"
-    printf '%s\n' "		@unauthorized \`!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX_IPV4}/32') || header({'X-Piercloud-Origin':'${CLOUDFRONT_ORIGIN_SECRET}'}))\`"
-    printf '%s\n' "		abort @unauthorized"
     printf '%s\n' "		# No rate_limit directive in the pinned official build (see the"
     printf '%s\n' "		# /rec* note above) — dashboard flood protection is the firewall"
-    printf '%s\n' "		# allowlist plus the CloudFront origin gate above (the rate_limit"
+    printf '%s\n' "		# allowlist plus the raw-peer origin gate above (the rate_limit"
     printf '%s\n' "		# directive itself is queued: issue #56)."
     printf '%s\n' "		reverse_proxy 127.0.0.1:${GATUS_PORT}"
     printf '%s\n' "	}"
@@ -245,6 +249,13 @@ render_caddyfile() { # print the Caddyfile to stdout
 assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving one)
   local cfg="${1:-${CADDY_CONFIG}}" live http_block https_block bad_up gatus_hits
   [ -r "$cfg" ] && [ -s "$cfg" ] || die "cannot read the rendered Caddyfile $cfg — the origin-hardening check cannot run; refusing to finish blind"
+  # #202 fail-closed tooth over the WHOLE file (comments included): the retired
+  # shared origin header must never be rendered again. Matched case-insensitively:
+  # Caddy canonicalizes header names, so a lowercase matcher is the same header.
+  # Only the two retired names are teeth (a legitimate header({...}) matcher is not).
+  if grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret' "$cfg"; then
+    die "serving Caddyfile $cfg carries the retired shared origin header (#202) — refusing to finish blind"
+  fi
   # Direct configuration lines only: a comment mentioning a retired directive
   # (this render carries one for `client_ip`) must neither hide nor trip it.
   live="$(grep -v '^[[:space:]]*#' "$cfg" || true)"
@@ -976,7 +987,7 @@ origin_ca_edge_prove() { # main-flow A2 proof: the public edge must serve the OR
     "[transport]"*)
       die "A2 edge pull could not complete (the request failed at the transport layer — see Detail for the curl exit) — check the anchor's egress DNS/TLS to the public edge and re-dispatch. Detail: ${edge_reason}" ;;
     *)
-      die "A2 edge pull through CloudFront failed — the served chain is incomplete or not leaf-first (CloudFront drops the connection with 502), the platform *.status records/distribution are absent, the origin gate (X-Piercloud-Origin) or firewall allowlist does not admit CloudFront, or the dashboard body marker is missing. Local :443 handshakes fine, so this is the edge leg: set ORIGIN_CA_CERT_PEM to the issued leaf-first chain and re-dispatch (docs/dr.md). Detail: ${edge_reason}" ;;
+      die "A2 edge pull through CloudFront failed — the served chain is incomplete or not leaf-first (CloudFront drops the connection with 502), the platform *.status records/distribution are absent, the origin peer gate or firewall allowlist does not admit CloudFront, or the origin client certificate is rejected, or the dashboard body marker is missing. Local :443 handshakes fine, so this is the edge leg: set ORIGIN_CA_CERT_PEM to the issued leaf-first chain and re-dispatch (docs/dr.md). Detail: ${edge_reason}" ;;
   esac
 }
 # --- origin-ca:end ---
@@ -2960,7 +2971,7 @@ gatus_puller_run_once
 #    CF_AOP_CA_PEM (legacy zone-level Authenticated Origin Pulls bundle for
 #    the pre-A2 Cloudflare edge; A2 retires AOP for the :443 origin leg —
 #    CloudFront has no AOP — so the expected post-cutover state is UNSET:
-#    edge auth = firewall allowlist + the X-Piercloud-Origin gate below.
+#    edge auth = firewall allowlist + the raw-peer gate + origin mTLS (#202).
 #    Pre-A2 Cloudflare-edge rollback only: set it per docs/dr.md).
 # ---------------------------------------------------------------------------
 log "Rendering dispatch-managed Caddyfile (${CADDY_CONFIG})"
@@ -2982,7 +2993,8 @@ origin_ca_select_pair
 #
 # Two sources feed ONE pool file and ONE `client_auth require_and_verify`:
 #   - CF_AOP_CA_PEM     — the legacy Cloudflare Authenticated Origin Pulls
-#     bundle (retired at the A2 CloudFront cutover; expected UNSET);
+#     bundle (retired at the A2 CloudFront cutover; expected UNSET, and REFUSED
+#     while ORIGIN_MTLS_CA_PEM is set: it would widen the trust pool);
 #   - ORIGIN_MTLS_CA_PEM — the self-held origin-mTLS CA (issue #202), read from
 #     the committed `scripts/origin-mtls-ca.pem` by 020 and exported into this
 #     script. CloudFront presents an ACM client certificate signed by it.
@@ -2991,6 +3003,9 @@ origin_ca_select_pair
 AOP_TLS=""
 MTLS_TLS=""
 CLIENT_CA_POOL=""
+if [ -n "${CF_AOP_CA_PEM:-}" ] && [ -n "${ORIGIN_MTLS_CA_PEM:-}" ]; then
+  die "CF_AOP_CA_PEM is set alongside ORIGIN_MTLS_CA_PEM — it would widen the origin trust pool beyond the committed origin-mTLS CA (any Cloudflare-zone leaf would pass). Unset CF_AOP_CA_PEM: it only served the pre-A2 Cloudflare-edge rollback, which origin mTLS does not support (pre-mTLS releases are never a valid target; they reopen #202)"
+fi
 if [ -n "${CF_AOP_CA_PEM:-}" ]; then
   case "${CF_AOP_CA_PEM}" in *"PRIVATE KEY"*) die "CF_AOP_CA_PEM must be certificate-only (it is written world-readable) — strip the private key from the bundle";; esac
   origin_ca_aop_deployed || die "CF_AOP_CA_PEM is not a bounded PEM certificate bundle (line-anchored BEGIN/END, base64-only bodies, every block parsing as exactly one X.509 certificate with no trailing DER) — refusing to deploy it (garbage must not disable the A2 chain gates)"
@@ -3028,8 +3043,8 @@ if [ -n "${CLIENT_CA_POOL}" ]; then
   AOP_TLS="yes"
   log "client-auth pool deployed ($(origin_ca_chain_blocks "${CADDY_AOP_CA}") CA(s)) — origin pulls must present a client cert signed by a pool CA (require_and_verify)"
 else
-  if [ -n "${STATUS_HOST:-}" ]; then die "STATUS_HOST is set but no client-auth CA is configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM both unset) — the shared header is not an origin gate; refusing to serve the status edge"; fi
-  warn "no client-auth CA configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM unset) — edge authentication is firewall-allowlist + the X-Piercloud-Origin gate; this is the pre-#202 state"
+  if [ -n "${STATUS_HOST:-}" ]; then die "STATUS_HOST is set but no client-auth CA is configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM both unset) — without a client-auth CA the origin has no TLS-layer authentication; refusing to serve the status edge"; fi
+  warn "no client-auth CA configured (CF_AOP_CA_PEM and ORIGIN_MTLS_CA_PEM unset) — the :443 origin cannot require a client certificate; the dashboard is not served without STATUS_HOST"
 fi
 CF_AOP_CA_PEM=""       # discard from memory (the file above is 644 on this box only)
 ORIGIN_MTLS_CA_PEM=""  # same
@@ -3048,7 +3063,7 @@ if [ "${ORIGIN_TLS}" = "1" ]; then
 elif [ -n "${AOP_TLS}" ]; then
   # No origin pair on the box: Caddy still obtains the dashboard certificate
   # automatically (HTTP-01), and the client-auth stanza MUST be emitted here
-  # too — without it the edge would be admitted on the shared header alone
+  # too — without it the :443 gate would admit the edge with no client
   # while this run's own trust-pool claim reads as enforced (review F1).
   DASH_TLS_STANZA="	tls {
 		client_auth {
@@ -3060,13 +3075,20 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
-# Pre-create root-only BEFORE the render: the :443 render carries the
-# X-Piercloud-Origin secret, so neither a fail-closed render nor a validate
-# rejection may leave it readable beyond root. The mode assumes the pinned
-# container runs as root — a Renovate bump to a non-root USER would make the
-# bind-mounted file unreadable on recreate; verify on every bump.
+# Pre-create root-only BEFORE the render. The rendered Caddyfile carries no
+# credential since #202, but it still names the main-box address, so neither a
+# fail-closed render nor a validate rejection may leave it readable beyond
+# root. The mode assumes the pinned container runs as root — a Renovate bump
+# to a non-root USER would make the bind-mounted file unreadable on recreate;
+# verify on every bump.
 install -m 0600 /dev/null "$TMP_CADDY"
 render_caddyfile >"$TMP_CADDY"
+# #202 fail-closed tooth: the retired shared origin header must never be rendered,
+# comments included. The render is text, so grep the whole file.
+if grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret' "$TMP_CADDY"; then
+  rm -f "$TMP_CADDY"
+  die "rendered Caddyfile carries the retired shared origin header (#202) — refusing to write it"
+fi
 if [ -f "${CADDY_CONFIG}" ] && cmp -s "${CADDY_CONFIG}" "$TMP_CADDY"; then
   # A no-op render still re-asserts 0600: a pre-0600 file must not survive
   # just because the bytes match.
@@ -3202,7 +3224,7 @@ fi
 # loaded config — an aborted reload (SSH drop, SIGKILL between the in-place
 # write and this line) would otherwise stay invisible, and the next dispatch
 # (identical render, equal mount bytes) would report green while the running Caddy
-# serves the old config (a rotated X-Piercloud-Origin secret or a changed
+# serves the old config (a rotated origin client-auth pool or a changed
 # MAIN_BOX_IPV4 would never apply). A no-op reload is cheap. This also
 # covers ORIGIN_CERT_CHANGED: the bind-mounted cert FILE kept its inode
 # (in-place write), so only a reload makes Caddy re-read it.
@@ -3373,17 +3395,23 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # (7 refused / 28 timeout) or a DNS problem (6): only a TLS-layer rejection
     # proves client_auth is enforcing — a dead :443 must not pass this probe.
     # Rollback wording follows the active pool source (review F5): the AOP
-    # secret hint is only true while CF_AOP_CA_PEM is the pool source. Under
-    # origin mTLS the committed CA ships in the release, so the rollback is a
-    # redeploy of the previous release (the shared header gate keeps the origin
-    # reachable until the follow-up cutover).
+    # secret hint is only true while CF_AOP_CA_PEM is the pool source (it is
+    # refused alongside the origin-mTLS CA, so under origin mTLS it is never a
+    # rollback). One rollback floor, docs/dr.md: while the platform still sends the
+    # retired header, any release carrying the origin-mTLS gate (4d157dd or later)
+    # is a valid target; once the platform drops the header, the floor is this
+    # release. Pre-mTLS releases are never a valid target (they reopen #202).
     if [ -n "${MTLS_TLS}" ]; then
-      pool_rollback="redeploy the previous release (the committed origin-mTLS CA ships in the release; before the header cutover the header gate keeps the origin reachable — after it, re-add the repository secret and the distribution origin header FIRST, then revert the anchor, never the anchor alone: docs/dr.md)"
-      pool_retry="the committed origin-mTLS CA is part of the release, so a rollback is a redeploy of the previous release (docs/dr.md)"
+      pool_rollback="While the platform still sends the retired header, any release carrying the origin-mTLS gate (4d157dd or later) is a valid rollback target. Once the platform drops the header, the floor is this release. Pre-mTLS releases are never a valid target (they reopen #202). Rollback floor: docs/dr.md"
+      pool_retry="redeploy a release carrying the origin-mTLS gate; the rollback floor is in docs/dr.md"
       pool_cause="the origin trust pool does not match CloudFront's client certificate"
     else
-      pool_rollback="roll back with: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && gh workflow run provision.yml -f mode=apply"
-      pool_retry="temporarily: gh secret delete CF_AOP_CA_PEM --repo ${GITHUB_REPOSITORY:-piercloud-net/terraform-piercloud-anchor} && re-dispatch; once the platform records converge the edge pull recovers. A2 cutover: AOP is retired for the :443 origin leg; delete CF_AOP_CA_PEM and do not re-enable"
+      # Unreachable in production: 020 always forwards the committed
+      # origin-mTLS CA (MTLS_TLS=yes) and a CF_AOP_CA_PEM beside it dies at
+      # pool assembly above. Kept for the harnesses that drive this span with
+      # an AOP-only pool; the text must still be true if it ever prints.
+      pool_rollback="no supported rollback to the Cloudflare AOP pool: origin mTLS refuses CF_AOP_CA_PEM alongside the committed CA. Pre-mTLS releases are never a valid target (they reopen #202; docs/dr.md)"
+      pool_retry="the origin-mTLS CA is the only supported client-auth pool: provision with the committed CA and without CF_AOP_CA_PEM (docs/dr.md)"
       pool_cause="the origin trust bundle does not match Cloudflare's client cert"
     fi
     neg_rc=0

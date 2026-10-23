@@ -141,11 +141,11 @@ except ImportError:  # fail closed: the pin must never skip silently
     print("FAIL PyYAML is required (python3-yaml)")
     sys.exit(2)
 
-# Platform-plane values every anchor legitimately shares: the one CloudFront
-# distribution's origin secret and the pc-host address (tang firewall source).
-# Tenants hold both by design (disclosed: docs/security-posture.md row 3).
+# Platform-plane values every anchor legitimately shares: the pc-host address
+# (tang firewall source). Tenants hold it by design. The CloudFront origin
+# secret was retired from the anchor path by #202 (origin mTLS gates the edge),
+# so it is no longer an allowed value anywhere in the workflows.
 SHARED = [
-    "${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}",
     "${{ secrets.MAIN_BOX_IPV4 }}",
 ]
 

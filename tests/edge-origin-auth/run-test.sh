@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # tests/edge-origin-auth/run-test.sh — CloudFront origin-auth proofs (call D).
 #
-# The :443 origin leg has two independent controls: the firewall admits only
-# the CloudFront origin-facing ranges + the main box (main.tf), and Caddy
-# requires the X-Piercloud-Origin secret header from those peers while
-# matching the RAW TCP peer (remote_ip; never header-derived)
-# (scripts/010-provision.sh). This harness drives the REAL render span
-# (extracted, never a copy) and asserts:
-#   - fail-closed: missing/ill-formed CLOUDFRONT_ORIGIN_SECRET or
-#     MAIN_BOX_IPV4 refuses to render the :443 dashboard block;
-#   - gate content: both CEL matchers + aborts, the secret, the main-box
-#     bypass, remote_ip, and NO trusted_proxies/client_ip_headers;
+# The :443 origin leg has three controls: the firewall admits only the
+# CloudFront origin-facing ranges + the main box (main.tf); Caddy admits by the
+# RAW TCP peer (remote_ip; never header-derived) (scripts/010-provision.sh);
+# and the origin client certificate is verified at the TLS layer
+# (client_auth require_and_verify, #202). The retired shared X-Piercloud-Origin
+# header gate is gone, and this harness pins its ABSENCE. It drives the REAL
+# render span (extracted, never a copy) and asserts:
+#   - fail-closed: ill-formed MAIN_BOX_IPV4 refuses to render the :443 block;
+#     an unset or malformed retired CLOUDFRONT_ORIGIN_SECRET no longer refuses
+#     (#202 tooth b) and is never rendered (tooth a);
+#   - gate content: the raw-peer @not_edge_peer matcher + abort, the main-box
+#     bypass, remote_ip, NO header matcher, and NO trusted_proxies/client_ip_headers;
+#   - mutation (d): re-inserting the retired @unauthorized matcher into the real
+#     render is refused by the extracted self-check;
 #   - :80 serves tang + ACME only (no @status dashboard handler);
 #   - HSTS on the :443 site (max-age=15552000, no includeSubDomains);
 #   - sync tooth: the 010 constant == cloudfront_ranges.tf (same set, 81);
 #   - firewall wiring: :443 loops the CloudFront ranges + the main-box rule,
 #     :80 still loops cf_edge_cidrs;
-#   - pipeline wiring: provision.yml passes + masks both secrets, 020
-#     exports both, ci.yml runs this harness with its path gate intact.
+#   - pipeline wiring: provision.yml no longer references the retired secret
+#     (tooth c), 020 never exports it, MAIN_BOX_IPV4 stays wired, ci.yml runs
+#     this harness with its path gate intact.
 # Cred-free, offline (no caddy, no network).
 set -euo pipefail
 
@@ -96,14 +101,16 @@ expect_fail() { # $1 label, $2 expected message substring; caller sets the env
 # ---- fail-closed ----------------------------------------------------------
 export MAIN_BOX_IPV4="${MAIN_BOX}"
 unset CLOUDFRONT_ORIGIN_SECRET
-expect_fail "missing CLOUDFRONT_ORIGIN_SECRET refuses" "CLOUDFRONT_ORIGIN_SECRET is not set"
+( render_443 ) >"${WORK}/Caddyfile.nosecret" || die "render with CLOUDFRONT_ORIGIN_SECRET unset refused (#202: the retired secret must not be required)"
+ok "render succeeds with CLOUDFRONT_ORIGIN_SECRET unset (#202 tooth b)"
 
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}"
 unset MAIN_BOX_IPV4
 expect_fail "missing MAIN_BOX_IPV4 refuses" "MAIN_BOX_IPV4 is not set"
 
 export CLOUDFRONT_ORIGIN_SECRET='sec ret' MAIN_BOX_IPV4="${MAIN_BOX}"
-expect_fail "secret outside [A-Za-z0-9._-] refuses" "must match [A-Za-z0-9._-]+"
+( render_443 ) >"${WORK}/Caddyfile.badsecret" || die "render with a malformed retired secret refused (#202)"
+hasnt "${WORK}/Caddyfile.badsecret" 'sec ret' "a malformed retired secret is never rendered (#202)"
 
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="1.2.3"
 expect_fail "short MAIN_BOX_IPV4 refuses" "not a bare IPv4"
@@ -133,13 +140,21 @@ CLOUDFRONT_ORIGIN_CIDRS="${saved_cidrs}"
 export CLOUDFRONT_ORIGIN_SECRET="${SECRET}" MAIN_BOX_IPV4="${MAIN_BOX}"
 ( render_443 ) > "${WORK}/Caddyfile.443" || die "happy-path render failed"
 has "${WORK}/Caddyfile.443" 'abort @not_edge_peer' "gate aborts non-CloudFront peers"
-has "${WORK}/Caddyfile.443" 'abort @unauthorized' "gate aborts peers without the secret"
-has "${WORK}/Caddyfile.443" "${SECRET}" "gate carries the origin secret"
+hasnt "${WORK}/Caddyfile.443" '@unauthorized' "gate has no header-only matcher (the retired @unauthorized is gone)"
+hasnt "${WORK}/Caddyfile.443" "${SECRET}" "render never carries the retired origin secret, even when set (#202 tooth a)"
+hasnt "${WORK}/Caddyfile.443" 'X-Piercloud-Origin' "render never names the retired origin header (#202 tooth a)"
+hasnt "${WORK}/Caddyfile.443" 'CLOUDFRONT_ORIGIN_SECRET' "render never names the retired secret variable (#202 tooth a)"
+hasnt "${WORK}/Caddyfile.443" 'header({' "render has no header({ matcher (#202 tooth a)"
 has "${WORK}/Caddyfile.443" 'remote_ip(' "gate matches the raw TCP peer (remote_ip)"
 hasnt "${WORK}/Caddyfile.443" 'trusted_proxies' "no trusted_proxies (header cannot move the peer gate)"
 hasnt "${WORK}/Caddyfile.443" 'client_ip_headers' "no client_ip_headers (header is never admission)"
 has "${WORK}/Caddyfile.443" 'header Strict-Transport-Security "max-age=15552000"' "HSTS max-age=15552000 on the :443 site"
 hasnt "${WORK}/Caddyfile.443" 'includeSubDomains' "HSTS does not includeSubDomains"
+# Red-team F3: strict SNI/Host is pinned explicitly, never left to the Caddy
+# default, and never disabled (insecure_off would let an empty SNI select the
+# match-less TLS policy, which has no client_auth).
+has "${WORK}/Caddyfile.443" 'strict_sni_host on' "render pins strict SNI/Host matching explicitly (F3)"
+hasnt "${WORK}/Caddyfile.443" 'insecure_off' "render never disables strict SNI/Host (F3)"
 
 # :80 carries tang + ACME only — no dashboard handler (origin hardening).
 awk '/^:80 \{/{f=1} f{print} f&&/^}$/{exit}' "${WORK}/Caddyfile.443" > "${WORK}/http.block"
@@ -301,11 +316,39 @@ case "${not_edge_line}" in
   *"!(remote_ip(${cf_cel}, '127.0.0.1/32', '::1/128', '${MAIN_BOX}/32'))"*) ok "not_edge_peer matcher lists all 81 ranges + loopback (v4+v6) + the main box" ;;
   *) bad "not_edge_peer matcher shape (got: $(printf '%s' "${not_edge_line}" | tail -c 200))" ;;
 esac
-unauth_line="$(grep -m1 '@unauthorized' "${WORK}/Caddyfile.443" || true)"
-case "${unauth_line}" in
-  *"!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX}/32') || header({'X-Piercloud-Origin':'${SECRET}'}))"*) ok "unauthorized matcher = loopback (v4+v6)/main-box bypass OR the secret header" ;;
-  *) bad "unauthorized matcher shape (got: $(printf '%s' "${unauth_line}" | tail -c 200))" ;;
-esac
+# (d) mutation: re-insert the retired @unauthorized header matcher into the REAL
+# render, right after the raw-peer abort where it used to sit. The render is
+# text, so the mutant is spliced from the real output, never retyped. The mutant
+# must carry the retired gate (so the refusal cannot be vacuous), and the
+# extracted self-check, which runs before every converge, must refuse it for
+# that reason.
+T=$'\t'
+unauth_gate="${T}${T}@unauthorized \`!(remote_ip('127.0.0.1/32', '::1/128', '${MAIN_BOX}/32') || header({'X-Piercloud-Origin':'${SECRET}'}))\`"
+awk -v gate="${unauth_gate}" -v gate2="${T}${T}abort @unauthorized" -v anchor="${T}${T}abort @not_edge_peer" \
+  '{ print } $0 == anchor { print gate; print gate2 }' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.unauth-mutant"
+has "${WORK}/Caddyfile.unauth-mutant" 'abort @unauthorized' "mutation (d): the re-inserted header gate is present in the mutant"
+hard_die "${WORK}/Caddyfile.unauth-mutant" "retired shared origin header (#202)" "mutation (d): the self-check refuses a render that re-inserts @unauthorized"
+
+# Fixture 18 (red-team F1): a LOWER-case retired header matcher. Caddy
+# canonicalizes header names, so `header x-piercloud-origin` is the same header
+# as X-Piercloud-Origin; a case-sensitive tooth passes it and the regression ships.
+lc_gate="${T}${T}@lc header x-piercloud-origin probe-value"
+awk -v gate="${lc_gate}" -v anchor="${T}${T}abort @not_edge_peer" \
+  '{ print } $0 == anchor { print gate }' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.lc-header"
+has "${WORK}/Caddyfile.lc-header" 'header x-piercloud-origin' "fixture 18: the lower-case retired header matcher is in the fixture"
+hard_die "${WORK}/Caddyfile.lc-header" "retired shared origin header (#202)" "self-check refuses a lower-case header x-piercloud-origin matcher (F1)"
+# Fixture 19 (red-team F5): a LEGITIMATE CEL header matcher is not the retired
+# header and must never false-red the gate.
+acc_gate="${T}${T}@accept header({'Accept':'application/json'})"
+awk -v gate="${acc_gate}" -v anchor="${T}${T}abort @not_edge_peer" \
+  '{ print } $0 == anchor { print gate }' "${WORK}/Caddyfile.443" > "${WORK}/Caddyfile.legit-header"
+has "${WORK}/Caddyfile.legit-header" "header({'Accept'" "fixture 19: a legitimate header({...}) matcher is in the fixture"
+hard_ok "${WORK}/Caddyfile.legit-header" "self-check accepts a legitimate header({'Accept':...}) matcher (F5: no false red)"
+# The teeth are the two retired names, case-insensitively, at both sites (the
+# in-function self-check and the post-render write gate), and no longer the
+# case-sensitive header({ alternative.
+is "010 teeth: two case-insensitive grep sites over the retired names" "2" "$(grep -cF "grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret'" "${PROVISION_SH}")"
+hasnt "${PROVISION_SH}" 'X-Piercloud-Origin|CLOUDFRONT_ORIGIN_SECRET|header\(\{' "the old case-sensitive teeth pattern (with header({) is gone (F1/F5)"
 
 # The gate must sit INSIDE the catch-all handle: Caddy adapts `abort` after
 # `handle`, so a site-level gate is dead code (tests/bind-e2e pins the
@@ -357,13 +400,14 @@ has "${PROVISION_SH}" 'install -m 0600 /dev/null "$TMP_CADDY"' "rendered Caddyfi
 has "${PROVISION_SH}" 'chmod 600 "${CADDY_CONFIG}"' "unchanged render re-asserts 0600 on the live Caddyfile"
 has "${PROVISION_SH}" '"PRIVATE KEY"*)' "AOP bundle rejects key-bearing PEMs (it is written world-readable)"
 has "${PROVISION_SH}" 'rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate' "validate failure removes the rendered file"
+has "${PROVISION_SH}" 'rendered Caddyfile carries the retired shared origin header (#202)' "render-time tooth refuses a retired-header render before it is written"
 
 # ---- pipeline wiring ------------------------------------------------------
-has "${PROV}" 'CLOUDFRONT_ORIGIN_SECRET: ${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}' "provision.yml passes CLOUDFRONT_ORIGIN_SECRET"
+hasnt "${PROV}" 'secrets.CLOUDFRONT_ORIGIN_SECRET' "provision.yml never references secrets.CLOUDFRONT_ORIGIN_SECRET (#202 tooth c)"
+hasnt "${PROV}" 'CLOUDFRONT_ORIGIN_SECRET' "provision.yml names no retired origin-secret variable"
 has "${PROV}" 'MAIN_BOX_IPV4: ${{ secrets.MAIN_BOX_IPV4 }}' "provision.yml passes MAIN_BOX_IPV4"
-has "${PROV}" '::add-mask::${{ secrets.CLOUDFRONT_ORIGIN_SECRET }}' "provision.yml masks the origin secret"
 has "${PROV}" '::add-mask::${{ secrets.MAIN_BOX_IPV4 }}' "provision.yml masks the main-box address"
-has "${ANCHOR_020}" "CLOUDFRONT_ORIGIN_SECRET='\$(q \"\${CLOUDFRONT_ORIGIN_SECRET:-}\")'" "020 exports CLOUDFRONT_ORIGIN_SECRET"
+hasnt "${ANCHOR_020}" 'CLOUDFRONT_ORIGIN_SECRET' "020 never exports the retired secret (the box env carries none)"
 has "${ANCHOR_020}" "MAIN_BOX_IPV4='\$(q \"\${MAIN_BOX_IPV4:-}\")'" "020 exports MAIN_BOX_IPV4"
 has "${CI}" 'tests/edge-origin-auth/run-test.sh' "ci.yml runs this harness"
 has "${CI}" 'edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/' "ci.yml path gate includes edge-origin-auth (witness pin intact)"

@@ -134,6 +134,8 @@ eval "$(grep '^CLOUDFRONT_ORIGIN_CIDRS=' "${PROVISION_SH}")"
 [ -n "${CLOUDFRONT_ORIGIN_CIDRS:-}" ] || die "CLOUDFRONT_ORIGIN_CIDRS extraction failed"
 export TENANT_USER TANG_PORT="${MOCK_PORT}" GATUS_PORT="${STUB_PORT}"
 export CADDY_CHALLENGE_DIR="${WORK}/acme-challenge"
+# Retired shared origin header (#202): the render must not need the secret.
+unset CLOUDFRONT_ORIGIN_SECRET
 # Bare :port (like production :80): matches ANY Host with plain HTTP, so the
 # catch-all abort is exercised exactly like prod (:80 serves tang + ACME
 # only; the dashboard is :443-only). (http://127.0.0.1:port would pin Host
@@ -154,13 +156,13 @@ log "CI Caddyfile rendered (:80 tang/ACME only; status host ${STATUS_HOST} unhan
 # production addressing and validate (never served here).
 ( export CADDY_HTTP_ADDR=":80" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
 export TENANT_USER=prodprobe STATUS_HOST=""
-export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
+export MAIN_BOX_IPV4=192.0.2.99
 export DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 caddy_status_names
 render_caddyfile > "${WORK}/Caddyfile.prodshape" )
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.prodshape" --adapter caddyfile
-grep -q "@unauthorized" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the CloudFront origin gate"
-grep -q "harness-origin-secret" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the origin secret in the gate"
+grep -q "@not_edge_peer" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the raw-peer origin gate"
+if grep -Eqi 'x-piercloud-origin|cloudfront_origin_secret' "${WORK}/Caddyfile.prodshape"; then die "prodshape render carries the retired shared origin header (#202)"; fi
 grep -q "192.0.2.99/32" "${WORK}/Caddyfile.prodshape" || die "prodshape render lacks the main-box bypass"
 HOME="${WORK}" "${CADDY_BIN}" validate --config "${WORK}/Caddyfile.ci" --adapter caddyfile
 log "Both renders validate (CI shape + shipped shape)"
@@ -181,7 +183,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin.key" -out "${WORK}/or
   -days 1 -nodes -subj "/CN=harness-origin" >/dev/null 2>&1 || die "openssl could not mint the harness origin pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export TENANT_USER=prodprobe STATUS_HOST=""
-  export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
+  export MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin.crt" CADDY_ORIGIN_KEY="${WORK}/origin.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # shellcheck disable=SC1090
@@ -200,7 +202,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/origin-ca.key" -out "${WORK}
   -days 1 -nodes -subj "/CN=harness-origin-ca" >/dev/null 2>&1 || die "openssl could not mint the harness origin-ca pair"
 ( export CADDY_HTTP_ADDR=":443" CADDY_SKIP_HTTPS="" TANG_PORT="8081" GATUS_PORT="8080"
   export TENANT_USER=prodprobe STATUS_HOST=""
-  export CLOUDFRONT_ORIGIN_SECRET=harness-origin-secret MAIN_BOX_IPV4=192.0.2.99
+  export MAIN_BOX_IPV4=192.0.2.99
   export ORIGIN_TLS="1" ORIGIN_CA_PAIR="1" AOP_TLS="yes"
   export CADDY_ORIGIN_CRT="${WORK}/origin-ca.crt" CADDY_ORIGIN_KEY="${WORK}/origin-ca.key" CADDY_AOP_CA="${WORK}/aop-ca.pem"
   # The REAL stanza builder (extracted above) must pick up the per-anchor
@@ -228,10 +230,11 @@ log "Per-anchor origin-ca render validates (real pair + AOP stanza compiled)"
 # peer/header matrix. Loopback is exempt (the on-box probes connect from
 # it), so the matrix uses MAIN_BOX_IPV4=127.0.0.2 and a test-scoped admitted
 # range 127.0.0.3/32 (production carries the 81 public AWS prefixes; the
-# render reads CLOUDFRONT_ORIGIN_CIDRS). The matrix includes a forged
-# client-IP header from an admitted peer: the gate must match the DIRECT
-# peer (remote_ip), never the trusted-proxy-resolved client, or a
-# viewer-supplied header would be spoofable through the edge.
+# render reads CLOUDFRONT_ORIGIN_CIDRS). The gate admits on the raw TCP peer
+# alone (remote_ip): the retired X-Piercloud-Origin header is ignored, and the
+# matrix forges CloudFront-Viewer-Address from an outside and an admitted peer,
+# so a viewer-supplied header can neither widen admission nor deny it. The TLS
+# layer (mTLS) is proven separately in the serve section below.
 log "Gate: adapted route order + served peer/header matrix"
 GATE_HOST="gateprobe.status.piercloud.net:${GATE_TLS_PORT}"
 # The cert SAN must cover the site host or Caddy falls back to ACME (which
@@ -241,7 +244,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/gate.key" -out "${WORK}/gate
   || die "openssl could not mint the gate pair"
 ( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
   export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}"
-  export CLOUDFRONT_ORIGIN_CIDRS="127.0.0.3/32" CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
+  export CLOUDFRONT_ORIGIN_CIDRS="127.0.0.3/32" MAIN_BOX_IPV4="127.0.0.2"
   export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
   caddy_status_names
   render_caddyfile > "${WORK}/Caddyfile.gate" )
@@ -274,15 +277,23 @@ for grp in site["handle"][0]["routes"]:
 if catchall is None:
     print("catch-all handle group not found")
     sys.exit(1)
-inner = [r["handle"][0] for r in catchall["handle"][0]["routes"]]
-kinds = ["abort" if h.get("handler") == "static_response" and h.get("abort") else h.get("handler") for h in inner]
-if kinds.count("abort") < 2 or "reverse_proxy" not in kinds:
-    print(f"gate handlers missing from the catch-all handle: {kinds}")
+routes = catchall["handle"][0]["routes"]
+kinds = ["abort" if r["handle"][0].get("handler") == "static_response" and r["handle"][0].get("abort") else r["handle"][0].get("handler") for r in routes]
+aborts = [r for r, k in zip(routes, kinds) if k == "abort"]
+# Exactly one abort, and it must be the @not_edge_peer raw-peer gate: an
+# unconditional abort (no matcher, or a matcher that is not the gate) would
+# pass a bare count and deny every request, or gate nothing at all.
+if len(aborts) != 1 or "reverse_proxy" not in kinds:
+    print(f"want exactly one abort and a reverse_proxy in the catch-all handle: {kinds}")
     sys.exit(1)
-if kinds.index("reverse_proxy") < max(i for i, k in enumerate(kinds) if k == "abort"):
+gate = [m.get("expression", {}) for m in aborts[0].get("match", []) if m.get("expression", {}).get("name") == "not_edge_peer" and "remote_ip" in m.get("expression", {}).get("expr", "")]
+if not gate:
+    print(f"the catch-all abort carries no @not_edge_peer remote_ip matcher: {aborts[0].get('match')}")
+    sys.exit(1)
+if kinds.index("reverse_proxy") < kinds.index("abort"):
     print(f"gate aborts after the reverse_proxy: {kinds}")
     sys.exit(1)
-print(f"adapted gate order OK: {kinds}")
+print(f"adapted gate order OK: {kinds}, matcher {gate[0]['name']}")
 PY
 }
 assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
@@ -293,7 +304,7 @@ assert_gate_order "${WORK}/Caddyfile.gate.json" "${GATE_HOST%:*}"
 # presence tooth below is what keeps a leaked override from passing.
 ( export CADDY_HTTP_ADDR=":${GATE_HTTP_PORT}" CADDY_SKIP_HTTPS="" TANG_PORT="${MOCK_PORT}" GATUS_PORT="${GATE_STUB_PORT}"
   export TENANT_USER=gateprobe STATUS_HOST="${GATE_HOST}"
-  export CLOUDFRONT_ORIGIN_SECRET="harness-origin-secret" MAIN_BOX_IPV4="127.0.0.2"
+  export MAIN_BOX_IPV4="127.0.0.2"
   export DASH_TLS_STANZA="	tls ${WORK}/gate.crt ${WORK}/gate.key"
   caddy_status_names
   render_caddyfile > "${WORK}/Caddyfile.gate.prod" )
@@ -327,14 +338,14 @@ gate_expect() { # $1 label, $2 source interface, $3 want (ok|abort); rest = extr
     abort) { [ "${code}" != "200" ] || [ "${rc}" -ne 0 ]; } && log "gate OK: ${label} (aborted, http ${code}, curl rc ${rc})" || die "gate: ${label} expected an abort, got 200" ;;
   esac
 }
-gate_expect "main box, no header passes"          127.0.0.2 ok
-gate_expect "admitted peer, no header aborts"     127.0.0.3 abort
-gate_expect "admitted peer, wrong header aborts"  127.0.0.3 abort -H 'X-Piercloud-Origin: wrong'
-gate_expect "admitted peer, secret passes"        127.0.0.3 ok    -H 'X-Piercloud-Origin: harness-origin-secret'
-gate_expect "outside peer, secret aborts"         127.0.0.4 abort -H 'X-Piercloud-Origin: harness-origin-secret'
-gate_expect "outside peer, no header aborts"      127.0.0.4 abort
-gate_expect "loopback, no header passes"          127.0.0.1 ok
-gate_expect "admitted peer, forged viewer-IP header aborts" 127.0.0.3 abort -H 'CloudFront-Viewer-Address: 127.0.0.1'
+gate_expect "main box, no header passes"                                  127.0.0.2 ok
+gate_expect "admitted peer, no header passes (peer gate, no secret)"    127.0.0.3 ok
+gate_expect "admitted peer, retired header ignored"                     127.0.0.3 ok    -H 'X-Piercloud-Origin: harness-origin-secret'
+gate_expect "outside peer, no header aborts"                            127.0.0.4 abort
+gate_expect "outside peer, retired header grants nothing"               127.0.0.4 abort -H 'X-Piercloud-Origin: harness-origin-secret'
+gate_expect "loopback, no header passes"                                127.0.0.1 ok
+gate_expect "outside peer, forged main-box viewer address aborts"       127.0.0.4 abort -H 'CloudFront-Viewer-Address: 127.0.0.2'
+gate_expect "admitted peer, forged outside viewer address still passes" 127.0.0.3 ok    -H 'CloudFront-Viewer-Address: 127.0.0.4'
 kill "${GATE_PID}" "${GATE_STUB_PID}" 2>/dev/null || true
 wait "${GATE_PID}" 2>/dev/null || true
 log "Gate matrix passed (adapted order + 8 request cases)"
@@ -408,6 +419,22 @@ curl -skf --max-time 10 --cert "${WORK}/aop-leaf.crt" --key "${WORK}/aop-leaf.ke
   || die "leaf-signed client was rejected by the AOP vhost"
 grep -q "gatus-stub-ok" "${WORK}/aop-pos.body" || die "leaf-signed client did not reach the stub backend (got: $(head -c 120 "${WORK}/aop-pos.body"))"
 log "PASS: leaf-signed client accepted end-to-end through the AOP vhost"
+# Retired header and out-of-pool client certificates, at the TLS layer (#202):
+# the shared header is not an admission signal, so a cert-less request that
+# still carries it dies in the handshake, and a client cert not issued by the
+# trust pool (a self-signed clientAuth leaf here) is refused.
+aop_hdr_rc=0
+curl -sk --max-time 10 -H 'X-Piercloud-Origin: harness-origin-secret' \
+  --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" -o /dev/null 2>/dev/null || aop_hdr_rc=$?
+[ "${aop_hdr_rc}" -ne 0 ] || die "AOP vhost answered a cert-less request carrying the retired header"
+openssl req -x509 -newkey rsa:2048 -keyout "${WORK}/rogue.key" -out "${WORK}/rogue.crt" \
+  -days 1 -nodes -subj "/CN=aop-rogue" -addext "extendedKeyUsage=clientAuth" >/dev/null 2>&1 \
+  || die "openssl could not mint the out-of-pool client cert"
+rogue_rc=0
+curl -sk --max-time 10 --cert "${WORK}/rogue.crt" --key "${WORK}/rogue.key" \
+  --resolve "${AOP_SNI}:443:127.0.0.1" "https://${AOP_SNI}/" -o /dev/null 2>/dev/null || rogue_rc=$?
+[ "${rogue_rc}" -ne 0 ] || die "AOP vhost accepted a client cert outside the trust pool"
+log "PASS: retired header without a client cert and an out-of-pool client cert are both refused at the TLS layer"
 
 # ---------------------------------------------------------------- 5. proxy
 log "Proxy assertions (content-identical + signature-verified)"

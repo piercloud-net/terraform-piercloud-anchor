@@ -17,20 +17,22 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 > cross-box interactions are answering clevis's TCP/80 challenges from the
 > main-box IP, serving ACME challenges on TCP/80 and the dashboard on TCP/443
 > (never on `:80`) to the platform edge — the CloudFront origin-facing ranges
-> + the main box on TCP/443 are the dashboard leg; on an anchor that carries this release, Caddy requires a CloudFront
-> client certificate signed by the committed origin-mTLS CA at the TLS
-> handshake (`client_auth require_and_verify`, issue #202) **and** still
-> requires the X-Piercloud-Origin secret header from every `:443` peer except
-> the main box and loopback `127.0.0.1/32`/`::1/128` (the on-box probes) until
-> the header-retirement cutover lands — call D); an anchor that does not yet carry this release gates on the header alone — plus probing the tenant's public endpoints
-> for availability (narrow firewall rules; no SSH inbound
+> + the main box on TCP/443 are the dashboard leg; Caddy requires a CloudFront
+> client certificate signed by the committed origin-mTLS CA
+> (`scripts/origin-mtls-ca.pem`; the trust pool is that CA only, since `CF_AOP_CA_PEM`
+> is refused beside it) at the TLS
+> handshake for every `:443` peer, the main box and loopback included
+> (`client_auth require_and_verify`, issue #202); the shared `X-Piercloud-Origin`
+> header is retired in this release and is not a gate. A pre-mTLS release, that is
+> one gated on that header alone, is never a valid rollback target. The anchor also
+> probes the tenant's public endpoints for availability (narrow firewall rules; no SSH inbound
 > from the main box either). Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
 > per-event via SCP password-reset + re-dispatch; netcup console/rescue as
 > last resort). No standing SSH keys exist anywhere. *You administer the anchor;
 > the anchor administers nothing.*
 
-**Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. The dashboard is `:443`-only (`:80` serves tang + ACME; issue #225 removed the plain-HTTP dashboard handler). Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate requiring the secret header from every peer except the main box and loopback), and inspection of the module surface.
+**Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. The dashboard is `:443`-only (`:80` serves tang + ACME; issue #225 removed the plain-HTTP dashboard handler). Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate admitting only those ranges and the main box and loopback by raw TCP peer, and requiring a client certificate at the TLS handshake from every peer), and inspection of the module surface.
 
 ### Scoped amendment — dynamic status-page endpoints (2026-10-12, issue #186)
 
@@ -120,7 +122,7 @@ as the repo-side controls.
 > name, so a repository-level copy would reach every managed anchor whose
 > environment lacks it.
 
-**Rationale.** Issue #198 closed the fall-through by blanking these values on every managed run, which also made a managed operator anchor impossible (no role, no witness, no alerts). Environment-scoped values give each anchor its own set; the refusal keeps the fall-through closed. Enforced by: the ungated banner job's repo-scope step (one presence probe per name, refuses a managed dispatch on any repository- or organization-level copy, before any gate or device card), and the `tests/managed-operator-plane` pin (bare reads only inside tenant-environment jobs; elsewhere only gated literals or the named shared forms (`CLOUDFRONT_ORIGIN_SECRET`, `MAIN_BOX_IPV4`), with the tenant-only `MANAGED_TENANT` and `TENANT_CUSTOMER_NUMBER` forms allowed only inside tenant-environment jobs (a job outside the banner closure gets only the global forms); the probe set equal to the pin's declared environment-scoped names plus the two tenant-only names; allowlisted workflow/banner keys; the preflight and repo-scope steps pinned by digest as banner steps 1–2; every tenant-environment job behind the banner with no status function in its `if:`). Unlike #198's unconditional blanking, this is a refusal with a disclosed race. `TENANT_USER` and `CUSTOMER_NUMBER` stay operator-only and are never read by a managed run; the platform-plane `CLOUDFRONT_ORIGIN_SECRET` and `MAIN_BOX_IPV4` are shared by design. **Residual:** a repository-level value created after a run's banner job passed is read by that run's later jobs (an operator-controlled race; the next dispatch refuses).
+**Rationale.** Issue #198 closed the fall-through by blanking these values on every managed run, which also made a managed operator anchor impossible (no role, no witness, no alerts). Environment-scoped values give each anchor its own set; the refusal keeps the fall-through closed. Enforced by: the ungated banner job's repo-scope step (one presence probe per name, refuses a managed dispatch on any repository- or organization-level copy, before any gate or device card), and the `tests/managed-operator-plane` pin (bare reads only inside tenant-environment jobs; elsewhere only gated literals or the named shared form (`MAIN_BOX_IPV4`), with the tenant-only `MANAGED_TENANT` and `TENANT_CUSTOMER_NUMBER` forms allowed only inside tenant-environment jobs (a job outside the banner closure gets only the global forms); the probe set equal to the pin's declared environment-scoped names plus the two tenant-only names; allowlisted workflow/banner keys; the preflight and repo-scope steps pinned by digest as banner steps 1–2; every tenant-environment job behind the banner with no status function in its `if:`). Unlike #198's unconditional blanking, this is a refusal with a disclosed race. `TENANT_USER` and `CUSTOMER_NUMBER` stay operator-only and are never read by a managed run; the platform-plane `MAIN_BOX_IPV4` is shared by design (the origin secret it once shared with the anchors is retired at #202). **Residual:** a repository-level value created after a run's banner job passed is read by that run's later jobs (an operator-controlled race; the next dispatch refuses).
 
 ### Scoped amendment — the external watch's own push channel (2026-10-17, issue #207)
 
