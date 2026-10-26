@@ -1030,7 +1030,7 @@ jobs:
         if: inputs.mode == 'apply'
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # SHA pin of setup-opentofu v2
         with:
-          tofu_version: "1.12.2"
+          tofu_version: "v1.13.2"
 
       - name: tofu init (stateless — local state dies with the runner)
         if: inputs.mode == 'apply'
@@ -1741,7 +1741,7 @@ jobs:
       - name: Set up OpenTofu (>= 1.11 for ephemeral values)
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # SHA pin of setup-opentofu v2
         with:
-          tofu_version: "1.12.2"
+          tofu_version: "v1.13.2"
       # M2: the real path (ephemeral exchange → data-source resolve →
       # plan → apply → state dies with the runner; policy name
       # piercloud-anchor-${hostname} lands fully in M3) now runs
