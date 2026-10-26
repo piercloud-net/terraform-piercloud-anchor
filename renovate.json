@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Auto-bump pins so exact versions never rot: GitHub Actions (@v1 pins incl. semver-calver-release), the Gatus docker image pinned inside scripts/010-provision.sh, and the OpenTofu version pinned in .opentofu-version (both via regex custom managers). Minor/patch bumps automerge once CI is green; MAJOR bumps always land as PRs for human review. Exception (M4): netcup-touching paths never automerge — they queue under the netcup-touching label as one batch PR (one approval per batch), via the packageRule below (placed after the automerge rule so it wins on overlap). The .opentofu-version bump stays auto-apply: CI-plane toolchain, inert until dispatch. Requires the Renovate GitHub App installed on this repo. Note: hosted-app commits are unsigned (signing is self-hosted-only), but squash merges produce GitHub web-flow-signed commits on main, so required_signatures holds; if platformAutomerge ever trips on the signature check, add renovate[bot] to the main-ruleset bypass list.",
-  "enabledManagers": ["github-actions", "custom.regex"],
+  "description": "Auto-bump pins so exact versions never rot: GitHub Actions (@v1 pins incl. semver-calver-release), the Gatus docker image pinned inside scripts/010-provision.sh, the OpenTofu version pinned in .opentofu-version (both via regex custom managers), and the netcup Terraform provider (rixlhq/netcup) constraints in versions.tf and examples/**/*.tf plus its lock file .terraform.lock.hcl (terraform manager). Minor/patch bumps automerge once CI is green; MAJOR bumps always land as PRs for human review. Exception (M4): netcup-touching paths never automerge — they queue under the netcup-touching label as one batch PR (one approval per batch), via the packageRule below (placed after the automerge rule so it wins on overlap). The batch covers the provider constraints and the lock file alike, so a lock-only bump cannot automerge either. lockFileMaintenance is disabled explicitly: a lock refresh would re-resolve every provider hash with no constraint change, outside the batch review; Renovate's default is also off, and the explicit setting keeps it off if that default changes. The .opentofu-version bump stays auto-apply: CI-plane toolchain, inert until dispatch. Requires the Renovate GitHub App installed on this repo. Note: hosted-app commits are unsigned (signing is self-hosted-only), but squash merges produce GitHub web-flow-signed commits on main, so required_signatures holds; if platformAutomerge ever trips on the signature check, add renovate[bot] to the main-ruleset bypass list.",
+  "enabledManagers": ["github-actions", "custom.regex", "terraform"],
   "customManagers": [
     {
       "customType": "regex",
@@ -25,6 +25,9 @@
       "versioningTemplate": "semver-coerced"
     }
   ],
+  "lockFileMaintenance": {
+    "enabled": false
+  },
   "packageRules": [
     {
       "description": "Auto-merge minor and patch bumps (Gatus image, action pins, tofu patch) once CI is green",
@@ -35,7 +38,7 @@
     },
     {
       "description": "Netcup-touching bumps queue under one label as one batch PR (one approval per batch); never automerge — they only take effect at dispatch",
-      "matchPaths": ["scripts/**", ".github/scripts/**", "**/*.tf", "examples/**"],
+      "matchPaths": ["scripts/**", ".github/scripts/**", "**/*.tf", "**/.terraform.lock.hcl", "examples/**"],
       "groupName": "netcup-touching batch",
       "addLabels": ["netcup-touching"],
       "automerge": false
