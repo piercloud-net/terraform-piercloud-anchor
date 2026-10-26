@@ -183,7 +183,7 @@ sensitive() { # $1 label, $2 block text
     bad "$1 (missing sensitive = true)"
   fi
 }
-for v in server_id scp_user_id customer_number; do
+for v in server_id scp_user_id; do
   sensitive "variable $v is sensitive" "$(block_of "$VARS" variable "$v")"
 done
 for o in server_id firewall_policy_id; do

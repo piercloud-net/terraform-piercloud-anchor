@@ -1,7 +1,3 @@
-provider "netcup" {
-  customer_number = var.customer_number
-}
-
 # Server id comes either directly from var.server_id, or from an exact-name
 # lookup in the account server list. The exactly-one-of rule is enforced by
 # a variable validation (see variables.tf); the account-level ambiguity
