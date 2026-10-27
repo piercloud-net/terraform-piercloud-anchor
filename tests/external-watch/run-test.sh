@@ -716,10 +716,16 @@ lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.gith
 # split-literal or a dynamic index — `vars[format('{0}{1}', 'EXTERNAL',
 # '_WATCH_TENANTS')]` contains both halves. Scan the FRAGMENTS any such
 # spelling must contain, so no name can be assembled outside the watch file.
-# The one exempt spelling: the shared Lane A span markers in 010 (#51), exact
-# comment lines `# --- BEGIN GATUS EXTERNAL ...` / `# --- END GATUS EXTERNAL ---`.
-# They hold no name; any other line carrying the fragment still reds.
-EWN_MARKER_RE='^scripts/010-provision\.sh:[0-9]+:# --- (BEGIN GATUS EXTERNAL \(|END GATUS EXTERNAL ---$)'
+# The one exempt spelling: the shared Lane A span markers in 010 (#51), as
+# exact comment lines (full-line match, both ends anchored, pinned text), each
+# present exactly once. They hold no name; any other line carrying the
+# fragment (a marker prefix with a tail included) still reds.
+EWN_BEGIN_LINE='# --- BEGIN GATUS EXTERNAL (Lane A #51: push-fed rows; keep markers) ---'
+EWN_END_LINE='# --- END GATUS EXTERNAL ---'
+EWN_MARKER_RE='^scripts/010-provision\.sh:[0-9]+:(# --- BEGIN GATUS EXTERNAL \(Lane A #51: push-fed rows; keep markers\) ---|# --- END GATUS EXTERNAL ---)$'
+for _ewn_m in "$EWN_BEGIN_LINE" "$EWN_END_LINE"; do
+  is "shared marker line occurs exactly once in 010: $_ewn_m" "1" "$(grep -cxF -- "$_ewn_m" "$ROOT/scripts/010-provision.sh" || true)"
+done
 ewn_frag() { # $1 fragment, $2 label
   local frc=0 fhits
   fhits="$(cd "$ROOT" && git grep -n -F -- "$1" -- .github scripts ':!.github/workflows/external-watch.yml')" || frc=$?

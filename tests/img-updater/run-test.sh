@@ -81,6 +81,18 @@ grep -q '^probe_tang_direct() {' "$WORK/probes.src" && grep -q '^adv_ok() {' "$W
   || { printf 'FAIL adv_ok/probe_tang_direct not found in 010\n'; exit 1; }
 PIN_LINES="$(grep -E '^(GATUS|CADDY)_IMAGE="' "$PROVISION")"
 eval "$PIN_LINES"
+[ -n "${GATUS_IMAGE:-}" ] && [ -n "${CADDY_IMAGE:-}" ] || { printf 'FAIL the GATUS_IMAGE/CADDY_IMAGE pin lines were not found in 010\n'; exit 1; }
+# The scenarios replay Docker Hub listings recorded while the repo pins were
+# twinproduction/gatus:v5.36.0 and caddy:2.11.4-alpine, so they run on those
+# recorded pins: Renovate moves the live 010 pins, the fixtures stay put. The
+# live pins must still sit in the recorded repository + major track (checked
+# below with the real track filter).
+LIVE_GATUS_IMAGE="$GATUS_IMAGE"
+LIVE_CADDY_IMAGE="$CADDY_IMAGE"
+LIVE_GATUS_VER="${LIVE_GATUS_IMAGE#twinproduction/gatus:v}"
+LIVE_CADDY_VER="${LIVE_CADDY_IMAGE#caddy:}"; LIVE_CADDY_VER="${LIVE_CADDY_VER%-alpine}"
+GATUS_IMAGE="twinproduction/gatus:v5.36.0"
+CADDY_IMAGE="caddy:2.11.4-alpine"
 GATUS_PIN="$GATUS_IMAGE"
 CADDY_PIN="$CADDY_IMAGE"
 
@@ -98,7 +110,7 @@ CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
 CADDY_AOP_CA="/etc/caddy/aop-ca.pem"
 CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
 EOF
-{ cat "$WORK/prelude.src"; printf '%s\n' "$PIN_LINES"; cat "$WORK/hard.src" "$WORK/probes.src" "$WORK/img.src"; } >"$WORK/lib.sh"
+{ cat "$WORK/prelude.src"; printf 'GATUS_IMAGE="%s"\nCADDY_IMAGE="%s"\n' "$GATUS_IMAGE" "$CADDY_IMAGE"; cat "$WORK/hard.src" "$WORK/probes.src" "$WORK/img.src"; } >"$WORK/lib.sh"
 
 # ---- PATH stubs ------------------------------------------------------------
 BIN="$WORK/bin"
@@ -300,6 +312,8 @@ suite_track() {
   local t tags pick
   is "track: caddy 2.x.y-alpine accepted" "2.11.7" "$(fn "$WORK" img_ver_key 2.11.7-alpine 2.11.4-alpine)"
   is "track: gatus v5.x.y accepted" "5.37.0" "$(fn "$WORK" img_ver_key v5.37.0 v5.36.0)"
+  is "track: the live 010 caddy pin sits in the recorded track" "$LIVE_CADDY_VER" "$(fn "$WORK" img_ver_key "${LIVE_CADDY_IMAGE#caddy:}" 2.11.4-alpine || true)"
+  is "track: the live 010 gatus pin sits in the recorded track" "$LIVE_GATUS_VER" "$(fn "$WORK" img_ver_key "${LIVE_GATUS_IMAGE#twinproduction/gatus:}" v5.36.0 || true)"
   for t in 3.0.0-alpine 2.11.7 2.11.7-builder-alpine 2.11-alpine 2.11.7-windowsservercore-ltsc2022 1.9.9-alpine 2.11.05-alpine 2.011.5-alpine 02.11.5-alpine; do
     is "track: caddy tag $t refused" "" "$(fn "$WORK" img_ver_key "$t" 2.11.4-alpine || true)"
   done
