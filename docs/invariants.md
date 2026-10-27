@@ -59,6 +59,17 @@ staged/approved path). Enforced by: the puller's file ownership (it never
 writes `config.yaml`), the systemd unit's `ReadWritePaths`, and
 `tests/gatus-pull` (validation + the two-writer boundary).
 
+### Scoped amendment — unattended OS security updates (2026-10-27, issue #51)
+
+> Invariant 2's "admin is dispatch-only" is amended for exactly one scoped
+> component: the box may install its own OS packages outside a dispatch,
+> only from the running release's security origin, only through the policy
+> (origin, reboot window, schedule, report script) that the last approved
+> dispatch rendered. It gains no credential beyond a loopback-only status
+> token, and every other admin action stays dispatch-only.
+
+**Rationale.** The trust rule is pcad.it-infra decision 2026-09-08 (every anchor change arrives through a per-run approved dispatch), as amended 2026-10-27: unattended applies to bits neither the operator nor the tenant chooses, and what may install stays approval-gated. Security patches for the distribution are such bits: waiting for a dispatch leaves a known-vulnerable, always-on box. The policy is rendered by `010` on every `mode=apply` (`OS_AUTO_UPDATES`, `OS_AUTO_REBOOT_TIME` are approval-gated variables); the box cannot widen it (the converge check refuses a run where apt sees any other origin). The updater reaches no user box and holds nothing that does; the status token can only push results for one row on the loopback-bound Gatus. Enforced by: the rendered `52piercloud-unattended-upgrades` file with `#clear` of the distro defaults, the converge self-checks (`apt-config` origin equality, `unattended-upgrade --dry-run`, `tangd.socket` enabled, timers + drop-ins), and `tests/os-updates`. Off switch: `OS_AUTO_UPDATES=off` + re-dispatch ([dr.md](dr.md)). Design: [updaters.md](updaters.md).
+
 ## Invariant 3 — one netcup account per anchor; one writer per account
 
 > One netcup account holds **exactly one anchor** — never several anchors per

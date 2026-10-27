@@ -186,6 +186,15 @@ Staged proof; the producers (slice `pc-status.json`, pc-control platform manifes
 - [ ] Witness negative (run from `pc-admin` `scripts/030-recording-pipeline.sh`): the witness key lists the bucket objects **and versions** but `GET`/`HEAD` fail and `ListParts` is denied — the key is list-only (`listFiles`, metadata-only, covering object/version/multipart listings; no read/write/delete) and **whole-bucket (no `namePrefix` — a scoped key returns 200 filtered and can silently miss markers)**. The versions listing is part of `listFiles` — B2 has no separate `listFileVersions` capability (live-verified 2026-09-27); a key whose listing is denied errors closed.
 - [ ] Retire path: delete the six secrets + re-dispatch; the timer and env file are gone, the verdict log is kept.
 
+### Unattended OS security updates (slice A-OS, issue #51)
+
+Harness: `tests/os-updates` (per-distro origin + refusal, off switch, reboot window, token, staleness, converge checks, the shared `GATUS EXTERNAL` render, mutants). Container proof: the rendered policy under `debian:trixie-slim` and `ubuntu:24.04` shows `unattended-upgrade --dry-run --debug` allowing only the security origin.
+
+- [ ] Dispatch (`mode=apply`, reviewed SHA, variables unset): the run log shows `OS updates: mode=on, reboot window 03:30 UTC` with the Debian security origin, the four converge lines (origin policy, `--dry-run`, `tangd.socket` enabled, timers + drop-ins) with `(OK)`, then `first status push landed`.
+- [ ] The `os-security-updates` row (group `anchor`) is green after the dispatch and again after the first nightly run (`journalctl -u apt-daily-upgrade` shows the `os-updates report:` line with `push=HTTP 200`).
+- [ ] A reboot at the window (a kernel update, or one hand-scheduled `shutdown -r` at the window from the console) brings tang back by itself: the `tang (via Caddy)` row recovers within minutes and `/adv` answers 200.
+- [ ] An `OS_AUTO_UPDATES=off` dispatch renders `Unattended-Upgrade "0"` and the row disappears; unsetting it brings both back.
+
 ### Docs-only
 
 - [ ] CI green (the greps and release validators still run on every PR).

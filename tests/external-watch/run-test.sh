@@ -716,9 +716,17 @@ lacks "watch names are not in the managed repo-scope list" "$(cat "${ROOT}/.gith
 # split-literal or a dynamic index — `vars[format('{0}{1}', 'EXTERNAL',
 # '_WATCH_TENANTS')]` contains both halves. Scan the FRAGMENTS any such
 # spelling must contain, so no name can be assembled outside the watch file.
+# The one exempt spelling: the shared Lane A span markers in 010 (#51), exact
+# comment lines `# --- BEGIN GATUS EXTERNAL ...` / `# --- END GATUS EXTERNAL ---`.
+# They hold no name; any other line carrying the fragment still reds.
+EWN_MARKER_RE='^scripts/010-provision\.sh:[0-9]+:# --- (BEGIN GATUS EXTERNAL \(|END GATUS EXTERNAL ---$)'
 ewn_frag() { # $1 fragment, $2 label
   local frc=0 fhits
-  fhits="$(cd "$ROOT" && git grep -l -F -- "$1" -- .github scripts ':!.github/workflows/external-watch.yml')" || frc=$?
+  fhits="$(cd "$ROOT" && git grep -n -F -- "$1" -- .github scripts ':!.github/workflows/external-watch.yml')" || frc=$?
+  if [ "$frc" = 0 ]; then
+    fhits="$(printf '%s\n' "$fhits" | { grep -vE "$EWN_MARKER_RE" || true; } | cut -d: -f1 | sort -u)"
+    [ -n "$fhits" ] || frc=1
+  fi
   case "$frc" in
     1) ok "$2: no fragment '$1' outside external-watch.yml" ;;
     0) bad "$2: fragment '$1' also in: ${fhits}" ;;

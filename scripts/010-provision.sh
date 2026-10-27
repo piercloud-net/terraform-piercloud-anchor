@@ -1089,6 +1089,743 @@ fi
 # via the .rotation-pending marker it drops above (see the block comment).
 collapse_keys
 
+# --- BEGIN OS UPDATES (tests/os-updates extracts this span; keep markers) ---
+# Lane A slice A-OS (#51): unattended OS SECURITY updates + a kernel reboot
+# window, reported on the status page. Everything that decides WHAT may
+# install is rendered here, i.e. approval-gated: the allowed origin (the
+# running release's -security pocket ONLY, read from /etc/os-release; any
+# other distro fails closed), the reboot window and the report script. Only
+# the payload (Debian/Ubuntu security packages) floats between dispatches
+# (docs/invariants.md Invariant 2 amendment; docs/updaters.md).
+#   OS_AUTO_UPDATES      unset/on = on; off = actively disabled
+#                        (Unattended-Upgrade "0", no status row); else refused.
+#   OS_AUTO_REBOOT_TIME  HH:MM UTC in 00:00-04:59, default 03:30.
+# Status: one Gatus external endpoint (group anchor, key
+# anchor_os-security-updates, heartbeat 26h) fed by a report script that runs
+# after every apt-daily-upgrade; the bearer token is box-generated per
+# provision (0600, never printed) and reaches curl on stdin only.
+OS_UPD_APT_CONF="${OS_UPD_APT_CONF:-/etc/apt/apt.conf.d/52piercloud-unattended-upgrades}"
+OS_UPD_OS_RELEASE="${OS_UPD_OS_RELEASE:-/etc/os-release}"
+OS_UPD_UNIT_DIR="${OS_UPD_UNIT_DIR:-/etc/systemd/system}"
+OS_UPD_SBIN="${OS_UPD_SBIN:-/usr/local/sbin/piercloud-os-updates-report.sh}"
+OS_UPD_TOKEN_FILE="${OS_UPD_TOKEN_FILE:-/etc/piercloud/os-updates.token}"
+OS_UPD_STATE_DIR="${OS_UPD_STATE_DIR:-/var/lib/piercloud}"
+OS_UPD_MARKER="${OS_UPD_MARKER:-/var/lib/piercloud/os-updates.installed}"
+OS_UPD_DROPIN_NAME="piercloud-os-updates.conf"
+OS_UPD_LISTS_AT="01:30"   # apt-daily.timer (package lists)
+OS_UPD_UPGRADE_AT="02:30" # apt-daily-upgrade.timer (+ up to 15m): a kernel lands and boots the same night
+
+os_updates_mode() { # -> on|off (unset = on; anything but on/off refused)
+  case "${OS_AUTO_UPDATES-}" in
+    ''|on) printf 'on\n' ;;
+    off) printf 'off\n' ;;
+    *) die "bad OS_AUTO_UPDATES (want unset/on/off): ${OS_AUTO_UPDATES}" ;;
+  esac
+}
+
+os_updates_reboot_time() { # -> validated HH:MM UTC (default 03:30, window 00:00-04:59)
+  local t="${OS_AUTO_REBOOT_TIME:-03:30}"
+  [[ "$t" =~ ^0[0-4]:[0-5][0-9]$ ]] \
+    || die "bad OS_AUTO_REBOOT_TIME (want HH:MM UTC between 00:00 and 04:59): ${OS_AUTO_REBOOT_TIME}"
+  printf '%s\n' "$t"
+}
+
+os_updates_origin_pattern() { # /etc/os-release ID -> the -security Origins-Pattern; anything else refused
+  local id
+  [ -r "$OS_UPD_OS_RELEASE" ] || die "OS updates: ${OS_UPD_OS_RELEASE} unreadable - cannot pin the security origin; refusing (fail closed)"
+  id="$(sed -n 's/^ID=//p' "$OS_UPD_OS_RELEASE" | head -n 1 | tr -d '"')"
+  case "$id" in
+    debian) printf '%s\n' 'origin=Debian,codename=${distro_codename}-security,label=Debian-Security' ;;
+    ubuntu) printf '%s\n' 'origin=Ubuntu,archive=${distro_codename}-security' ;;
+    *) die "OS updates: unsupported distribution ID '${id}' in ${OS_UPD_OS_RELEASE} (want debian or ubuntu) - refusing to configure unattended upgrades with an unknown origin (fail closed; OS_AUTO_UPDATES=off skips this slice)" ;;
+  esac
+}
+
+render_os_updates_apt_conf() { # $1 mode, $2 local reboot HH:MM, $3 origin pattern (empty when off)
+  printf '%s\n' "// DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh, #51)."
+  printf '%s\n' "// Re-rendered on every provision run; hand edits are overwritten. The"
+  printf '%s\n' "// #clear lines drop the distro defaults so ONLY the -security origin applies."
+  printf '%s\n' "#clear Unattended-Upgrade::Origins-Pattern;"
+  printf '%s\n' "#clear Unattended-Upgrade::Allowed-Origins;"
+  if [ "$1" = on ]; then
+    printf 'Unattended-Upgrade::Origins-Pattern { "%s"; };\n' "$3"
+    printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";'
+    printf '%s\n' 'APT::Periodic::Unattended-Upgrade "1";'
+    printf '%s\n' 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'
+    printf '%s\n' 'Unattended-Upgrade::Automatic-Reboot "true";'
+    printf '%s\n' 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'
+    printf 'Unattended-Upgrade::Automatic-Reboot-Time "%s";\n' "$2"
+  else
+    printf '%s\n' 'APT::Periodic::Unattended-Upgrade "0";'
+    printf '%s\n' 'Unattended-Upgrade::Automatic-Reboot "false";'
+  fi
+}
+
+render_os_updates_timer_dropin() { # $1 = HH:MM UTC
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)." "[Timer]" "OnCalendar=" "OnCalendar=*-*-* ${1}:00 UTC" "RandomizedDelaySec=15m"
+}
+
+render_os_updates_service_dropin() {
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51): push the status heartbeat after each run." "[Service]" "ExecStartPost=-${OS_UPD_SBIN}"
+}
+
+render_os_updates_report() { # the on-box report script (paths baked from this run)
+  printf '#!/usr/bin/env bash\n'
+  printf 'TOKEN_FILE="${OS_UPD_TOKEN_FILE:-%s}"\n' "$OS_UPD_TOKEN_FILE"
+  printf 'MARKER="${OS_UPD_MARKER:-%s}"\n' "$OS_UPD_MARKER"
+  printf 'GATUS_URL="${OS_UPD_GATUS_URL:-http://127.0.0.1:%s}"\n' "$GATUS_PORT"
+  cat <<'OS_UPD_REPORT_EOF'
+# piercloud-os-updates-report.sh - DISPATCH-MANAGED (scripts/010-provision.sh, #51).
+# Pushes the os-security-updates heartbeat to the local Gatus external endpoint.
+# success = the newest of (unattended-upgrade's success stamp, the install
+# marker) is younger than 48 h. The error field carries counts only. The
+# bearer token goes to curl on stdin (-K -), never argv, never stdout.
+set -uo pipefail
+STAMP="${OS_UPD_STAMP:-/var/lib/apt/periodic/unattended-upgrades-stamp}"
+REBOOT_FLAG="${OS_UPD_REBOOT_FLAG:-/var/run/reboot-required}"
+KEY="anchor_os-security-updates"
+MAX_AGE=172800
+now="${OS_UPD_NOW:-$(date +%s)}"
+newest=0
+for f in "$STAMP" "$MARKER"; do
+  [ -e "$f" ] || continue
+  m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  [ "$m" -gt "$newest" ] && newest="$m"
+done
+age=$((now - newest))
+if [ "$newest" -gt 0 ] && [ "$age" -lt "$MAX_AGE" ]; then success=true; else success=false; fi
+if sim="$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)"; then
+  pending="$(printf '%s\n' "$sim" | grep -c '^Inst .*-security' || true)"
+else
+  pending=unknown
+fi
+reboot=no
+[ -e "$REBOOT_FLAG" ] && reboot=yes
+if [ "$newest" -gt 0 ]; then age_h=$((age / 3600)); else age_h=never; fi
+err="pending-security:${pending},reboot-required:${reboot},last-ok-age-h:${age_h}"
+[ "$success" = true ] || err="stale-over-48h,${err}"
+[ -s "$TOKEN_FILE" ] || { printf 'os-updates report: no token file - push skipped\n'; exit 3; }
+token="$(tr -d '[:space:]' <"$TOKEN_FILE")"
+code="$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+  | curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST -K - \
+    "${GATUS_URL}/api/v1/endpoints/${KEY}/external?success=${success}&error=${err}&duration=${SECONDS}s" 2>/dev/null || true)"
+printf 'os-updates report: success=%s pending-security=%s reboot-required=%s last-ok-age-h=%s push=HTTP %s\n' \
+  "$success" "$pending" "$reboot" "$age_h" "${code:-none}"
+[ "$code" = "200" ] || exit 3
+exit 0
+OS_UPD_REPORT_EOF
+}
+
+os_updates_gatus_item() { # $1 token -> one external-endpoints item (alerts when a push channel exists)
+  printf '%s\n' "  - name: os-security-updates" "    group: anchor" "    token: \"${1}\"" "    heartbeat:" "      interval: 26h  # nightly push after apt-daily-upgrade; a miss records a failure"
+  if [ -n "${NTFY_TOPIC:-}" ]; then
+    printf '%s\n' "    alerts:" "      - type: ntfy" "        failure-threshold: 1" "        send-on-resolved: true" "        provider-override:" "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
+  fi
+}
+
+os_updates_install_file() { # $1 dest, $2 mode; content on stdin (atomic replace)
+  local tmp="${1}.tmp.$$"
+  mkdir -p "$(dirname "$1")"
+  cat >"$tmp"
+  chmod "$2" "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+os_updates_apply() { # render + enable + converge self-checks; appends the status item to gatus_ext_items
+  local mode reboot_utc reboot_local pattern got want token svc_dropin u
+  mode="$(os_updates_mode)"
+  reboot_utc="$(os_updates_reboot_time)"
+  pattern=""
+  [ "$mode" = on ] && pattern="$(os_updates_origin_pattern)"
+  # Automatic-Reboot-Time is handed to shutdown(8), which reads LOCAL time.
+  reboot_local="$(date -d "today ${reboot_utc} UTC" +%H:%M)"
+  [ "$reboot_local" = "$reboot_utc" ] \
+    || warn "OS updates: box timezone is not UTC - reboot window ${reboot_utc} UTC rendered as ${reboot_local} local (re-dispatch after a DST change to re-align)"
+  log "OS updates: mode=${mode}, reboot window ${reboot_utc} UTC, origin ${pattern:-<none>}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y -qq unattended-upgrades >/dev/null
+  render_os_updates_apt_conf "$mode" "$reboot_local" "$pattern" | os_updates_install_file "$OS_UPD_APT_CONF" 0644
+  render_os_updates_timer_dropin "$OS_UPD_LISTS_AT" | os_updates_install_file "${OS_UPD_UNIT_DIR}/apt-daily.timer.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_timer_dropin "$OS_UPD_UPGRADE_AT" | os_updates_install_file "${OS_UPD_UNIT_DIR}/apt-daily-upgrade.timer.d/${OS_UPD_DROPIN_NAME}" 0644
+  svc_dropin="${OS_UPD_UNIT_DIR}/apt-daily-upgrade.service.d/${OS_UPD_DROPIN_NAME}"
+  if [ "$mode" = on ]; then
+    mkdir -p "$OS_UPD_STATE_DIR" "$(dirname "$OS_UPD_TOKEN_FILE")"
+    chmod 700 "$OS_UPD_STATE_DIR"
+    # Grace for a fresh (or re-enabled) install: the marker starts the 48 h clock.
+    if [ ! -e "$svc_dropin" ] || [ ! -e "$OS_UPD_MARKER" ]; then touch "$OS_UPD_MARKER"; fi
+    render_os_updates_report | os_updates_install_file "$OS_UPD_SBIN" 0755
+    render_os_updates_service_dropin | os_updates_install_file "$svc_dropin" 0644
+    token="$(openssl rand -hex 32)"
+    printf '%s\n' "$token" | (umask 077; os_updates_install_file "$OS_UPD_TOKEN_FILE" 0600)
+    gatus_ext_items+=("$(os_updates_gatus_item "$token")")
+  else
+    rm -f "$svc_dropin" "$OS_UPD_SBIN" "$OS_UPD_TOKEN_FILE"
+    log "OS updates: OS_AUTO_UPDATES=off - unattended upgrades actively disabled (Unattended-Upgrade \"0\"), no status row"
+  fi
+  systemctl daemon-reload
+  systemctl enable apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  systemctl restart apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  # Converge self-checks (fail closed): the policy apt sees is exactly the rendered one.
+  got="$(apt-config dump --format '%f=%v%n' | grep -E '^Unattended-Upgrade::(Origins-Pattern|Allowed-Origins)::=' || true)"
+  want=""
+  [ "$mode" = on ] && want="Unattended-Upgrade::Origins-Pattern::=${pattern}"
+  [ "$got" = "$want" ] \
+    || die "OS updates: apt sees a different origin policy than rendered (want only '${want:-<none>}', got '$(printf '%s' "$got" | tr '\n' ' ')') - another apt.conf.d file overrides it; refusing to finish blind"
+  log "OS updates: apt origin policy is exactly the rendered one (OK)"
+  unattended-upgrade --dry-run >/dev/null 2>&1 \
+    || die "OS updates: 'unattended-upgrade --dry-run' failed on the rendered config - refusing to finish blind"
+  log "OS updates: unattended-upgrade --dry-run accepts the rendered config (OK)"
+  [ "$(systemctl is-enabled tangd.socket 2>/dev/null || true)" = enabled ] \
+    || die "OS updates: tangd.socket is not enabled - tang would not come back after the automatic reboot; refusing"
+  log "OS updates: tangd.socket enabled - tang returns by socket activation after a reboot (OK)"
+  for u in apt-daily.timer apt-daily-upgrade.timer; do
+    [ "$(systemctl is-enabled "$u" 2>/dev/null || true)" = enabled ] || die "OS updates: ${u} is not enabled - refusing"
+    systemctl show -p DropInPaths --value "$u" 2>/dev/null | grep -qF "${u}.d/${OS_UPD_DROPIN_NAME}" \
+      || die "OS updates: ${u} does not load its ${OS_UPD_DROPIN_NAME} drop-in - refusing"
+  done
+  if [ "$mode" = on ]; then
+    systemctl show -p DropInPaths --value apt-daily-upgrade.service 2>/dev/null | grep -qF "apt-daily-upgrade.service.d/${OS_UPD_DROPIN_NAME}" \
+      || die "OS updates: apt-daily-upgrade.service does not load the report drop-in - refusing"
+  fi
+  log "OS updates: apt-daily ${OS_UPD_LISTS_AT} / apt-daily-upgrade ${OS_UPD_UPGRADE_AT} UTC timers enabled with their drop-ins (OK)"
+}
+
+os_updates_first_report() { # after Gatus is up: first heartbeat (retries across the Gatus config reload)
+  [ "$(os_updates_mode)" = on ] || return 0
+  local i out=""
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if out="$(bash "$OS_UPD_SBIN" 2>&1)"; then
+      log "OS updates: first status push landed (${out#os-updates report: })"
+      return 0
+    fi
+    [ "$i" -lt 12 ] && sleep "${OS_UPD_RETRY_SLEEP:-5}"
+  done
+  warn "OS updates: the first status push did not land (${out}) - the nightly run pushes again; a missed 26h heartbeat turns the row red"
+}
+# --- END OS UPDATES ---
+
+# --- BEGIN IMG UPDATER (tests/img-updater extracts this span; keep markers) ---
+# A-IMG (#51, Lane A): the box moves its own Caddy and Gatus containers to
+# newer builds inside the APPROVED track, outside a dispatch. Everything that
+# decides WHAT may run is rendered here by the provision run (approval-gated):
+# the repository + track (the repo pin's major + suffix: caddy 2.x.y-alpine,
+# gatus v5.x.y), the soak, the run/validate args and this code. Only the
+# digest floats. Docs: docs/updaters.md; trust rule: docs/invariants.md.
+#
+# Precedence (load-bearing; tests/img-updater): the state file records the
+# current ref per container. A provision run uses max(repo pin, recorded)
+# inside the SAME track - it never downgrades below what the updater moved to;
+# a pin in another track (a Lane B major bump) resets the track; a recorded
+# bad digest is never selected; IMG_AUTO_UPDATES=off returns to the repo pin
+# (the dispatch-only manual rollback, docs/dr.md).
+#
+# Paths are overridable for the offline harness only; the dispatch env never
+# exports these names, so on-box runs get the canonical defaults.
+IMG_STATE_DIR="${IMG_STATE_DIR:-/var/lib/piercloud-img}"
+IMG_ENV_FILE="${IMG_ENV_FILE:-/etc/piercloud-img/img-update.env}"
+IMG_SBIN="${IMG_SBIN:-/usr/local/sbin/piercloud-img-update}"
+IMG_SERVICE="${IMG_SERVICE:-/etc/systemd/system/piercloud-img-update.service}"
+IMG_TIMER="${IMG_TIMER:-/etc/systemd/system/piercloud-img-update.timer}"
+IMG_LOCK_FILE="${IMG_LOCK_FILE:-/run/piercloud-img-update.lock}"
+IMG_TOKEN_FILE="${IMG_TOKEN_FILE:-/etc/piercloud-img/status-token}"
+
+img_gatus_key() { # $1 = row name -> the Gatus endpoint key (group anchor; Gatus sanitizes / _ , . # + & and spaces to -)
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed 's#[/_,.\#+& ]#-#g')"
+  printf 'anchor_%s' "$s"
+}
+
+img_gatus_item() { # $1 = row name, $2 = push token -> one complete external-endpoints item (rendered by the shared span in the Gatus render)
+  printf '%s\n' "  - name: $1" "    group: anchor" "    token: \"$2\"" "    heartbeat:" \
+    "      interval: 26h  # the updater pushes every ~6 h; a missed heartbeat records a failure (stale = down)"
+  if [ -n "${NTFY_TOPIC:-}" ]; then
+    printf '%s\n' "    alerts:" "      - type: ntfy" "        failure-threshold: 1" "        send-on-resolved: false" \
+      "        provider-override:" "          priority: 4  # once per bad candidate or missed heartbeat; routine success never notifies"
+  fi
+}
+
+img_status_items_add() { # on: regenerate the push token (0600, never printed) + append both rows to gatus_ext_items; off: drop the token
+  local dir tmp token
+  case "$(img_updater_mode)" in
+    on) ;;
+    off) rm -f "$IMG_TOKEN_FILE"; return 0 ;;
+    *) die "bad IMG_AUTO_UPDATES (want unset/on/off): ${IMG_AUTO_UPDATES:-}" ;;
+  esac
+  dir="$(dirname "$IMG_TOKEN_FILE")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  token="$(openssl rand -hex 32 2>/dev/null)" || die "could not generate the container-updater push token (openssl rand) - refusing to render a tokenless push row"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "container-updater push token is not 64 lowercase hex - refusing to render it"
+  tmp="$(mktemp "${dir}/.token.XXXXXX")"
+  printf '%s\n' "$token" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$IMG_TOKEN_FILE"
+  gatus_ext_items+=("$(img_gatus_item "caddy updates" "$token")" "$(img_gatus_item "gatus updates" "$token")")
+}
+
+img_updater_mode() { # on | off | bad - unset/empty = on (default ON, owner 2026-10-27)
+  case "${IMG_AUTO_UPDATES-}" in
+    ''|on) printf 'on' ;;
+    off) printf 'off' ;;
+    *) printf 'bad' ;;
+  esac
+}
+
+img_soak_hours() { # validated soak in hours (default 6); returns 1 on a bad value
+  local v="${IMG_UPDATE_SOAK_HOURS:-6}"
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#v}" -le 3 ] && [ "$((10#$v))" -le 720 ] || return 1
+  printf '%s' "$((10#$v))"
+}
+
+img_split_ref() { # $1 = repo:tag[@sha256:hex] -> "repo tag digest" (digest may be empty)
+  local r="$1" d=""
+  case "$r" in *@*) d="${r#*@}"; r="${r%%@*}" ;; esac
+  printf '%s %s %s' "${r%:*}" "${r##*:}" "$d"
+}
+
+img_ver_key() { # $1 = tag, $2 = pin tag -> "MAJ.MIN.PATCH" when $1 is in the pin's track; 1 otherwise
+  local re pfx maj sfx
+  re='^(v?)([0-9]+)\.([0-9]+)\.([0-9]+)(-[a-z]+)?$'
+  [[ "$2" =~ $re ]] || return 1
+  pfx="${BASH_REMATCH[1]}"; maj="${BASH_REMATCH[2]}"; sfx="${BASH_REMATCH[5]}"
+  [[ "$1" =~ $re ]] || return 1
+  [ "${BASH_REMATCH[1]}" = "$pfx" ] && [ "${BASH_REMATCH[2]}" = "$maj" ] && [ "${BASH_REMATCH[5]}" = "$sfx" ] || return 1
+  printf '%s.%s.%s' "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))" "$((10#${BASH_REMATCH[4]}))"
+}
+
+img_ver_gt() { # $1 > $2 for MAJ.MIN.PATCH keys
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<<"$1"
+  IFS=. read -r b1 b2 b3 <<<"$2"
+  [ "$a1" -gt "$b1" ] && return 0
+  [ "$a1" -lt "$b1" ] && return 1
+  [ "$a2" -gt "$b2" ] && return 0
+  [ "$a2" -lt "$b2" ] && return 1
+  [ "$a3" -gt "$b3" ]
+}
+
+img_state_get() { # $1 = name -> the recorded current ref (validated); 1 when absent/invalid
+  local f="${IMG_STATE_DIR}/$1.state" v
+  [ -f "$f" ] || return 1
+  v="$(sed -n 's/^ref=//p' "$f" | head -n 1)"
+  [[ "$v" =~ ^[a-z0-9][a-z0-9./-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$v"
+}
+
+img_state_put() { # $1 = name, $2 = repo:tag@sha256:hex
+  local tmp
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  tmp="$(mktemp "${IMG_STATE_DIR}/.state.XXXXXX")"
+  printf 'ref=%s\n' "$2" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "${IMG_STATE_DIR}/$1.state"
+}
+
+img_is_bad() { # $1 = name, $2 = digest -> 0 when the digest is held as bad (never retried)
+  [ -n "$2" ] && [ -f "${IMG_STATE_DIR}/$1.bad" ] && grep -qxF -- "$2" "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_mark_bad() { # $1 = name, $2 = digest
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  img_is_bad "$1" "$2" || printf '%s\n' "$2" >>"${IMG_STATE_DIR}/$1.bad"
+  chmod 600 "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_effective_ref() { # $1 = name, $2 = repo pin -> the ref to run: max(pin, recorded) inside the pin's track
+  local rec prepo ptag rrepo rtag rdig pk rk
+  if [ "$(img_updater_mode)" != "on" ]; then printf '%s' "$2"; return 0; fi
+  rec="$(img_state_get "$1")" || { printf '%s' "$2"; return 0; }
+  read -r prepo ptag _ <<<"$(img_split_ref "$2")"
+  read -r rrepo rtag rdig <<<"$(img_split_ref "$rec")"
+  pk="$(img_ver_key "$ptag" "$ptag")" || { printf '%s' "$2"; return 0; }
+  if [ "$rrepo" != "$prepo" ] || ! rk="$(img_ver_key "$rtag" "$ptag")" || img_is_bad "$1" "$rdig" || img_ver_gt "$pk" "$rk"; then
+    printf '%s' "$2"
+    return 0
+  fi
+  printf '%s' "$rec"
+}
+
+img_reconcile_state() { # $1 = name, $2 = repo pin: drop a record the pin no longer honours (off switch, other repo/track, bad, below the pin)
+  local rec
+  rec="$(img_state_get "$1")" || return 0
+  if [ "$(img_effective_ref "$1" "$2")" != "$rec" ]; then
+    rm -f "${IMG_STATE_DIR}/$1.state"
+    log "$1: updater record ${rec%%@*} is not honoured by the repo pin $2 (off switch, another track, a bad digest or below the pin) - back on the pin"
+  fi
+}
+
+img_local_digest() { # $1 = local ref, $2 = repo -> the registry digest docker recorded for it (empty when unknown)
+  docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null \
+    | sed -n "s#^$2@\(sha256:[0-9a-f]\{64\}\)\$#\1#p" | head -n 1 || true
+}
+
+img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path -> the bind mounts 010's validate AND run share
+  local a="-v $1:$2:ro"
+  if [ "${ORIGIN_TLS:-0}" = "1" ]; then
+    a="${a} -v ${CADDY_ORIGIN_CRT}:${CADDY_ORIGIN_CRT}:ro -v ${CADDY_ORIGIN_KEY}:${CADDY_ORIGIN_KEY}:ro"
+  fi
+  if [ -n "${AOP_TLS:-}" ]; then
+    a="${a} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
+  fi
+  printf '%s' "$a"
+}
+
+img_caddy_validate() { # $1 = container ref, $2 = Caddyfile to validate (010's pre-install validate args, verbatim)
+  local args
+  args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new)"
+  # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
+  docker run --rm $args "$1" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
+}
+
+img_run_caddy() { # $1 = container ref -> create the caddy container (the ONE docker run 010 and the updater share)
+  local mounts
+  mounts="$(img_caddy_mount_args "${CADDY_CONFIG}" /etc/caddy/Caddyfile)"
+  # --network host (NOT -p publishing): Caddy dials 127.0.0.1:8081/:8080 for
+  # tangd/Gatus on the HOST loopback; see section e2.
+  # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
+  docker run -d --name caddy --restart unless-stopped \
+    --network host \
+    --memory 256m \
+    -e GOMEMLIMIT=230MiB -e GOMAXPROCS=1 \
+    $mounts \
+    --mount type=volume,source=caddy-data,target=/data \
+    --mount type=volume,source=caddy-config,target=/config \
+    -v "${CADDY_CHALLENGE_DIR}:/var/lib/caddy/acme-challenge" \
+    "$1" >/dev/null
+}
+
+img_run_gatus() { # $1 = container ref -> create the gatus container (the ONE docker run 010 and the updater share)
+  docker run -d --name gatus --restart unless-stopped \
+    -p "127.0.0.1:${GATUS_PORT}:8080" \
+    --add-host=hostanchor:host-gateway \
+    -e GATUS_CONFIG_PATH=/config \
+    -v "$(dirname "${GATUS_CONFIG}")":/config:ro \
+    --mount type=volume,source=gatus-data,target=/data \
+    "$1" >/dev/null
+}
+
+certless_probe() { # $1 = status host -> sets CERTLESS_RC/CERTLESS_ERR; 0 = rejected at TLS with a client-auth alert
+  CERTLESS_RC=0
+  CERTLESS_ERR="$(curl -sSk --max-time 10 --resolve "$1:443:127.0.0.1" "https://$1/" -o /dev/null 2>&1)" || CERTLESS_RC=$?
+  case "$CERTLESS_RC" in
+    35|55|56) printf '%s' "$CERTLESS_ERR" | grep -qiE 'alert (certificate required|bad certificate)' ;;
+    *) return 1 ;;
+  esac
+}
+
+edge_pull_200() { # $1 = status host -> sets EDGE_RC/EDGE_CODE; 0 = the public edge answered HTTP 200 (3 attempts)
+  local attempt
+  for attempt in 1 2 3; do
+    EDGE_RC=0
+    EDGE_CODE="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$1/")" || EDGE_RC=$?
+    if [ "$EDGE_RC" -eq 0 ] && [ "$EDGE_CODE" = "200" ]; then return 0; fi
+    if [ "$attempt" -lt 3 ]; then
+      log "edge pull attempt ${attempt}/3 failed (curl exit ${EDGE_RC}, HTTP ${EDGE_CODE:-none}; 200 required); retrying in ${EDGE_PULL_RETRY_SLEEP:-5}s"
+      sleep "${EDGE_PULL_RETRY_SLEEP:-5}"
+    fi
+  done
+  return 1
+}
+
+img_selfcheck() { # the converge self-checks (on-box subset); prints the failing reason class, returns 1 on failure
+  local i ok adv
+  ok=0
+  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
+    if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then ok=1; break; fi
+    sleep "${IMG_CHECK_SLEEP:-5}"
+  done
+  [ "$ok" = "1" ] || { printf 'gatus'; return 1; }
+  ok=0
+  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
+    if probe_tang_direct >/dev/null 2>&1; then ok=1; break; fi
+    sleep "${IMG_CHECK_SLEEP:-5}"
+  done
+  [ "$ok" = "1" ] || { printf 'tang-direct'; return 1; }
+  ok=0
+  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
+    adv="$(mktemp)"
+    if curl -sf --max-time 5 http://127.0.0.1/adv -o "$adv" && adv_ok "$adv" >/dev/null 2>&1; then ok=1; rm -f "$adv"; break; fi
+    rm -f "$adv"
+    sleep "${IMG_CHECK_SLEEP:-5}"
+  done
+  [ "$ok" = "1" ] || { printf 'caddy-80'; return 1; }
+  : "$i"
+  [ -n "${STATUS_HOST:-}" ] || return 0
+  ( assert_caddyfile_hardened ) >/dev/null 2>&1 || { printf 'hardening'; return 1; }
+  if [ -n "${AOP_TLS:-}" ]; then
+    certless_probe "${STATUS_HOST}" || { printf 'certless'; return 1; }
+    edge_pull_200 "${STATUS_HOST}" >/dev/null 2>&1 || { printf 'edge'; return 1; }
+  elif [ "${ORIGIN_TLS:-0}" = "1" ]; then
+    curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null \
+      || { printf 'local-443'; return 1; }
+  fi
+  return 0
+}
+
+img_hub_tags() { # $1 = repo, $2 = current tag -> the registry tag list (JSON array, <= 3 pages) for the track's major
+  local hubrepo prefix url page body next acc
+  case "$1" in */*) hubrepo="$1" ;; *) hubrepo="library/$1" ;; esac
+  prefix="$(printf '%s' "$2" | sed -n 's/^\(v\{0,1\}[0-9]\{1,\}\.\).*/\1/p')"
+  [ -n "$prefix" ] || return 1
+  url="https://hub.docker.com/v2/repositories/${hubrepo}/tags?page_size=100&name=${prefix}"
+  acc='[]'
+  for page in 1 2 3; do
+    body="$(curl -fsS --proto '=https' --max-time 30 "$url")" || return 1
+    acc="$(jq -c --argjson acc "$acc" '$acc + [.results[] | {name: (.name | tostring), digest: (.digest | tostring), pushed: (.tag_last_pushed | tostring)}]' <<<"$body")" || return 1
+    next="$(jq -r '.next | tostring' <<<"$body")" || return 1
+    case "$next" in
+      null) break ;;
+      "https://hub.docker.com/v2/repositories/${hubrepo}/tags?"*) url="$next" ;;
+      *) return 1 ;;
+    esac
+  done
+  : "$page"
+  printf '%s' "$acc"
+}
+
+img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current digest; stdin = tag list -> "tag digest" or nothing
+  local soak cutoff now ptag cur name digest pushed key at best="" best_key="" best_digest=""
+  soak="$(img_soak_hours)" || return 1
+  now="${IMG_NOW:-$(date +%s)}"
+  cutoff=$((now - soak * 3600))
+  read -r _ ptag _ <<<"$(img_split_ref "$2")"
+  cur="$(img_ver_key "$3" "$ptag")" || return 1
+  while IFS=$'\t' read -r name digest pushed; do
+    key="$(img_ver_key "$name" "$ptag")" || continue
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+    at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
+    [ "$at" -le "$cutoff" ] || continue
+    img_is_bad "$1" "$digest" && continue
+    if img_ver_gt "$key" "$cur" || { [ "$key" = "$cur" ] && [ "$digest" != "$4" ]; }; then
+      if [ -z "$best" ] || img_ver_gt "$key" "$best_key"; then
+        best="$name"; best_key="$key"; best_digest="$digest"
+      fi
+    fi
+  done < <(jq -r '.[] | [.name, .digest, .pushed] | @tsv')
+  [ -z "$best" ] || printf '%s %s' "$best" "$best_digest"
+}
+
+img_report() { # $1 = name, $2 = true|false, $3 = error text (version/digest prefix/reason class only), $4 = seconds
+  local key tok q
+  key="$(img_gatus_key "$1 updates")"
+  tok="$(cat "$IMG_TOKEN_FILE" 2>/dev/null || true)"
+  [ -n "$tok" ] || return 1
+  q="success=$2&duration=${4:-0}s"
+  if [ -n "$3" ]; then q="${q}&error=$(jq -rn --arg e "$3" '$e | @uri')"; fi
+  curl -fsS --max-time 15 -X POST -K - -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/${key}/external?${q}" <<IMG_AUTH_EOF
+header = "Authorization: Bearer ${tok}"
+IMG_AUTH_EOF
+}
+
+img_alert_direct() { # $1 = message: the fallback push when Gatus cannot take the status (the same ntfy topic/token Gatus alerts with)
+  [ -n "${NTFY_TOPIC:-}" ] || return 0
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    curl -fsS --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" <<IMG_NTFY_EOF || true
+header = "Authorization: Bearer ${NTFY_TOKEN}"
+IMG_NTFY_EOF
+  else
+    curl -fsS --max-time 15 -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" || true
+  fi
+}
+
+img_swap() { # $1 = name, $2 = ref -> recreate the container on that ref with 010's args
+  docker rm -f "$1" >/dev/null 2>&1 || true
+  case "$1" in
+    caddy) img_run_caddy "$2" || return 1 ;;
+    gatus) img_run_gatus "$2" || return 1 ;;
+    *) return 1 ;;
+  esac
+  sleep "${IMG_START_SLEEP:-3}"
+  docker ps --format '{{.Names}}' | grep -qx "$1"
+}
+
+img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) for one container
+  local t0 cur repo tag cdig tags cand ctag cnew newref reason="" r2="" msg
+  t0="$(date +%s)"
+  cur="$(img_effective_ref "$1" "$2")"
+  read -r repo tag cdig <<<"$(img_split_ref "$cur")"
+  [ -n "$cdig" ] || cdig="$(img_local_digest "$cur" "$repo")"
+  if ! tags="$(img_hub_tags "$repo" "$tag")"; then
+    log "$1: registry tag list unavailable - no push this round (a persistent outage reds the row at the heartbeat)"
+    return 0
+  fi
+  cand="$(img_pick_candidate "$1" "$2" "$tag" "$cdig" <<<"$tags")" || cand=""
+  if [ -z "$cand" ]; then
+    log "$1: ${tag} (${cdig:7:12}) is the newest soaked build in the track"
+    img_report "$1" true "" "$(( $(date +%s) - t0 ))" || log "$1: status push failed (Gatus unreachable?)"
+    return 0
+  fi
+  read -r ctag cnew <<<"$cand"
+  newref="${repo}:${ctag}@${cnew}"
+  if ! docker pull -q "${repo}@${cnew}" >/dev/null 2>&1; then
+    log "$1: pull of ${ctag} (${cnew:7:12}) failed - retried next round"
+    return 0
+  fi
+  if [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; then
+    img_mark_bad "$1" "$cnew"
+    msg="rejected ver=${ctag} dig=${cnew:7:12} reason=validate"
+    log "$1: ${msg}"
+    img_report "$1" false "$msg" "$(( $(date +%s) - t0 ))" || img_alert_direct "$1: ${msg}"
+    return 0
+  fi
+  log "$1: swapping ${tag} (${cdig:7:12}) -> ${ctag} (${cnew:7:12})"
+  if img_swap "$1" "$newref" && reason="$(img_selfcheck)"; then
+    img_state_put "$1" "$newref"
+    log "$1: now on ${ctag} (${cnew:7:12}); self-checks passed"
+    img_report "$1" true "" "$(( $(date +%s) - t0 ))" || log "$1: status push failed (Gatus unreachable?)"
+    return 0
+  fi
+  reason="${reason:-start}"
+  img_mark_bad "$1" "$cnew"
+  if img_swap "$1" "$cur" && r2="$(img_selfcheck)"; then
+    msg="rolled-back ver=${ctag} dig=${cnew:7:12} reason=${reason}"
+  else
+    msg="restore-failed ver=${tag} after ver=${ctag} dig=${cnew:7:12} reason=${reason}/${r2:-start}"
+  fi
+  log "$1: ${msg}"
+  img_report "$1" false "$msg" "$(( $(date +%s) - t0 ))" || img_alert_direct "$1: ${msg}"
+  return 0
+}
+
+img_updater_main() { # the on-box entry point (the rendered script calls only this)
+  [ "$(img_updater_mode)" = "on" ] || { log "IMG_AUTO_UPDATES is not on - nothing to do"; return 0; }
+  img_soak_hours >/dev/null || die "bad IMG_UPDATE_SOAK_HOURS in the rendered updater"
+  if [ -r "$IMG_ENV_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$IMG_ENV_FILE"
+  fi
+  img_update_one gatus "$GATUS_IMAGE"
+  img_update_one caddy "$CADDY_IMAGE"
+}
+
+render_img_updater() { # print the on-box updater: constants + the reused 010 functions + the entry call
+  local v fn
+  cat <<'IMG_UPDATER_HEAD_EOF'
+#!/usr/bin/env bash
+# piercloud-img-update - DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh).
+# DO NOT EDIT BY HAND - re-rendered on every provision run (A-IMG #51; docs/updaters.md).
+set -euo pipefail
+umask 077
+IMG_UPDATER_HEAD_EOF
+  for v in IMG_STATE_DIR IMG_ENV_FILE IMG_TOKEN_FILE GATUS_IMAGE CADDY_IMAGE GATUS_PORT GATUS_CONFIG TANG_PORT \
+    CADDY_CONFIG CADDY_ORIGIN_CRT CADDY_ORIGIN_KEY CADDY_AOP_CA CADDY_CHALLENGE_DIR ORIGIN_TLS AOP_TLS STATUS_HOST \
+    IMG_AUTO_UPDATES IMG_UPDATE_SOAK_HOURS; do
+    printf '%s=%q\n' "$v" "${!v-}"
+  done
+  for fn in log warn die adv_ok probe_tang_direct assert_caddyfile_hardened img_gatus_key \
+    img_updater_mode img_soak_hours img_split_ref img_ver_key img_ver_gt img_state_get img_state_put img_is_bad \
+    img_mark_bad img_effective_ref img_local_digest img_caddy_mount_args img_caddy_validate img_run_caddy img_run_gatus \
+    certless_probe edge_pull_200 img_selfcheck img_hub_tags img_pick_candidate img_report img_alert_direct img_swap \
+    img_update_one img_updater_main; do
+    declare -f "$fn" || return 1
+  done
+  printf '%s\n' 'img_updater_main "$@"'
+}
+
+render_img_updater_service() { # print the systemd service unit
+  cat <<IMG_SERVICE_EOF
+[Unit]
+Description=piercloud container updater (Caddy + Gatus inside the approved track; A-IMG #51)
+Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/updaters.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n -E 0 ${IMG_LOCK_FILE} ${IMG_SBIN}
+User=root
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+IMG_SERVICE_EOF
+}
+
+render_img_updater_timer() { # print the systemd timer unit (every 6 h + jitter)
+  cat <<'IMG_TIMER_EOF'
+[Unit]
+Description=Run the piercloud container updater every 6 hours
+
+[Timer]
+OnActiveSec=30min
+OnUnitInactiveSec=6h
+AccuracySec=1min
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
+IMG_TIMER_EOF
+}
+
+img_lock_acquire() { # serialize provision's container recreates against an in-flight update (held to the end of the run)
+  command -v flock >/dev/null 2>&1 || return 0
+  exec {IMG_LOCK_FD}>"$IMG_LOCK_FILE"
+  flock -w 900 "$IMG_LOCK_FD" || die "the container updater still holds ${IMG_LOCK_FILE} after 15 min - refusing to race it; re-dispatch"
+}
+
+img_updater_install() { # render + install the updater, its 0600 env file and units (IMG_AUTO_UPDATES on)
+  local tmp
+  mkdir -p "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")" "$(dirname "$IMG_SBIN")" "$(dirname "$IMG_SERVICE")" "$(dirname "$IMG_TIMER")"
+  chmod 700 "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")"
+  tmp="$(mktemp)"
+  render_img_updater >"$tmp" || { rm -f "$tmp"; die "container updater render failed (a reused 010 function is missing) - refusing to install"; }
+  bash -n "$tmp" || { rm -f "$tmp"; die "rendered container updater failed bash -n - refusing to install"; }
+  chmod 0755 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$IMG_SBIN"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh). 0600, root-only."
+    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$IMG_ENV_FILE"
+  render_img_updater_service >"$IMG_SERVICE.tmp.$$"
+  chmod 0644 "$IMG_SERVICE.tmp.$$"
+  mv "$IMG_SERVICE.tmp.$$" "$IMG_SERVICE"
+  render_img_updater_timer >"$IMG_TIMER.tmp.$$"
+  chmod 0644 "$IMG_TIMER.tmp.$$"
+  mv "$IMG_TIMER.tmp.$$" "$IMG_TIMER"
+  systemctl daemon-reload
+  systemctl enable piercloud-img-update.timer >/dev/null
+  systemctl restart piercloud-img-update.timer
+  log "container updater installed (6 h timer + jitter, soak ${IMG_SOAK:-6}h, track = the repo pin's major; env file 0600)"
+}
+
+img_updater_disable() { # IMG_AUTO_UPDATES=off: remove the updater + the current records (bad-digest holds are kept)
+  rm -f "${IMG_STATE_DIR}/caddy.state" "${IMG_STATE_DIR}/gatus.state"
+  if [ ! -e "$IMG_SERVICE" ] && [ ! -e "$IMG_TIMER" ] && [ ! -e "$IMG_SBIN" ] && [ ! -e "$IMG_ENV_FILE" ]; then
+    return 0
+  fi
+  log "IMG_AUTO_UPDATES=off - removing the container updater (the containers run the repo pins from this run on)"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now piercloud-img-update.timer >/dev/null 2>&1 || true
+    systemctl stop piercloud-img-update.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$IMG_SERVICE" "$IMG_TIMER" "$IMG_SBIN" "$IMG_ENV_FILE"
+  if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+}
+# --- END IMG UPDATER ---
+
+# ---------------------------------------------------------------------------
+# a2) OS security updates + kernel reboot window (Lane A, #51; docs/updaters.md)
+# ---------------------------------------------------------------------------
+gatus_ext_items=()
+os_updates_apply
+
+# ---------------------------------------------------------------------------
+# a3) Container-updater status rows (A-IMG, #51; docs/updaters.md): one Gatus
+#    external row per auto-updated container + its push token, appended to
+#    the shared gatus_ext_items before the Gatus render (IMG UPDATER span).
+# ---------------------------------------------------------------------------
+img_status_items_add
+
 # ---------------------------------------------------------------------------
 # b) thumbprint — the ONE value you must save
 # ---------------------------------------------------------------------------
@@ -1144,67 +1881,6 @@ assert_no_key_leak
 #    row is monitor-only; operator = it alerts).
 # ---------------------------------------------------------------------------
 # --- gatus-render:start ---
-# --- GATUS EXTERNAL:start --- (shared Lane A sub-span; tests/img-updater extracts it)
-# Gatus external endpoints (pinned TwiN/gatus v5.36.0: POST
-# /api/v1/endpoints/{key}/external?success=&error=&duration=, the bearer
-# token checked per endpoint, a heartbeat watchdog that fails the row once no
-# push arrived inside the interval). Each on-box updater slice appends its
-# "name|heartbeat" items to gatus_ext_items on ITS OWN line below, so merging
-# the slices is a union. The push token is generated on this box, 0600,
-# regenerated on every provision run and never printed (the config file that
-# carries it is 0600 too).
-GATUS_EXT_TOKEN_FILE="${GATUS_EXT_TOKEN_FILE:-/etc/piercloud-status/external-token}"
-gatus_ext_items=()
-# A-IMG (#51): one row per auto-updated container (IMG_AUTO_UPDATES unset/on).
-case "${IMG_AUTO_UPDATES-}" in
-  ''|on) gatus_ext_items+=("caddy updates|26h" "gatus updates|26h") ;;
-  off) ;;
-  *) die "bad IMG_AUTO_UPDATES (want unset/on/off): ${IMG_AUTO_UPDATES}" ;;
-esac
-gatus_ext_key() { # $1 = row name -> the Gatus endpoint key (group anchor; Gatus sanitizes / _ , . # + & and spaces to -)
-  local s
-  s="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed 's#[/_,.\#+& ]#-#g')"
-  printf 'anchor_%s' "$s"
-}
-gatus_ext_token_ensure() { # regenerate the push token (0600), or remove it when no external row renders
-  local dir tmp
-  if [ "${#gatus_ext_items[@]}" -eq 0 ]; then
-    rm -f "$GATUS_EXT_TOKEN_FILE"
-    return 0
-  fi
-  dir="$(dirname "$GATUS_EXT_TOKEN_FILE")"
-  mkdir -p "$dir"
-  chmod 700 "$dir"
-  tmp="$(mktemp "${dir}/.token.XXXXXX")"
-  if ! openssl rand -hex 32 >"$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    die "could not generate the external-endpoint push token (openssl rand) - refusing to render a tokenless push row"
-  fi
-  chmod 600 "$tmp"
-  mv "$tmp" "$GATUS_EXT_TOKEN_FILE"
-}
-gatus_ext_yaml() { # print the external-endpoints block; call INSIDE the render group, never in $(...) (alert_intent must count)
-  local item name hb tok
-  [ "${#gatus_ext_items[@]}" -gt 0 ] || return 0
-  tok="$(cat "$GATUS_EXT_TOKEN_FILE" 2>/dev/null || true)"
-  case "$tok" in ''|*[!0-9a-f]*) die "external-endpoint push token missing or not lowercase hex - refusing to render it" ;; esac
-  printf '%s\n' "" "external-endpoints:"
-  printf '%s\n' "  # Pushed by the on-box updaters (docs/updaters.md); a missed heartbeat"
-  printf '%s\n' "  # reds the row (stale = down). Routine success never notifies."
-  for item in "${gatus_ext_items[@]}"; do
-    name="${item%%|*}"
-    hb="${item#*|}"
-    case "$name" in ''|*[!a-z0-9\ -]*) die "bad external endpoint name (chars [a-z0-9 -]): $name" ;; esac
-    case "$hb" in ''|*[!0-9hm]*) die "bad external endpoint heartbeat (want e.g. 26h): $hb" ;; esac
-    printf '%s\n' "  - name: ${name}" "    group: anchor" "    token: \"${tok}\"" "    heartbeat:" "      interval: ${hb}"
-    if [ -n "${NTFY_TOPIC:-}" ]; then
-      printf '%s\n' "    alerts:" "      - type: ntfy" "        failure-threshold: 1" "        send-on-resolved: false" \
-        "        provider-override:" "          priority: 4  # alert class 4 (once per bad candidate or missed heartbeat; never a night emergency)"
-      alert_intent "$name"
-    fi
-  done
-}
-# --- GATUS EXTERNAL:end ---
 # Operator-role gate (issue #134, call C1): unset/tenant = the platform row
 # is monitor-only; operator = the platform row alerts (with a push topic).
 # Fail closed on anything else — an unknown role must not silently alert.
@@ -1247,6 +1923,19 @@ alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
   ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
   printf -v ALERTS_EXPECTED_NAMES '%s%s\n' "${ALERTS_EXPECTED_NAMES}" "${1}"
 }
+# --- BEGIN GATUS EXTERNAL (Lane A #51: push-fed rows; keep markers) ---
+# Slices append complete `  - name:` items to gatus_ext_items before this
+# span; `external-endpoints:` renders only when at least one exists. An item
+# carrying an alerts stanza records its alert intent here (C4 ledger).
+declare -p gatus_ext_items >/dev/null 2>&1 || gatus_ext_items=()
+GATUS_EXT_YAML=""
+for _ext_item in "${gatus_ext_items[@]}"; do
+  _ext_name="$(printf '%s\n' "$_ext_item" | sed -n '1s/^  - name: //p')"
+  [ -n "$_ext_name" ] || die "Gatus external item does not start with '  - name: ' - refusing to render"
+  if printf '%s\n' "$_ext_item" | grep -qx '    alerts:'; then alert_intent "$_ext_name"; fi
+  printf -v GATUS_EXT_YAML '%s%s\n' "$GATUS_EXT_YAML" "$_ext_item"
+done
+# --- END GATUS EXTERNAL ---
 if [ "$PULLER_MODE" -eq 1 ]; then
   # The fragment owns every watched row. The dispatch-env pairs cannot reach
   # the box as monitors anymore, so drop them LOUDLY here (dispatch time is
@@ -1404,12 +2093,9 @@ else
   # but never pushed. Set the NTFY_TOPIC secret + re-dispatch for alerts."
   warn "NTFY_TOPIC unset — Gatus checks endpoints but cannot push failures anywhere."
 fi
-# External-endpoint push token (GATUS EXTERNAL sub-span above): regenerated
-# on every run, before the render that embeds it; never printed.
-gatus_ext_token_ensure
 TMP_CFG="${GATUS_CONFIG}.new"
 # Root-only BEFORE the render: the config carries the ntfy token and the
-# external-endpoint push token (the pinned Gatus container runs as root).
+# external-endpoint push tokens (the pinned Gatus container runs as root).
 install -m 0600 /dev/null "$TMP_CFG"
 {
   printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
@@ -1478,7 +2164,10 @@ install -m 0600 /dev/null "$TMP_CFG"
       alert_intent "dashboard TLS (via edge)"
     fi
   fi
-  gatus_ext_yaml
+  if [ -n "$GATUS_EXT_YAML" ]; then
+    printf '%s\n' "" "external-endpoints:"
+    printf '%s' "$GATUS_EXT_YAML"
+  fi
 } >"$TMP_CFG"
 # Render-time assertion (issue #134, call C4): the rendered alert stanzas
 # must equal the intent ledger recorded while rendering — the #118 class of
@@ -2894,476 +3583,6 @@ gatus_puller_disable() { # remove the puller artifacts + the puller-owned fragme
 }
 # --- END GATUS PULLER ---
 
-# --- BEGIN IMG UPDATER (tests/img-updater extracts this span; keep markers) ---
-# A-IMG (#51, Lane A): the box moves its own Caddy and Gatus containers to
-# newer builds inside the APPROVED track, outside a dispatch. Everything that
-# decides WHAT may run is rendered here by the provision run (approval-gated):
-# the repository + track (the repo pin's major + suffix: caddy 2.x.y-alpine,
-# gatus v5.x.y), the soak, the run/validate args and this code. Only the
-# digest floats. Docs: docs/updaters.md; trust rule: docs/invariants.md.
-#
-# Precedence (load-bearing; tests/img-updater): the state file records the
-# current ref per container. A provision run uses max(repo pin, recorded)
-# inside the SAME track - it never downgrades below what the updater moved to;
-# a pin in another track (a Lane B major bump) resets the track; a recorded
-# bad digest is never selected; IMG_AUTO_UPDATES=off returns to the repo pin
-# (the dispatch-only manual rollback, docs/dr.md).
-#
-# Paths are overridable for the offline harness only; the dispatch env never
-# exports these names, so on-box runs get the canonical defaults.
-IMG_STATE_DIR="${IMG_STATE_DIR:-/var/lib/piercloud-img}"
-IMG_ENV_FILE="${IMG_ENV_FILE:-/etc/piercloud-img/img-update.env}"
-IMG_SBIN="${IMG_SBIN:-/usr/local/sbin/piercloud-img-update}"
-IMG_SERVICE="${IMG_SERVICE:-/etc/systemd/system/piercloud-img-update.service}"
-IMG_TIMER="${IMG_TIMER:-/etc/systemd/system/piercloud-img-update.timer}"
-IMG_LOCK_FILE="${IMG_LOCK_FILE:-/run/piercloud-img-update.lock}"
-
-img_updater_mode() { # on | off | bad - unset/empty = on (default ON, owner 2026-10-27)
-  case "${IMG_AUTO_UPDATES-}" in
-    ''|on) printf 'on' ;;
-    off) printf 'off' ;;
-    *) printf 'bad' ;;
-  esac
-}
-
-img_soak_hours() { # validated soak in hours (default 6); returns 1 on a bad value
-  local v="${IMG_UPDATE_SOAK_HOURS:-6}"
-  case "$v" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#v}" -le 3 ] && [ "$((10#$v))" -le 720 ] || return 1
-  printf '%s' "$((10#$v))"
-}
-
-img_split_ref() { # $1 = repo:tag[@sha256:hex] -> "repo tag digest" (digest may be empty)
-  local r="$1" d=""
-  case "$r" in *@*) d="${r#*@}"; r="${r%%@*}" ;; esac
-  printf '%s %s %s' "${r%:*}" "${r##*:}" "$d"
-}
-
-img_ver_key() { # $1 = tag, $2 = pin tag -> "MAJ.MIN.PATCH" when $1 is in the pin's track; 1 otherwise
-  local re pfx maj sfx
-  re='^(v?)([0-9]+)\.([0-9]+)\.([0-9]+)(-[a-z]+)?$'
-  [[ "$2" =~ $re ]] || return 1
-  pfx="${BASH_REMATCH[1]}"; maj="${BASH_REMATCH[2]}"; sfx="${BASH_REMATCH[5]}"
-  [[ "$1" =~ $re ]] || return 1
-  [ "${BASH_REMATCH[1]}" = "$pfx" ] && [ "${BASH_REMATCH[2]}" = "$maj" ] && [ "${BASH_REMATCH[5]}" = "$sfx" ] || return 1
-  printf '%s.%s.%s' "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))" "$((10#${BASH_REMATCH[4]}))"
-}
-
-img_ver_gt() { # $1 > $2 for MAJ.MIN.PATCH keys
-  local a1 a2 a3 b1 b2 b3
-  IFS=. read -r a1 a2 a3 <<<"$1"
-  IFS=. read -r b1 b2 b3 <<<"$2"
-  [ "$a1" -gt "$b1" ] && return 0
-  [ "$a1" -lt "$b1" ] && return 1
-  [ "$a2" -gt "$b2" ] && return 0
-  [ "$a2" -lt "$b2" ] && return 1
-  [ "$a3" -gt "$b3" ]
-}
-
-img_state_get() { # $1 = name -> the recorded current ref (validated); 1 when absent/invalid
-  local f="${IMG_STATE_DIR}/$1.state" v
-  [ -f "$f" ] || return 1
-  v="$(sed -n 's/^ref=//p' "$f" | head -n 1)"
-  [[ "$v" =~ ^[a-z0-9][a-z0-9./-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || return 1
-  printf '%s' "$v"
-}
-
-img_state_put() { # $1 = name, $2 = repo:tag@sha256:hex
-  local tmp
-  mkdir -p "$IMG_STATE_DIR"
-  chmod 700 "$IMG_STATE_DIR"
-  tmp="$(mktemp "${IMG_STATE_DIR}/.state.XXXXXX")"
-  printf 'ref=%s\n' "$2" >"$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "${IMG_STATE_DIR}/$1.state"
-}
-
-img_is_bad() { # $1 = name, $2 = digest -> 0 when the digest is held as bad (never retried)
-  [ -n "$2" ] && [ -f "${IMG_STATE_DIR}/$1.bad" ] && grep -qxF -- "$2" "${IMG_STATE_DIR}/$1.bad"
-}
-
-img_mark_bad() { # $1 = name, $2 = digest
-  mkdir -p "$IMG_STATE_DIR"
-  chmod 700 "$IMG_STATE_DIR"
-  img_is_bad "$1" "$2" || printf '%s\n' "$2" >>"${IMG_STATE_DIR}/$1.bad"
-  chmod 600 "${IMG_STATE_DIR}/$1.bad"
-}
-
-img_effective_ref() { # $1 = name, $2 = repo pin -> the ref to run: max(pin, recorded) inside the pin's track
-  local rec prepo ptag rrepo rtag rdig pk rk
-  if [ "$(img_updater_mode)" != "on" ]; then printf '%s' "$2"; return 0; fi
-  rec="$(img_state_get "$1")" || { printf '%s' "$2"; return 0; }
-  read -r prepo ptag _ <<<"$(img_split_ref "$2")"
-  read -r rrepo rtag rdig <<<"$(img_split_ref "$rec")"
-  pk="$(img_ver_key "$ptag" "$ptag")" || { printf '%s' "$2"; return 0; }
-  if [ "$rrepo" != "$prepo" ] || ! rk="$(img_ver_key "$rtag" "$ptag")" || img_is_bad "$1" "$rdig" || img_ver_gt "$pk" "$rk"; then
-    printf '%s' "$2"
-    return 0
-  fi
-  printf '%s' "$rec"
-}
-
-img_reconcile_state() { # $1 = name, $2 = repo pin: drop a record the pin no longer honours (off switch, other repo/track, bad, below the pin)
-  local rec
-  rec="$(img_state_get "$1")" || return 0
-  if [ "$(img_effective_ref "$1" "$2")" != "$rec" ]; then
-    rm -f "${IMG_STATE_DIR}/$1.state"
-    log "$1: updater record ${rec%%@*} is not honoured by the repo pin $2 (off switch, another track, a bad digest or below the pin) - back on the pin"
-  fi
-}
-
-img_local_digest() { # $1 = local ref, $2 = repo -> the registry digest docker recorded for it (empty when unknown)
-  docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null \
-    | sed -n "s#^$2@\(sha256:[0-9a-f]\{64\}\)\$#\1#p" | head -n 1 || true
-}
-
-img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path -> the bind mounts 010's validate AND run share
-  local a="-v $1:$2:ro"
-  if [ "${ORIGIN_TLS:-0}" = "1" ]; then
-    a="${a} -v ${CADDY_ORIGIN_CRT}:${CADDY_ORIGIN_CRT}:ro -v ${CADDY_ORIGIN_KEY}:${CADDY_ORIGIN_KEY}:ro"
-  fi
-  if [ -n "${AOP_TLS:-}" ]; then
-    a="${a} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
-  fi
-  printf '%s' "$a"
-}
-
-img_caddy_validate() { # $1 = container ref, $2 = Caddyfile to validate (010's pre-install validate args, verbatim)
-  local args
-  args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new)"
-  # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
-  docker run --rm $args "$1" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
-}
-
-img_run_caddy() { # $1 = container ref -> create the caddy container (the ONE docker run 010 and the updater share)
-  local mounts
-  mounts="$(img_caddy_mount_args "${CADDY_CONFIG}" /etc/caddy/Caddyfile)"
-  # --network host (NOT -p publishing): Caddy dials 127.0.0.1:8081/:8080 for
-  # tangd/Gatus on the HOST loopback; see section e2.
-  # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
-  docker run -d --name caddy --restart unless-stopped \
-    --network host \
-    --memory 256m \
-    -e GOMEMLIMIT=230MiB -e GOMAXPROCS=1 \
-    $mounts \
-    --mount type=volume,source=caddy-data,target=/data \
-    --mount type=volume,source=caddy-config,target=/config \
-    -v "${CADDY_CHALLENGE_DIR}:/var/lib/caddy/acme-challenge" \
-    "$1" >/dev/null
-}
-
-img_run_gatus() { # $1 = container ref -> create the gatus container (the ONE docker run 010 and the updater share)
-  docker run -d --name gatus --restart unless-stopped \
-    -p "127.0.0.1:${GATUS_PORT}:8080" \
-    --add-host=hostanchor:host-gateway \
-    -e GATUS_CONFIG_PATH=/config \
-    -v "$(dirname "${GATUS_CONFIG}")":/config:ro \
-    --mount type=volume,source=gatus-data,target=/data \
-    "$1" >/dev/null
-}
-
-certless_probe() { # $1 = status host -> sets CERTLESS_RC/CERTLESS_ERR; 0 = rejected at TLS with a client-auth alert
-  CERTLESS_RC=0
-  CERTLESS_ERR="$(curl -sSk --max-time 10 --resolve "$1:443:127.0.0.1" "https://$1/" -o /dev/null 2>&1)" || CERTLESS_RC=$?
-  case "$CERTLESS_RC" in
-    35|55|56) printf '%s' "$CERTLESS_ERR" | grep -qiE 'alert (certificate required|bad certificate)' ;;
-    *) return 1 ;;
-  esac
-}
-
-edge_pull_200() { # $1 = status host -> sets EDGE_RC/EDGE_CODE; 0 = the public edge answered HTTP 200 (3 attempts)
-  local attempt
-  for attempt in 1 2 3; do
-    EDGE_RC=0
-    EDGE_CODE="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$1/")" || EDGE_RC=$?
-    if [ "$EDGE_RC" -eq 0 ] && [ "$EDGE_CODE" = "200" ]; then return 0; fi
-    if [ "$attempt" -lt 3 ]; then
-      log "edge pull attempt ${attempt}/3 failed (curl exit ${EDGE_RC}, HTTP ${EDGE_CODE:-none}; 200 required); retrying in ${EDGE_PULL_RETRY_SLEEP:-5}s"
-      sleep "${EDGE_PULL_RETRY_SLEEP:-5}"
-    fi
-  done
-  return 1
-}
-
-img_selfcheck() { # the converge self-checks (on-box subset); prints the failing reason class, returns 1 on failure
-  local i ok adv
-  ok=0
-  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then ok=1; break; fi
-    sleep "${IMG_CHECK_SLEEP:-5}"
-  done
-  [ "$ok" = "1" ] || { printf 'gatus'; return 1; }
-  ok=0
-  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    if probe_tang_direct >/dev/null 2>&1; then ok=1; break; fi
-    sleep "${IMG_CHECK_SLEEP:-5}"
-  done
-  [ "$ok" = "1" ] || { printf 'tang-direct'; return 1; }
-  ok=0
-  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    adv="$(mktemp)"
-    if curl -sf --max-time 5 http://127.0.0.1/adv -o "$adv" && adv_ok "$adv" >/dev/null 2>&1; then ok=1; rm -f "$adv"; break; fi
-    rm -f "$adv"
-    sleep "${IMG_CHECK_SLEEP:-5}"
-  done
-  [ "$ok" = "1" ] || { printf 'caddy-80'; return 1; }
-  : "$i"
-  [ -n "${STATUS_HOST:-}" ] || return 0
-  ( assert_caddyfile_hardened ) >/dev/null 2>&1 || { printf 'hardening'; return 1; }
-  if [ -n "${AOP_TLS:-}" ]; then
-    certless_probe "${STATUS_HOST}" || { printf 'certless'; return 1; }
-    edge_pull_200 "${STATUS_HOST}" >/dev/null 2>&1 || { printf 'edge'; return 1; }
-  elif [ "${ORIGIN_TLS:-0}" = "1" ]; then
-    curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null \
-      || { printf 'local-443'; return 1; }
-  fi
-  return 0
-}
-
-img_hub_tags() { # $1 = repo, $2 = current tag -> the registry tag list (JSON array, <= 3 pages) for the track's major
-  local hubrepo prefix url page body next acc
-  case "$1" in */*) hubrepo="$1" ;; *) hubrepo="library/$1" ;; esac
-  prefix="$(printf '%s' "$2" | sed -n 's/^\(v\{0,1\}[0-9]\{1,\}\.\).*/\1/p')"
-  [ -n "$prefix" ] || return 1
-  url="https://hub.docker.com/v2/repositories/${hubrepo}/tags?page_size=100&name=${prefix}"
-  acc='[]'
-  for page in 1 2 3; do
-    body="$(curl -fsS --proto '=https' --max-time 30 "$url")" || return 1
-    acc="$(jq -c --argjson acc "$acc" '$acc + [.results[] | {name: (.name | tostring), digest: (.digest | tostring), pushed: (.tag_last_pushed | tostring)}]' <<<"$body")" || return 1
-    next="$(jq -r '.next | tostring' <<<"$body")" || return 1
-    case "$next" in
-      null) break ;;
-      "https://hub.docker.com/v2/repositories/${hubrepo}/tags?"*) url="$next" ;;
-      *) return 1 ;;
-    esac
-  done
-  : "$page"
-  printf '%s' "$acc"
-}
-
-img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current digest; stdin = tag list -> "tag digest" or nothing
-  local soak cutoff now ptag cur name digest pushed key at best="" best_key="" best_digest=""
-  soak="$(img_soak_hours)" || return 1
-  now="${IMG_NOW:-$(date +%s)}"
-  cutoff=$((now - soak * 3600))
-  read -r _ ptag _ <<<"$(img_split_ref "$2")"
-  cur="$(img_ver_key "$3" "$ptag")" || return 1
-  while IFS=$'\t' read -r name digest pushed; do
-    key="$(img_ver_key "$name" "$ptag")" || continue
-    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
-    at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
-    [ "$at" -le "$cutoff" ] || continue
-    img_is_bad "$1" "$digest" && continue
-    if img_ver_gt "$key" "$cur" || { [ "$key" = "$cur" ] && [ "$digest" != "$4" ]; }; then
-      if [ -z "$best" ] || img_ver_gt "$key" "$best_key"; then
-        best="$name"; best_key="$key"; best_digest="$digest"
-      fi
-    fi
-  done < <(jq -r '.[] | [.name, .digest, .pushed] | @tsv')
-  [ -z "$best" ] || printf '%s %s' "$best" "$best_digest"
-}
-
-img_report() { # $1 = name, $2 = true|false, $3 = error text (version/digest prefix/reason class only), $4 = seconds
-  local key tok q
-  key="$(gatus_ext_key "$1 updates")"
-  tok="$(cat "$GATUS_EXT_TOKEN_FILE" 2>/dev/null || true)"
-  [ -n "$tok" ] || return 1
-  q="success=$2&duration=${4:-0}s"
-  if [ -n "$3" ]; then q="${q}&error=$(jq -rn --arg e "$3" '$e | @uri')"; fi
-  curl -fsS --max-time 15 -X POST -K - -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/${key}/external?${q}" <<IMG_AUTH_EOF
-header = "Authorization: Bearer ${tok}"
-IMG_AUTH_EOF
-}
-
-img_alert_direct() { # $1 = message: the fallback push when Gatus cannot take the status (the same ntfy topic/token Gatus alerts with)
-  [ -n "${NTFY_TOPIC:-}" ] || return 0
-  if [ -n "${NTFY_TOKEN:-}" ]; then
-    curl -fsS --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" <<IMG_NTFY_EOF || true
-header = "Authorization: Bearer ${NTFY_TOKEN}"
-IMG_NTFY_EOF
-  else
-    curl -fsS --max-time 15 -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" || true
-  fi
-}
-
-img_swap() { # $1 = name, $2 = ref -> recreate the container on that ref with 010's args
-  docker rm -f "$1" >/dev/null 2>&1 || true
-  case "$1" in
-    caddy) img_run_caddy "$2" || return 1 ;;
-    gatus) img_run_gatus "$2" || return 1 ;;
-    *) return 1 ;;
-  esac
-  sleep "${IMG_START_SLEEP:-3}"
-  docker ps --format '{{.Names}}' | grep -qx "$1"
-}
-
-img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) for one container
-  local t0 cur repo tag cdig tags cand ctag cnew newref reason="" r2="" msg
-  t0="$(date +%s)"
-  cur="$(img_effective_ref "$1" "$2")"
-  read -r repo tag cdig <<<"$(img_split_ref "$cur")"
-  [ -n "$cdig" ] || cdig="$(img_local_digest "$cur" "$repo")"
-  if ! tags="$(img_hub_tags "$repo" "$tag")"; then
-    log "$1: registry tag list unavailable - no push this round (a persistent outage reds the row at the heartbeat)"
-    return 0
-  fi
-  cand="$(img_pick_candidate "$1" "$2" "$tag" "$cdig" <<<"$tags")" || cand=""
-  if [ -z "$cand" ]; then
-    log "$1: ${tag} (${cdig:7:12}) is the newest soaked build in the track"
-    img_report "$1" true "" "$(( $(date +%s) - t0 ))" || log "$1: status push failed (Gatus unreachable?)"
-    return 0
-  fi
-  read -r ctag cnew <<<"$cand"
-  newref="${repo}:${ctag}@${cnew}"
-  if ! docker pull -q "${repo}@${cnew}" >/dev/null 2>&1; then
-    log "$1: pull of ${ctag} (${cnew:7:12}) failed - retried next round"
-    return 0
-  fi
-  if [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; then
-    img_mark_bad "$1" "$cnew"
-    msg="rejected ver=${ctag} dig=${cnew:7:12} reason=validate"
-    log "$1: ${msg}"
-    img_report "$1" false "$msg" "$(( $(date +%s) - t0 ))" || img_alert_direct "$1: ${msg}"
-    return 0
-  fi
-  log "$1: swapping ${tag} (${cdig:7:12}) -> ${ctag} (${cnew:7:12})"
-  if img_swap "$1" "$newref" && reason="$(img_selfcheck)"; then
-    img_state_put "$1" "$newref"
-    log "$1: now on ${ctag} (${cnew:7:12}); self-checks passed"
-    img_report "$1" true "" "$(( $(date +%s) - t0 ))" || log "$1: status push failed (Gatus unreachable?)"
-    return 0
-  fi
-  reason="${reason:-start}"
-  img_mark_bad "$1" "$cnew"
-  if img_swap "$1" "$cur" && r2="$(img_selfcheck)"; then
-    msg="rolled-back ver=${ctag} dig=${cnew:7:12} reason=${reason}"
-  else
-    msg="restore-failed ver=${tag} after ver=${ctag} dig=${cnew:7:12} reason=${reason}/${r2:-start}"
-  fi
-  log "$1: ${msg}"
-  img_report "$1" false "$msg" "$(( $(date +%s) - t0 ))" || img_alert_direct "$1: ${msg}"
-  return 0
-}
-
-img_updater_main() { # the on-box entry point (the rendered script calls only this)
-  [ "$(img_updater_mode)" = "on" ] || { log "IMG_AUTO_UPDATES is not on - nothing to do"; return 0; }
-  img_soak_hours >/dev/null || die "bad IMG_UPDATE_SOAK_HOURS in the rendered updater"
-  if [ -r "$IMG_ENV_FILE" ]; then
-    # shellcheck source=/dev/null
-    . "$IMG_ENV_FILE"
-  fi
-  img_update_one gatus "$GATUS_IMAGE"
-  img_update_one caddy "$CADDY_IMAGE"
-}
-
-render_img_updater() { # print the on-box updater: constants + the reused 010 functions + the entry call
-  local v fn
-  printf '%s\n' '#!/usr/bin/env bash' \
-    '# piercloud-img-update - DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh).' \
-    '# DO NOT EDIT BY HAND - re-rendered on every provision run (A-IMG #51; docs/updaters.md).' \
-    'set -euo pipefail' 'umask 077'
-  for v in IMG_STATE_DIR IMG_ENV_FILE GATUS_EXT_TOKEN_FILE GATUS_IMAGE CADDY_IMAGE GATUS_PORT GATUS_CONFIG TANG_PORT \
-    CADDY_CONFIG CADDY_ORIGIN_CRT CADDY_ORIGIN_KEY CADDY_AOP_CA CADDY_CHALLENGE_DIR ORIGIN_TLS AOP_TLS STATUS_HOST \
-    IMG_AUTO_UPDATES IMG_UPDATE_SOAK_HOURS; do
-    printf '%s=%q\n' "$v" "${!v-}"
-  done
-  for fn in log warn die adv_ok probe_tang_direct assert_caddyfile_hardened gatus_ext_key \
-    img_updater_mode img_soak_hours img_split_ref img_ver_key img_ver_gt img_state_get img_state_put img_is_bad \
-    img_mark_bad img_effective_ref img_local_digest img_caddy_mount_args img_caddy_validate img_run_caddy img_run_gatus \
-    certless_probe edge_pull_200 img_selfcheck img_hub_tags img_pick_candidate img_report img_alert_direct img_swap \
-    img_update_one img_updater_main; do
-    declare -f "$fn" || return 1
-  done
-  printf '%s\n' 'img_updater_main "$@"'
-}
-
-render_img_updater_service() { # print the systemd service unit
-  cat <<IMG_SERVICE_EOF
-[Unit]
-Description=piercloud container updater (Caddy + Gatus inside the approved track; A-IMG #51)
-Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/updaters.md
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/flock -n -E 0 ${IMG_LOCK_FILE} ${IMG_SBIN}
-User=root
-TimeoutStartSec=30min
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=yes
-IMG_SERVICE_EOF
-}
-
-render_img_updater_timer() { # print the systemd timer unit (every 6 h + jitter)
-  cat <<'IMG_TIMER_EOF'
-[Unit]
-Description=Run the piercloud container updater every 6 hours
-
-[Timer]
-OnActiveSec=30min
-OnUnitInactiveSec=6h
-AccuracySec=1min
-RandomizedDelaySec=30min
-
-[Install]
-WantedBy=timers.target
-IMG_TIMER_EOF
-}
-
-img_lock_acquire() { # serialize provision's container recreates against an in-flight update (held to the end of the run)
-  command -v flock >/dev/null 2>&1 || return 0
-  exec {IMG_LOCK_FD}>"$IMG_LOCK_FILE"
-  flock -w 900 "$IMG_LOCK_FD" || die "the container updater still holds ${IMG_LOCK_FILE} after 15 min - refusing to race it; re-dispatch"
-}
-
-img_updater_install() { # render + install the updater, its 0600 env file and units (IMG_AUTO_UPDATES on)
-  local tmp
-  mkdir -p "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")" "$(dirname "$IMG_SBIN")" "$(dirname "$IMG_SERVICE")" "$(dirname "$IMG_TIMER")"
-  chmod 700 "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")"
-  tmp="$(mktemp)"
-  render_img_updater >"$tmp" || { rm -f "$tmp"; die "container updater render failed (a reused 010 function is missing) - refusing to install"; }
-  bash -n "$tmp" || { rm -f "$tmp"; die "rendered container updater failed bash -n - refusing to install"; }
-  chmod 0755 "$tmp"
-  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
-  mv "$tmp" "$IMG_SBIN"
-  tmp="$(mktemp)"
-  {
-    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh). 0600, root-only."
-    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
-    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
-  } >"$tmp"
-  chmod 0600 "$tmp"
-  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
-  mv "$tmp" "$IMG_ENV_FILE"
-  render_img_updater_service >"$IMG_SERVICE.tmp.$$"
-  chmod 0644 "$IMG_SERVICE.tmp.$$"
-  mv "$IMG_SERVICE.tmp.$$" "$IMG_SERVICE"
-  render_img_updater_timer >"$IMG_TIMER.tmp.$$"
-  chmod 0644 "$IMG_TIMER.tmp.$$"
-  mv "$IMG_TIMER.tmp.$$" "$IMG_TIMER"
-  systemctl daemon-reload
-  systemctl enable piercloud-img-update.timer >/dev/null
-  systemctl restart piercloud-img-update.timer
-  log "container updater installed (6 h timer + jitter, soak ${IMG_SOAK:-6}h, track = the repo pin's major; env file 0600)"
-}
-
-img_updater_disable() { # IMG_AUTO_UPDATES=off: remove the updater + the current records (bad-digest holds are kept)
-  rm -f "${IMG_STATE_DIR}/caddy.state" "${IMG_STATE_DIR}/gatus.state"
-  if [ ! -e "$IMG_SERVICE" ] && [ ! -e "$IMG_TIMER" ] && [ ! -e "$IMG_SBIN" ] && [ ! -e "$IMG_ENV_FILE" ]; then
-    return 0
-  fi
-  log "IMG_AUTO_UPDATES=off - removing the container updater (the containers run the repo pins from this run on)"
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now piercloud-img-update.timer >/dev/null 2>&1 || true
-    systemctl stop piercloud-img-update.service >/dev/null 2>&1 || true
-  fi
-  rm -f "$IMG_SERVICE" "$IMG_TIMER" "$IMG_SBIN" "$IMG_ENV_FILE"
-  if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
-}
-# --- END IMG UPDATER ---
 
 # ---------------------------------------------------------------------------
 # c0b) Container updater switch (A-IMG #51): validated here, before any
@@ -7978,5 +8197,8 @@ case "$(recording_witness_state)" in
     recording_witness_disable
     ;;
 esac
+
+# h) OS updates: first status heartbeat now that Gatus serves (#51)
+os_updates_first_report
 
 log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-<alias>.status.piercloud.net} (visitor TLS at the edge; the origin leg on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

@@ -4,7 +4,7 @@
 # on-box container updater (issue #51, Lane A).
 #
 # Extracts the REAL spans from scripts/010-provision.sh (never a copy): the
-# IMG UPDATER span, the GATUS EXTERNAL sub-span, the HARDENING CHECK span and
+# IMG UPDATER span, the HARDENING CHECK span and
 # the adv_ok/probe_tang_direct probes the updater embeds. docker, curl,
 # systemctl and sleep are PATH stubs; the registry answers come from the
 # recorded Docker Hub tag-list fixtures in fixtures/ (no network). Proves:
@@ -61,13 +61,12 @@ if [ -z "${IMG_HARNESS_SPAN:-}" ]; then
 else
   cp "$IMG_HARNESS_SPAN" "$WORK/img.src"
 fi
-span '# --- GATUS EXTERNAL:start' '# --- GATUS EXTERNAL:end ---' >"$WORK/ext.src"
 span '# --- BEGIN HARDENING CHECK' '# --- END HARDENING CHECK ---' >"$WORK/hard.src"
 # The 010 tang probe writes a fixed /tmp path (PrivateTmp on the box); the
 # harness points it at its own work dir so a concurrent run cannot collide.
 mkdir -p "$WORK/tmp"
 { fn_src adv_ok; fn_src probe_tang_direct; } | sed "s#/tmp/tang-direct.json#$WORK/tmp/tang-direct.json#g" >"$WORK/probes.src"
-[ -s "$WORK/img.src" ] && [ -s "$WORK/ext.src" ] && [ -s "$WORK/hard.src" ] || { printf 'FAIL a span extracted empty\n'; exit 1; }
+[ -s "$WORK/img.src" ] && [ -s "$WORK/hard.src" ] || { printf 'FAIL a span extracted empty\n'; exit 1; }
 grep -q '^probe_tang_direct() {' "$WORK/probes.src" && grep -q '^adv_ok() {' "$WORK/probes.src" \
   || { printf 'FAIL adv_ok/probe_tang_direct not found in 010\n'; exit 1; }
 PIN_LINES="$(grep -E '^(GATUS|CADDY)_IMAGE="' "$PROVISION")"
@@ -81,6 +80,7 @@ log()  { printf 'log: %s\n' "$*"; }
 warn() { printf 'warn: %s\n' "$*" >&2; }
 die()  { printf 'FAIL(die): %s\n' "$*" >&2; exit 1; }
 alert_intent() { :; }
+gatus_ext_items=()
 TANG_PORT="8081"
 GATUS_PORT="8080"
 CADDY_ORIGIN_CRT="/etc/caddy/origin.crt"
@@ -88,7 +88,7 @@ CADDY_ORIGIN_KEY="/etc/caddy/origin.key"
 CADDY_AOP_CA="/etc/caddy/aop-ca.pem"
 CADDY_CHALLENGE_DIR="/var/lib/caddy/acme-challenge"
 EOF
-{ cat "$WORK/prelude.src"; printf '%s\n' "$PIN_LINES"; cat "$WORK/hard.src" "$WORK/probes.src" "$WORK/ext.src" "$WORK/img.src"; } >"$WORK/lib.sh"
+{ cat "$WORK/prelude.src"; printf '%s\n' "$PIN_LINES"; cat "$WORK/hard.src" "$WORK/probes.src" "$WORK/img.src"; } >"$WORK/lib.sh"
 
 # ---- PATH stubs ------------------------------------------------------------
 BIN="$WORK/bin"
@@ -184,7 +184,7 @@ new_case() { # $1 case label; env: MODE (IMG_AUTO_UPDATES), SOAK -> sets C (case
   printf 'twinproduction/gatus@%s\ncaddy@%s\n' "$GATUS_OLD" "$CADDY_OLD" >"$C/stub/repodigests"
   : >"$C/stub/docker.log"; : >"$C/stub/curl.log"; : >"$C/stub/curl.stdin"; : >"$C/stub/push.log"; : >"$C/stub/ntfy.log"
   (
-    IMG_STATE_DIR="$C/state" IMG_ENV_FILE="$C/etc/env" GATUS_EXT_TOKEN_FILE="$C/etc/token" \
+    IMG_STATE_DIR="$C/state" IMG_ENV_FILE="$C/etc/env" IMG_TOKEN_FILE="$C/etc/token" \
     CADDY_CONFIG="$C/etc/Caddyfile" GATUS_CONFIG="$C/etc/gatus/config.yaml" \
     IMG_AUTO_UPDATES="${MODE-}" IMG_UPDATE_SOAK_HOURS="${SOAK-}"
     # shellcheck source=/dev/null
@@ -352,14 +352,17 @@ suite_token() {
   lacks "token: never in the push URL" "$(cat "$C/stub/push.log")" "$TOKEN"
   lacks "token: never in the rendered updater" "$(cat "$C/updater")" "$TOKEN"
   rm -rf "$d"; mkdir -p "$d"
-  out="$( ( GATUS_EXT_TOKEN_FILE="$d/sub/token"; . "$WORK/lib.sh"; gatus_ext_token_ensure; NTFY_TOPIC=t gatus_ext_yaml ) 2>&1 )"
+  out="$( ( IMG_TOKEN_FILE="$d/sub/token"; NTFY_TOPIC=t; . "$WORK/lib.sh"; img_status_items_add; printf '%s\n' "${gatus_ext_items[@]}" ) 2>&1 )"
   is "token: token file is 0600" "600" "$(stat -c %a "$d/sub/token" 2>/dev/null)"
   is "token: token dir is 0700" "700" "$(stat -c %a "$d/sub" 2>/dev/null)"
   has "token: external rows rendered with the 26 h heartbeat" "$out" "      interval: 26h"
   has "token: caddy row rendered" "$out" "  - name: caddy updates"
+  has "token: gatus row rendered" "$out" "  - name: gatus updates"
+  has "token: rows carry the box token" "$out" "    token: \"$(cat "$d/sub/token" 2>/dev/null)\""
+  lacks "token: the add call prints nothing" "$( ( IMG_TOKEN_FILE="$d/sub/t2"; . "$WORK/lib.sh"; img_status_items_add ) 2>&1 )" "token"
   has "token: alert once per failure, no resolve push" "$out" "        send-on-resolved: false"
   first="$(cat "$d/sub/token")"
-  ( GATUS_EXT_TOKEN_FILE="$d/sub/token"; . "$WORK/lib.sh"; gatus_ext_token_ensure ) >/dev/null 2>&1
+  ( IMG_TOKEN_FILE="$d/sub/token"; . "$WORK/lib.sh"; img_status_items_add ) >/dev/null 2>&1
   second="$(cat "$d/sub/token")"
   if [ -n "$first" ] && [ "$first" != "$second" ]; then ok "token: regenerated on every provision run"; else bad "token: regenerated on every provision run"; fi
   if [[ "$second" =~ ^[0-9a-f]{64}$ ]]; then ok "token: 256-bit lowercase hex"; else bad "token: 256-bit lowercase hex"; fi
@@ -368,11 +371,13 @@ suite_token() {
 suite_off() {
   local d="$WORK/off" out
   rm -rf "$d"; mkdir -p "$d"
-  out="$( ( IMG_AUTO_UPDATES=off GATUS_EXT_TOKEN_FILE="$d/token"; . "$WORK/lib.sh"; printf '%s' "${#gatus_ext_items[@]}" ) 2>&1 )"
+  : >"$d/token"
+  out="$( ( IMG_AUTO_UPDATES=off IMG_TOKEN_FILE="$d/token"; . "$WORK/lib.sh"; img_status_items_add; printf '%s' "${#gatus_ext_items[@]}" ) 2>&1 )"
   is "off: no external rows rendered" "0" "$out"
-  out="$( ( IMG_AUTO_UPDATES="" GATUS_EXT_TOKEN_FILE="$d/token"; . "$WORK/lib.sh"; printf '%s' "${#gatus_ext_items[@]}" ) 2>&1 )"
+  if [ -e "$d/token" ]; then bad "off: the push token is removed"; else ok "off: the push token is removed"; fi
+  out="$( ( IMG_AUTO_UPDATES="" IMG_TOKEN_FILE="$d/token"; . "$WORK/lib.sh"; img_status_items_add; printf '%s' "${#gatus_ext_items[@]}" ) 2>&1 )"
   is "off: unset = on (two rows)" "2" "$out"
-  if ( IMG_AUTO_UPDATES=yes; . "$WORK/lib.sh" ) >/dev/null 2>&1; then bad "off: any other value is refused"; else ok "off: any other value is refused"; fi
+  if ( IMG_AUTO_UPDATES=yes IMG_TOKEN_FILE="$d/token"; . "$WORK/lib.sh"; img_status_items_add ) >/dev/null 2>&1; then bad "off: any other value is refused"; else ok "off: any other value is refused"; fi
   is "off: mode off" "off" "$(fn "$d" IMG_AUTO_UPDATES=off img_updater_mode)"
   is "off: mode bad" "bad" "$(fn "$d" IMG_AUTO_UPDATES=true img_updater_mode)"
   MODE="off" SOAK="" new_case off_run
@@ -389,7 +394,7 @@ suite_install() {
   out="$( ( export PATH="$BIN:$PATH" STUB="$d"
     IMG_STATE_DIR="$d/state" IMG_ENV_FILE="$d/etc/img.env" IMG_SBIN="$d/sbin/upd" IMG_SERVICE="$d/units/u.service" \
     IMG_TIMER="$d/units/u.timer" NTFY_TOPIC=pc-test-topic NTFY_TOKEN=ntfy-test-credential CADDY_CONFIG="$d/Caddyfile" \
-    GATUS_CONFIG="$d/gatus/config.yaml" GATUS_EXT_TOKEN_FILE="$d/token"
+    GATUS_CONFIG="$d/gatus/config.yaml" IMG_TOKEN_FILE="$d/token"
     . "$WORK/lib.sh"; ORIGIN_TLS=0; AOP_TLS=""; STATUS_HOST=""
     img_updater_install ) 2>&1 )" || bad "install: completes ($out)"
   is "install: env file 0600" "600" "$(stat -c %a "$d/etc/img.env" 2>/dev/null)"
@@ -429,7 +434,14 @@ has "010: provision applies the precedence for caddy" "$PROV_TXT" 'CADDY_RUN_IMA
 is "010: exactly one gatus docker run" "1" "$(grep -c 'docker run -d --name gatus' "$PROVISION")"
 is "010: exactly one caddy docker run" "1" "$(grep -c 'docker run -d --name caddy' "$PROVISION")"
 is "010: exactly one caddy validate" "1" "$(grep -c 'caddy validate --config' "$PROVISION")"
-has "010: the gatus render emits the external rows" "$PROV_TXT" '  gatus_ext_yaml'
+add_line="$(grep -nx 'img_status_items_add' "$PROVISION" | head -n1 | cut -d: -f1)"
+reset_line="$(grep -nx 'gatus_ext_items=()' "$PROVISION" | head -n1 | cut -d: -f1)"
+ext_line="$(grep -n '^# --- BEGIN GATUS EXTERNAL' "$PROVISION" | head -n1 | cut -d: -f1)"
+if [ -n "$add_line" ] && [ -n "$reset_line" ] && [ -n "$ext_line" ] && [ "$reset_line" -lt "$add_line" ] && [ "$add_line" -lt "$ext_line" ]; then
+  ok "010: the rows join gatus_ext_items after the reset and before the shared GATUS EXTERNAL render"
+else
+  bad "010: the rows join gatus_ext_items after the reset and before the shared GATUS EXTERNAL render"
+fi
 
 # ---- mutation teeth ---------------------------------------------------------
 # Each mutant is a literal (old, new) pair over the extracted span; the
@@ -464,6 +476,9 @@ mutant "validate skipped" validate '[ "$1" = "caddy" ] && ! img_caddy_validate' 
 mutant "token in argv" token '-X POST -K -' '-X POST -H "X-Push: ${tok}" -K -'
 mutant "off switch ignored" off "off) printf 'off' ;;" "off) printf 'on' ;;"
 mutant "state record skipped" swap "    img_state_put \"\$1\" \"\$newref\"${NL}" ''
+mutant "push token world-readable" token '  chmod 600 "$tmp"
+  mv "$tmp" "$IMG_TOKEN_FILE"' '  chmod 644 "$tmp"
+  mv "$tmp" "$IMG_TOKEN_FILE"'
 mutant "env file world-readable" install "  chmod 0600 \"\$tmp\"${NL}" "  chmod 0644 \"\$tmp\"${NL}"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
