@@ -162,7 +162,7 @@ OPERATOR_ONLY = {"ci.yml", "external-watch.yml"}
 # Every `uses:` value per workflow file, exactly. A composite action reads the
 # calling job's `vars`, and this pin does not scan action files, so any other
 # value fails closed. Tenant-reachable files use SHA-pinned actions only; the
-# owner's tag-pinned release actions are allowed only in the release workflows
+# owner's release actions are allowed (pinned to a commit SHA, `# v1.2.7`) only in the release workflows
 # (which no managed run can select). An unlisted file may use nothing.
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 UPLOAD = "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"
@@ -172,9 +172,9 @@ USES_ALLOWED = {
     "broker-report-selftest.yml": {CHECKOUT},
     "ci.yml": {CHECKOUT, TOFU},
     "external-watch.yml": {CHECKOUT},
-    "release.yml": {"cad0p/semver-calver-release/release@v1"},
-    "validate-package-version.yml": {"cad0p/semver-calver-release/validate-package-version@v1"},
-    "validate-release-pr.yml": {"cad0p/semver-calver-release/validate-release-pr@v1"},
+    "release.yml": {"cad0p/semver-calver-release/release@b57af46335825afcbf8173a9fa0a32dbee8d1a01"},
+    "validate-package-version.yml": {"cad0p/semver-calver-release/validate-package-version@b57af46335825afcbf8173a9fa0a32dbee8d1a01"},
+    "validate-release-pr.yml": {"cad0p/semver-calver-release/validate-release-pr@b57af46335825afcbf8173a9fa0a32dbee8d1a01"},
 }
 
 CORE_TAGS = {

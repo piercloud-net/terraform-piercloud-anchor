@@ -264,7 +264,7 @@ jobs:
           echo "Repo-scope check ok ($probes names, none at repository or organization level)."
 
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -330,7 +330,7 @@ jobs:
           # themselves are out of scope for v0.2.
           printf 'head_sha=%s head_short=%s alias=%s\n' "$HEAD_SHA" "$HEAD_SHORT" "$TENANT_USER" > head-sha.txt
       - name: Upload head-SHA artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: head-sha-${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
           path: head-sha.txt
@@ -432,7 +432,7 @@ jobs:
       TENANT_USER: ${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
     steps:
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # M2: the A1 entrypoint lives in this repo
@@ -1028,7 +1028,7 @@ jobs:
 
       - name: Set up OpenTofu (>= 1.11 for ephemeral values)
         if: inputs.mode == 'apply'
-        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # SHA pin of setup-opentofu v2
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version: "v1.13.2"
 
@@ -1362,7 +1362,7 @@ jobs:
         # always(): the CSR is most needed when a LATER step fails (the run
         # already wrote it before the probes). apply-only, like the A1 window.
         if: always() && inputs.mode == 'apply'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: origin-ca-csr-${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
           path: origin-ca.csr
@@ -1636,7 +1636,7 @@ jobs:
       ANCHOR_IPV4: ${{ needs.device-flow.outputs.anchor_ipv4 }}
     steps:
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Managed-lane guard (b3b #189 retired the direct-token writer)
@@ -1674,11 +1674,11 @@ jobs:
     if: inputs.mode == 'apply'
     steps:
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up OpenTofu (>= 1.11 for ephemeral values)
-        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # SHA pin of setup-opentofu v2
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version: "v1.13.2"
       # M2: the real path (ephemeral exchange → data-source resolve →
@@ -1698,7 +1698,7 @@ jobs:
     if: inputs.mode == 'check'
     steps:
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Retention-cap assertion (H1)
@@ -1727,7 +1727,7 @@ jobs:
     if: inputs.mode == 'update-ip'
     steps:
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Protocol (enforced in M2): ADD new source first, old kept during
@@ -1762,7 +1762,7 @@ jobs:
     if: inputs.mode == 'apply'
     steps:
       - name: Checkout (no credentials persisted)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # SHA pin of checkout v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Write thumbprint captured by the A1 provision step
@@ -1794,7 +1794,7 @@ jobs:
           echo "bind_url=${BIND_SCHEME}://${ANCHOR_FQDN}" >> thumbprint.txt
           echo "clevis luks bind -d /dev/sda3 tang '{\"url\":\"${BIND_SCHEME}://${ANCHOR_FQDN}\"}'" >> thumbprint.txt
       - name: Upload thumbprint artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # SHA pin of upload-artifact v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: thumbprint-${{ needs.device-flow.outputs.tenant_user }}
           path: thumbprint.txt

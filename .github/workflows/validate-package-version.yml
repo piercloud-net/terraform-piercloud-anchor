@@ -12,4 +12,4 @@ jobs:
   validate-package-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: cad0p/semver-calver-release/validate-package-version@v1
+      - uses: cad0p/semver-calver-release/validate-package-version@b57af46335825afcbf8173a9fa0a32dbee8d1a01 # v1.2.7
