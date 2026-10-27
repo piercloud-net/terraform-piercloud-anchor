@@ -1,6 +1,6 @@
 # Security posture — standing credentials on the anchor
 
-This is the anchor repo's RT-1 standing-credential inventory: what long-lived credentials the module can place on a box, where they live, and what blast radius a compromised anchor gives. The trustee framing that this inventory feeds is the RT-1 security-trust-model note (pcad.it-infra `research/2026-09-13-r6-security-trustmodel`).
+This is the anchor repo's RT-1 standing-credential inventory: what long-lived credentials the module can place on a box, where they live, and what blast radius a compromised anchor gives. The trustee framing that this inventory feeds is the RT-1 security-trust-model note (the owner's 2026-09-13 R6 security trust-model research, kept outside this repository).
 
 ## Default posture
 

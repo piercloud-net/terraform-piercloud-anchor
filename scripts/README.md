@@ -2,7 +2,7 @@
 
 Every script in this directory follows the same invariants:
 
-1. **Numbered.** `NNN-name.sh` (three-digit, zero-padded — matches the pcad.it-infra house convention), ordered by execution phase. Numbers are never reused; new scripts take the next free number.
+1. **Numbered.** `NNN-name.sh` (three-digit, zero-padded — the house convention across the owner's infrastructure repos), ordered by execution phase. Numbers are never reused; new scripts take the next free number.
 2. **On-box, dispatch-run.** Scripts run ON the target box, started by the A1 dispatch (the runner pipes them over per-run-approved SSH) — or by a human pasting them into the netcup SCP remote console as fallback. API-touching CI workflows (`.github/workflows/` + CI-called `.github/scripts/`, below) hold user-box credentials only inside the per-run device-flow (the token dies with the runner).
 3. **Idempotent.** Safe to re-run at any time, on any state — re-running must converge, never break.
 4. **Verify live twice.** After first provision, re-run the script from the top and confirm the box still converges cleanly (drift check), and verify the service does its job twice (for the anchor: a successful clevis boot after a reboot, twice).
