@@ -55,6 +55,13 @@ die()  { printf '\n\033[1;31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (netcup SCP remote console, root login)"
 
+# Provision-activity marker (#51): the OS reboot gate (piercloud-os-reboot)
+# holds the reboot while THIS run is alive. pid + start time, so a stale file
+# left by a dead run (or a reused pid) never holds it; /run clears on boot.
+PROVISION_PIDFILE="/run/piercloud-provision.pid"
+{ printf '%s %s\n' "$$" "$(sed 's/^.*) //' "/proc/$$/stat" | cut -d' ' -f20)" >"$PROVISION_PIDFILE"; } 2>/dev/null \
+  || warn "could not write ${PROVISION_PIDFILE} - the OS reboot gate cannot see this provision run"
+
 # --- BEGIN CADDY RENDER (tests/bind-e2e/run-bind-e2e.sh extracts this span; keep markers) ---
 # Tenant naming is canonical in scripts/lib/naming.sh (the workflow resolve
 # step sources it). Inside the nested
@@ -203,6 +210,20 @@ render_caddyfile() { # print the Caddyfile to stdout
     printf '%s\n' "	handle @dashtang {"
     printf '%s\n' "		abort"
     printf '%s\n' "	}"
+    printf '%s\n' "	# Gatus push API (#51): only the on-box report pushes, straight to the"
+    printf '%s\n' "	# loopback Gatus port. The dashboard leg (every peer, loopback included)"
+    printf '%s\n' "	# never reaches .../external nor any non-GET/HEAD /api/v1/endpoints/ path."
+    printf '%s\n' "	@gatus_push path /api/v1/endpoints/*/external /api/v1/endpoints/*/external/"
+    printf '%s\n' "	handle @gatus_push {"
+    printf '%s\n' "		abort"
+    printf '%s\n' "	}"
+    printf '%s\n' "	@gatus_api_write {"
+    printf '%s\n' "		path /api/v1/endpoints/*"
+    printf '%s\n' "		not method GET HEAD"
+    printf '%s\n' "	}"
+    printf '%s\n' "	handle @gatus_api_write {"
+    printf '%s\n' "		abort"
+    printf '%s\n' "	}"
     printf '%s\n' "	handle {"
     printf '%s\n' "		# Origin admission (#202): the raw TCP peer (remote_ip, never client_ip"
     printf '%s\n' "		# or a forwarded or viewer-address header) must be a CloudFront origin-"
@@ -305,6 +326,13 @@ assert_caddyfile_hardened() { # $1 = Caddyfile to assert (default: the serving o
   elif printf '%s\n' "$https_block" | grep -Fq 'Pc-Edge-Client-Sha256'; then
     die "serving Caddyfile $cfg echoes Pc-Edge-Client-Sha256 on :443 without client_auth require_and_verify (the placeholder would be the SHA-256 of the empty string) — refusing to finish blind"
   fi
+  # #51: the Gatus push API is refused on the dashboard leg (exact one-tab
+  # site-level lines: a deeper indent would sit inside another handle).
+  printf '%s\n' "$https_block" | grep -Fxq "$(printf '\t@gatus_push path /api/v1/endpoints/*/external /api/v1/endpoints/*/external/')" \
+    && printf '%s\n' "$https_block" | grep -Fxq "$(printf '\thandle @gatus_push {')" \
+    && printf '%s\n' "$https_block" | grep -Fxq "$(printf '\thandle @gatus_api_write {')" \
+    && printf '%s\n' "$https_block" | grep -Fxq "$(printf '\t\tnot method GET HEAD')" \
+    || die "serving Caddyfile $cfg does not refuse the Gatus push API (/api/v1/endpoints/*/external, non-GET /api/v1/endpoints/*) on the :443 dashboard leg (#51) — refusing to finish blind"
   if printf '%s\n' "$https_block" | grep -Eqi 'header[[:space:]]+[-!]strict-transport-security'; then
     die "serving Caddyfile $cfg deletes Strict-Transport-Security again after setting it — the hardening render did not converge; refusing to finish blind"
   fi
@@ -1089,6 +1117,425 @@ fi
 # via the .rotation-pending marker it drops above (see the block comment).
 collapse_keys
 
+# --- BEGIN OS UPDATES (tests/os-updates extracts this span; keep markers) ---
+# Lane A slice A-OS (#51): unattended OS SECURITY updates + a kernel reboot
+# window, reported on the status page. Everything that decides WHAT may
+# install is rendered here, i.e. approval-gated: the allowed origin (the
+# running release's -security pocket ONLY, read from /etc/os-release; any
+# other distro fails closed), the reboot window, the reboot gate and the
+# report script. Only the payload (Debian/Ubuntu security packages) floats
+# between dispatches (docs/invariants.md Invariant 2 amendment; docs/updaters.md).
+#   OS_AUTO_UPDATES      unset/on = on; off = actively disabled
+#                        (Unattended-Upgrade "0", no status row); else refused.
+#   OS_AUTO_REBOOT_TIME  HH:MM UTC in 00:00-04:59, default 03:30.
+# Refusal discipline: every check that can run before a write runs first, and
+# ANY refusal (before or after arming) calls os_updates_disarm first, so a
+# refused run never leaves a widened or half-armed box.
+# Reboot: unattended-upgrade's own Automatic-Reboot stays "false"; a rendered
+# piercloud-os-reboot.timer (OnCalendar in UTC) starts a oneshot whose
+# ExecCondition gate reboots only when /run/reboot-required exists, no
+# provision run is alive (PROVISION_PIDFILE, pid + start time), no tang key
+# rotation is pending (.rotation-pending) and apt-daily-upgrade is not running.
+# Status: one Gatus external endpoint (group anchor, key
+# anchor_os-security-updates, heartbeat 26h) fed by a report script that runs
+# after every apt-daily-upgrade (ExecStopPost); the bearer token is
+# box-generated per provision (0600, never printed), lands in its file only after
+# the Gatus config carrying it did (os_updates_commit_token), and reaches curl
+# on stdin only.
+OS_UPD_APT_CONF="${OS_UPD_APT_CONF:-/etc/apt/apt.conf.d/52piercloud-unattended-upgrades}"
+OS_UPD_OS_RELEASE="${OS_UPD_OS_RELEASE:-/etc/os-release}"
+OS_UPD_UNIT_DIR="${OS_UPD_UNIT_DIR:-/etc/systemd/system}"
+OS_UPD_SBIN="${OS_UPD_SBIN:-/usr/local/sbin/piercloud-os-updates-report.sh}"
+OS_UPD_GATE="${OS_UPD_GATE:-/usr/local/sbin/piercloud-os-reboot-gate.sh}"
+OS_UPD_TOKEN_FILE="${OS_UPD_TOKEN_FILE:-/etc/piercloud/os-updates.token}"
+OS_UPD_STATE_DIR="${OS_UPD_STATE_DIR:-/var/lib/piercloud}"
+OS_UPD_MARKER="${OS_UPD_MARKER:-/var/lib/piercloud/os-updates.installed}"
+OS_UPD_RUN_MARKER="${OS_UPD_RUN_MARKER:-/var/lib/piercloud/os-updates.last-run}"
+OS_UPD_UPGRADE_STAMP="${OS_UPD_UPGRADE_STAMP:-/var/lib/apt/periodic/upgrade-stamp}"
+OS_UPD_LISTS_DIR="${OS_UPD_LISTS_DIR:-/var/lib/apt/lists}"
+OS_UPD_REBOOT_FLAG="${OS_UPD_REBOOT_FLAG:-/run/reboot-required}"
+OS_UPD_ROTATION_MARKER="${OS_UPD_ROTATION_MARKER:-${TANG_KEYS_DIR:-/var/db/tang}/.rotation-pending}"
+OS_UPD_PROVISION_PIDFILE="${OS_UPD_PROVISION_PIDFILE:-${PROVISION_PIDFILE:-/run/piercloud-provision.pid}}"
+OS_UPD_SWAP_MARK="${OS_UPD_SWAP_MARK:-/run/piercloud-os-updates.swap}"
+OS_UPD_APT_GET_BIN="${OS_UPD_APT_GET_BIN:-/usr/bin/apt-get}"
+OS_UPD_APT_BIN="${OS_UPD_APT_BIN:-/usr/bin/apt}"
+OS_UPD_CURL_BIN="${OS_UPD_CURL_BIN:-/usr/bin/curl}"
+OS_UPD_SYSTEMCTL_BIN="${OS_UPD_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+OS_UPD_RUN_ONCE_TIMEOUT=900
+OS_UPD_DROPIN_NAME="piercloud-os-updates.conf"
+OS_UPD_REBOOT_UNIT="piercloud-os-reboot"
+OS_UPD_LISTS_AT="01:30"   # apt-daily.timer (package lists)
+OS_UPD_UPGRADE_AT="02:30" # apt-daily-upgrade.timer (+ up to 15m): a kernel lands and boots the same night
+OSU_MODE="" OSU_REBOOT="" OSU_PATTERN="" OS_UPD_NEW_TOKEN=""
+
+os_updates_disarm() { # the safe state: nothing armed, nothing widened (every refusal lands here)
+  local d
+  mkdir -p "$(dirname "$OS_UPD_APT_CONF")" 2>/dev/null || true
+  render_os_updates_apt_conf off "" | os_updates_install_file "$OS_UPD_APT_CONF" 0644 2>/dev/null || true
+  for d in apt-daily.timer.d apt-daily-upgrade.timer.d apt-daily-upgrade.service.d; do
+    rm -f "${OS_UPD_UNIT_DIR}/${d}/${OS_UPD_DROPIN_NAME}"
+  done
+  systemctl disable --now "${OS_UPD_REBOOT_UNIT}.timer" >/dev/null 2>&1 || true
+  rm -f "${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.timer" "${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.service" \
+    "$OS_UPD_SBIN" "$OS_UPD_GATE" "$OS_UPD_TOKEN_FILE"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+os_updates_refuse() { # disarm, then fail the run
+  os_updates_disarm
+  die "$* (OS updates disarmed: Unattended-Upgrade \"0\", Automatic-Reboot \"false\", no timer drop-ins, no reboot timer, no report hook)"
+}
+
+os_updates_validate() { # sets OSU_MODE / OSU_REBOOT / OSU_PATTERN; refuses (disarmed) on any bad input
+  local id
+  case "${OS_AUTO_UPDATES-}" in
+    ''|on) OSU_MODE=on ;;
+    off) OSU_MODE=off ;;
+    *) os_updates_refuse "bad OS_AUTO_UPDATES (want unset/on/off): ${OS_AUTO_UPDATES}" ;;
+  esac
+  OSU_REBOOT="${OS_AUTO_REBOOT_TIME:-03:30}"
+  [[ "$OSU_REBOOT" =~ ^0[0-4]:[0-5][0-9]$ ]] \
+    || os_updates_refuse "bad OS_AUTO_REBOOT_TIME (want HH:MM UTC between 00:00 and 04:59): ${OS_AUTO_REBOOT_TIME}"
+  OSU_PATTERN=""
+  [ "$OSU_MODE" = on ] || return 0
+  [ -r "$OS_UPD_OS_RELEASE" ] || os_updates_refuse "OS updates: ${OS_UPD_OS_RELEASE} unreadable - cannot pin the security origin; refusing (fail closed)"
+  id="$(sed -n 's/^ID=//p' "$OS_UPD_OS_RELEASE" | head -n 1 | tr -d '"')"
+  case "$id" in
+    debian) OSU_PATTERN='origin=Debian,codename=${distro_codename}-security,label=Debian-Security' ;;
+    ubuntu) OSU_PATTERN='origin=Ubuntu,archive=${distro_codename}-security' ;;
+    *) os_updates_refuse "OS updates: unsupported distribution ID '${id}' in ${OS_UPD_OS_RELEASE} (want debian or ubuntu) - refusing to configure unattended upgrades with an unknown origin (fail closed; OS_AUTO_UPDATES=off skips this slice)" ;;
+  esac
+}
+
+os_updates_utc() { # the box runs on UTC: set it when it does not, refuse when it will not
+  local tz
+  tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+  case "$tz" in
+    UTC|Etc/UTC) ;;
+    *)
+      log "OS updates: box timezone is '${tz:-unknown}' - setting UTC (timedatectl set-timezone UTC; the reboot window and timers are UTC)"
+      timedatectl set-timezone UTC >/dev/null 2>&1 || true
+      tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+      ;;
+  esac
+  case "$tz" in
+    UTC|Etc/UTC) log "OS updates: box timezone is UTC (OK)" ;;
+    *) os_updates_refuse "OS updates: box timezone is '${tz:-unknown}' after timedatectl set-timezone UTC - refusing (the reboot window is UTC)" ;;
+  esac
+}
+
+render_os_updates_apt_conf() { # $1 mode, $2 origin pattern (empty when off)
+  printf '%s\n' "// DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh, #51)."
+  printf '%s\n' "// Re-rendered on every provision run; hand edits are overwritten. The"
+  printf '%s\n' "// #clear lines drop the distro defaults so ONLY the -security origin applies."
+  printf '%s\n' "// The reboot is NOT unattended-upgrade's: ${OS_UPD_REBOOT_UNIT}.timer reboots through a gate."
+  printf '%s\n' "#clear Unattended-Upgrade::Origins-Pattern;"
+  printf '%s\n' "#clear Unattended-Upgrade::Allowed-Origins;"
+  if [ "$1" = on ]; then
+    printf 'Unattended-Upgrade::Origins-Pattern { "%s"; };\n' "$2"
+    printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";'
+    printf '%s\n' 'APT::Periodic::Unattended-Upgrade "1";'
+    printf '%s\n' 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'
+  else
+    printf '%s\n' 'APT::Periodic::Unattended-Upgrade "0";'
+  fi
+  printf '%s\n' 'Unattended-Upgrade::Automatic-Reboot "false";'
+}
+
+render_os_updates_timer_dropin() { # $1 = HH:MM UTC
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)." "[Timer]" "OnCalendar=" "OnCalendar=*-*-* ${1}:00 UTC" "RandomizedDelaySec=15m"
+}
+
+render_os_updates_service_dropin() { # ExecStopPost runs after success AND failure; --after-run marks a real run
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51): push the status heartbeat after each run." "[Service]" "ExecStopPost=-${OS_UPD_SBIN} --after-run"
+}
+
+render_os_updates_reboot_timer() { # $1 = HH:MM UTC
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)."
+  printf '%s\n' "[Unit]" "Description=piercloud OS reboot window (${1} UTC)" \
+    "[Timer]" "OnCalendar=*-*-* ${1}:00 UTC" "AccuracySec=1min" "Persistent=false" "[Install]" "WantedBy=timers.target"
+}
+
+render_os_updates_reboot_service() {
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)."
+  printf '%s\n' "[Unit]" "Description=piercloud OS reboot for a pending update (gated)" \
+    "[Service]" "Type=oneshot" "ExecCondition=${OS_UPD_GATE}" "ExecStart=${OS_UPD_SYSTEMCTL_BIN} reboot"
+}
+
+render_os_updates_consts() { # the baked constants both on-box scripts share (no env override)
+  printf '#!/bin/bash\n'
+  printf '%s\n' "# DISPATCH-MANAGED (scripts/010-provision.sh, #51). Paths and thresholds are baked; the environment cannot move them."
+  printf '%s\n' 'PATH=/usr/sbin:/usr/bin:/sbin:/bin' 'export PATH LC_ALL=C'
+  printf 'TOKEN_FILE=%q\nMARKER=%q\nRUN_MARKER=%q\nUPGRADE_STAMP=%q\nLISTS_DIR=%q\n' \
+    "$OS_UPD_TOKEN_FILE" "$OS_UPD_MARKER" "$OS_UPD_RUN_MARKER" "$OS_UPD_UPGRADE_STAMP" "$OS_UPD_LISTS_DIR"
+  printf 'REBOOT_FLAG=%q\nROTATION=%q\nPROVISION_PIDFILE=%q\nSWAP_MARK=%q\n' \
+    "$OS_UPD_REBOOT_FLAG" "$OS_UPD_ROTATION_MARKER" "$OS_UPD_PROVISION_PIDFILE" "$OS_UPD_SWAP_MARK"
+  printf 'GATUS_URL=%q\nAPT_GET=%q\nAPT=%q\nCURL=%q\nSYSTEMCTL=%q\n' \
+    "http://127.0.0.1:${GATUS_PORT}" "$OS_UPD_APT_GET_BIN" "$OS_UPD_APT_BIN" "$OS_UPD_CURL_BIN" "$OS_UPD_SYSTEMCTL_BIN"
+  cat <<'OS_UPD_CONSTS_EOF'
+live() { # $1 marker "<pid> <starttime>" -> 0 while that exact process is alive (pid reuse defeated)
+  local pid st now_st
+  [ -r "$1" ] || return 1
+  read -r pid st <"$1" || return 1
+  case "$pid:$st" in *[!0-9:]*|:*|*:) return 1 ;; esac
+  now_st="$(/usr/bin/sed 's/^.*) //' "/proc/${pid}/stat" 2>/dev/null | /usr/bin/cut -d' ' -f20)"
+  [ -n "$now_st" ] && [ "$now_st" = "$st" ]
+}
+OS_UPD_CONSTS_EOF
+}
+
+render_os_updates_gate() { # ExecCondition of the reboot oneshot: exit 0 = reboot, 1 = skip tonight
+  render_os_updates_consts
+  cat <<'OS_UPD_GATE_EOF'
+# piercloud-os-reboot-gate.sh - the reboot fires only when every condition holds.
+set -u
+say() { printf 'os-reboot gate: %s\n' "$*"; }
+[ -e "$REBOOT_FLAG" ] || { say "no reboot required - skip"; exit 1; }
+live "$PROVISION_PIDFILE" && { say "a provision run is in progress - reboot held to the next window"; exit 1; }
+[ -e "$ROTATION" ] && { say "tang key rotation pending (.rotation-pending) - reboot held until the operator clears it"; exit 1; }
+"$SYSTEMCTL" is-active --quiet apt-daily-upgrade.service && { say "apt-daily-upgrade still running - reboot held to the next window"; exit 1; }
+say "reboot required, no provision run or tang rotation in progress - rebooting"
+exit 0
+OS_UPD_GATE_EOF
+}
+
+render_os_updates_report() { # the on-box report script
+  render_os_updates_consts
+  cat <<'OS_UPD_REPORT_EOF'
+# piercloud-os-updates-report.sh - pushes the os-security-updates heartbeat to
+# the loopback Gatus external endpoint. Green means actually current:
+#   pending security updates known (apt simulation + apt list ok), AND
+#   0 pending security updates (installable Inst lines in the simulation PLUS
+#   kept-back/held ones: -security candidates in apt list --upgradable that
+#   the simulation does not install), AND the newest *security*InRelease
+#   < 48 h, AND either the last REAL run < 48 h (RUN_MARKER, written only by
+#   --after-run from apt-daily-upgrade's ExecStopPost after a successful
+#   service whose upgrade-stamp is < 26 h; the converge --dry-run never
+#   writes it) or the fresh-install grace (no real run since the install
+#   marker, marker < 26 h). The grace excuses ONLY the missing run: pending
+#   security updates and stale lists are red with or without it.
+# The error field carries reasons and counts only. The bearer token goes to
+# curl on stdin (-K -), never argv, never stdout.
+set -uo pipefail
+KEY="anchor_os-security-updates"
+MAX_AGE=172800
+GRACE=93600
+mtime() { /usr/bin/stat -c %Y "$1" 2>/dev/null || printf '0\n'; }
+hours() { if [ "$1" -gt 0 ]; then printf '%s\n' "$(( (now - $1) / 3600 ))"; else printf 'never\n'; fi; }
+now="$(/usr/bin/date +%s)"
+if [ "${1:-}" = --after-run ]; then
+  up="$(mtime "$UPGRADE_STAMP")"
+  if [ "${SERVICE_RESULT:-}" = success ] && [ "$up" -gt 0 ] && [ $((now - up)) -lt "$GRACE" ]; then
+    /usr/bin/touch "$RUN_MARKER" || printf 'os-updates report: cannot write the run marker\n'
+  else
+    printf 'os-updates report: apt-daily-upgrade result=%s upgrade-stamp-age-h=%s - run marker NOT refreshed\n' "${SERVICE_RESULT:-unknown}" "$(hours "$up")"
+  fi
+fi
+# A provision run is swapping the token + Gatus config: wait for it (max 5 min).
+i=0
+while live "$SWAP_MARK" && [ "$i" -lt 60 ]; do /usr/bin/sleep 5; i=$((i + 1)); done
+run_m="$(mtime "$RUN_MARKER")"
+inst_m="$(mtime "$MARKER")"
+lists_m=0
+for f in "$LISTS_DIR"/*security*InRelease; do
+  [ -e "$f" ] || continue
+  m="$(mtime "$f")"
+  [ "$m" -gt "$lists_m" ] && lists_m="$m"
+done
+# I = installable security upgrade (simulation Inst line); L = a -security
+# candidate in apt list --upgradable. An L without an I is kept back / held:
+# unattended-upgrades will not install it, so it needs a human.
+pending=unknown
+kept=unknown
+if sim="$("$APT_GET" -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)" \
+    && upg="$("$APT" -q list --upgradable 2>/dev/null)"; then
+  read -r pending kept < <({
+    printf '%s\n' "$sim" | /usr/bin/awk '/^Inst .*-security/ { print "I", $2 }'
+    printf '%s\n' "$upg" | /usr/bin/awk '{ n = split($1, a, "/"); if (n < 2) next; m = split(a[2], s, ","); for (i = 1; i <= m; i++) if (s[i] ~ /-security$/) { print "L", a[1]; break } }'
+  } | /usr/bin/awk '{ k[$2] = k[$2] $1 } END { p = 0; h = 0; for (n in k) { p++; if (k[n] !~ /I/) h++ } print p, h }')
+fi
+case "$pending:$kept" in *[!0-9:]*|:*|*:) pending=unknown; kept=unknown ;; esac
+grace=no
+if [ "$inst_m" -gt 0 ] && [ "$run_m" -le "$inst_m" ] && [ $((now - inst_m)) -lt "$GRACE" ]; then grace=yes; fi
+reasons=""
+if [ "$pending" = unknown ]; then
+  reasons="pending-unknown"
+else
+  [ "$grace" = yes ] || { [ "$run_m" -gt 0 ] && [ $((now - run_m)) -lt "$MAX_AGE" ]; } || reasons="${reasons}run-stale-over-48h,"
+  { [ "$lists_m" -gt 0 ] && [ $((now - lists_m)) -lt "$MAX_AGE" ]; } || reasons="${reasons}lists-stale-over-48h,"
+  [ "$pending" -eq 0 ] || reasons="${reasons}security-pending,"
+  [ "$kept" -eq 0 ] || reasons="${reasons}security-kept-back,"
+  reasons="${reasons%,}"
+fi
+if [ -z "$reasons" ]; then success=true; else success=false; fi
+reboot=no
+if [ -e "$REBOOT_FLAG" ]; then reboot=yes; [ -e "$ROTATION" ] && reboot=held-rotation; fi
+counts="pending-security:${pending},kept-back-security:${kept},reboot-required:${reboot},last-run-age-h:$(hours "$run_m"),lists-age-h:$(hours "$lists_m"),grace:${grace}"
+err="${reasons:+${reasons},}${counts}"
+line="success=${success} reasons=${reasons:-none} ${counts//,/ }"
+line="${line//:/=}"
+[ -s "$TOKEN_FILE" ] || { printf 'os-updates report: %s push=skipped (cause: token-missing)\n' "$line"; exit 3; }
+token="$(/usr/bin/tr -d '[:space:]' <"$TOKEN_FILE")"
+code="$("$CURL" -sS -o /dev/null -w '%{http_code}' -m 10 -X POST -K - \
+    "${GATUS_URL}/api/v1/endpoints/${KEY}/external?success=${success}&error=${err}&duration=${SECONDS}s" 2>/dev/null <<CURL_CFG || true
+header = "Authorization: Bearer ${token}"
+CURL_CFG
+)"
+printf 'os-updates report: %s push=HTTP %s\n' "$line" "${code:-none}"
+[ "$code" = "200" ] || exit 3
+exit 0
+OS_UPD_REPORT_EOF
+}
+
+os_updates_gatus_item() { # $1 token -> one external-endpoints item (alerts when a push channel exists)
+  printf '%s\n' "  - name: os-security-updates" "    group: anchor" "    token: \"${1}\"" "    heartbeat:" "      interval: 26h  # nightly push after apt-daily-upgrade; a miss records a failure"
+  if [ -n "${NTFY_TOPIC:-}" ]; then
+    # provider-override is the per-alert override (TwiN/gatus v5.36.0
+    # alerting/alert/alert.go `provider-override`; ntfy GetConfig merges its priority).
+    printf '%s\n' "    alerts:" "      - type: ntfy" "        failure-threshold: 1" "        send-on-resolved: true" "        provider-override:" "          priority: 4  # alert class 4 (time-sensitive; never a night emergency)"
+  fi
+}
+
+os_updates_install_file() { # $1 dest, $2 mode; content on stdin (atomic replace)
+  local tmp="${1}.tmp.$$"
+  mkdir -p "$(dirname "$1")"
+  (umask 077; cat >"$tmp")
+  chmod "$2" "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+os_updates_render_units() { # $1 root prefix ("" = this box): scripts, drop-ins, reboot timer + service
+  local r="$1"
+  render_os_updates_report | os_updates_install_file "${r}${OS_UPD_SBIN}" 0700
+  render_os_updates_gate | os_updates_install_file "${r}${OS_UPD_GATE}" 0700
+  render_os_updates_timer_dropin "$OS_UPD_LISTS_AT" | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/apt-daily.timer.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_timer_dropin "$OS_UPD_UPGRADE_AT" | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/apt-daily-upgrade.timer.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_service_dropin | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/apt-daily-upgrade.service.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_reboot_timer "$OSU_REBOOT" | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.timer" 0644
+  render_os_updates_reboot_service | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.service" 0644
+}
+
+os_updates_render_tree() { # $1 root dir: every mode=on artifact under it, nothing on this box (tools/vm-timetravel)
+  os_updates_validate
+  [ "$OSU_MODE" = on ] || die "os_updates_render_tree: OS_AUTO_UPDATES=off renders nothing"
+  render_os_updates_apt_conf on "$OSU_PATTERN" | os_updates_install_file "${1}${OS_UPD_APT_CONF}" 0644
+  mkdir -p "${1}${OS_UPD_STATE_DIR}"
+  chmod 700 "${1}${OS_UPD_STATE_DIR}"
+  os_updates_render_units "$1"
+}
+
+os_updates_apply() { # validate -> pre-arm checks -> arm -> converge checks; appends the status item
+  local got want svc_dropin u
+  os_updates_validate
+  log "OS updates: mode=${OSU_MODE}, reboot window ${OSU_REBOOT} UTC, origin ${OSU_PATTERN:-<none>}"
+  if [ "$OSU_MODE" = off ]; then
+    os_updates_disarm
+    got="$(apt-config dump --format '%f=%v%n' | grep -E '^Unattended-Upgrade::(Origins-Pattern|Allowed-Origins)::=' || true)"
+    [ -z "$got" ] || os_updates_refuse "OS updates: off, but apt still sees an origin policy ('$(printf '%s' "$got" | tr '\n' ' ')') - another apt.conf.d file overrides it; refusing to finish blind"
+    log "OS updates: DISABLED by the approval-gated variable OS_AUTO_UPDATES=off - no unattended security updates and no reboot window on this box; the os-security-updates status row is removed (docs/updaters.md)"
+    return 0
+  fi
+  # Pre-arm checks: nothing below this block has been written yet.
+  [ "$(systemctl is-enabled tangd.socket 2>/dev/null || true)" = enabled ] \
+    || os_updates_refuse "OS updates: tangd.socket is not enabled - tang would not come back after the automatic reboot; refusing"
+  log "OS updates: tangd.socket enabled - tang returns by socket activation after a reboot (OK)"
+  os_updates_utc
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y -qq unattended-upgrades >/dev/null || os_updates_refuse "OS updates: apt-get install unattended-upgrades failed"
+  # Arm the policy, then prove apt sees exactly it.
+  render_os_updates_apt_conf on "$OSU_PATTERN" | os_updates_install_file "$OS_UPD_APT_CONF" 0644
+  got="$(apt-config dump --format '%f=%v%n' | grep -E '^Unattended-Upgrade::(Origins-Pattern|Allowed-Origins)::=' || true)"
+  want="Unattended-Upgrade::Origins-Pattern::=${OSU_PATTERN}"
+  [ "$got" = "$want" ] \
+    || os_updates_refuse "OS updates: apt sees a different origin policy than rendered (want only '${want}', got '$(printf '%s' "$got" | tr '\n' ' ')') - another apt.conf.d file overrides it; refusing to finish blind"
+  log "OS updates: apt origin policy is exactly the rendered one (OK)"
+  unattended-upgrade --dry-run >/dev/null 2>&1 \
+    || os_updates_refuse "OS updates: 'unattended-upgrade --dry-run' failed on the rendered config - refusing to finish blind"
+  log "OS updates: unattended-upgrade --dry-run accepts the rendered config (OK)"
+  # Timers, the report hook and the gated reboot.
+  svc_dropin="${OS_UPD_UNIT_DIR}/apt-daily-upgrade.service.d/${OS_UPD_DROPIN_NAME}"
+  mkdir -p "$OS_UPD_STATE_DIR" "$(dirname "$OS_UPD_TOKEN_FILE")"
+  chmod 700 "$OS_UPD_STATE_DIR"
+  # Grace for a fresh (or re-enabled) install: until the first real run or 26 h.
+  if [ ! -e "$svc_dropin" ] || [ ! -e "$OS_UPD_MARKER" ]; then touch "$OS_UPD_MARKER"; fi
+  os_updates_render_units ""
+  systemctl daemon-reload
+  systemctl enable apt-daily.timer apt-daily-upgrade.timer "${OS_UPD_REBOOT_UNIT}.timer" >/dev/null 2>&1 || true
+  systemctl restart apt-daily.timer apt-daily-upgrade.timer "${OS_UPD_REBOOT_UNIT}.timer" >/dev/null 2>&1 || true
+  for u in apt-daily.timer apt-daily-upgrade.timer "${OS_UPD_REBOOT_UNIT}.timer"; do
+    [ "$(systemctl is-enabled "$u" 2>/dev/null || true)" = enabled ] || os_updates_refuse "OS updates: ${u} is not enabled - refusing"
+  done
+  for u in apt-daily.timer apt-daily-upgrade.timer apt-daily-upgrade.service; do
+    systemctl show -p DropInPaths --value "$u" 2>/dev/null | grep -qF "${u}.d/${OS_UPD_DROPIN_NAME}" \
+      || os_updates_refuse "OS updates: ${u} does not load its ${OS_UPD_DROPIN_NAME} drop-in - refusing"
+  done
+  log "OS updates: apt-daily ${OS_UPD_LISTS_AT} / apt-daily-upgrade ${OS_UPD_UPGRADE_AT} UTC timers enabled with their drop-ins, report hook loaded (OK)"
+  log "OS updates: ${OS_UPD_REBOOT_UNIT}.timer at ${OSU_REBOOT} UTC, gated on reboot-required / no provision run / no tang rotation (OK)"
+  # The new token goes into the Gatus render now; its file lands only after the
+  # config carrying it did (os_updates_commit_token), so pushes never 401.
+  OS_UPD_NEW_TOKEN="$(openssl rand -hex 32)"
+  gatus_ext_items+=("$(os_updates_gatus_item "$OS_UPD_NEW_TOKEN")")
+}
+
+os_updates_swap_begin() { # called by the Gatus render before the config write: reports wait
+  [ -n "$OS_UPD_NEW_TOKEN" ] || return 0
+  { printf '%s %s\n' "$$" "$(sed 's/^.*) //' "/proc/$$/stat" 2>/dev/null | cut -d' ' -f20)" >"$OS_UPD_SWAP_MARK"; } 2>/dev/null || true
+}
+
+os_updates_commit_token() { # called right after the Gatus config write landed byte-identical
+  [ -n "$OS_UPD_NEW_TOKEN" ] || return 0
+  printf '%s\n' "$OS_UPD_NEW_TOKEN" | os_updates_install_file "$OS_UPD_TOKEN_FILE" 0600
+}
+
+os_updates_swap_end() { # after Gatus restarted on the new config: reports may push again
+  rm -f "$OS_UPD_SWAP_MARK"
+}
+
+os_updates_run_once() { # one synchronous real run in the dispatch, so the row is green now
+  [ "$OSU_MODE" = on ] || { log "OS updates: run-once skipped (OS_AUTO_UPDATES=off)"; return 0; }
+  local rc=0
+  # apt.systemd.daily skips unattended-upgrade when its day stamp is from today.
+  rm -f "$OS_UPD_UPGRADE_STAMP"
+  log "OS updates: run-once: starting apt-daily-upgrade.service (timeout ${OS_UPD_RUN_ONCE_TIMEOUT} s)"
+  timeout "$OS_UPD_RUN_ONCE_TIMEOUT" systemctl start apt-daily-upgrade.service >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) log "OS updates: run-once: apt-daily-upgrade.service completed (OK)" ;;
+    124) warn "OS updates: run-once did not finish within ${OS_UPD_RUN_ONCE_TIMEOUT} s (cause: timeout) - the unit keeps running; the nightly run reports" ;;
+    *) warn "OS updates: run-once failed (cause: service-failed, rc=${rc}) - journalctl -u apt-daily-upgrade from the console; the row stays red until a real run succeeds" ;;
+  esac
+}
+
+os_updates_first_report() { # after the run-once: the row's state in the run log (counts only)
+  [ "$OSU_MODE" = on ] || return 0
+  local i out="" cause
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if out="$(bash "$OS_UPD_SBIN" 2>&1)"; then
+      out="$(printf '%s\n' "$out" | tail -n 1)"
+      case "$out" in
+        *"success=true "*) log "OS updates: status push landed, row green (${out#os-updates report: })" ;;
+        *) warn "OS updates: status push landed but the row is RED (${out#os-updates report: }) - see docs/dr.md" ;;
+      esac
+      return 0
+    fi
+    [ "$i" -lt 12 ] && sleep "${OS_UPD_RETRY_SLEEP:-5}"
+  done
+  out="$(printf '%s\n' "$out" | tail -n 1)"
+  case "$out" in
+    *"cause: token-missing"*) cause=token-missing ;;
+    *"push=HTTP 401"*) cause=token-rejected-401 ;;
+    *"push=HTTP 000"*|*"push=HTTP none"*) cause=gatus-unreachable ;;
+    *) cause="gatus-http-${out##*push=HTTP }" ;;
+  esac
+  warn "OS updates: the first status push did not land (cause: ${cause}; ${out#os-updates report: }) - the nightly run pushes again; a missed 26h heartbeat turns the row red"
+}
+# --- END OS UPDATES ---
+
+# ---------------------------------------------------------------------------
+# a2) OS security updates + kernel reboot window (Lane A, #51; docs/updaters.md)
+# ---------------------------------------------------------------------------
+gatus_ext_items=()
+os_updates_apply
+
 # ---------------------------------------------------------------------------
 # b) thumbprint — the ONE value you must save
 # ---------------------------------------------------------------------------
@@ -1186,6 +1633,19 @@ alert_intent() { # $1 = endpoint name (one call per appended alert stanza)
   ALERTS_EXPECTED=$((ALERTS_EXPECTED + 1))
   printf -v ALERTS_EXPECTED_NAMES '%s%s\n' "${ALERTS_EXPECTED_NAMES}" "${1}"
 }
+# --- BEGIN GATUS EXTERNAL (Lane A #51: push-fed rows; keep markers) ---
+# Slices append complete `  - name:` items to gatus_ext_items before this
+# span; `external-endpoints:` renders only when at least one exists. An item
+# carrying an alerts stanza records its alert intent here (C4 ledger).
+declare -p gatus_ext_items >/dev/null 2>&1 || gatus_ext_items=()
+GATUS_EXT_YAML=""
+for _ext_item in "${gatus_ext_items[@]}"; do
+  _ext_name="$(printf '%s\n' "$_ext_item" | sed -n '1s/^  - name: //p')"
+  [ -n "$_ext_name" ] || die "Gatus external item does not start with '  - name: ' - refusing to render"
+  if printf '%s\n' "$_ext_item" | grep -qx '    alerts:'; then alert_intent "$_ext_name"; fi
+  printf -v GATUS_EXT_YAML '%s%s\n' "$GATUS_EXT_YAML" "$_ext_item"
+done
+# --- END GATUS EXTERNAL ---
 if [ "$PULLER_MODE" -eq 1 ]; then
   # The fragment owns every watched row. The dispatch-env pairs cannot reach
   # the box as monitors anymore, so drop them LOUDLY here (dispatch time is
@@ -1344,6 +1804,10 @@ else
   warn "NTFY_TOPIC unset — Gatus checks endpoints but cannot push failures anywhere."
 fi
 TMP_CFG="${GATUS_CONFIG}.new"
+# The config holds bearer tokens (ntfy, the #51 external-endpoint token):
+# root-only from the first byte (the Gatus container runs as root: FROM scratch, no USER).
+: >"$TMP_CFG"
+chmod 0600 "$TMP_CFG"
 {
   printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh)."
   printf '%s\n' "# DO NOT EDIT BY HAND — re-rendered on every provision run. Change monitors"
@@ -1411,6 +1875,10 @@ TMP_CFG="${GATUS_CONFIG}.new"
       alert_intent "dashboard TLS (via edge)"
     fi
   fi
+  if [ -n "$GATUS_EXT_YAML" ]; then
+    printf '%s\n' "" "external-endpoints:"
+    printf '%s' "$GATUS_EXT_YAML"
+  fi
 } >"$TMP_CFG"
 # Render-time assertion (issue #134, call C4): the rendered alert stanzas
 # must equal the intent ledger recorded while rendering — the #118 class of
@@ -1462,11 +1930,21 @@ else
   # observed live 2026-10-07). Truncate+rewrite keeps the inode but is not
   # atomic; the post-write cmp catches a short/failed write at run time (a
   # power loss mid-write is repaired only by the next dispatch).
-  cat "$TMP_CFG" >"${GATUS_CONFIG}"
+  # #51: pushes wait while the token + config swap is in flight; the mode is
+  # tightened BEFORE the new bytes land (a pre-#51 file is 0644).
+  if declare -F os_updates_swap_begin >/dev/null; then os_updates_swap_begin; fi
+  [ ! -e "${GATUS_CONFIG}" ] || chmod 0600 "${GATUS_CONFIG}"
+  (umask 077; cat "$TMP_CFG" >"${GATUS_CONFIG}")
   cmp -s "$TMP_CFG" "${GATUS_CONFIG}" || die "in-place Gatus config write did not land byte-identical (out of space?) — refusing to restart Gatus on a partial config"
+  # The new status token reaches its file only now that the config carrying it landed.
+  if declare -F os_updates_commit_token >/dev/null; then os_updates_commit_token; fi
   rm -f "$TMP_CFG"
   log "Gatus config installed in place (rendered from dispatch env)"
 fi
+chmod 0600 "${GATUS_CONFIG}"
+[ "$(stat -c %a "${GATUS_CONFIG}")" = 600 ] \
+  || die "Gatus config ${GATUS_CONFIG} is not mode 0600 after the write - it holds bearer tokens; refusing"
+log "Gatus config is mode 0600 (root-only; it holds bearer tokens) (OK)"
 # --- gatus-render:end ---
 
 # --- BEGIN GATUS PULLER (tests/gatus-pull extracts this span; keep markers) ---
@@ -2946,6 +3424,7 @@ fi
 # named volume.
 docker restart gatus >/dev/null
 log "Gatus restarted"
+if declare -F os_updates_swap_end >/dev/null; then os_updates_swap_end; fi
 # Prove the monitor from the tenant's chair: endpoint statuses print into the
 # run log (the tenant has no shell — this output IS their dashboard check).
 # Path confirmed against the pinned source (TwiN/gatus v5.36.0 api/api.go:
@@ -3395,6 +3874,7 @@ if [ -n "${STATUS_HOST:-}" ]; then
   if [ -z "${CADDY_SKIP_HTTPS:-}" ]; then
     assert_caddyfile_hardened
     log "serving Caddyfile carries the origin hardening (no :80 dashboard handler, no proxy-trust directives, HSTS) (OK)"
+    log "serving Caddyfile refuses the Gatus push API on the dashboard leg (only the loopback Gatus port takes pushes) (OK)"
   fi
   # SNI must be the real hostname: curl sends no SNI for an IP-literal URL
   # and Caddy selects the origin cert by SNI, so a Host header alone fails a
@@ -7426,5 +7906,9 @@ case "$(recording_witness_state)" in
     recording_witness_disable
     ;;
 esac
+
+# h) OS updates: one real run now that Gatus serves, then the row state (#51)
+os_updates_run_once
+os_updates_first_report
 
 log "Done. tang is up (loopback, via Caddy :80), the thumbprint is above, Gatus is dispatch-managed (statuses printed above), dashboard at https://${STATUS_HOST:-<alias>.status.piercloud.net} (visitor TLS at the edge; the origin leg on the box), bind URL http://${ANCHOR_HOSTNAME:-anchor-01-<alias>}.piercloud.net (record verified by the DNS stage)."

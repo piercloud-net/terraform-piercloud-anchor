@@ -235,6 +235,8 @@ jobs:
           REPO_SCOPE_RECORDING_WITNESS_ACK_IDENTITIES: ${{ vars.RECORDING_WITNESS_ACK_IDENTITIES != '' }}
           REPO_SCOPE_RECORDING_WITNESS_COLD_START_SECONDS: ${{ vars.RECORDING_WITNESS_COLD_START_SECONDS != '' }}
           REPO_SCOPE_RECORDING_WITNESS_SWEEP_SECONDS: ${{ vars.RECORDING_WITNESS_SWEEP_SECONDS != '' }}
+          REPO_SCOPE_OS_AUTO_UPDATES: ${{ vars.OS_AUTO_UPDATES != '' }}
+          REPO_SCOPE_OS_AUTO_REBOOT_TIME: ${{ vars.OS_AUTO_REBOOT_TIME != '' }}
           REPO_SCOPE_MANAGED_TENANT: ${{ vars.MANAGED_TENANT != '' }}
         run: |
           set -euo pipefail
@@ -1270,6 +1272,12 @@ jobs:
           # unset: it lives on the anchor's environment too, never at
           # repository level (the banner refuses a managed dispatch then).
           STATUS_PULLER: ${{ vars.STATUS_PULLER }}
+          # Unattended OS security updates (#51, docs/updaters.md): VARIABLES
+          # (the anchor's environment on a managed run). OS_AUTO_UPDATES unset
+          # = on, `off` = actively disabled; OS_AUTO_REBOOT_TIME = HH:MM UTC in
+          # 00:00-04:59 (default 03:30). The box validates both (fail closed).
+          OS_AUTO_UPDATES: ${{ vars.OS_AUTO_UPDATES }}
+          OS_AUTO_REBOOT_TIME: ${{ vars.OS_AUTO_REBOOT_TIME }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
