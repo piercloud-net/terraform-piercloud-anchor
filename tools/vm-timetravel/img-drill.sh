@@ -2,7 +2,7 @@
 # tools/vm-timetravel/img-drill.sh - MANUAL live proof of the container-updater
 # rollback drill (#253, docs/updaters.md "Drill (rollback ladder, live proof)").
 # NOT in CI (needs /dev/kvm and Docker Hub; ~3 min with a cached qcow2 and
-# images, ~10-15 min cold; the summary log records start and end). See
+# warm Docker Hub pulls, ~10-15 min cold; the summary log records start and end). See
 # docs/verification.md.
 #
 # Boots the Debian trixie genericcloud qcow2 under qemu + KVM INSIDE a docker
