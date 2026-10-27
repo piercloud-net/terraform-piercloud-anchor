@@ -1787,7 +1787,7 @@ img_caddy_validate() { # $1 = container ref (validated BY DIGEST, repo@sha256, w
   args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new "$eph")"
   # No network, no capabilities, read-only root (scratch /config + /data):
   # an unproven build sees the mounted files but cannot ship them anywhere.
-  # NET_BIND_SERVICE is the ONE capability kept: the image's /usr/bin/caddy
+  # NET_BIND_SERVICE is the ONE capability kept: the build's /usr/bin/caddy
   # carries the file capability cap_net_bind_service=ep, and execve refuses
   # (EPERM, "exec /usr/bin/caddy: operation not permitted") a binary whose
   # file capabilities the bounding set cannot grant. With --network none it
