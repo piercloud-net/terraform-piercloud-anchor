@@ -19,8 +19,12 @@
 #   (e) the bearer token is 0600, regenerated per run, written only by
 #       os_updates_commit_token (after the Gatus config), reaches curl on
 #       stdin only and is never printed;
-#   (f) green = pending known AND (grace OR real run < 48 h AND security lists
-#       < 48 h AND 0 pending); grace ends at the first real run or 26 h; only
+#   (f) green = pending known AND 0 pending security (installable OR kept
+#       back / held: apt list --upgradable -security candidates the simulation
+#       does not install, per-distro fixtures) AND security lists < 48 h AND
+#       (real run < 48 h OR grace); the grace excuses ONLY the missing run
+#       (pending or stale lists are red inside it) and ends at the first real
+#       run or 26 h; only
 #       --after-run (SERVICE_RESULT=success + fresh upgrade-stamp) writes the
 #       run marker; env overrides of paths/thresholds are ignored; a live
 #       token swap makes the report wait;
@@ -44,7 +48,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=143
+MIN_CHECKS=152
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 has()   { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1 (missing: $3)" ;; esac; }
@@ -73,6 +77,12 @@ mkdir -p "$BIN"
 cat >"$BIN/apt-get" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in *" -s "*) [ -n "${FAKE_SIM_RC:-}" ] && exit "$FAKE_SIM_RC"; cat "${FAKE_SIM:-/dev/null}" ;; esac
+exit 0
+EOF
+# apt list --upgradable: FAKE_LIST is the listing (kept-back fixtures).
+cat >"$BIN/apt" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in *" list "*) [ -n "${FAKE_LIST_RC:-}" ] && exit "$FAKE_LIST_RC"; printf 'Listing...\n'; cat "${FAKE_LIST:-/dev/null}" ;; esac
 exit 0
 EOF
 # apt-config dump: models apt's list merge - distro defaults survive unless the
@@ -139,10 +149,10 @@ newcase() { # $1 label -> sets D (case dir) and exports the fixture env
     OS_UPD_UPGRADE_STAMP="$D/state/upgrade-stamp" OS_UPD_LISTS_DIR="$D/lists" \
     OS_UPD_REBOOT_FLAG="$D/run/reboot-required" OS_UPD_ROTATION_MARKER="$D/state/.rotation-pending" \
     OS_UPD_PROVISION_PIDFILE="$D/run/provision.pid" OS_UPD_SWAP_MARK="$D/run/swap" \
-    OS_UPD_APT_GET_BIN="$BIN/apt-get" OS_UPD_CURL_BIN="$BIN/curl" OS_UPD_SYSTEMCTL_BIN="$BIN/systemctl" \
+    OS_UPD_APT_GET_BIN="$BIN/apt-get" OS_UPD_APT_BIN="$BIN/apt" OS_UPD_CURL_BIN="$BIN/curl" OS_UPD_SYSTEMCTL_BIN="$BIN/systemctl" \
     OS_UPD_RETRY_SLEEP=0 FAKE_TZ_FILE="$D/tz" FAKE_SYSTEMCTL_LOG="$D/systemctl.log" \
     FAKE_CURL_ARGV="$D/curl.argv" FAKE_CURL_STDIN="$D/curl.stdin"
-  unset OS_AUTO_UPDATES OS_AUTO_REBOOT_TIME NTFY_TOPIC FAKE_APT_EXTRA FAKE_UU_RC FAKE_DISABLED FAKE_NO_DROPIN FAKE_HTTP FAKE_SIM FAKE_SIM_RC FAKE_TZ_STUCK FAKE_START_RC FAKE_UPGRADE_ACTIVE
+  unset OS_AUTO_UPDATES OS_AUTO_REBOOT_TIME NTFY_TOPIC FAKE_APT_EXTRA FAKE_UU_RC FAKE_DISABLED FAKE_NO_DROPIN FAKE_HTTP FAKE_SIM FAKE_SIM_RC FAKE_LIST FAKE_LIST_RC FAKE_TZ_STUCK FAKE_START_RC FAKE_UPGRADE_ACTIVE
   printf 'UTC\n' >"$FAKE_TZ_FILE"
   printf 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nID=debian\nVERSION_CODENAME=trixie\n' >"$OS_UPD_OS_RELEASE"
 }
@@ -286,14 +296,51 @@ chk_stale() { # the green/red matrix
   red - 27 1 || return 1                          # no real run, grace (26h) over
   red 1 60 - || return 1                          # no security lists at all
   export FAKE_SIM="$PEND2"
-  red 1 60 1 || return 1; case "$ARGV" in *security-pending,pending-security:2,*) ;; *) return 1 ;; esac
-  green - 1 - || return 1; case "$ARGV" in *grace:yes*) ;; *) return 1 ;; esac   # fresh install: grace
-  green 30 1 - || return 1                        # re-enabled: install marker newer than the old run
-  red 1 25 - || return 1                          # the first real run ends the grace at once
+  red 1 60 1 || return 1; case "$ARGV" in *security-pending,pending-security:2,kept-back-security:0,*) ;; *) return 1 ;; esac
+  export FAKE_SIM="$PEND0"
+  green 60 1 1 || return 1; case "$ARGV" in *grace:yes*) ;; *) return 1 ;; esac   # re-enabled: install marker newer than the old run
+  green 1 25 1 || return 1; case "$ARGV" in *grace:no*) ;; *) return 1 ;; esac    # the first real run ends the grace at once
   export FAKE_SIM_RC=100
-  red - 1 - || return 1; case "$ARGV" in *pending-unknown,pending-security:unknown*) ;; *) return 1 ;; esac
+  red - 1 1 || return 1; case "$ARGV" in *pending-unknown,pending-security:unknown*) ;; *) return 1 ;; esac
   red 1 60 1 || return 1
   unset FAKE_SIM_RC
+  export FAKE_LIST_RC=100                         # apt list failing is pending-unknown too
+  red 1 60 1 || return 1; case "$ARGV" in *pending-unknown,pending-security:unknown,kept-back-security:unknown*) ;; *) return 1 ;; esac
+  unset FAKE_LIST_RC
+}
+chk_grace() { # the grace excuses ONLY the missing run (lead decision on PR #254 verify)
+  newcase grace; apply "$1" || return 1
+  export FAKE_SIM="$PEND0"
+  green - 1 1 || return 1; case "$ARGV" in *grace:yes*) ;; *) return 1 ;; esac   # fresh, 0 pending, fresh lists: green
+  export FAKE_SIM="$PEND2"
+  red - 1 1 || return 1; case "$ARGV" in *security-pending,pending-security:2,*grace:yes*) ;; *) return 1 ;; esac
+  export FAKE_SIM="$PEND0"                        # failed first run: no run marker, 240 h lists
+  red - 1 240 || return 1; case "$ARGV" in *lists-stale-over-48h,*lists-age-h:240,grace:yes*) ;; *) return 1 ;; esac
+  red - 1 - || return 1; case "$ARGV" in *lists-stale-over-48h,*grace:yes*) ;; *) return 1 ;; esac
+}
+KB_DEB_SIM="$WORK/kb-deb-sim"; KB_DEB_LIST="$WORK/kb-deb-list"
+printf '%s\n' 'Reading package lists...' 'The following packages have been kept back:' '  liblzma5' \
+  'Inst tzdata [2025a-1] (2025b-0+deb13u1 Debian:13.1/stable-updates [all])' >"$KB_DEB_SIM"
+printf '%s\n' 'liblzma5/stable-security 5.8.1-1+deb13u2 amd64 [upgradable from: 5.8.1-1+deb13u1]' \
+  'tzdata/stable-updates 2025b-0+deb13u1 all [upgradable from: 2025a-1]' >"$KB_DEB_LIST"
+KB_UBU_SIM="$WORK/kb-ubu-sim"; KB_UBU_LIST="$WORK/kb-ubu-list"
+printf '%s\n' 'The following packages have been kept back:' '  liblzma5' \
+  'Inst libudev1 [255.4-1ubuntu8.17] (255.4-1ubuntu8.18 Ubuntu:24.04/noble-updates, Ubuntu:24.04/noble-security [amd64])' >"$KB_UBU_SIM"
+printf '%s\n' 'liblzma5/noble-updates,noble-security 5.6.1+really5.4.5-1ubuntu0.4 amd64 [upgradable from: 5.6.1+really5.4.5-1ubuntu0.3]' \
+  'libudev1/noble-updates,noble-security 255.4-1ubuntu8.18 amd64 [upgradable from: 255.4-1ubuntu8.17]' \
+  'snapd/noble-updates 2.66+24.04 amd64 [upgradable from: 2.63+24.04]' >"$KB_UBU_LIST"
+KB_OTHER_SIM="$WORK/kb-other-sim"; KB_OTHER_LIST="$WORK/kb-other-list"
+printf '%s\n' 'The following packages have been kept back:' '  snapd' >"$KB_OTHER_SIM"
+printf '%s\n' 'snapd/noble-updates 2.66+24.04 amd64 [upgradable from: 2.63+24.04]' >"$KB_OTHER_LIST"
+chk_kept() { # kept-back / held security upgrades (no Inst line) are red on both distros
+  newcase kept; apply "$1" || return 1
+  export FAKE_SIM="$KB_DEB_SIM" FAKE_LIST="$KB_DEB_LIST"     # Debian trixie apt 3.0 shape
+  red 1 60 1 || return 1; case "$ARGV" in *security-pending,security-kept-back,pending-security:1,kept-back-security:1,*) ;; *) return 1 ;; esac
+  red - 1 1 || return 1; case "$ARGV" in *security-kept-back,*grace:yes*) ;; *) return 1 ;; esac   # the grace never masks it
+  export FAKE_SIM="$KB_UBU_SIM" FAKE_LIST="$KB_UBU_LIST"     # Ubuntu noble apt 2.8 shape (Inst + list deduped)
+  red 1 60 1 || return 1; case "$ARGV" in *security-pending,security-kept-back,pending-security:2,kept-back-security:1,*) ;; *) return 1 ;; esac
+  export FAKE_SIM="$KB_OTHER_SIM" FAKE_LIST="$KB_OTHER_LIST" # a kept-back NON-security package stays green
+  green 1 60 1 || return 1; case "$ARGV" in *pending-security:0,kept-back-security:0,*) ;; *) return 1 ;; esac
 }
 chk_afterrun() { # only a successful real run with a fresh upgrade-stamp writes the run marker
   newcase ar; apply "$1" || return 1
@@ -423,6 +470,8 @@ if apply "$S" && grep -q 'Unattended-Upgrade "1"' "$OS_UPD_APT_CONF"; then ok "(
 if chk_window "$S"; then ok "(d) reboot window maps 1:1 to the UTC timer under TZ=Europe/Rome (00:00/04:59/01:15/03:30); 05:00, 3:30, 24:00, 03:60, padded, 0330, 12:00, 23:59 refused + disarmed"; else bad "(d) reboot window"; fi
 if chk_token "$S"; then ok "(e) token: 64 hex, 0600, per run, written only by the commit after the Gatus config, stdin only, never printed"; else bad "(e) token handling"; fi
 if chk_stale "$S"; then ok "(f) green matrix: run/lists < 48 h + 0 pending; grace to first run or 26 h; pending unknown red"; else bad "(f) green matrix"; tail -n 2 "$D/r.out" 2>/dev/null || true; fi
+if chk_grace "$S"; then ok "(f) grace excuses only the missing run: fresh install + 0 pending + fresh lists green; + pending red; failed first run + 240 h lists red"; else bad "(f) grace scope"; tail -n 2 "$D/r.out" 2>/dev/null || true; fi
+if chk_kept "$S"; then ok "(f) kept-back security upgrades red on the Debian and Ubuntu apt list shapes, deduped with Inst; a kept-back non-security package green"; else bad "(f) kept-back security"; tail -n 2 "$D/r.out" 2>/dev/null || true; fi
 if chk_afterrun "$S"; then ok "(f) only --after-run (SERVICE_RESULT=success, upgrade-stamp < 26 h) writes the run marker"; else bad "(f) run marker"; fi
 if chk_envproof "$S"; then ok "(f) env overrides (paths, thresholds, PATH) ignored; absolute command paths baked"; else bad "(f) env proof"; fi
 if chk_swapwait "$S"; then ok "(f) a live token swap holds the push; a dead swap marker does not"; else bad "(f) swap wait"; fi
@@ -436,7 +485,7 @@ has "(f) reboot-required flag" "$ARGV" "reboot-required:yes"
 has "(f) last-run age in hours" "$ARGV" "last-run-age-h:1,"
 has "(f) lists age in hours" "$ARGV" "lists-age-h:1,"
 has "(f) push targets the external endpoint key" "$ARGV" "http://127.0.0.1:8080/api/v1/endpoints/anchor_os-security-updates/external?success=false&error=security-pending,"
-has "(f) report line is reasons + counts only" "$(cat "$D/r.out")" "success=false reasons=security-pending pending-security=2 reboot-required=yes last-run-age-h=1 lists-age-h=1 grace=no push=HTTP 200"
+has "(f) report line is reasons + counts only" "$(cat "$D/r.out")" "success=false reasons=security-pending pending-security=2 kept-back-security=0 reboot-required=yes last-run-age-h=1 lists-age-h=1 grace=no push=HTTP 200"
 is "(f) push 200 exits 0" 0 "$RC"
 : >"$OS_UPD_ROTATION_MARKER"; report 1 60 1
 has "(f) reboot held by a pending rotation is visible" "$ARGV" "reboot-required:held-rotation"
@@ -586,6 +635,13 @@ mutant "run age ignored" chk_stale "s.replace('[ \$((now - run_m)) -lt \"\$MAX_A
 mutant "security lists freshness ignored" chk_stale "s.replace('[ \$((now - lists_m)) -lt \"\$MAX_AGE\" ]', 'true', 1)"
 mutant "pending security ignored" chk_stale "s.replace('[ \"\$pending\" -eq 0 ] || reasons=', 'true || reasons=', 1)"
 mutant "pending unknown reads green" chk_stale "s.replace('  reasons=\"pending-unknown\"', '  reasons=\"\"', 1)"
+mutant "grace masks pending security" chk_grace "s.replace('  [ \"\$pending\" -eq 0 ] || reasons=', '  [ \"\$grace\" = yes ] || [ \"\$pending\" -eq 0 ] || reasons=', 1)"
+mutant "grace masks stale lists" chk_grace "s.replace('  { [ \"\$lists_m\" -gt 0 ]', '  [ \"\$grace\" = yes ] || { [ \"\$lists_m\" -gt 0 ]', 1)"
+mutant "grace no longer excuses the missing run" chk_grace "s.replace('  [ \"\$grace\" = yes ] || { [ \"\$run_m\"', '  { [ \"\$run_m\"', 1)"
+mutant "kept-back security ignored" chk_kept "s.replace('  [ \"\$kept\" -eq 0 ] || reasons=', '  true || reasons=', 1)"
+mutant "apt list not read (Inst lines only)" chk_kept "s.replace('if (s[i] ~ /-security\$/)', 'if (0)', 1)"
+mutant "kept-back counts every listed security candidate (no Inst dedupe)" chk_kept "s.replace('if (k[n] !~ /I/) h++', 'h++', 1)"
+mutant "apt list failure ignored" chk_stale "s.replace('    && upg=\"\$(\"\$APT\" -q list --upgradable 2>/dev/null)\"', '    && { upg=\"\$(\"\$APT\" -q list --upgradable 2>/dev/null)\" || true; }', 1)"
 mutant "grace 72 h" chk_stale "s.replace('GRACE=93600', 'GRACE=259200', 1)"
 mutant "grace survives the first real run" chk_stale "s.replace('[ \"\$run_m\" -le \"\$inst_m\" ] && ', '', 1)"
 mutant "run marker on any service result" chk_afterrun "s.replace('[ \"\${SERVICE_RESULT:-}\" = success ] && ', '', 1)"

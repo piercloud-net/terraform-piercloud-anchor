@@ -1158,6 +1158,7 @@ OS_UPD_ROTATION_MARKER="${OS_UPD_ROTATION_MARKER:-${TANG_KEYS_DIR:-/var/db/tang}
 OS_UPD_PROVISION_PIDFILE="${OS_UPD_PROVISION_PIDFILE:-${PROVISION_PIDFILE:-/run/piercloud-provision.pid}}"
 OS_UPD_SWAP_MARK="${OS_UPD_SWAP_MARK:-/run/piercloud-os-updates.swap}"
 OS_UPD_APT_GET_BIN="${OS_UPD_APT_GET_BIN:-/usr/bin/apt-get}"
+OS_UPD_APT_BIN="${OS_UPD_APT_BIN:-/usr/bin/apt}"
 OS_UPD_CURL_BIN="${OS_UPD_CURL_BIN:-/usr/bin/curl}"
 OS_UPD_SYSTEMCTL_BIN="${OS_UPD_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 OS_UPD_RUN_ONCE_TIMEOUT=900
@@ -1269,8 +1270,8 @@ render_os_updates_consts() { # the baked constants both on-box scripts share (no
     "$OS_UPD_TOKEN_FILE" "$OS_UPD_MARKER" "$OS_UPD_RUN_MARKER" "$OS_UPD_UPGRADE_STAMP" "$OS_UPD_LISTS_DIR"
   printf 'REBOOT_FLAG=%q\nROTATION=%q\nPROVISION_PIDFILE=%q\nSWAP_MARK=%q\n' \
     "$OS_UPD_REBOOT_FLAG" "$OS_UPD_ROTATION_MARKER" "$OS_UPD_PROVISION_PIDFILE" "$OS_UPD_SWAP_MARK"
-  printf 'GATUS_URL=%q\nAPT_GET=%q\nCURL=%q\nSYSTEMCTL=%q\n' \
-    "http://127.0.0.1:${GATUS_PORT}" "$OS_UPD_APT_GET_BIN" "$OS_UPD_CURL_BIN" "$OS_UPD_SYSTEMCTL_BIN"
+  printf 'GATUS_URL=%q\nAPT_GET=%q\nAPT=%q\nCURL=%q\nSYSTEMCTL=%q\n' \
+    "http://127.0.0.1:${GATUS_PORT}" "$OS_UPD_APT_GET_BIN" "$OS_UPD_APT_BIN" "$OS_UPD_CURL_BIN" "$OS_UPD_SYSTEMCTL_BIN"
   cat <<'OS_UPD_CONSTS_EOF'
 live() { # $1 marker "<pid> <starttime>" -> 0 while that exact process is alive (pid reuse defeated)
   local pid st now_st
@@ -1303,12 +1304,16 @@ render_os_updates_report() { # the on-box report script
   cat <<'OS_UPD_REPORT_EOF'
 # piercloud-os-updates-report.sh - pushes the os-security-updates heartbeat to
 # the loopback Gatus external endpoint. Green means actually current:
-#   pending security updates known (apt simulation ok), AND either
-#   the fresh-install grace (no real run since the install marker, marker < 26 h)
-#   or: the last REAL run < 48 h (RUN_MARKER, written only by --after-run from
-#   apt-daily-upgrade's ExecStopPost after a successful service whose
-#   upgrade-stamp is < 26 h; the converge --dry-run never writes it), the
-#   newest *security*InRelease < 48 h, and 0 pending security updates.
+#   pending security updates known (apt simulation + apt list ok), AND
+#   0 pending security updates (installable Inst lines in the simulation PLUS
+#   kept-back/held ones: -security candidates in apt list --upgradable that
+#   the simulation does not install), AND the newest *security*InRelease
+#   < 48 h, AND either the last REAL run < 48 h (RUN_MARKER, written only by
+#   --after-run from apt-daily-upgrade's ExecStopPost after a successful
+#   service whose upgrade-stamp is < 26 h; the converge --dry-run never
+#   writes it) or the fresh-install grace (no real run since the install
+#   marker, marker < 26 h). The grace excuses ONLY the missing run: pending
+#   security updates and stale lists are red with or without it.
 # The error field carries reasons and counts only. The bearer token goes to
 # curl on stdin (-K -), never argv, never stdout.
 set -uo pipefail
@@ -1337,26 +1342,35 @@ for f in "$LISTS_DIR"/*security*InRelease; do
   m="$(mtime "$f")"
   [ "$m" -gt "$lists_m" ] && lists_m="$m"
 done
-if sim="$("$APT_GET" -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)"; then
-  pending="$(printf '%s\n' "$sim" | /usr/bin/grep -c '^Inst .*-security' || true)"
-else
-  pending=unknown
+# I = installable security upgrade (simulation Inst line); L = a -security
+# candidate in apt list --upgradable. An L without an I is kept back / held:
+# unattended-upgrades will not install it, so it needs a human.
+pending=unknown
+kept=unknown
+if sim="$("$APT_GET" -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)" \
+    && upg="$("$APT" -q list --upgradable 2>/dev/null)"; then
+  read -r pending kept < <({
+    printf '%s\n' "$sim" | /usr/bin/awk '/^Inst .*-security/ { print "I", $2 }'
+    printf '%s\n' "$upg" | /usr/bin/awk '{ n = split($1, a, "/"); if (n < 2) next; m = split(a[2], s, ","); for (i = 1; i <= m; i++) if (s[i] ~ /-security$/) { print "L", a[1]; break } }'
+  } | /usr/bin/awk '{ k[$2] = k[$2] $1 } END { p = 0; h = 0; for (n in k) { p++; if (k[n] !~ /I/) h++ } print p, h }')
 fi
+case "$pending:$kept" in *[!0-9:]*|:*|*:) pending=unknown; kept=unknown ;; esac
 grace=no
 if [ "$inst_m" -gt 0 ] && [ "$run_m" -le "$inst_m" ] && [ $((now - inst_m)) -lt "$GRACE" ]; then grace=yes; fi
 reasons=""
 if [ "$pending" = unknown ]; then
   reasons="pending-unknown"
-elif [ "$grace" = no ]; then
-  { [ "$run_m" -gt 0 ] && [ $((now - run_m)) -lt "$MAX_AGE" ]; } || reasons="${reasons}run-stale-over-48h,"
+else
+  [ "$grace" = yes ] || { [ "$run_m" -gt 0 ] && [ $((now - run_m)) -lt "$MAX_AGE" ]; } || reasons="${reasons}run-stale-over-48h,"
   { [ "$lists_m" -gt 0 ] && [ $((now - lists_m)) -lt "$MAX_AGE" ]; } || reasons="${reasons}lists-stale-over-48h,"
   [ "$pending" -eq 0 ] || reasons="${reasons}security-pending,"
+  [ "$kept" -eq 0 ] || reasons="${reasons}security-kept-back,"
   reasons="${reasons%,}"
 fi
 if [ -z "$reasons" ]; then success=true; else success=false; fi
 reboot=no
 if [ -e "$REBOOT_FLAG" ]; then reboot=yes; [ -e "$ROTATION" ] && reboot=held-rotation; fi
-counts="pending-security:${pending},reboot-required:${reboot},last-run-age-h:$(hours "$run_m"),lists-age-h:$(hours "$lists_m"),grace:${grace}"
+counts="pending-security:${pending},kept-back-security:${kept},reboot-required:${reboot},last-run-age-h:$(hours "$run_m"),lists-age-h:$(hours "$lists_m"),grace:${grace}"
 err="${reasons:+${reasons},}${counts}"
 line="success=${success} reasons=${reasons:-none} ${counts//,/ }"
 line="${line//:/=}"
