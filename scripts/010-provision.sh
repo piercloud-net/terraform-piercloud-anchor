@@ -3086,7 +3086,7 @@ edge_pull_200() { # $1 = status host -> sets EDGE_RC/EDGE_CODE; 0 = the public e
 }
 
 img_selfcheck() { # the converge self-checks (on-box subset); prints the failing reason class, returns 1 on failure
-  local i ok
+  local i ok adv
   ok=0
   for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
     if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then ok=1; break; fi
@@ -3101,7 +3101,9 @@ img_selfcheck() { # the converge self-checks (on-box subset); prints the failing
   [ "$ok" = "1" ] || { printf 'tang-direct'; return 1; }
   ok=0
   for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    if curl -sf --max-time 5 http://127.0.0.1/adv -o /tmp/caddy-adv.json && adv_ok /tmp/caddy-adv.json >/dev/null 2>&1; then ok=1; break; fi
+    adv="$(mktemp)"
+    if curl -sf --max-time 5 http://127.0.0.1/adv -o "$adv" && adv_ok "$adv" >/dev/null 2>&1; then ok=1; rm -f "$adv"; break; fi
+    rm -f "$adv"
     sleep "${IMG_CHECK_SLEEP:-5}"
   done
   [ "$ok" = "1" ] || { printf 'caddy-80'; return 1; }
