@@ -237,6 +237,8 @@ jobs:
           REPO_SCOPE_RECORDING_WITNESS_SWEEP_SECONDS: ${{ vars.RECORDING_WITNESS_SWEEP_SECONDS != '' }}
           REPO_SCOPE_OS_AUTO_UPDATES: ${{ vars.OS_AUTO_UPDATES != '' }}
           REPO_SCOPE_OS_AUTO_REBOOT_TIME: ${{ vars.OS_AUTO_REBOOT_TIME != '' }}
+          REPO_SCOPE_IMG_AUTO_UPDATES: ${{ vars.IMG_AUTO_UPDATES != '' }}
+          REPO_SCOPE_IMG_UPDATE_SOAK_HOURS: ${{ vars.IMG_UPDATE_SOAK_HOURS != '' }}
           REPO_SCOPE_MANAGED_TENANT: ${{ vars.MANAGED_TENANT != '' }}
         run: |
           set -euo pipefail
@@ -1278,6 +1280,13 @@ jobs:
           # 00:00-04:59 (default 03:30). The box validates both (fail closed).
           OS_AUTO_UPDATES: ${{ vars.OS_AUTO_UPDATES }}
           OS_AUTO_REBOOT_TIME: ${{ vars.OS_AUTO_REBOOT_TIME }}
+          # Caddy/Gatus updates within the approved major line (#51,
+          # docs/updaters.md): VARIABLES (the anchor's environment on a managed
+          # run). IMG_AUTO_UPDATES unset = on, off = back to the repo pins;
+          # IMG_UPDATE_SOAK_HOURS = whole hours 0-720 (default 6). The box
+          # validates both (fail closed).
+          IMG_AUTO_UPDATES: ${{ vars.IMG_AUTO_UPDATES }}
+          IMG_UPDATE_SOAK_HOURS: ${{ vars.IMG_UPDATE_SOAK_HOURS }}
           GATUS_ENDPOINTS: ${{ secrets.GATUS_ENDPOINTS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}

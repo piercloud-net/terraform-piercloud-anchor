@@ -613,7 +613,7 @@ jobs:
   unit-tests-scripts:
     name: unit-tests (scripts)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -645,7 +645,7 @@ jobs:
             # cloudfront_ranges.tf sync tooth and the firewall-wiring
             # assertions live in tests/edge-origin-auth, so a ranges
             # refresh or rule edit must not skip them.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh|origin-mtls-ca\.pem)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|gatus-pull|os-updates|external-watch|managed-inputs|managed-operator-plane|broker-dns|broker-provision-dns|edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/|tests/opentofu-pin/|\.opentofu-version$|.*\.tf$)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh|origin-mtls-ca\.pem)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|gatus-pull|os-updates|img-updater|external-watch|managed-inputs|managed-operator-plane|broker-dns|broker-provision-dns|edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/|tests/opentofu-pin/|\.opentofu-version$|.*\.tf$)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -686,6 +686,7 @@ jobs:
           bash tests/broker-provision-dns/run-test.sh
           bash tests/os-updates/run-test.sh
           bash tests/opentofu-pin/run-test.sh
+          bash tests/img-updater/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |

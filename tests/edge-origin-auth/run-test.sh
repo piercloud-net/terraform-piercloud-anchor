@@ -199,7 +199,13 @@ hard_die() { # $1 file, $2 message substring, $3 label -> must REFUSE, for that 
 # Wiring: the definition is executed by a real no-argument call asserting the
 # serving file, so deleting the call, passing an argument, or retargeting the
 # default cannot stay green.
-is "assert_caddyfile_hardened: one definition + one call" "2" "$(grep -c 'assert_caddyfile_hardened' "${PROVISION_SH}")"
+# The on-box container updater (A-IMG #51, IMG UPDATER span) embeds the same
+# definition (declare -f) and re-runs it bare after a swap; outside that span
+# the one-definition + one-call wiring holds unchanged.
+img_span_src="$(sed -n '/^# --- BEGIN IMG UPDATER/,/^# --- END IMG UPDATER ---$/p' "${PROVISION_SH}")"
+is "assert_caddyfile_hardened: one definition + one call (outside the updater span)" "2" "$(sed '/^# --- BEGIN IMG UPDATER/,/^# --- END IMG UPDATER ---$/d' "${PROVISION_SH}" | grep -c 'assert_caddyfile_hardened')"
+is "updater span: the function is embedded once and called bare once" "2" "$(printf '%s\n' "$img_span_src" | grep -c 'assert_caddyfile_hardened')"
+is "updater span: the post-swap call is the bare no-argument call" "1" "$(printf '%s\n' "$img_span_src" | grep -cF '( assert_caddyfile_hardened ) >/dev/null 2>&1')"
 is "the converge self-check call site is the bare call" "1" "$(grep -cE '^    assert_caddyfile_hardened$' "${PROVISION_SH}")"
 is "the self-check default is the serving Caddyfile" "1" "$(grep -cF 'local cfg="${1:-${CADDY_CONFIG}}" live http_block https_block bad_up gatus_hits' "${PROVISION_SH}")"
 has "${PROVISION_SH}" 'if [ -z "${CADDY_SKIP_HTTPS:-}" ]; then' "the self-check stays behind the CADDY_SKIP_HTTPS harness guard"
