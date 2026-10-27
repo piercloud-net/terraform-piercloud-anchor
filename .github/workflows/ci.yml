@@ -342,14 +342,10 @@ jobs:
           #   direct Cloudflare/Gcore DNS APIs are retired (b3b #189): once
           #   this lands, a re-appearance fails this gate (PR runs use the
           #   pattern fetched from origin/main).
-          #   github.com: the pinned release download of the temporarily
-          #   patched community provider (issue #219 / #218 stopgap; the
-          #   artifact is sha256-pinned in provision.yml, so the host grants
-          #   nothing by itself).
           #   API paths: firewall policies, server interfaces, servers, and
           #   the auth/device/token discovery keys.
           # Patterns run from the contract source (/tmp/contract-ci.yml — see fetch step); files from HEAD.
-          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|broker\.piercloud\.net|github\.com)(/|$)'
+          allowed_url='://(www\.servercontrolpanel\.de|api\.ipify\.org|ipv4\.icanhazip\.com|ntfy\.sh|broker\.piercloud\.net)(/|$)'
           # Passwordless bootstrap (issue #50) extends the surface with task
           # polling (/tasks) and the approver guard (/users/{id}); the
           # provisioning-only stems above stay intact (sanity check enforces).
@@ -649,7 +645,7 @@ jobs:
             # cloudfront_ranges.tf sync tooth and the firewall-wiring
             # assertions live in tests/edge-origin-auth, so a ranges
             # refresh or rule edit must not skip them.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh|origin-mtls-ca\.pem)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|provider-stopgap|public-log-safety|gatus-render|gatus-pull|external-watch|managed-inputs|managed-operator-plane|broker-dns|broker-provision-dns|edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/|tests/opentofu-pin/|\.opentofu-version$|.*\.tf$)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh|origin-mtls-ca\.pem)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|public-log-safety|gatus-render|gatus-pull|external-watch|managed-inputs|managed-operator-plane|broker-dns|broker-provision-dns|edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/|tests/opentofu-pin/|\.opentofu-version$|.*\.tf$)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -676,7 +672,6 @@ jobs:
           bash tests/ntfy-token-handrun/run-test.sh
           bash tests/retention-cap/run-test.sh
           bash tests/policy-naming/run-test.sh
-          bash tests/provider-stopgap/run-test.sh
           bash tests/public-log-safety/run-test.sh
           bash tests/edge-origin-auth/run-test.sh
           bash tests/origin-mtls/run-test.sh

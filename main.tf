@@ -1,5 +1,10 @@
+# Pin the SCP base URL: it is where the SCP API token is sent, so an
+# environment override (NETCUP_SCP_BASE_URL) must not redirect it. An explicit
+# provider attribute wins over the env var in provider v2.1.1 (envOrString).
+# The value is the upstream default. Cost: callers cannot use count, for_each,
+# enabled or depends_on on this module (OpenTofu legacy-module rule).
 provider "netcup" {
-  customer_number = var.customer_number
+  scp_base_url = "https://www.servercontrolpanel.de/scp-core"
 }
 
 # Server id comes either directly from var.server_id, or from an exact-name
@@ -50,10 +55,10 @@ resource "netcup_scp_server" "anchor" {
   server_id       = local.resolved_server_id
   hostname        = var.hostname
   os_optimization = "LINUX"
-  # No autostart here by design (live 2026-09-08): the provider PUTs all
-  # fields on any update and the API 400s `server.autostart.alreadyactive`
-  # when it is already on — which is the netcup default for new servers.
-  # Keep it as-ordered; confirm once in SCP → server → autostart.
+  # No autostart here by design: it is Optional+Computed, so an unset value
+  # is never sent and the netcup default stays. Live 2026-09-08 (v1 PUT-all)
+  # the API 400'd `server.autostart.alreadyactive`. Confirm once in
+  # SCP → server → autostart.
 }
 
 # Account-level firewall policy: tang (TCP/80) is reachable only from the
@@ -95,11 +100,9 @@ resource "netcup_scp_user_firewall_policy" "tang" {
     # client certificate is verified at the TLS layer (#202). The retired shared
     # origin header is not a gate. :8080/:8081 never leave loopback (on-box
     # bindings, not firewall rules).
-    # Live 2026-09-08 (issue #61): the rixlhq/netcup provider models
-    # `sources` as an order-significant List, but the SCP API echoes it
-    # back in nondeterministic order — any multi-source rule fails apply
-    # with "inconsistent result after apply". One rule per CIDR keeps
-    # every `sources` a singleton, where order is trivially stable.
+    # rixlhq/netcup v2 models rule `sources` and `destinations` as unordered
+    # sets, so the v1 order-sensitivity (issue #61) does not apply. One rule
+    # per CIDR is kept so this upgrade does not churn live rules.
     # Equivalence: ACCEPT iff (port, proto, direction match AND the source
     # is in the edge set) — a union of singleton rules accepts exactly the
     # same packets as one rule carrying the whole set; the default posture

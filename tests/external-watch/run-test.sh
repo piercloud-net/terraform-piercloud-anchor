@@ -43,9 +43,9 @@ WORK="$(mktemp -d /tmp/external-watch.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
 # ---- tooling for the round-6 pin folds -------------------------------------
-# PyYAML is a test dependency (tests/provider-stopgap does the same): the
-# env-map pin below loads the REAL workflow, so a missing parser must fail
-# loudly instead of silently skipping the pin.
+# PyYAML is a test dependency: the env-map pin below loads the REAL
+# workflow, so a missing parser must fail loudly instead of silently skipping
+# the pin.
 python3 -I -B -c 'import yaml' 2>/dev/null || { printf 'FAIL PyYAML is required (python3-yaml)\n'; exit 1; }
 
 # Loads the workflow with a duplicate-key-REJECTING loader (PyYAML's

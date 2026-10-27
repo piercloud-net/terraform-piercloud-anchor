@@ -6,18 +6,6 @@ This is the anchor repo's RT-1 standing-credential inventory: what long-lived cr
 
 The module provisions **no SSH access and no write-capable standing credentials for the anchor's infrastructure** — inbound or outbound. The one credential with a write surface is the ntfy publish token used by the alerting plane (row 2): it can publish to the tenant's notification topic, and nothing else. Nobody logs into the anchor: every change arrives through a per-run approved dispatch (the runner is the admin path), and the netcup device-flow token dies with the runner. Re-entry after the root lock is per-event; rescue mode stays the last resort and disables the netcup firewall (any rescue boot → rotate tang keys).
 
-## Prebuilt provider binary in plan/apply (temporary — issue #218, upstream PR #47)
-
-`provision.yml` carries one deliberate exception to the "everything the run executes comes from the lock file" rule: an apply-only step stages a **prebuilt netcup provider** (the empty-array-as-map fix, upstream issue rixlhq/terraform-provider-netcup#46 / PR #47) and points OpenTofu at it through `dev_overrides`.
-
-- **It is not covered by `.terraform.lock.hcl`.** `dev_overrides` bypasses the lock for plan/apply, so the committed hashes vouch for what `tofu init` installs — which plan/apply then does not use.
-- **Its integrity rests on two things:** the sha256 pinned in the step (`PROVIDER_SHA256`, verified before use, fail-closed) and its provenance — the release tag sits on upstream `v1.2.1` + one fix commit, and the binary stamps that commit (`go version -m` → `vcs.revision`, `vcs.modified=false`). Both checks are recorded in the step comment.
-- **It executes with the run's netcup credential:** the step runs after the device-flow step exported `NETCUP_SCP_ACCESS_TOKEN` / `NETCUP_SCP_REFRESH_TOKEN_FILE`, so the binary holds the same plan/apply authority as the registry build would — but it is not a build the lock vouches for.
-- **It is a stopgap, not a supply-chain change:** `required_providers` still names `rixlhq/netcup`, `tofu init` still runs without the override, and the step is deleted when upstream ships the fix. **Removal order matters:** delete the step first, then the release, then the fork branch — deleting the release first fails every apply closed at the download.
-- **Not a boundary:** the digest pin authenticates bytes against the release, not against the source tree; whoever controls that fork release controls both. Treat the provenance as source-auditable, build-not-reproduced-by-CI.
-
-Pinned by `tests/provider-stopgap` (structure via a YAML parse, plus a behavioural leg that executes the step's run block against a stub download and requires a digest mismatch to abort).
-
 ## Standing-credential inventory
 
 | # | Credential | Where it lives | Capability | Blast radius if the anchor is compromised | Rotate / retire |

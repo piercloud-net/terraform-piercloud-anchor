@@ -5,7 +5,7 @@ This file holds the engineering conventions of this repo. The hard invariants li
 ## Shape
 
 - Standard OpenTofu module layout: the root IS the module (`versions.tf`, `variables.tf`, `main.tf`, `outputs.tf`); `examples/` holds a runnable quickstart; `scripts/` numbered human-run scripts; `docs/` this folder. No `modules/` wrapper (registry doc generation requirement).
-- Provider: community `rixlhq/netcup` (`~> 1.2`); OpenTofu `>= 1.11` (ephemeral values), pinned via `.opentofu-version`.
+- Provider: community `rixlhq/netcup` (`>= 2.1.1, < 3.0.0`); OpenTofu `>= 1.11` (ephemeral values), pinned via `.opentofu-version`.
 - The module **adopts** an existing netcup server (the SCP API cannot create or delete servers); the user orders the box manually.
 
 ## Release discipline
@@ -55,7 +55,7 @@ This is a public repo — every byte can be published, run logs, summaries and a
 - the account's server list, and a resolved server's address inventory beyond its public A-record address; tenant GitHub identities;
 - SSH host keys and tang fingerprints (the thumbprint is published only through its H1 legs — the run artifact, the password manager, and the pending committed break-glass file / platform registry).
 
-**Identifier handling** — identifier inputs (`server_id`, `scp_user_id`, `customer_number`) are `sensitive = true` in the module; provider-read identifiers (order name, old hostname, MAC) are `::add-mask::`ed at first receipt, before any print. Masks live for the job lifetime and redact later log lines, so mask-before-print ordering is the review-critical property. Policy names carry public values only (hostname, run id) — never the server id.
+**Identifier handling** — identifier inputs (`server_id`, `scp_user_id`) are `sensitive = true` in the module; provider-read identifiers (order name, old hostname, MAC) are `::add-mask::`ed at first receipt, before any print. Masks live for the job lifetime and redact later log lines, so mask-before-print ordering is the review-critical property. Policy names carry public values only (hostname, run id) — never the server id.
 
 - Nothing sensitive in committed files: no credentials, no hostnames/IPs of real deployments, no internal strategy.
 - Scripts print one-time values (thumbprint, generated passwords) to the console only; never log them to files that could be committed.
