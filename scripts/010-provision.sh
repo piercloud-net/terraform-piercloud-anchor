@@ -1317,7 +1317,14 @@ os_updates_first_report() { # after Gatus is up: first heartbeat (retries across
 # inside the SAME track - it never downgrades below what the updater moved to;
 # a pin in another track (a Lane B major bump) resets the track; a recorded
 # bad digest is never selected; IMG_AUTO_UPDATES=off returns to the repo pin
-# (the dispatch-only manual rollback, docs/dr.md).
+# (the dispatch-only manual rollback, docs/dr.md). The repo pin itself runs BY
+# DIGEST: provision resolves its tag once and records it (<name>.pin).
+#
+# Caddy availability outranks updating (tang's only listener is Caddy :80):
+# a failed candidate walks a ladder - restore the previous exact digest,
+# else the recorded pin digest, each verified tang-first - and when every
+# rung fails the updater alerts direct (ntfy) and disarms until the next
+# dispatch. Every status push is derived from checks run at push time.
 #
 # Paths are overridable for the offline harness only; the dispatch env never
 # exports these names, so on-box runs get the canonical defaults.
@@ -1337,7 +1344,7 @@ img_gatus_key() { # $1 = row name -> the Gatus endpoint key (group anchor; Gatus
 
 img_gatus_item() { # $1 = row name, $2 = push token -> one complete external-endpoints item (rendered by the shared span in the Gatus render)
   printf '%s\n' "  - name: $1" "    group: anchor" "    token: \"$2\"" "    heartbeat:" \
-    "      interval: 26h  # the updater pushes every ~6 h; a missed heartbeat records a failure (stale = down)"
+    "      interval: 24h  # the updater pushes every ~6 h; no push for 24 h records a failure (stale = down)"
   if [ -n "${NTFY_TOPIC:-}" ]; then
     printf '%s\n' "    alerts:" "      - type: ntfy" "        failure-threshold: 1" "        send-on-resolved: false" \
       "        provider-override:" "          priority: 4  # once per bad candidate or missed heartbeat; routine success never notifies"
@@ -1386,12 +1393,13 @@ img_split_ref() { # $1 = repo:tag[@sha256:hex] -> "repo tag digest" (digest may 
 
 img_ver_key() { # $1 = tag, $2 = pin tag -> "MAJ.MIN.PATCH" when $1 is in the pin's track; 1 otherwise
   local re pfx maj sfx
-  re="^(v?)([0-9]+)\\.([0-9]+)\\.([0-9]+)(-[a-z]+)?\$"
+  # Strict numerals: no leading zeros (2.11.05 never aliases 2.11.5), at most 9 digits.
+  re="^(v?)(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})(-[a-z]+)?\$"
   [[ "$2" =~ $re ]] || return 1
   pfx="${BASH_REMATCH[1]}"; maj="${BASH_REMATCH[2]}"; sfx="${BASH_REMATCH[5]}"
   [[ "$1" =~ $re ]] || return 1
   [ "${BASH_REMATCH[1]}" = "$pfx" ] && [ "${BASH_REMATCH[2]}" = "$maj" ] && [ "${BASH_REMATCH[5]}" = "$sfx" ] || return 1
-  printf '%s.%s.%s' "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))" "$((10#${BASH_REMATCH[4]}))"
+  printf '%s.%s.%s' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
 }
 
 img_ver_gt() { # $1 > $2 for MAJ.MIN.PATCH keys
@@ -1405,36 +1413,90 @@ img_ver_gt() { # $1 > $2 for MAJ.MIN.PATCH keys
   [ "$a3" -gt "$b3" ]
 }
 
-img_state_get() { # $1 = name -> the recorded current ref (validated); 1 when absent/invalid
-  local f="${IMG_STATE_DIR}/$1.state" v
-  [ -f "$f" ] || return 1
-  v="$(sed -n 's/^ref=//p' "$f" | head -n 1)"
+img_now() { # the clock (IMG_NOW pins it for the offline harness only)
+  printf '%s' "${IMG_NOW:-$(date +%s)}"
+}
+
+img_ref_write() { # $1 = file, $2 = repo:tag@sha256:hex -> atomic 0600 "ref=" record
+  local tmp
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  tmp="$(mktemp "${IMG_STATE_DIR}/.ref.XXXXXX")"
+  printf 'ref=%s\n' "$2" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$1"
+}
+
+img_ref_read() { # $1 = file -> its validated by-digest ref; 1 when absent/invalid
+  local v
+  [ -f "$1" ] || return 1
+  v="$(sed -n 's/^ref=//p' "$1" | head -n 1)"
   [[ "$v" =~ ^[a-z0-9][a-z0-9./-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || return 1
   printf '%s' "$v"
 }
 
+img_state_get() { # $1 = name -> the recorded current ref (validated); 1 when absent/invalid
+  img_ref_read "${IMG_STATE_DIR}/$1.state"
+}
+
 img_state_put() { # $1 = name, $2 = repo:tag@sha256:hex
-  local tmp
-  mkdir -p "$IMG_STATE_DIR"
-  chmod 700 "$IMG_STATE_DIR"
-  tmp="$(mktemp "${IMG_STATE_DIR}/.state.XXXXXX")"
-  printf 'ref=%s\n' "$2" >"$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "${IMG_STATE_DIR}/$1.state"
+  img_ref_write "${IMG_STATE_DIR}/$1.state" "$2"
 }
 
-img_is_bad() { # $1 = name, $2 = digest -> 0 when the digest is held as bad (never retried)
-  [ -n "$2" ] && [ -f "${IMG_STATE_DIR}/$1.bad" ] && grep -qxF -- "$2" "${IMG_STATE_DIR}/$1.bad"
+img_pin_get() { # $1 = name -> the provisioned repo pin BY DIGEST (resolved once per pin tag by a provision run); 1 when absent/invalid
+  img_ref_read "${IMG_STATE_DIR}/$1.pin"
 }
 
-img_mark_bad() { # $1 = name, $2 = digest
+img_bad_line() { # $1 = name, $2 = digest -> its hold line "digest version reason epoch"; 1 when not held
+  [ -n "$2" ] && [ -f "${IMG_STATE_DIR}/$1.bad" ] || return 1
+  awk -v d="$2" '$1 == d { print; f = 1; exit } END { if (!f) exit 1 }' "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_is_bad() { # $1 = name, $2 = digest -> 0 when the digest is held as bad
+  img_bad_line "$1" "$2" >/dev/null
+}
+
+img_version_mark_at() { # $1 = name, $2 = version key -> the newest hold time for ANY digest of that version; 1 when none
+  [ -f "${IMG_STATE_DIR}/$1.bad" ] || return 1
+  awk -v v="$2" '$2 == v && $4 ~ /^[0-9]+$/ { if ($4 + 0 > m) m = $4 + 0; f = 1 } END { if (!f) exit 1; print m }' "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_mark_bad() { # $1 = name, $2 = digest, $3 = version key, $4 = reason class -> hold (reason + time recorded)
   mkdir -p "$IMG_STATE_DIR"
   chmod 700 "$IMG_STATE_DIR"
-  img_is_bad "$1" "$2" || printf '%s\n' "$2" >>"${IMG_STATE_DIR}/$1.bad"
+  img_is_bad "$1" "$2" || printf '%s %s %s %s\n' "$2" "$3" "$4" "$(img_now)" >>"${IMG_STATE_DIR}/$1.bad"
   chmod 600 "${IMG_STATE_DIR}/$1.bad"
 }
 
-img_effective_ref() { # $1 = name, $2 = repo pin -> the ref to run: max(pin, recorded) inside the pin's track
+img_marks_expire() { # $1 = name, $2 = new pin version key: a pin change clears every hold at or below the new pin (the documented manual clear)
+  local f="${IMG_STATE_DIR}/$1.bad" tmp d v rest
+  [ -f "$f" ] || return 0
+  tmp="$(mktemp "${IMG_STATE_DIR}/.bad.XXXXXX")"
+  while read -r d v rest; do
+    if [[ "$v" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] && img_ver_gt "$v" "$2"; then printf '%s %s %s\n' "$d" "$v" "$rest"; fi
+  done <"$f" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$f"
+}
+
+img_pin_resolve() { # $1 = name, $2 = repo pin (repo:tag) -> the pin BY DIGEST: resolved once per pin tag, recorded, holds at/below it cleared (provision only)
+  local rec base repo tag dig pk
+  base="${2%%@*}"
+  if rec="$(img_pin_get "$1")" && [ "${rec%%@*}" = "$base" ]; then
+    case "$2" in *@sha256:*) [ "$rec" = "$2" ] && { printf '%s' "$rec"; return 0; } ;; *) printf '%s' "$rec"; return 0 ;; esac
+  fi
+  read -r repo tag dig <<<"$(img_split_ref "$2")"
+  if [ -z "$dig" ]; then
+    docker pull -q "$base" >/dev/null 2>&1 || return 1
+    dig="$(img_local_digest "$base" "$repo")"
+  fi
+  [[ "$dig" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  img_ref_write "${IMG_STATE_DIR}/$1.pin" "${base}@${dig}"
+  if pk="$(img_ver_key "$tag" "$tag")"; then img_marks_expire "$1" "$pk"; fi
+  printf '%s@%s' "$base" "$dig"
+}
+
+img_effective_ref() { # $1 = name, $2 = repo pin by digest -> the ref to run: max(pin, recorded) inside the pin's track
   local rec prepo ptag rrepo rtag rdig pk rk
   if [ "$(img_updater_mode)" != "on" ]; then printf '%s' "$2"; return 0; fi
   rec="$(img_state_get "$1")" || { printf '%s' "$2"; return 0; }
@@ -1448,12 +1510,12 @@ img_effective_ref() { # $1 = name, $2 = repo pin -> the ref to run: max(pin, rec
   printf '%s' "$rec"
 }
 
-img_reconcile_state() { # $1 = name, $2 = repo pin: drop a record the pin no longer honours (off switch, other repo/track, bad, below the pin)
+img_reconcile_state() { # $1 = name, $2 = repo pin by digest: drop a record the pin no longer honours (off switch, other repo/track, bad, below the pin)
   local rec
   rec="$(img_state_get "$1")" || return 0
   if [ "$(img_effective_ref "$1" "$2")" != "$rec" ]; then
     rm -f "${IMG_STATE_DIR}/$1.state"
-    log "$1: updater record ${rec%%@*} is not honoured by the repo pin $2 (off switch, another track, a bad digest or below the pin) - back on the pin"
+    log "$1: updater record ${rec%%@*} is not honoured by the repo pin ${2%%@*} (off switch, another track, a bad digest or below the pin) - back on the pin"
   fi
 }
 
@@ -1473,11 +1535,15 @@ img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path -> th
   printf '%s' "$a"
 }
 
-img_caddy_validate() { # $1 = container ref, $2 = Caddyfile to validate (010's pre-install validate args, verbatim)
-  local args
+img_caddy_validate() { # $1 = container ref (validated BY DIGEST, repo@sha256, when it carries one), $2 = Caddyfile -> 010's pre-install validate, confined
+  local args ref="$1" repo dig
+  read -r repo _ dig <<<"$(img_split_ref "$1")"
+  [ -z "$dig" ] || ref="${repo}@${dig}"
   args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new)"
+  # No network, no capabilities, read-only root (scratch /config + /data):
+  # an unproven build sees the mounted files but cannot ship them anywhere.
   # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
-  docker run --rm $args "$1" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
+  docker run --rm --network none --cap-drop ALL --read-only --tmpfs /config --tmpfs /data $args "$ref" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
 }
 
 img_run_caddy() { # $1 = container ref -> create the caddy container (the ONE docker run 010 and the updater share)
@@ -1530,30 +1596,38 @@ edge_pull_200() { # $1 = status host -> sets EDGE_RC/EDGE_CODE; 0 = the public e
   return 1
 }
 
-img_selfcheck() { # the converge self-checks (on-box subset); prints the failing reason class, returns 1 on failure
-  local i ok adv
-  ok=0
-  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"; then ok=1; break; fi
-    sleep "${IMG_CHECK_SLEEP:-5}"
+img_try() { # $1 = probe -> 0 once it passes (IMG_CHECK_TRIES attempts, IMG_CHECK_SLEEP apart)
+  local i n="${IMG_CHECK_TRIES:-6}"
+  for i in $(seq 1 "$n"); do
+    if "$1"; then return 0; fi
+    [ "$i" -ge "$n" ] || sleep "${IMG_CHECK_SLEEP:-5}"
   done
-  [ "$ok" = "1" ] || { printf 'gatus'; return 1; }
-  ok=0
-  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    if probe_tang_direct >/dev/null 2>&1; then ok=1; break; fi
-    sleep "${IMG_CHECK_SLEEP:-5}"
-  done
-  [ "$ok" = "1" ] || { printf 'tang-direct'; return 1; }
-  ok=0
-  for i in $(seq 1 "${IMG_CHECK_TRIES:-6}"); do
-    adv="$(mktemp)"
-    if curl -sf --max-time 5 http://127.0.0.1/adv -o "$adv" && adv_ok "$adv" >/dev/null 2>&1; then ok=1; rm -f "$adv"; break; fi
-    rm -f "$adv"
-    sleep "${IMG_CHECK_SLEEP:-5}"
-  done
-  [ "$ok" = "1" ] || { printf 'caddy-80'; return 1; }
-  : "$i"
-  [ -n "${STATUS_HOST:-}" ] || return 0
+  return 1
+}
+
+img_probe_tang_direct() { # tang answers on its own loopback socket
+  probe_tang_direct >/dev/null 2>&1
+}
+
+img_probe_caddy80() { # tang answers THROUGH Caddy :80 (the main box's unlock path)
+  local adv rc=1
+  adv="$(mktemp)"
+  if curl -sf --max-time 5 http://127.0.0.1/adv -o "$adv" && adv_ok "$adv" >/dev/null 2>&1; then rc=0; fi
+  rm -f "$adv"
+  return "$rc"
+}
+
+img_probe_gatus() { # the loopback Gatus serves its statuses
+  curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"
+}
+
+img_selfcheck() { # the converge self-checks, tang path FIRST; prints the failing reason class, returns 1 on failure
+  img_try img_probe_tang_direct || { printf 'tang-direct'; return 1; }
+  img_try img_probe_caddy80 || { printf 'caddy-80'; return 1; }
+  img_try img_probe_gatus || { printf 'gatus'; return 1; }
+  # No silent pass: without the status host the TLS/hardening half cannot
+  # be proven, so the check fails (the round never swaps on an unproven box).
+  [ -n "${STATUS_HOST:-}" ] || { printf 'no-status-host'; return 1; }
   ( assert_caddyfile_hardened ) >/dev/null 2>&1 || { printf 'hardening'; return 1; }
   if [ -n "${AOP_TLS:-}" ]; then
     certless_probe "${STATUS_HOST}" || { printf 'certless'; return 1; }
@@ -1565,14 +1639,43 @@ img_selfcheck() { # the converge self-checks (on-box subset); prints the failing
   return 0
 }
 
-img_hub_tags() { # $1 = repo, $2 = current tag -> the registry tag list (JSON array, <= 3 pages) for the track's major
-  local hubrepo prefix url page body next acc
+img_running() { # $1 = name -> 0 when the container is up (reads the whole list: no early-exit pipe under pipefail)
+  local names
+  names="$(docker ps --format '{{.Names}}' 2>/dev/null)" || return 1
+  printf '%s\n' "$names" | grep -xF -- "$1" >/dev/null
+}
+
+img_running_digest_is() { # $1 = name, $2 = repo, $3 = digest -> 0 when the RUNNING container's image carries repo@digest
+  local id ds
+  id="$(docker inspect --format '{{.Image}}' "$1" 2>/dev/null)" || return 1
+  [ -n "$id" ] || return 1
+  ds="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$id" 2>/dev/null)" || return 1
+  printf '%s\n' "$ds" | grep -xF -- "$2@$3" >/dev/null
+}
+
+img_verify() { # $1 = name, $2 = repo by-digest ref -> prints the failing class; 0 when that exact digest runs and every self-check passes (computed now, never cached)
+  local repo dig
+  read -r repo _ dig <<<"$(img_split_ref "$2")"
+  img_running "$1" || { printf 'not-running'; return 1; }
+  img_running_digest_is "$1" "$repo" "$dig" || { printf 'digest'; return 1; }
+  img_selfcheck
+}
+
+img_hub_rows() { # stdin = tag list JSON -> "name digest pushed" lines (whitespace folded)
+  jq -r '.[] | [.name, .digest, .pushed] | map(tostring | gsub("[[:space:]]"; "_")) | join(" ")'
+}
+
+img_hub_tags() { # $1 = repo, $2 = current tag -> the COMPLETE tag list (JSON array) for the track's major; 1 on any page error or at the page cap (never a partial list)
+  local hubrepo prefix url page=0 body next acc
   case "$1" in */*) hubrepo="$1" ;; *) hubrepo="library/$1" ;; esac
   prefix="$(printf '%s' "$2" | sed -n 's/^\(v\{0,1\}[0-9]\{1,\}\.\).*/\1/p')"
   [ -n "$prefix" ] || return 1
+  # name= is filtered server-side (the major prefix), so the pages stay few.
   url="https://hub.docker.com/v2/repositories/${hubrepo}/tags?page_size=100&name=${prefix}"
   acc='[]'
-  for page in 1 2 3; do
+  while :; do
+    page=$((page + 1))
+    [ "$page" -le 20 ] || return 1
     body="$(curl -fsS --proto '=https' --max-time 30 "$url")" || return 1
     acc="$(jq -c --argjson acc "$acc" '$acc + [.results[] | {name: (.name | tostring), digest: (.digest | tostring), pushed: (.tag_last_pushed | tostring)}]' <<<"$body")" || return 1
     next="$(jq -r '.next | tostring' <<<"$body")" || return 1
@@ -1582,14 +1685,13 @@ img_hub_tags() { # $1 = repo, $2 = current tag -> the registry tag list (JSON ar
       *) return 1 ;;
     esac
   done
-  : "$page"
   printf '%s' "$acc"
 }
 
 img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current digest; stdin = tag list -> "tag digest" or nothing
-  local soak cutoff now ptag cur name digest pushed key at best="" best_key="" best_digest=""
+  local soak cutoff now ptag cur name digest pushed key at mat best="" best_key="" best_digest=""
   soak="$(img_soak_hours)" || return 1
-  now="${IMG_NOW:-$(date +%s)}"
+  now="$(img_now)"
   cutoff=$((now - soak * 3600))
   read -r _ ptag _ <<<"$(img_split_ref "$2")"
   cur="$(img_ver_key "$3" "$ptag")" || return 1
@@ -1599,13 +1701,38 @@ img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current dig
     at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
     [ "$at" -le "$cutoff" ] || continue
     img_is_bad "$1" "$digest" && continue
+    # A version that already had a bad digest: a re-pushed digest under it
+    # soaks again, counted from the hold.
+    if mat="$(img_version_mark_at "$1" "$key")" && [ "$mat" -gt "$cutoff" ]; then continue; fi
     if img_ver_gt "$key" "$cur" || { [ "$key" = "$cur" ] && [ "$digest" != "$4" ]; }; then
       if [ -z "$best" ] || img_ver_gt "$key" "$best_key"; then
         best="$name"; best_key="$key"; best_digest="$digest"
       fi
     fi
-  done < <(jq -r '.[] | [.name, .digest, .pushed] | map(tostring | gsub("[[:space:]]"; "_")) | join(" ")')
+  done < <(img_hub_rows)
   [ -z "$best" ] || printf '%s %s' "$best" "$best_digest"
+}
+
+img_behind() { # $1 = name, $2 = pin, $3 = current ref, $4 = this round's outcome class; stdin = tag list -> "behind:<tag> reason:<class>" (0) when the box trails the newest in-track build for longer than soak + one cycle; 1 otherwise
+  local soak now ptag ctag cdig ck name digest pushed key at nk="" ntag="" ndig="" nat=0 line cls
+  soak="$(img_soak_hours)" || return 1
+  now="$(img_now)"
+  read -r _ ptag _ <<<"$(img_split_ref "$2")"
+  read -r _ ctag cdig <<<"$(img_split_ref "$3")"
+  ck="$(img_ver_key "$ctag" "$ptag")" || return 1
+  while read -r name digest pushed; do
+    key="$(img_ver_key "$name" "$ptag")" || continue
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+    at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
+    if [ -z "$nk" ] || img_ver_gt "$key" "$nk"; then nk="$key"; ntag="$name"; ndig="$digest"; nat="$at"; fi
+  done < <(img_hub_rows)
+  [ -n "$nk" ] || return 1
+  img_ver_gt "$ck" "$nk" && return 1
+  [ "$ck" = "$nk" ] && [ "$cdig" = "$ndig" ] && return 1
+  # One cycle = the 6 h timer + its 30 min jitter + 30 min slack.
+  [ $((now - nat)) -gt $(( (soak + 7) * 3600 )) ] || return 1
+  if line="$(img_bad_line "$1" "$ndig")"; then cls="bad-$(printf '%s' "$line" | awk '{print $3}')"; else cls="$4"; fi
+  printf 'behind:%s reason:%s' "$ntag" "$cls"
 }
 
 img_report() { # $1 = name, $2 = true|false, $3 = error text (version/digest prefix/reason class only), $4 = seconds
@@ -1620,15 +1747,21 @@ header = "Authorization: Bearer ${tok}"
 IMG_AUTH_EOF
 }
 
-img_alert_direct() { # $1 = message: the fallback push when Gatus cannot take the status (the same ntfy topic/token Gatus alerts with)
+img_alert_direct() { # $1 = message: the direct ntfy push (Gatus may be what broke); topic AND token ride curl stdin, never argv
   [ -n "${NTFY_TOPIC:-}" ] || return 0
-  if [ -n "${NTFY_TOKEN:-}" ]; then
-    curl -fsS --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" <<IMG_NTFY_EOF || true
-header = "Authorization: Bearer ${NTFY_TOKEN}"
-IMG_NTFY_EOF
-  else
-    curl -fsS --max-time 15 -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" || true
-  fi
+  [[ "$NTFY_TOPIC" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { log "direct alert skipped: the ntfy topic is not a plain name"; return 0; }
+  {
+    printf 'url = "https://ntfy.sh/%s"\n' "$NTFY_TOPIC"
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'header = "Authorization: Bearer %s"\n' "$NTFY_TOKEN"; fi
+  } | curl -fsS --proto '=https' --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" || true
+}
+
+img_finish() { # $1 = name, $2 = true|false, $3 = message (bounded classes, version, 12-hex digest prefix), $4 = t0 -> push; a red result that cannot reach Gatus goes direct
+  local d=$(( $(date +%s) - $4 ))
+  if [ "$2" = "true" ]; then log "$1: green"; else log "$1: $3"; fi
+  img_report "$1" "$2" "$3" "$d" && return 0
+  log "$1: status push failed (Gatus unreachable?)"
+  [ "$2" = "true" ] || img_alert_direct "$1: $3"
 }
 
 img_swap() { # $1 = name, $2 = ref -> recreate the container on that ref with 010's args
@@ -1639,55 +1772,120 @@ img_swap() { # $1 = name, $2 = ref -> recreate the container on that ref with 01
     *) return 1 ;;
   esac
   sleep "${IMG_START_SLEEP:-3}"
-  docker ps --format '{{.Names}}' | grep -qx "$1"
+  img_running "$1"
 }
 
-img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) for one container
-  local t0 cur repo tag cdig tags cand ctag cnew newref reason="" r2="" msg
-  t0="$(date +%s)"
-  cur="$(img_effective_ref "$1" "$2")"
-  read -r repo tag cdig <<<"$(img_split_ref "$cur")"
-  [ -n "$cdig" ] || cdig="$(img_local_digest "$cur" "$repo")"
-  if ! tags="$(img_hub_tags "$repo" "$tag")"; then
-    log "$1: registry tag list unavailable - no push this round (a persistent outage reds the row at the heartbeat)"
+img_ladder() { # $1 = name, $2 = previous ref (exact digest), $3 = provisioned pin ref -> after a failed candidate; prints rolled-back | fell-back-to-pin:<cls> | all-rungs-failed:<cls>/<cls>
+  local r1="" r2=""
+  if img_swap "$1" "$2" && r1="$(img_verify "$1" "$2")"; then printf 'rolled-back'; return 0; fi
+  r1="${r1:-start}"
+  log "$1: restore of the previous digest failed (${r1}) - falling back to the provisioned repo pin" >&2
+  if img_swap "$1" "$3" && r2="$(img_verify "$1" "$3")"; then printf 'fell-back-to-pin:%s' "$r1"; return 0; fi
+  printf 'all-rungs-failed:%s/%s' "$r1" "${r2:-start}"
+  return 1
+}
+
+img_disarmed() { # -> the disarm reason class (0) while the updater is disarmed; cleared only by a provision run
+  local f="${IMG_STATE_DIR}/disarmed" r
+  [ -f "$f" ] || return 1
+  r="$(sed -n 's/^reason=//p' "$f" | head -n 1 | LC_ALL=C tr -cd 'a-z0-9:/-')"
+  printf '%s' "${r:-unknown}"
+}
+
+img_disarm() { # $1 = reason class -> stop updating until the next dispatch
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  printf 'reason=%s\nat=%s\n' "$1" "$(img_now)" >"${IMG_STATE_DIR}/disarmed"
+  chmod 600 "${IMG_STATE_DIR}/disarmed"
+}
+
+img_after_failure() { # $1 = name, $2 = previous ref, $3 = pin ref, $4 = message head, $5 = t0 -> run the ladder and report its outcome
+  local out msg
+  if out="$(img_ladder "$1" "$2" "$3")"; then
+    case "$out" in
+      rolled-back) msg="rolled-back $4" ;;
+      *) rm -f "${IMG_STATE_DIR}/$1.state"; msg="${out%%:*} $4 restore=${out#*:}" ;;
+    esac
+    img_finish "$1" false "$msg" "$5"
     return 0
   fi
-  cand="$(img_pick_candidate "$1" "$2" "$tag" "$cdig" <<<"$tags")" || cand=""
-  if [ -z "$cand" ]; then
-    log "$1: ${tag} (${cdig:7:12}) is the newest soaked build in the track"
-    img_report "$1" true "" "$(( $(date +%s) - t0 ))" || log "$1: status push failed (Gatus unreachable?)"
-    return 0
-  fi
-  read -r ctag cnew <<<"$cand"
-  newref="${repo}:${ctag}@${cnew}"
-  if ! docker pull -q "${repo}@${cnew}" >/dev/null 2>&1; then
-    log "$1: pull of ${ctag} (${cnew:7:12}) failed - retried next round"
-    return 0
-  fi
-  if [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; then
-    img_mark_bad "$1" "$cnew"
-    msg="rejected ver=${ctag} dig=${cnew:7:12} reason=validate"
-    log "$1: ${msg}"
-    img_report "$1" false "$msg" "$(( $(date +%s) - t0 ))" || img_alert_direct "$1: ${msg}"
-    return 0
-  fi
-  log "$1: swapping ${tag} (${cdig:7:12}) -> ${ctag} (${cnew:7:12})"
-  if img_swap "$1" "$newref" && reason="$(img_selfcheck)"; then
-    img_state_put "$1" "$newref"
-    log "$1: now on ${ctag} (${cnew:7:12}); self-checks passed"
-    img_report "$1" true "" "$(( $(date +%s) - t0 ))" || log "$1: status push failed (Gatus unreachable?)"
-    return 0
-  fi
-  reason="${reason:-start}"
-  img_mark_bad "$1" "$cnew"
-  if img_swap "$1" "$cur" && r2="$(img_selfcheck)"; then
-    msg="rolled-back ver=${ctag} dig=${cnew:7:12} reason=${reason}"
-  else
-    msg="restore-failed ver=${tag} after ver=${ctag} dig=${cnew:7:12} reason=${reason}/${r2:-start}"
-  fi
+  # Every rung failed: leave the best-effort container running, alert NOW
+  # (direct ntfy - Gatus may be the thing that broke), disarm the updater.
+  msg="all-rungs-failed $4 restore=${out#*:} disarmed"
+  img_disarm "all-rungs-failed"
+  img_alert_direct "$1: ${msg}"
   log "$1: ${msg}"
-  img_report "$1" false "$msg" "$(( $(date +%s) - t0 ))" || img_alert_direct "$1: ${msg}"
-  return 0
+  img_report "$1" false "$msg" "$(( $(date +%s) - $5 ))" || log "$1: status push failed (Gatus unreachable?)"
+}
+
+img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) for one container; every report is derived from live checks run now
+  local t0 pin cur repo tag cdig tags cand ctag cnew ckey newref r outcome="none" msg
+  t0="$(date +%s)"
+  if ! pin="$(img_pin_get "$1")" || [ "${pin%%@*}" != "$2" ]; then
+    img_finish "$1" false "no-pin-record" "$t0"
+    return 0
+  fi
+  cur="$(img_effective_ref "$1" "$pin")"
+  read -r repo tag cdig <<<"$(img_split_ref "$cur")"
+  if r="$(img_disarmed)"; then
+    img_finish "$1" false "disarmed:${r}" "$t0"
+    return 0
+  fi
+  # Live health of what runs NOW first: an unhealthy box never swaps (a
+  # candidate would be blamed for the box) and never reports green.
+  if ! r="$(img_verify "$1" "$cur")"; then
+    img_finish "$1" false "unhealthy:${r} ver=${tag} dig=${cdig:7:12}" "$t0"
+    return 0
+  fi
+  if [ -n "${IMG_DRILL:-}" ] && [ "${IMG_DRILL}" = "$1" ]; then
+    # Manual drill (root on the box, docs/updaters.md): re-create the
+    # current digest as the "candidate", fail it on purpose, walk the ladder.
+    log "$1: DRILL - candidate-scoped fault on ${tag} (${cdig:7:12}); expecting a clean rollback"
+    img_swap "$1" "$cur" || true
+    img_after_failure "$1" "$cur" "$pin" "drill ver=${tag} dig=${cdig:7:12} reason=drill" "$t0"
+    return 0
+  fi
+  if ! tags="$(img_hub_tags "$repo" "$tag")"; then
+    img_finish "$1" false "registry-listing-incomplete" "$t0"
+    return 0
+  fi
+  cand="$(img_pick_candidate "$1" "$pin" "$tag" "$cdig" <<<"$tags")" || cand=""
+  if [ -n "$cand" ]; then
+    read -r ctag cnew <<<"$cand"
+    ckey="$(img_ver_key "$ctag" "${tag}")" || ckey="0.0.0"
+    newref="${repo}:${ctag}@${cnew}"
+    if ! docker pull -q "${repo}@${cnew}" >/dev/null 2>&1; then
+      log "$1: pull of ${ctag} (${cnew:7:12}) failed - retried next round"
+      outcome="pull"
+    elif [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; then
+      if img_caddy_validate "$cur" "${CADDY_CONFIG}" >/dev/null 2>&1; then
+        img_mark_bad "$1" "$cnew" "$ckey" "validate"
+        img_finish "$1" false "rejected ver=${ctag} dig=${cnew:7:12} reason=validate" "$t0"
+      else
+        img_finish "$1" false "validate-config ver=${ctag} dig=${cnew:7:12} (the running build rejects the live Caddyfile too; nothing held)" "$t0"
+      fi
+      return 0
+    else
+      log "$1: swapping ${tag} (${cdig:7:12}) -> ${ctag} (${cnew:7:12})"
+      r=""
+      if img_swap "$1" "$newref" && r="$(img_verify "$1" "$newref")"; then
+        img_state_put "$1" "$newref"
+        log "$1: now on ${ctag} (${cnew:7:12}); self-checks passed"
+        cur="$newref"
+        outcome="updated"
+      else
+        r="${r:-start}"
+        img_mark_bad "$1" "$cnew" "$ckey" "$r"
+        img_after_failure "$1" "$cur" "$pin" "ver=${ctag} dig=${cnew:7:12} reason=${r}" "$t0"
+        return 0
+      fi
+    fi
+  fi
+  if msg="$(img_behind "$1" "$pin" "$cur" "$outcome" <<<"$tags")"; then
+    img_finish "$1" false "$msg" "$t0"
+  else
+    img_finish "$1" true "" "$t0"
+  fi
 }
 
 img_updater_main() { # the on-box entry point (the rendered script calls only this)
@@ -1716,9 +1914,12 @@ IMG_UPDATER_HEAD_EOF
     printf '%s=%q\n' "$v" "${!v-}"
   done
   for fn in log warn die adv_ok probe_tang_direct assert_caddyfile_hardened img_gatus_key \
-    img_updater_mode img_soak_hours img_split_ref img_ver_key img_ver_gt img_state_get img_state_put img_is_bad \
-    img_mark_bad img_effective_ref img_local_digest img_caddy_mount_args img_caddy_validate img_run_caddy img_run_gatus \
-    certless_probe edge_pull_200 img_selfcheck img_hub_tags img_pick_candidate img_report img_alert_direct img_swap \
+    img_updater_mode img_soak_hours img_split_ref img_ver_key img_ver_gt img_now img_ref_write img_ref_read \
+    img_state_get img_state_put img_pin_get img_bad_line img_is_bad img_version_mark_at img_mark_bad \
+    img_effective_ref img_caddy_mount_args img_caddy_validate img_run_caddy img_run_gatus \
+    certless_probe edge_pull_200 img_try img_probe_tang_direct img_probe_caddy80 img_probe_gatus img_selfcheck \
+    img_running img_running_digest_is img_verify img_hub_rows img_hub_tags img_pick_candidate img_behind img_report \
+    img_alert_direct img_finish img_swap img_ladder img_disarmed img_disarm img_after_failure \
     img_update_one img_updater_main; do
     declare -f "$fn" || return 1
   done
@@ -1792,14 +1993,16 @@ img_updater_install() { # render + install the updater, its 0600 env file and un
   render_img_updater_timer >"$IMG_TIMER.tmp.$$"
   chmod 0644 "$IMG_TIMER.tmp.$$"
   mv "$IMG_TIMER.tmp.$$" "$IMG_TIMER"
+  # A dispatch re-arms an updater that disarmed itself (every rung failed).
+  rm -f "${IMG_STATE_DIR}/disarmed"
   systemctl daemon-reload
   systemctl enable piercloud-img-update.timer >/dev/null
   systemctl restart piercloud-img-update.timer
   log "container updater installed (6 h timer + jitter, soak ${IMG_SOAK:-6}h, track = the repo pin's major; env file 0600)"
 }
 
-img_updater_disable() { # IMG_AUTO_UPDATES=off: remove the updater + the current records (bad-digest holds are kept)
-  rm -f "${IMG_STATE_DIR}/caddy.state" "${IMG_STATE_DIR}/gatus.state"
+img_updater_disable() { # IMG_AUTO_UPDATES=off: remove the updater + the current records (bad-digest holds and the by-digest pin records are kept)
+  rm -f "${IMG_STATE_DIR}/caddy.state" "${IMG_STATE_DIR}/gatus.state" "${IMG_STATE_DIR}/disarmed"
   if [ ! -e "$IMG_SERVICE" ] && [ ! -e "$IMG_TIMER" ] && [ ! -e "$IMG_SBIN" ] && [ ! -e "$IMG_ENV_FILE" ]; then
     return 0
   fi
@@ -3656,9 +3859,14 @@ log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
 # A-IMG precedence (#51): hold the updater lock for the rest of the run, then
 # run max(repo pin, updater record) inside the pin's track.
 img_lock_acquire
-img_reconcile_state gatus "${GATUS_IMAGE}"
-GATUS_RUN_IMAGE="$(img_effective_ref gatus "${GATUS_IMAGE}")"
-[ "${GATUS_RUN_IMAGE}" = "${GATUS_IMAGE}" ] \
+# No tag-only runs (#51 F4): the repo pin is resolved to a registry digest
+# once per pin tag and recorded; every path (no record, off, reconcile) runs
+# that digest.
+GATUS_PIN_REF="$(img_pin_resolve gatus "${GATUS_IMAGE}")" \
+  || die "could not resolve the Gatus repo pin ${GATUS_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only image"
+img_reconcile_state gatus "${GATUS_PIN_REF}"
+GATUS_RUN_IMAGE="$(img_effective_ref gatus "${GATUS_PIN_REF}")"
+[ "${GATUS_RUN_IMAGE}" = "${GATUS_PIN_REF}" ] \
   || log "Gatus: the updater moved to ${GATUS_RUN_IMAGE%%@*} (digest ${GATUS_RUN_IMAGE##*@sha256:}) - at or above the repo pin ${GATUS_IMAGE} in the same track, kept (no downgrade)"
 # Stale-mount guard: the container bind-mounts the config directory (D8:
 # /config), so the container's /config/config.yaml is compared through its
@@ -3867,9 +4075,11 @@ fi
 TMP_CADDY="${CADDY_CONFIG}.new"
 # A-IMG precedence (#51): validate and run on max(repo pin, updater record)
 # inside the pin's track (the lock is held since section d).
-img_reconcile_state caddy "${CADDY_IMAGE}"
-CADDY_RUN_IMAGE="$(img_effective_ref caddy "${CADDY_IMAGE}")"
-[ "${CADDY_RUN_IMAGE}" = "${CADDY_IMAGE}" ] \
+CADDY_PIN_REF="$(img_pin_resolve caddy "${CADDY_IMAGE}")" \
+  || die "could not resolve the Caddy repo pin ${CADDY_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only image"
+img_reconcile_state caddy "${CADDY_PIN_REF}"
+CADDY_RUN_IMAGE="$(img_effective_ref caddy "${CADDY_PIN_REF}")"
+[ "${CADDY_RUN_IMAGE}" = "${CADDY_PIN_REF}" ] \
   || log "Caddy: the updater moved to ${CADDY_RUN_IMAGE%%@*} (digest ${CADDY_RUN_IMAGE##*@sha256:}) - at or above the repo pin ${CADDY_IMAGE} in the same track, kept (no downgrade)"
 # Pre-create root-only BEFORE the render. The rendered Caddyfile carries no
 # credential since #202, but it still names the main-box address, so neither a
