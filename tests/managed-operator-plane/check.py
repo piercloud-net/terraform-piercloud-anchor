@@ -162,7 +162,7 @@ OPERATOR_ONLY = {"ci.yml", "external-watch.yml"}
 # Every `uses:` value per workflow file, exactly. A composite action reads the
 # calling job's `vars`, and this pin does not scan action files, so any other
 # value fails closed. Tenant-reachable files use SHA-pinned actions only; the
-# owner's release actions are allowed (pinned to a commit SHA, `# v1`) only in the release workflows
+# owner's release actions are allowed (pinned to a commit SHA, `# v1.2.7`) only in the release workflows
 # (which no managed run can select). An unlisted file may use nothing.
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 UPLOAD = "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"

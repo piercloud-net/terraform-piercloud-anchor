@@ -13,4 +13,4 @@ jobs:
   validate-release-pr:
     runs-on: ubuntu-latest
     steps:
-      - uses: cad0p/semver-calver-release/validate-release-pr@b57af46335825afcbf8173a9fa0a32dbee8d1a01 # v1
+      - uses: cad0p/semver-calver-release/validate-release-pr@b57af46335825afcbf8173a9fa0a32dbee8d1a01 # v1.2.7

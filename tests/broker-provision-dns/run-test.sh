@@ -536,7 +536,7 @@ is "exactly one write_anchor_dns token in the job" "1" "$(printf '%s\n' "$JOB_LI
 # checkout identity (`repository:`/`ref:` under `with:` would source an
 # attacker's broker-dns.sh), a job-env injection (LD_PRELOAD), or any other
 # added/edited line in the job. Any deliberate job edit updates this pin.
-is "anchor-dns job blob hash (pin: update after a deliberate edit)" "7e0b5d0df4ac0a12da01b080560382781bd87c7f31c53b1ac13bde29e021378b" "$(printf '%s\n' "$JOB_RAW" | sha256sum | cut -d' ' -f1)"
+is "anchor-dns job blob hash (pin: update after a deliberate edit)" "910074294b60eae6493323236ecf3560f6c31f460044b27b59ae7643f67cbdcf" "$(printf '%s\n' "$JOB_RAW" | sha256sum | cut -d' ' -f1)"
 for v in LD_PRELOAD LD_LIBRARY_PATH; do
   lacks_word "job does not set $v" "$v" "$JOB"
 done
@@ -650,7 +650,7 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # see an inserted step in the same job that rewrites a harness on the runner
 # before the pinned run step executes it (the static harnesses read the PR
 # tree, not the runner workspace). Any deliberate job edit updates this pin.
-is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "e416edef96aa28bc11ec25ce2ad7f516e099a063b0e92a17b7ec4bb4d1ebb27b" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "07e6e0516cd43df19d71b078245be00ce93076e768e75a1e78159e8bf585349d" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -663,7 +663,7 @@ SCP_END="$(awk -F'\t' -v s="$SCP_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*
 is "exactly one scp-endpoint-allowlist job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"scp-endpoint-allowlist\"|'scp-endpoint-allowlist'|scp-endpoint-allowlist)[[:space:]]*:?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$" "$CI")"
 if [ -n "$SCP_START" ] && [ -n "$SCP_END" ]; then
   SCP_JOB_BLOB="$(sed -n "$((SCP_START + 1)),$((SCP_END - 1))p" "$CI")"
-  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "f7d98c0ac8deb7e8ddfc407ee0129492c2858e9d286c7942a41779fce5727827" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "4a01a456ada849c7e507a69e155ac65ce7bc06cdd88b640c14a7c76be01b9799" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "scp-endpoint-allowlist job span not found in ci.yml"
 fi

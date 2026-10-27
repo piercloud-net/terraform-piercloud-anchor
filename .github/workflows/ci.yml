@@ -17,8 +17,8 @@ jobs:
     name: tofu fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
-      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # tag: v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version_file: .opentofu-version
       - name: tofu fmt -check -recursive
@@ -28,8 +28,8 @@ jobs:
     name: tofu validate (cred-free)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
-      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # tag: v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version_file: .opentofu-version
       - name: tofu init -backend=false
@@ -46,7 +46,7 @@ jobs:
     name: key-material grep (from main)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch origin/main (patterns source of truth; files scanned stay on this PR tree)
         run: |
           set -euo pipefail
@@ -199,7 +199,7 @@ jobs:
     name: SCP endpoint allowlist grep (from main)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch origin/main (patterns source of truth; files scanned stay on this PR tree)
         run: |
           set -euo pipefail
@@ -381,7 +381,7 @@ jobs:
     name: secret-print grep (C-A, from main)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch origin/main (patterns source of truth; files scanned stay on this PR tree)
         run: |
           set -euo pipefail
@@ -530,7 +530,7 @@ jobs:
     name: shared-origin grep (from main)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch origin/main (pattern source of truth; files scanned stay on this PR tree)
         run: |
           set -euo pipefail
@@ -615,7 +615,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Gate on changed paths (CI scripts or harnesses)
@@ -734,7 +734,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Gate on changed paths (provisioning surface or harness)
         id: gate
         run: |
@@ -776,7 +776,7 @@ jobs:
     name: jq boolean-read guard (false != empty)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Boolean fields must not be read with jq's `// empty`
         run: |
           set -euo pipefail
@@ -799,6 +799,6 @@ jobs:
     name: scrub-canary (redactor proof)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run the scrub canaries (cred-free, no live values, no cloud)
         run: bash tests/scrub-canary/run-scrub-canary.sh
