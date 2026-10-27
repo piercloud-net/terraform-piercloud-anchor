@@ -332,7 +332,7 @@ jobs:
           # themselves are out of scope for v0.2.
           printf 'head_sha=%s head_short=%s alias=%s\n' "$HEAD_SHA" "$HEAD_SHORT" "$TENANT_USER" > head-sha.txt
       - name: Upload head-SHA artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: head-sha-${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
           path: head-sha.txt
@@ -1370,7 +1370,7 @@ jobs:
         # always(): the CSR is most needed when a LATER step fails (the run
         # already wrote it before the probes). apply-only, like the A1 window.
         if: always() && inputs.mode == 'apply'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: origin-ca-csr-${{ inputs.tenant != '' && inputs.tenant || vars.TENANT_USER }}
           path: origin-ca.csr
@@ -1802,7 +1802,7 @@ jobs:
           echo "bind_url=${BIND_SCHEME}://${ANCHOR_FQDN}" >> thumbprint.txt
           echo "clevis luks bind -d /dev/sda3 tang '{\"url\":\"${BIND_SCHEME}://${ANCHOR_FQDN}\"}'" >> thumbprint.txt
       - name: Upload thumbprint artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thumbprint-${{ needs.device-flow.outputs.tenant_user }}
           path: thumbprint.txt
