@@ -39,6 +39,7 @@ printf 'ID=debian\nVERSION_CODENAME=trixie\n' >"$WORK/os-release"
   source <(sed -n "$((b + 1)),$((e - 1))p" "$P")
   OS_UPD_OS_RELEASE="$WORK/os-release" os_updates_render_tree "$WORK/tree" )
 tar -C "$WORK/tree" -cf "$WORK/tree.tar" .
+cp "$ROOT/tools/vm-timetravel/base-image.sh" "$WORK/base-image.sh" # ci-allowlist: helper file name, not an image reference.
 
 # 2. the in-container driver
 cat >"$WORK/inner.sh" <<'INNER'
@@ -51,9 +52,8 @@ apt-get update -qq >/dev/null
 if [ "$ARCH" = arm64 ]; then pk="qemu-system-arm qemu-efi-aarch64"; else pk="qemu-system-x86"; fi
 # shellcheck disable=SC2086
 apt-get install -y -qq --no-install-recommends $pk qemu-utils dosfstools mtools openssh-client curl ca-certificates >/dev/null
-BASE="/cache/debian-13-genericcloud-$ARCH.qcow2"
-URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-$ARCH.qcow2" # ci-allowlist: Debian cloud qcow2 URL for the manual VM proof, not an SCP reference
-[ -s "$BASE" ] || curl -fsSL -o "$BASE" "$URL"
+source /w/base-image.sh # ci-allowlist: helper file name, not an image reference.
+BASE="$(vmtt_stage_base "$ARCH" /cache /w/base.qcow2 2>/w/base.err)" || { cat /w/base.err | tee -a /w/summary.log; say "FAIL: base qcow2 refused, VM not booted"; exit 1; }
 qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" /w/vm.qcow2 8G
 ssh-keygen -q -t ed25519 -N '' -f /w/key
 printf 'instance-id: vmtt-1\nlocal-hostname: vmtt\n' >/w/meta-data
