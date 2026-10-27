@@ -209,7 +209,7 @@ for case in mv chmod; do
   rm -rf "$C"
 done
 
-# (n) an interrupt mid-download removes the temp file, even when the caller runs
+# (n) SIGINT/SIGTERM/SIGHUP mid-download remove the temp file, even when the caller runs
 # the helper inside $(...) (where a caller's EXIT trap cannot see a variable
 # set by the helper): the download subshell owns its own traps
 mkdir -p "$TMP/bini"
@@ -222,7 +222,7 @@ kill -"$SIG" "$PPID"
 sleep 5
 STUB
 chmod +x "$TMP/bini/curl"
-for sig in INT TERM; do
+for sig in INT TERM HUP; do
   C="$TMP/cache-n-$sig"; mkdir -p "$C"
   rc=0
   (

@@ -18,7 +18,7 @@
 # (sha256sum of the file matches), and only then copy the per-arch lines.
 # Record both hostnames, the sha256 of SHA512SUMS and the exact lines in the
 # commit message. LIMIT: both names are served by the same Debian mirror
-# network today (same addresses, same redirect target), so the two fetches
+# network today (both names resolve to the same addresses), so the two fetches
 # are NOT independent: the check catches a truncated or transient bad
 # response, not a substituted mirror or CDN, and not a compromise of Debian
 # itself. A fetch from an independent vantage (another network, or the
@@ -60,9 +60,11 @@ vmtt_base_image() { # $1 arch, $2 cache dir -> prints the verified cached path, 
   fi
   tmp="$(mktemp "${cache}/.${name}.XXXXXX")" || return 1
   # The download runs in its own subshell with its own EXIT trap, so the temp
-  # file is removed on every exit path, SIGINT/SIGTERM included, whatever the
+  # file is removed on a failure, SIGINT, SIGTERM or SIGHUP, whatever the
   # caller does with traps (callers invoke this helper inside $(...), where a
-  # caller's EXIT trap never sees a variable set here). After the mv the temp
+  # caller's EXIT trap never sees a variable set here). SIGKILL runs no trap
+  # and leaves the .XXXXXX temp behind; it is never used as a cached image
+  # (the cache name differs) and can be removed by hand. After the mv the temp
   # name no longer exists, so the EXIT trap is a no-op on success.
   (
     trap 'rm -f -- "$tmp"' EXIT
@@ -83,8 +85,7 @@ vmtt_base_image() { # $1 arch, $2 cache dir -> prints the verified cached path, 
       exit 1
     fi
   ) || return 1
-  printf '%s
-' "$path"
+  printf '%s\n' "$path"
 }
 
 vmtt_stage_base() { # $1 arch, $2 cache dir, $3 destination -> prints $3, a verified private copy the caller boots from
