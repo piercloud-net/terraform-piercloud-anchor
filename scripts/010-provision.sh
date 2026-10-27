@@ -1250,12 +1250,14 @@ render_os_updates_service_dropin() { # ExecStopPost runs after success AND failu
 }
 
 render_os_updates_reboot_timer() { # $1 = HH:MM UTC
-  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)." "[Unit]" "Description=piercloud OS reboot window (${1} UTC)" \
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)."
+  printf '%s\n' "[Unit]" "Description=piercloud OS reboot window (${1} UTC)" \
     "[Timer]" "OnCalendar=*-*-* ${1}:00 UTC" "AccuracySec=1min" "Persistent=false" "[Install]" "WantedBy=timers.target"
 }
 
 render_os_updates_reboot_service() {
-  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)." "[Unit]" "Description=piercloud OS reboot for a pending update (gated)" \
+  printf '%s\n' "# DISPATCH-MANAGED by scripts/010-provision.sh (#51)."
+  printf '%s\n' "[Unit]" "Description=piercloud OS reboot for a pending update (gated)" \
     "[Service]" "Type=oneshot" "ExecCondition=${OS_UPD_GATE}" "ExecStart=${OS_UPD_SYSTEMCTL_BIN} reboot"
 }
 
