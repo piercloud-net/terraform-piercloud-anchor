@@ -1,10 +1,3 @@
-variable "customer_number" {
-  description = "netcup customer number (SCP). Can also be supplied via the NETCUP_CUSTOMER_NUMBER environment variable instead. Sensitive: redacted from plan/apply output."
-  type        = string
-  default     = null
-  sensitive   = true
-}
-
 variable "scp_user_id" {
   description = "Numeric id of the SCP user that will own the firewall policy. Find it in the netcup SCP under Account > Users, or via `data.netcup_scp_user`. Required for the module to manage the firewall policy; leave null to skip firewall provisioning (guided by the `next_step` output). Sensitive: redacted from plan/apply output."
   type        = number
