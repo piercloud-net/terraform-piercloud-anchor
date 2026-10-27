@@ -32,20 +32,6 @@
       "datasourceTemplate": "github-releases",
       "versioningTemplate": "semver-coerced",
       "extractVersionTemplate": "^v?(?<version>\\d+\\.\\d+\\.\\d+)$"
-    },
-    {
-      "customType": "regex",
-      "description": "OpenTofu CLI version pinned in provision.yml (setup-opentofu tofu_version input)",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/provision\\.yml$/"
-      ],
-      "matchStrings": [
-        "tofu_version: \"v(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
-      ],
-      "depNameTemplate": "opentofu/opentofu",
-      "datasourceTemplate": "github-releases",
-      "versioningTemplate": "semver-coerced",
-      "extractVersionTemplate": "^v?(?<version>\\d+\\.\\d+\\.\\d+)$"
     }
   ],
   "lockFileMaintenance": {
