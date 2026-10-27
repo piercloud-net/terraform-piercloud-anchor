@@ -28,7 +28,16 @@
 #   pin         the repo pin runs by a recorded digest (never tag-only);
 #   validate    a candidate the live Caddyfile rejects never runs (and a
 #               Caddyfile the running build rejects too holds nothing);
-#   drill       IMG_DRILL=<name> (root on the box) yields a clean rollback;
+#   drill       IMG_DRILL=<caddy|gatus> (root, under the updater lock) fails a
+#               real candidate with a drill-only fault and walks the ladder
+#               (each rung logged), holds nothing, and is refused while the
+#               lock is held or for a non-root caller;
+#   caddy80     a Caddy candidate that breaks tang on :80 after the swap is
+#               rolled back and :80 serves tang again;
+#   retry       one transient candidate failure (self-check or validate) is
+#               re-checked once and holds nothing; a repeat holds;
+#   ephemeral   validate mounts a fresh stand-in origin pair, never the live key;
+#   green       a green push carries running:<tag>@sha256:<12 hex>;
 #   token       the push token reaches curl on stdin only, never argv/output;
 #   off         IMG_AUTO_UPDATES=off renders no rows and removes the updater;
 #   install     modes (0700 state, 0600 env/token), the 6 h jittered timer.
@@ -139,6 +148,18 @@ case "$1" in
   run)
     case " $* " in
       *" --rm "*) printf '%s\n' "$*" >>"$STUB/validate.log"
+        prev=""
+        for a in "$@"; do
+          if [ "$prev" = "-v" ]; then
+            src="${a%%:*}"; dst="${a#*:}"; dst="${dst%%:*}"
+            case "$dst" in */origin.crt|*/origin.key)
+              if [ -s "$src" ] && { openssl pkey -in "$src" -noout 2>/dev/null || openssl x509 -in "$src" -noout 2>/dev/null; }; then st=parses; else st=missing; fi
+              printf '%s <- %s %s file=%s dir=%s\n' "$dst" "$src" "$st" "$(stat -c %a "$src" 2>/dev/null)" "$(stat -c %a "$(dirname "$src")" 2>/dev/null)" >>"$STUB/validate.mounts" ;;
+            esac
+          fi
+          prev="$a"
+        done
+        if listed "$STUB/validate_bad_once" "$*"; then rm -f "$STUB/validate_bad_once"; exit 125; fi
         listed "$STUB/validate_bad" "$*" && exit 1
         exit "$(cat "$STUB/validate_rc" 2>/dev/null || echo 0)" ;;
     esac
@@ -172,7 +193,9 @@ done
 emit() { if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then printf '%s' "$1" >"$out"; elif [ -z "$out" ]; then printf '%s' "$1"; fi; }
 broken() { # $1 container name -> 0 when it runs a digest the case marked broken
   [ -e "$STUB/fail_all" ] && return 0
-  [ -f "$STUB/broken" ] && [ -f "$STUB/running.$1" ] || return 1
+  [ -f "$STUB/running.$1" ] || return 1
+  if [ -s "$STUB/broken_once" ] && grep -qF -- "$(cat "$STUB/broken_once")" "$STUB/running.$1"; then rm -f "$STUB/broken_once"; return 0; fi
+  [ -f "$STUB/broken" ] || return 1
   while IFS= read -r d; do [ -n "$d" ] && grep -qF -- "$d" "$STUB/running.$1" && return 0; done <"$STUB/broken"
   return 1
 }
@@ -197,11 +220,21 @@ case "$url" in
   http://127.0.0.1:8080/api/v1/endpoints/*/external*) printf '%s\n' "$url" >>"$STUB/push.log"; exit "$(cat "$STUB/push_rc" 2>/dev/null || echo 0)" ;;
   http://127.0.0.1:8081/adv) [ -e "$STUB/tang_down" ] && exit 7; emit "$ADV" ;;
   http://127.0.0.1/adv) broken caddy && exit 22; emit "$ADV" ;;
+  https://status.example.test/) emit ok ;;
   https://ntfy.sh/*) printf '%s\n' "$url" >>"$STUB/ntfy.log" ;;
   *) exit 7 ;;
 esac
 [ -z "$wfmt" ] || printf '200'
 exit 0
+EOF
+# id -u: 0 only when the case marks the caller root (deterministic on any runner).
+cat >"$BIN/id" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-u" ] && [ -n "${STUB:-}" ]; then
+  if [ -e "$STUB/root" ]; then echo 0; else echo 1000; fi
+  exit 0
+fi
+exec /usr/bin/id "$@"
 EOF
 for t in systemctl sleep; do
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s $*" >>"${STUB:-/dev/null}/sys.log" 2>/dev/null || true\nexit 0\n' "$t" >"$BIN/$t"
@@ -246,12 +279,12 @@ new_case() { # $1 case label; env: MODE (IMG_AUTO_UPDATES), SOAK -> sets C (case
   printf 'twinproduction/gatus@%s\ncaddy@%s\n' "$GATUS_OLD" "$CADDY_OLD" >"$C/stub/repodigests"
   : >"$C/stub/docker.log"; : >"$C/stub/curl.log"; : >"$C/stub/curl.stdin"; : >"$C/stub/push.log"; : >"$C/stub/ntfy.log"
   (
-    IMG_STATE_DIR="$C/state" IMG_ENV_FILE="$C/etc/env" IMG_TOKEN_FILE="$C/etc/token" \
+    IMG_STATE_DIR="$C/state" IMG_ENV_FILE="$C/etc/env" IMG_TOKEN_FILE="$C/etc/token" IMG_LOCK_FILE="$C/lock" \
     CADDY_CONFIG="$C/etc/Caddyfile" GATUS_CONFIG="$C/etc/gatus/config.yaml" \
     IMG_AUTO_UPDATES="${MODE-}" IMG_UPDATE_SOAK_HOURS="${SOAK-}"
     # shellcheck source=/dev/null
     . "$WORK/lib.sh"
-    STATUS_HOST="${SH-$STATUS_TEST_HOST}" ORIGIN_TLS=0 AOP_TLS=""
+    STATUS_HOST="${SH-$STATUS_TEST_HOST}" ORIGIN_TLS="${OTLS:-0}" AOP_TLS=""
     # The hardening check has its own harness (tests/edge-origin-auth); here a
     # stub stands in so the case controls it (hard_fail in the stub dir).
     assert_caddyfile_hardened() { [ ! -e "$STUB/hard_fail" ]; }
@@ -350,7 +383,7 @@ suite_swap() {
   is "swap: caddy runs 2.11.7-alpine by digest" "caddy:2.11.7-alpine@$CADDY_NEW" "$(cat "$C/stub/running.caddy")"
   has "swap: pulled by digest" "$(cat "$C/stub/docker.log")" "pull -q caddy@$CADDY_NEW"
   has "swap: caddy validate of the LIVE Caddyfile with the candidate" "$(cat "$C/stub/validate.log" 2>/dev/null)" \
-    "run --rm --network none --cap-drop ALL --read-only --tmpfs /config --tmpfs /data -v $C/etc/Caddyfile:/tmp/Caddyfile.new:ro caddy@$CADDY_NEW caddy validate --config /tmp/Caddyfile.new --adapter caddyfile"
+    "run --rm --network none --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /config --tmpfs /data -v $C/etc/Caddyfile:/tmp/Caddyfile.new:ro caddy@$CADDY_NEW caddy validate --config /tmp/Caddyfile.new --adapter caddyfile"
   vline="$(grep -n 'run --rm' "$C/stub/docker.log" | head -n1 | cut -d: -f1)"
   rline="$(grep -n 'run -d --name caddy' "$C/stub/docker.log" | head -n1 | cut -d: -f1)"
   if [ -n "$vline" ] && [ -n "$rline" ] && [ "$vline" -lt "$rline" ]; then ok "swap: validate runs before the caddy recreate"; else bad "swap: validate runs before the caddy recreate"; fi
@@ -364,6 +397,8 @@ suite_swap() {
   has "swap: push key for caddy" "$(cat "$C/stub/push.log")" "/api/v1/endpoints/anchor_caddy-updates/external?success=true"
   has "swap: push key for gatus" "$(cat "$C/stub/push.log")" "/api/v1/endpoints/anchor_gatus-updates/external?success=true"
   is "swap: no alert on success" "" "$(cat "$C/stub/ntfy.log")"
+  has "green: the caddy row carries the running version + short digest" "$(push_of caddy | grep 'success=true')" "&error=running%3A2.11.7-alpine%40sha256%3Aeb4d35b7452d"
+  has "green: the gatus row carries the running version + short digest" "$(push_of gatus | grep 'success=true')" "&error=running%3Av5.37.0%40sha256%3A094eb186e552"
   : >"$C/stub/docker.log"; : >"$C/stub/push.log"
   printf 'twinproduction/gatus@%s\ncaddy@%s\n' "$GATUS_NEW" "$CADDY_NEW" >"$C/stub/repodigests"
   run_updater "$NOW_LATE" || bad "swap rerun: exits 0"
@@ -483,7 +518,7 @@ suite_binding() {
   has "binding: a running digest != candidate fails before the self-checks" "$(push_of caddy)" "error=rolled-back%20ver%3D2.11.7-alpine%20dig%3Deb4d35b7452d%20reason%3Ddigest"
   is "binding: restored to the pin digest" "$CADDY_PIN_REF" "$(cat "$C/stub/running.caddy")"
   has "binding: validate runs the candidate BY DIGEST" "$(cat "$C/stub/validate.log")" " caddy@$CADDY_NEW caddy validate"
-  has "binding: validate is confined (no network, no caps, read-only)" "$(cat "$C/stub/validate.log")" "run --rm --network none --cap-drop ALL --read-only "
+  has "binding: validate is confined (no network, only the exec-required cap, read-only)" "$(cat "$C/stub/validate.log")" "run --rm --network none --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only "
 }
 
 suite_registry() {
@@ -564,17 +599,109 @@ suite_marks() {
 }
 
 suite_drill() {
-  MODE="" SOAK="" new_case drill
-  printf 'ref=caddy:2.11.7-alpine@%s\n' "$CADDY_NEW" >"$C/state/caddy.state"
-  printf 'caddy:2.11.7-alpine@%s\n' "$CADDY_NEW" >"$C/stub/running.caddy"
-  run_updater "$NOW_LATE" IMG_DRILL=caddy || bad "drill: exits 0"
-  has "drill: a candidate-scoped fault yields a clean rollback" "$(push_of caddy)" "error=rolled-back%20drill%20ver%3D2.11.7-alpine%20dig%3Deb4d35b7452d%20reason%3Ddrill"
-  is "drill: the same digest runs afterwards" "caddy:2.11.7-alpine@$CADDY_NEW" "$(cat "$C/stub/running.caddy")"
-  if [ -e "$C/state/caddy.bad" ] || [ -e "$C/state/disarmed" ]; then bad "drill: no hold, no disarm"; else ok "drill: no hold, no disarm"; fi
-  is "drill: caddy recreated twice (fault + restore)" "2" "$(grep -c 'run -d --name caddy' "$C/stub/docker.log")"
+  local n ref ver d12 o rc
+  for n in caddy gatus; do
+    MODE="" SOAK="" new_case "drill_$n"
+    : >"$C/stub/root"
+    if [ "$n" = caddy ]; then
+      ref="caddy:2.11.7-alpine@$CADDY_NEW"; ver="2.11.7-alpine"; d12="${CADDY_NEW:7:12}"
+      printf 'ref=%s\n' "$ref" >"$C/state/caddy.state"
+      printf '%s\n' "$ref" >"$C/stub/running.caddy"
+    else
+      ref="$GATUS_PIN_REF"; ver="v5.36.0"; d12="${GATUS_OLD:7:12}"
+    fi
+    run_updater "$NOW_LATE" IMG_DRILL="$n" || bad "drill $n: exits 0 ($(tail -2 "$C/out.log"))"
+    o="$(cat "$C/out.log")"
+    has "drill $n: rung 0 logged (candidate re-created with the injected fault)" "$o" "$n: DRILL rung 0 - candidate $ver ($d12) re-created with an injected self-check fault"
+    has "drill $n: the candidate really fails its self-check (re-check included)" "$o" "$n: candidate check failed (drill-fault) - one re-check"
+    has "drill $n: rung 0 failure logged" "$o" "$n: DRILL rung 0 - the candidate failed as injected (drill-fault)"
+    has "drill $n: rung 1 logged" "$o" "$n: ladder rung 1 - restoring the previous digest $ver ($d12)"
+    has "drill $n: rung 1 green logged" "$o" "$n: ladder rung 1 green - back on $ver ($d12)"
+    has "drill $n: red push rolled-back, reason drill-fault" "$(push_of "$n")" "error=rolled-back%20drill%20ver%3D${ver}%20dig%3D${d12}%20reason%3Ddrill-fault"
+    is "drill $n: the same (pinned/recorded) digest runs afterwards" "$ref" "$(cat "$C/stub/running.$n")"
+    if [ -s "$C/state/$n.bad" ] || [ -e "$C/state/disarmed" ]; then bad "drill $n: no bad mark, no disarm"; else ok "drill $n: no bad mark, no disarm"; fi
+    is "drill $n: recreated twice (candidate + rung 1)" "2" "$(grep -c "run -d --name $n" "$C/stub/docker.log")"
+    : >"$C/stub/push.log"
+    run_updater "$NOW_LATE" || bad "drill $n rerun: exits 0"
+    has "drill $n: the next round is green again" "$(push_of "$n")" "success=true"
+  done
+  # A live provision run holds the updater lock: the drill refuses, touches nothing.
+  MODE="" SOAK="" new_case drill_locked
+  : >"$C/stub/root"
+  rc=0
+  ( exec 9>>"$C/lock"; flock 9; run_updater "$NOW_LATE" IMG_DRILL=caddy ) || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "drill: refused while a provision run holds the lock"; else bad "drill: refused while a provision run holds the lock"; fi
+  has "drill: the refusal names the lock" "$(cat "$C/out.log")" "is held (a provision run or an update round is live) - drill refused"
+  lacks "drill: nothing recreated under a held lock" "$(cat "$C/stub/docker.log")" "run -d"
+  is "drill: nothing pushed under a held lock" "" "$(cat "$C/stub/push.log")"
+  # Root only, caddy|gatus only.
+  MODE="" SOAK="" new_case drill_nonroot
+  rc=0; run_updater "$NOW_LATE" IMG_DRILL=caddy || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "drill: refused for a non-root caller"; else bad "drill: refused for a non-root caller"; fi
+  lacks "drill: a non-root drill recreates nothing" "$(cat "$C/stub/docker.log")" "run -d"
+  MODE="" SOAK="" new_case drill_name
+  : >"$C/stub/root"
+  rc=0; run_updater "$NOW_LATE" IMG_DRILL=tang || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "drill: an unknown IMG_DRILL name is refused"; else bad "drill: an unknown IMG_DRILL name is refused"; fi
+}
+
+suite_caddy80() {
+  local o
+  # The Caddy CANDIDATE breaks tang on :80 after the swap (tang direct still answers).
+  MODE="" SOAK="" new_case caddy80
+  printf '%s\n' "$CADDY_NEW" >"$C/stub/broken"
+  run_updater "$NOW_LATE" || bad "caddy80: exits 0"
+  o="$(cat "$C/out.log")"
+  has "caddy80: the candidate fails on :80 after the swap (tang direct passed first)" "$o" "caddy: candidate check failed (caddy-80)"
+  has "caddy80: red rolled-back, reason caddy-80" "$(push_of caddy)" "error=rolled-back%20ver%3D2.11.7-alpine%20dig%3Deb4d35b7452d%20reason%3Dcaddy-80"
+  has "caddy80: rung 1 verified green (tang direct + tang via :80) on the previous digest" "$o" "caddy: ladder rung 1 green - back on 2.11.4-alpine (${CADDY_OLD:7:12})"
+  is "caddy80: the previous exact digest runs" "$CADDY_PIN_REF" "$(cat "$C/stub/running.caddy")"
+  has "caddy80: the candidate is held (reason caddy-80)" "$(cat "$C/state/caddy.bad" 2>/dev/null)" "$CADDY_NEW 2.11.7 caddy-80 "
+  is "caddy80: tang answers through Caddy :80 after the rollback" "0" "$(STUB="$C/stub" PATH="$BIN:$PATH" curl -sf --max-time 5 -o /dev/null http://127.0.0.1/adv >/dev/null 2>&1; echo $?)"
   : >"$C/stub/push.log"
-  run_updater "$NOW_LATE" || bad "drill rerun: exits 0"
-  has "drill: the next round is green again" "$(push_of caddy)" "success=true"
+  run_updater "$NOW_LATE" || bad "caddy80 rerun: exits 0"
+  lacks "caddy80: the next round's live check passes on the restored digest" "$(push_of caddy)" "unhealthy"
+  lacks "caddy80: the held candidate is not retried" "$(grep 'run -d --name caddy' "$C/stub/docker.log" | tail -n 1)" "$CADDY_NEW"
+}
+
+suite_retry() {
+  local n d
+  # One transient self-check failure right after the swap: re-checked once, kept, nothing held.
+  for n in caddy gatus; do
+    MODE="" SOAK="" new_case "retry_$n"
+    if [ "$n" = caddy ]; then d="$CADDY_NEW"; else d="$GATUS_NEW"; fi
+    printf '%s\n' "$d" >"$C/stub/broken_once"
+    run_updater "$NOW_LATE" || bad "retry $n: exits 0"
+    if [ -e "$C/stub/broken_once" ]; then bad "retry $n: the first check really failed (flag consumed)"; else ok "retry $n: the first check really failed (flag consumed)"; fi
+    has "retry $n: the re-check is logged" "$(cat "$C/out.log")" "$n: candidate passed its re-check"
+    has "retry $n: the candidate is kept" "$(cat "$C/stub/running.$n")" "$d"
+    if [ -s "$C/state/$n.bad" ]; then bad "retry $n: a single transient failure holds nothing"; else ok "retry $n: a single transient failure holds nothing"; fi
+    has "retry $n: green" "$(push_of "$n")" "success=true"
+  done
+  # One transient validate failure (docker exit 125): re-checked once, swapped, nothing held.
+  MODE="" SOAK="" new_case retry_validate
+  printf '%s\n' "$CADDY_NEW" >"$C/stub/validate_bad_once"
+  run_updater "$NOW_LATE" || bad "retry validate: exits 0"
+  has "retry validate: the re-check is logged" "$(cat "$C/out.log")" "failed validate - one re-check"
+  is "retry validate: the candidate is swapped in" "caddy:2.11.7-alpine@$CADDY_NEW" "$(cat "$C/stub/running.caddy")"
+  if [ -s "$C/state/caddy.bad" ]; then bad "retry validate: a single transient validate failure holds nothing"; else ok "retry validate: a single transient validate failure holds nothing"; fi
+}
+
+suite_ephemeral() {
+  local v m
+  MODE="" SOAK="" OTLS=1 new_case ephemeral
+  run_updater "$NOW_LATE" || bad "ephemeral: exits 0 ($(tail -2 "$C/out.log"))"
+  v="$(cat "$C/stub/validate.log" 2>/dev/null)"
+  m="$(cat "$C/stub/validate.mounts" 2>/dev/null)"
+  has "ephemeral: the candidate was validated with the origin pair mounted" "$v" ":/etc/caddy/origin.key:ro"
+  lacks "ephemeral: validate never mounts the live origin key" "$v" "-v /etc/caddy/origin.key:"
+  lacks "ephemeral: validate never mounts the live origin cert" "$v" "-v /etc/caddy/origin.crt:"
+  has "ephemeral: the stand-in key sits under the state dir, parses, 0600 in a 0700 dir" "$m" "/etc/caddy/origin.key <- $C/state/.validate."
+  has "ephemeral: stand-in key mode" "$(grep 'origin.key <-' <<<"$m")" "parses file=600 dir=700"
+  has "ephemeral: stand-in cert parses" "$(grep 'origin.crt <-' <<<"$m")" " parses "
+  is "ephemeral: the stand-in pair is removed after validate" "0" "$(find "$C/state" -maxdepth 1 -name '.validate.*' | wc -l)"
+  is "ephemeral: the candidate still swaps in" "caddy:2.11.7-alpine@$CADDY_NEW" "$(cat "$C/stub/running.caddy")"
+  has "ephemeral: the caddy RUN (not validate) mounts the live pair" "$(grep 'run -d --name caddy' "$C/stub/docker.log")" "-v /etc/caddy/origin.key:/etc/caddy/origin.key:ro"
 }
 
 suite_validate() {
@@ -585,6 +712,7 @@ suite_validate() {
   lacks "validate: no caddy docker run" "$(cat "$C/stub/docker.log")" "run -d --name caddy"
   has "validate: rejected candidate held as bad (reason validate)" "$(cat "$C/state/caddy.bad" 2>/dev/null)" "$CADDY_NEW 2.11.7 validate "
   has "validate: failure pushed" "$(grep caddy-updates "$C/stub/push.log")" "reason%3Dvalidate"
+  is "validate: a deterministic rejection is held after the second identical rejection (one re-check)" "2" "$(grep -c "caddy@$CADDY_NEW caddy validate" "$C/stub/validate.log")"
 }
 
 suite_token() {
@@ -666,7 +794,7 @@ suite_install() {
   if ( . "$WORK/lib.sh"; unset -f adv_ok; render_img_updater ) >/dev/null 2>&1; then bad "render: a missing reused function fails the render"; else ok "render: a missing reused function fails the render"; fi
 }
 
-SUITES="precedence track soak swap rollback ladder live binding registry freeze marks drill validate token off install"
+SUITES="precedence track soak swap rollback ladder live binding registry freeze marks drill caddy80 retry ephemeral validate token off install"
 if [ -n "$SUITE_ONLY" ]; then
   "suite_$SUITE_ONLY"
   [ "$fail" -eq 0 ]
@@ -737,7 +865,16 @@ mutant "gatus checked before tang" live "  img_try img_probe_tang_direct || { pr
 mutant "status host empty passes silently" live "  [ -n \"\${STATUS_HOST:-}\" ] || { printf 'no-status-host'; return 1; }" "  [ -n \"\${STATUS_HOST:-}\" ] || return 0"
 mutant "running digest not asserted" binding "  img_running_digest_is \"\$1\" \"\$repo\" \"\$dig\" || { printf 'digest'; return 1; }${NL}" ''
 mutant "validate by tag" binding '  [ -z "$dig" ] || ref="${repo}@${dig}"' '  :'
-mutant "validate unconfined" binding 'docker run --rm --network none --cap-drop ALL --read-only' 'docker run --rm'
+mutant "validate unconfined" binding 'docker run --rm --network none --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only' 'docker run --rm'
+mutant "drill fault not honoured" drill "  if [ -n \"\${IMG_DRILL_FAULT:-}\" ] && [ \"\${IMG_DRILL:-}\" = \"\$1\" ]; then printf 'drill-fault'; return 1; fi" '  :'
+mutant "drill ignores a held lock" drill '  flock -n "$IMG_DRILL_LOCK_FD" || die' '  true || die'
+mutant "drill honoured for non-root" drill '  [ "$(id -u)" = "0" ] || die' '  true || die'
+mutant "caddy :80 not probed" caddy80 "  img_try img_probe_caddy80 || { printf 'caddy-80'; return 1; }" '  :'
+mutant "no candidate re-check" retry '  if { img_running "$1" || img_swap "$1" "$2"; } && r="$(img_verify "$1" "$2")"; then' '  if false; then'
+mutant "no validate re-check" retry 'sleep "${IMG_RECHECK_SLEEP:-20}"; ! img_caddy_validate "$newref"' 'sleep "${IMG_RECHECK_SLEEP:-20}"; true || img_caddy_validate "$newref"'
+mutant "validate mounts the live key" ephemeral '  if [ -n "${3:-}" ]; then crt="$3/origin.crt"; key="$3/origin.key"; fi' '  :'
+mutant "stand-in pair left behind" ephemeral '  [ -z "$eph" ] || rm -rf "$eph"' '  :'
+mutant "green carries no version" swap '    img_finish "$1" true "running:${tag}@sha256:${cdig:7:12}" "$t0"' '    img_finish "$1" true "" "$t0"'
 mutant "partial tag list at a page cap" registry '    [ "$page" -le 20 ] || return 1' '    [ "$page" -le 3 ] || break'
 mutant "page error returns a partial list" registry '--max-time 30 "$url")" || return 1' '--max-time 30 "$url")" || break'
 mutant "behind never red" freeze '  [ -n "$nk" ] || return 1' '  return 1'

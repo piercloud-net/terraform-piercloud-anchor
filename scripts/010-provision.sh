@@ -1750,10 +1750,11 @@ img_local_digest() { # $1 = local ref, $2 = repo -> the registry digest docker r
     | sed -n "s#^$2@\(sha256:[0-9a-f]\{64\}\)\$#\1#p" | head -n 1 || true
 }
 
-img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path -> the bind mounts 010's validate AND run share
-  local a="-v $1:$2:ro"
+img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path, $3 = optional host dir with a stand-in origin.crt/origin.key (validate) -> the bind mounts 010's validate AND run share
+  local a="-v $1:$2:ro" crt="${CADDY_ORIGIN_CRT}" key="${CADDY_ORIGIN_KEY}"
+  if [ -n "${3:-}" ]; then crt="$3/origin.crt"; key="$3/origin.key"; fi
   if [ "${ORIGIN_TLS:-0}" = "1" ]; then
-    a="${a} -v ${CADDY_ORIGIN_CRT}:${CADDY_ORIGIN_CRT}:ro -v ${CADDY_ORIGIN_KEY}:${CADDY_ORIGIN_KEY}:ro"
+    a="${a} -v ${crt}:${CADDY_ORIGIN_CRT}:ro -v ${key}:${CADDY_ORIGIN_KEY}:ro"
   fi
   if [ -n "${AOP_TLS:-}" ]; then
     a="${a} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
@@ -1761,15 +1762,40 @@ img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path -> th
   printf '%s' "$a"
 }
 
-img_caddy_validate() { # $1 = container ref (validated BY DIGEST, repo@sha256, when it carries one), $2 = Caddyfile -> 010's pre-install validate, confined
-  local args ref="$1" repo dig
+img_caddy_validate() { # $1 = container ref (validated BY DIGEST, repo@sha256, when it carries one), $2 = Caddyfile -> 010's pre-install validate, confined, never shown the live origin key
+  local args ref="$1" repo dig eph="" rc=0
   read -r repo _ dig <<<"$(img_split_ref "$1")"
   [ -z "$dig" ] || ref="${repo}@${dig}"
-  args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new)"
+  if [ "${ORIGIN_TLS:-0}" = "1" ]; then
+    # The validated build never sees the live origin pair: `caddy validate`
+    # only loads the files at the Caddyfile's paths and pairs key with cert
+    # (no chain, name or expiry check), so every validate gets a fresh
+    # self-signed P-256 pair at the SAME in-container paths, minted in a 0700
+    # dir under the state dir (not /tmp: the updater runs with PrivateTmp,
+    # which dockerd cannot see) and removed right after. The trust-pool CA
+    # is public and mounts as is.
+    mkdir -p "$IMG_STATE_DIR" && chmod 700 "$IMG_STATE_DIR" || return 1
+    eph="$(mktemp -d "${IMG_STATE_DIR}/.validate.XXXXXX")" || return 1
+    chmod 700 "$eph"
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj "/CN=img-validate.invalid" \
+        -keyout "$eph/origin.key" -out "$eph/origin.crt" >/dev/null 2>&1; then
+      rm -rf "$eph"
+      printf 'img_caddy_validate: could not mint the ephemeral validate pair (openssl)\n' >&2
+      return 1
+    fi
+  fi
+  args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new "$eph")"
   # No network, no capabilities, read-only root (scratch /config + /data):
   # an unproven build sees the mounted files but cannot ship them anywhere.
+  # NET_BIND_SERVICE is the ONE capability kept: the image's /usr/bin/caddy
+  # carries the file capability cap_net_bind_service=ep, and execve refuses
+  # (EPERM, "exec /usr/bin/caddy: operation not permitted") a binary whose
+  # file capabilities the bounding set cannot grant. With --network none it
+  # binds nothing reachable.
   # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
-  docker run --rm --network none --cap-drop ALL --read-only --tmpfs /config --tmpfs /data $args "$ref" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
+  docker run --rm --network none --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /config --tmpfs /data $args "$ref" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || rc=$?
+  [ -z "$eph" ] || rm -rf "$eph"
+  return "$rc"
 }
 
 img_run_caddy() { # $1 = container ref -> create the caddy container (the ONE docker run 010 and the updater share)
@@ -1885,7 +1911,12 @@ img_verify() { # $1 = name, $2 = repo by-digest ref -> prints the failing class;
   read -r repo _ dig <<<"$(img_split_ref "$2")"
   img_running "$1" || { printf 'not-running'; return 1; }
   img_running_digest_is "$1" "$repo" "$dig" || { printf 'digest'; return 1; }
-  img_selfcheck
+  img_selfcheck || return 1
+  # Drill-only fault (docs/updaters.md "Drill"): honoured only inside a root
+  # IMG_DRILL round for this very container, and only AFTER the real checks
+  # passed, so the drilled candidate is still verified for real.
+  if [ -n "${IMG_DRILL_FAULT:-}" ] && [ "${IMG_DRILL:-}" = "$1" ]; then printf 'drill-fault'; return 1; fi
+  return 0
 }
 
 img_hub_rows() { # stdin = tag list JSON -> "name digest pushed" lines (whitespace folded)
@@ -1962,7 +1993,7 @@ img_behind() { # $1 = name, $2 = pin, $3 = current ref, $4 = this round's outcom
   printf 'behind:%s reason:%s' "$ntag" "$cls"
 }
 
-img_report() { # $1 = name, $2 = true|false, $3 = error text (version/digest prefix/reason class only), $4 = seconds
+img_report() { # $1 = name, $2 = true|false, $3 = message (green: running:<tag>@sha256:<12 hex>; red: version/digest prefix/reason class only), $4 = seconds
   local key tok q
   key="$(img_gatus_key "$1 updates")"
   tok="$(cat "$IMG_TOKEN_FILE" 2>/dev/null || true)"
@@ -1991,7 +2022,7 @@ IMG_NTFY_EOF
 
 img_finish() { # $1 = name, $2 = true|false, $3 = message (bounded classes, version, 12-hex digest prefix), $4 = t0 -> push; a red result that cannot reach Gatus goes direct
   local d=$(( $(date +%s) - $4 ))
-  if [ "$2" = "true" ]; then log "$1: green"; else log "$1: $3"; fi
+  if [ "$2" = "true" ]; then log "$1: green ${3}"; else log "$1: $3"; fi
   img_report "$1" "$2" "$3" "$d" && return 0
   log "$1: status push failed (Gatus unreachable?)"
   [ "$2" = "true" ] || img_alert_direct "$1: $3"
@@ -2008,12 +2039,29 @@ img_swap() { # $1 = name, $2 = ref -> recreate the container on that ref with 01
   img_running "$1"
 }
 
+img_candidate() { # $1 = name, $2 = candidate ref -> swap to it and verify it; ONE re-check after a pause before it counts (a transient never holds a digest); prints the failing class
+  local r=""
+  if img_swap "$1" "$2" && r="$(img_verify "$1" "$2")"; then return 0; fi
+  log "$1: candidate check failed (${r:-start}) - one re-check in ${IMG_RECHECK_SLEEP:-20}s before it counts" >&2
+  sleep "${IMG_RECHECK_SLEEP:-20}"
+  r=""
+  if { img_running "$1" || img_swap "$1" "$2"; } && r="$(img_verify "$1" "$2")"; then
+    log "$1: candidate passed its re-check (the first failure was transient; nothing held)" >&2
+    return 0
+  fi
+  printf '%s' "${r:-start}"
+  return 1
+}
+
 img_ladder() { # $1 = name, $2 = previous ref (exact digest), $3 = provisioned pin ref -> after a failed candidate; prints rolled-back | fell-back-to-pin:<cls> | all-rungs-failed:<cls>/<cls>
-  local r1="" r2=""
-  if img_swap "$1" "$2" && r1="$(img_verify "$1" "$2")"; then printf 'rolled-back'; return 0; fi
+  local r1="" r2="" t d
+  read -r _ t d <<<"$(img_split_ref "$2")"
+  log "$1: ladder rung 1 - restoring the previous digest ${t} (${d:7:12})" >&2
+  if img_swap "$1" "$2" && r1="$(img_verify "$1" "$2")"; then log "$1: ladder rung 1 green - back on ${t} (${d:7:12})" >&2; printf 'rolled-back'; return 0; fi
   r1="${r1:-start}"
-  log "$1: restore of the previous digest failed (${r1}) - falling back to the provisioned repo pin" >&2
-  if img_swap "$1" "$3" && r2="$(img_verify "$1" "$3")"; then printf 'fell-back-to-pin:%s' "$r1"; return 0; fi
+  read -r _ t d <<<"$(img_split_ref "$3")"
+  log "$1: restore of the previous digest failed (${r1}) - ladder rung 2: the provisioned repo pin ${t} (${d:7:12})" >&2
+  if img_swap "$1" "$3" && r2="$(img_verify "$1" "$3")"; then log "$1: ladder rung 2 green - on the pin" >&2; printf 'fell-back-to-pin:%s' "$r1"; return 0; fi
   printf 'all-rungs-failed:%s/%s' "$r1" "${r2:-start}"
   return 1
 }
@@ -2071,11 +2119,18 @@ img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) fo
     return 0
   fi
   if [ -n "${IMG_DRILL:-}" ] && [ "${IMG_DRILL}" = "$1" ]; then
-    # Manual drill (root on the box, docs/updaters.md): re-create the
-    # current digest as the "candidate", fail it on purpose, walk the ladder.
-    log "$1: DRILL - candidate-scoped fault on ${tag} (${cdig:7:12}); expecting a clean rollback"
-    img_swap "$1" "$cur" || true
-    img_after_failure "$1" "$cur" "$pin" "drill ver=${tag} dig=${cdig:7:12} reason=drill" "$t0"
+    # Drill (root on the box, under the updater lock; docs/updaters.md): the
+    # CURRENT digest is re-created as the candidate with a drill-only fault
+    # that fails its self-check after the real checks ran; the candidate path
+    # (re-check included) and the ladder then run for real. Nothing is held
+    # and no record changes: every rung is the current digest or the pin.
+    log "$1: DRILL rung 0 - candidate ${tag} (${cdig:7:12}) re-created with an injected self-check fault"
+    if r="$(IMG_DRILL_FAULT=1 img_candidate "$1" "$cur")"; then
+      img_finish "$1" false "drill-fault-not-injected ver=${tag} dig=${cdig:7:12}" "$t0"
+      return 0
+    fi
+    log "$1: DRILL rung 0 - the candidate failed as injected (${r}); walking the ladder"
+    img_after_failure "$1" "$cur" "$pin" "drill ver=${tag} dig=${cdig:7:12} reason=${r}" "$t0"
     return 0
   fi
   if ! tags="$(img_hub_tags "$repo" "$tag")"; then
@@ -2090,7 +2145,9 @@ img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) fo
     if ! docker pull -q "${repo}@${cnew}" >/dev/null 2>&1; then
       log "$1: pull of ${ctag} (${cnew:7:12}) failed - retried next round"
       outcome="pull"
-    elif [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; then
+    elif [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1 \
+        && { log "$1: ${ctag} (${cnew:7:12}) failed validate - one re-check in ${IMG_RECHECK_SLEEP:-20}s before it counts"
+             sleep "${IMG_RECHECK_SLEEP:-20}"; ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; }; then
       if img_caddy_validate "$cur" "${CADDY_CONFIG}" >/dev/null 2>&1; then
         img_mark_bad "$1" "$cnew" "$ckey" "validate"
         img_finish "$1" false "rejected ver=${ctag} dig=${cnew:7:12} reason=validate" "$t0"
@@ -2100,14 +2157,12 @@ img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) fo
       return 0
     else
       log "$1: swapping ${tag} (${cdig:7:12}) -> ${ctag} (${cnew:7:12})"
-      r=""
-      if img_swap "$1" "$newref" && r="$(img_verify "$1" "$newref")"; then
+      if r="$(img_candidate "$1" "$newref")"; then
         img_state_put "$1" "$newref"
         log "$1: now on ${ctag} (${cnew:7:12}); self-checks passed"
         cur="$newref"
         outcome="updated"
       else
-        r="${r:-start}"
         img_mark_bad "$1" "$cnew" "$ckey" "$r"
         img_after_failure "$1" "$cur" "$pin" "ver=${ctag} dig=${cnew:7:12} reason=${r}" "$t0"
         return 0
@@ -2117,13 +2172,25 @@ img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) fo
   if msg="$(img_behind "$1" "$pin" "$cur" "$outcome" <<<"$tags")"; then
     img_finish "$1" false "$msg" "$t0"
   else
-    img_finish "$1" true "" "$t0"
+    # Green carries what runs (the round's final ref, after any swap).
+    read -r _ tag cdig <<<"$(img_split_ref "$cur")"
+    img_finish "$1" true "running:${tag}@sha256:${cdig:7:12}" "$t0"
   fi
+}
+
+img_drill_guard() { # IMG_DRILL is set: caddy|gatus only, root only, and only while it can take the updater lock itself (a live provision run or round refuses it)
+  case "$IMG_DRILL" in caddy|gatus) ;; *) die "IMG_DRILL must be caddy or gatus" ;; esac
+  [ "$(id -u)" = "0" ] || die "IMG_DRILL is honoured only for root on the box - drill refused"
+  exec {IMG_DRILL_LOCK_FD}>>"$IMG_LOCK_FILE" || die "cannot open ${IMG_LOCK_FILE} - drill refused"
+  flock -n "$IMG_DRILL_LOCK_FD" || die "${IMG_LOCK_FILE} is held (a provision run or an update round is live) - drill refused; retry once it is idle (do not wrap the drill in flock)"
+  log "DRILL ${IMG_DRILL}: holding ${IMG_LOCK_FILE} for the whole round"
 }
 
 img_updater_main() { # the on-box entry point (the rendered script calls only this)
   [ "$(img_updater_mode)" = "on" ] || { log "IMG_AUTO_UPDATES is not on - nothing to do"; return 0; }
   img_soak_hours >/dev/null || die "bad IMG_UPDATE_SOAK_HOURS in the rendered updater"
+  unset IMG_DRILL_FAULT
+  if [ -n "${IMG_DRILL:-}" ]; then img_drill_guard; fi
   if [ -r "$IMG_ENV_FILE" ]; then
     # shellcheck source=/dev/null
     . "$IMG_ENV_FILE"
@@ -2141,7 +2208,7 @@ render_img_updater() { # print the on-box updater: constants + the reused 010 fu
 set -euo pipefail
 umask 077
 IMG_UPDATER_HEAD_EOF
-  for v in IMG_STATE_DIR IMG_ENV_FILE IMG_TOKEN_FILE GATUS_IMAGE CADDY_IMAGE GATUS_PORT GATUS_CONFIG TANG_PORT \
+  for v in IMG_STATE_DIR IMG_ENV_FILE IMG_TOKEN_FILE IMG_LOCK_FILE GATUS_IMAGE CADDY_IMAGE GATUS_PORT GATUS_CONFIG TANG_PORT \
     CADDY_CONFIG CADDY_ORIGIN_CRT CADDY_ORIGIN_KEY CADDY_AOP_CA CADDY_CHALLENGE_DIR ORIGIN_TLS AOP_TLS STATUS_HOST \
     IMG_AUTO_UPDATES IMG_UPDATE_SOAK_HOURS; do
     printf '%s=%q\n' "$v" "${!v-}"
@@ -2152,8 +2219,8 @@ IMG_UPDATER_HEAD_EOF
     img_effective_ref img_caddy_mount_args img_caddy_validate img_run_caddy img_run_gatus \
     certless_probe edge_pull_200 img_try img_probe_tang_direct img_probe_caddy80 img_probe_gatus img_selfcheck \
     img_running img_running_digest_is img_verify img_hub_rows img_hub_tags img_pick_candidate img_behind img_report \
-    img_alert_direct img_finish img_swap img_ladder img_disarmed img_disarm img_after_failure \
-    img_update_one img_updater_main; do
+    img_alert_direct img_finish img_swap img_candidate img_ladder img_disarmed img_disarm img_after_failure \
+    img_update_one img_drill_guard img_updater_main; do
     declare -f "$fn" || return 1
   done
   printf '%s\n' 'img_updater_main "$@"'
