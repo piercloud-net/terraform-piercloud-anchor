@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Update policy (rationale: docs/updaters.md). Advisory fixes (Dependabot alerts plus OSV) for minor, patch, pin and digest updates automerge with no soak. Routine minor, patch, pin and digest updates automerge after a 7-day soak once CI is green. Major updates always wait for a human. Netcup-touching paths (scripts/**, .github/scripts/**, **/*.tf, **/.terraform.lock.hcl, examples/**) never automerge, security or not. Their routine updates group into one netcup-touching batch PR, except the Gatus and Caddy images in scripts/010-provision.sh, which sit outside the batch, follow the routine soak, and still never automerge when advisory. The OpenTofu pins (.opentofu-version and provision.yml tofu_version) move as one group. lockFileMaintenance is off; notifications use Renovate defaults.",
+  "description": "Update policy (rationale: docs/updaters.md). Advisory fixes (Dependabot alerts plus OSV) for minor and patch updates automerge with no soak. Routine minor and patch updates automerge after a 7-day soak once CI is green. Digest moves (same tag, new digest), initial pins and majors always wait for a human, routine or advisory. Netcup-touching paths (scripts/**, .github/scripts/**, **/*.tf, **/.terraform.lock.hcl, examples/**) never automerge, security or not. Their routine updates group into one netcup-touching batch PR, except the Gatus and Caddy images in scripts/010-provision.sh, which sit outside the batch and follow the routine soak; their advisory fixes automerge with no soak. Gatus and Caddy on any other netcup-touching path never automerge. cad0p/semver-calver-release is operator-owned and never automerges. The OpenTofu pins (.opentofu-version and provision.yml tofu_version) move as one group. lockFileMaintenance is off; notifications use Renovate defaults.",
   "enabledManagers": [
     "github-actions",
     "custom.regex",
@@ -61,13 +61,10 @@
   "internalChecksFilter": "strict",
   "packageRules": [
     {
-      "description": "R1 routine: minor, patch, pin and digest updates automerge after a 7-day soak (strict internalChecksFilter holds the PR until the age passes)",
+      "description": "R1 routine: minor and patch updates automerge after a 7-day soak (strict internalChecksFilter holds the PR until the age passes). Digest and pin updates are excluded (R2b)",
       "matchUpdateTypes": [
         "minor",
-        "patch",
-        "pin",
-        "digest",
-        "pinDigest"
+        "patch"
       ],
       "minimumReleaseAge": "7 days",
       "automerge": true,
@@ -82,23 +79,29 @@
       "automerge": false
     },
     {
-      "description": "R3 advisory fast lane: advisory minor, patch, pin and digest updates automerge with no soak. Soak removal comes from vulnerabilityAlerts (minimumReleaseAge null, force-applied). automerge cannot live in vulnerabilityAlerts because force keys win over every later rule, which would override the netcup deny rules (R4, R6)",
+      "description": "R2b digest (same tag moved), initial pin and pinDigest updates: never automerge, routine or advisory. A moved tag is the hijack signature, so a human reviews it",
+      "matchUpdateTypes": [
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "R3 advisory fast lane: advisory minor and patch updates automerge with no soak. Soak removal comes from vulnerabilityAlerts (minimumReleaseAge null, force-applied). automerge cannot live in vulnerabilityAlerts because force keys win over every later rule, which would override the netcup deny rules (R4, R6)",
       "matchJsonata": [
         "isVulnerabilityAlert = true"
       ],
       "matchUpdateTypes": [
         "minor",
-        "patch",
-        "pin",
-        "digest",
-        "pinDigest"
+        "patch"
       ],
       "automerge": true,
       "automergeType": "pr",
       "platformAutomerge": true
     },
     {
-      "description": "R4 netcup-touching batch: routine and advisory bumps group into one PR with a label, never automerge. Gatus and Caddy are excluded here (R5)",
+      "description": "R4 netcup-touching batch: routine and advisory bumps group into one PR with a label, never automerge. Gatus and Caddy are excluded here (R5 for scripts/010-provision.sh, R6b elsewhere)",
       "matchFileNames": [
         "scripts/**",
         ".github/scripts/**",
@@ -117,7 +120,10 @@
       "automerge": false
     },
     {
-      "description": "R5 Gatus and Caddy images (scripts/010-provision.sh): outside the netcup batch; minor and patch automerge after the 7-day soak, majors human (R2)",
+      "description": "R5 Gatus and Caddy images in scripts/010-provision.sh: outside the netcup batch; minor and patch automerge after the 7-day soak (advisory fixes take the R3 fast lane with no soak), majors human (R2)",
+      "matchFileNames": [
+        "scripts/010-provision.sh"
+      ],
       "matchDepNames": [
         "twinproduction/gatus",
         "caddy"
@@ -132,7 +138,7 @@
       "platformAutomerge": true
     },
     {
-      "description": "R6 deny: advisory updates on netcup-touching paths never automerge, including Gatus and Caddy (placed after R3 and R5, so it wins)",
+      "description": "R6 deny: advisory updates on netcup-touching paths never automerge. Gatus and Caddy are excluded, so this deny cannot override their advisory fast lane (R5, R6b handle them). Placed after R3 so it wins",
       "matchJsonata": [
         "isVulnerabilityAlert = true"
       ],
@@ -142,6 +148,30 @@
         "**/*.tf",
         "**/.terraform.lock.hcl",
         "examples/**"
+      ],
+      "matchDepNames": [
+        "!twinproduction/gatus",
+        "!caddy"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "R6b Gatus and Caddy on netcup-touching paths other than scripts/010-provision.sh: never automerge, any update type, advisory included. Batched with R4. The file scope stops an identically named dep elsewhere from inheriting R5",
+      "matchDepNames": [
+        "twinproduction/gatus",
+        "caddy"
+      ],
+      "matchFileNames": [
+        "scripts/**",
+        ".github/scripts/**",
+        "**/*.tf",
+        "**/.terraform.lock.hcl",
+        "examples/**",
+        "!scripts/010-provision.sh"
+      ],
+      "groupName": "netcup-touching batch",
+      "addLabels": [
+        "netcup-touching"
       ],
       "automerge": false
     },
@@ -153,7 +183,7 @@
       "groupName": "opentofu"
     },
     {
-      "description": "R8 pin GitHub Actions to commit digests (digest updates keep the # v1 comment pins current)",
+      "description": "R8 pin GitHub Actions to commit digests; the # vX.Y.Z comment is the version Renovate tracks",
       "matchManagers": [
         "github-actions"
       ],
@@ -168,6 +198,16 @@
         "opentofu/opentofu"
       ],
       "pinDigests": false
+    },
+    {
+      "description": "R10 operator-owned: cad0p/semver-calver-release (self-validating via validate-* on pull_request, runs with contents: write) never automerges, any update type, advisory included. Placed last so no later rule can override it",
+      "matchPackageNames": [
+        "cad0p/semver-calver-release"
+      ],
+      "addLabels": [
+        "operator-owned"
+      ],
+      "automerge": false
     }
   ]
 }
