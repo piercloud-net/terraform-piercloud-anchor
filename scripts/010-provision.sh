@@ -1386,7 +1386,7 @@ img_split_ref() { # $1 = repo:tag[@sha256:hex] -> "repo tag digest" (digest may 
 
 img_ver_key() { # $1 = tag, $2 = pin tag -> "MAJ.MIN.PATCH" when $1 is in the pin's track; 1 otherwise
   local re pfx maj sfx
-  re='^(v?)([0-9]+)\.([0-9]+)\.([0-9]+)(-[a-z]+)?$'
+  re="^(v?)([0-9]+)\\.([0-9]+)\\.([0-9]+)(-[a-z]+)?\$"
   [[ "$2" =~ $re ]] || return 1
   pfx="${BASH_REMATCH[1]}"; maj="${BASH_REMATCH[2]}"; sfx="${BASH_REMATCH[5]}"
   [[ "$1" =~ $re ]] || return 1
@@ -1593,7 +1593,7 @@ img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current dig
   cutoff=$((now - soak * 3600))
   read -r _ ptag _ <<<"$(img_split_ref "$2")"
   cur="$(img_ver_key "$3" "$ptag")" || return 1
-  while IFS=$'\t' read -r name digest pushed; do
+  while read -r name digest pushed; do
     key="$(img_ver_key "$name" "$ptag")" || continue
     [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
     at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
@@ -1604,7 +1604,7 @@ img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current dig
         best="$name"; best_key="$key"; best_digest="$digest"
       fi
     fi
-  done < <(jq -r '.[] | [.name, .digest, .pushed] | @tsv')
+  done < <(jq -r '.[] | [.name, .digest, .pushed] | map(tostring | gsub("[[:space:]]"; "_")) | join(" ")')
   [ -z "$best" ] || printf '%s %s' "$best" "$best_digest"
 }
 
@@ -1772,7 +1772,7 @@ img_updater_install() { # render + install the updater, its 0600 env file and un
   mkdir -p "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")" "$(dirname "$IMG_SBIN")" "$(dirname "$IMG_SERVICE")" "$(dirname "$IMG_TIMER")"
   chmod 700 "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")"
   tmp="$(mktemp)"
-  render_img_updater >"$tmp" || { rm -f "$tmp"; die "container updater render failed (a reused 010 function is missing) - refusing to install"; }
+  render_img_updater >"$tmp" || { rm -f "$tmp"; die "container updater render failed (a reused 010 helper is missing) - refusing to install"; }
   bash -n "$tmp" || { rm -f "$tmp"; die "rendered container updater failed bash -n - refusing to install"; }
   chmod 0755 "$tmp"
   if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
