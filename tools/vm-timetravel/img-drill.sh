@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # tools/vm-timetravel/img-drill.sh - MANUAL live proof of the container-updater
 # rollback drill (#253, docs/updaters.md "Drill (rollback ladder, live proof)").
-# NOT in CI (needs /dev/kvm, Docker Hub and ~10-15 min). See docs/verification.md.
+# NOT in CI (needs /dev/kvm and Docker Hub; ~3 min with a cached qcow2 and
+# images, ~10-15 min cold; the summary log records start and end). See
+# docs/verification.md.
 #
 # Boots the Debian trixie genericcloud qcow2 under qemu + KVM INSIDE a docker
 # container (same pattern as run.sh: the host needs docker and /dev/kvm, no
@@ -26,6 +28,9 @@
 # Deviations from production (harness only; the updater code is unchanged):
 #   - tang is installed and moved to 127.0.0.1:${TANG_PORT} with a socket
 #     drop-in replicated from 010's tang block (that block is not a span);
+#     if tang does not answer at once, the script runs the package's
+#     tangd-keygen into the unit's key directory (010 relies on the package
+#     postinst for the first keys);
 #   - the Gatus config is minimal (sqlite storage + web port + one tang (via
 #     Caddy) endpoint, as Gatus refuses a config without one, + the rendered
 #     external-endpoints rows), not 010's full inline render;
@@ -171,7 +176,7 @@ log "updater installed at ${U} (soak 720 h, ntfy unset, timer stopped)"
 cinfo() { docker inspect --format '{{.Id}} {{.State.StartedAt}}' "$1"; }
 cdig() { local id; id="$(docker inspect --format '{{.Image}}' "$1")"; docker inspect --format '{{join .RepoDigests " "}}' "$id"; } # ci-allowlist: code - docker inspect field name, not a live reference.
 statehash() { (cd "$IMG_STATE_DIR" && ls -A && find . -type f -print0 | sort -z | xargs -0 sha256sum); }
-rowjson() { curl -fsS "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/$(img_gatus_key "$1 updates")/statuses?pageSize=100"; } # ci-allowlist: on-VM loopback Gatus read-back of the push row, not a provider endpoint.
+rowjson() { curl -fsS "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/$(img_gatus_key "$1 updates")/statuses?pageSize=100"; }
 rowlast() { rowjson "$1" | jq -c '.results | sort_by(.timestamp) | last | {success, errors}'; }
 rowcount() { rowjson "$1" | jq '.results | length'; }
 creates() { docker events --since "$1" --until "$2" --filter type=container --filter event=create --format '{{.Actor.Attributes.name}} {{index .Actor.Attributes "image"}}'; } # ci-allowlist: code - docker events attribute name, not a live reference.
@@ -220,7 +225,7 @@ drill() { # $1 = name, $2 = step letter
     "grep -q '${n}: DRILL rung 0 - candidate ${tag} (${d12}) re-created' '$s.out' && grep -q 'the candidate failed as injected (drill-fault)' '$s.out' && ! grep -q drill-fault-not-injected '$s.out'"
   chk "${s}) re-check fails - docs: 'the re-check fails the same way'" \
     "grep -q '${n}: candidate check failed (drill-fault) - one re-check' '$s.out' && ! grep -q 'passed its re-check' '$s.out'"
-  chk "${s}) rung 1 restores the same digest, verified - docs: 'rung 1 restores the previous exact digest (the same one) and verifies it for real (digest assert + every self-check, tang first)'" \
+  chk "${s}) rung 1 restores the same digest, verified - docs: 'rung 1 restores the previous exact digest (the same one) and verifies it for real (digest assert + every self-check, tang first)'; here every self-check except the AOP/mTLS probes (AOP_TLS empty)" \
     "grep -q '${n}: ladder rung 1 - restoring the previous digest ${tag} (${d12})' '$s.out' && grep -q '${n}: ladder rung 1 green - back on ${tag} (${d12})' '$s.out' && ! grep -q 'ladder rung 2' '$s.out'"
   chk "${s}) recreated twice on the same digest - docs: 'the container is recreated twice on the same digest'" \
     "[ '$nc' = 2 ] && [ '$no' = 0 ] && [ -n '$bd' ] && [ '$bd' = '$ad' ] && [ '${bi%% *}' != '${ai%% *}' ] && [ '${bi#* }' != '${ai#* }' ]"
@@ -288,9 +293,10 @@ exit "$rc"
 INNER
 
 rc=0
+START="$(date -u +%FT%TZ)"
 docker run --rm --device /dev/kvm -v "$WORK:/w" -v "$CACHE:/cache" debian:trixie-slim bash /w/inner.sh "$ARCH" || rc=$?
 cp "$WORK/full.log" "$FULL" 2>/dev/null || true
-{ printf 'vm-img-drill %s arch=%s rc=%s head=%s\n' "$(date -u +%FT%TZ)" "$ARCH" "$rc" "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+{ printf 'vm-img-drill start=%s end=%s arch=%s rc=%s head=%s\n' "$START" "$(date -u +%FT%TZ)" "$ARCH" "$rc" "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   printf 'docs/updaters.md "Drill (rollback ladder, live proof)"; full transcript: %s\n' "$FULL"
   cat "$WORK/summary.log" 2>/dev/null || true; } | tee "$LOG"
 exit "$rc"
