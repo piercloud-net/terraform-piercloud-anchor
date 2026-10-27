@@ -1,6 +1,6 @@
 # Updaters
 
-Two kinds of update keep the anchor current: Renovate bumps the pins in this repo (they reach a box only through an approved dispatch or the on-box image lane), and the on-box updaters (Lane A, issue #51) apply the narrow class of updates neither the operator nor the tenant chooses.
+Two kinds of update keep the anchor current: Renovate bumps the pins in this repo (they reach a box only through an approved dispatch), and the on-box updaters (Lane A, issue #51) apply the narrow class of updates neither the operator nor the tenant chooses.
 
 ## Dependency updates (Renovate)
 
