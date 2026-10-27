@@ -165,7 +165,7 @@ OPERATOR_ONLY = {"ci.yml", "external-watch.yml"}
 # owner's release actions are allowed (pinned to a commit SHA, `# v1.2.7`) only in the release workflows
 # (which no managed run can select). An unlisted file may use nothing.
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-UPLOAD = "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"
+UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 TOFU = "opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4"
 USES_ALLOWED = {
     "provision.yml": {CHECKOUT, UPLOAD, TOFU},
