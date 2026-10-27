@@ -2,7 +2,7 @@
 
 The **recording-completeness witness** is an optional component of this module. When enabled, it renders a small systemd timer on the anchor that checks the *metadata* of the operator's B2 recording bucket and raises ntfy alerts when the recording pipeline stops looking complete. It is the anchor-side detection half of the A2 recording pipeline (`pc-admin` ships recorded sessions and audit events to B2 with Object Lock); it exists because Object Lock fixes the *content* of what was shipped, not the *completeness* of what should have been shipped.
 
-**Rail amendment (2026-09-21):** the anchor's job expands from *tang + uptime monitor* to *tang + uptime monitor + list-only witness*. The rail stays "no sensitive data, ever": the witness sees metadata only — never content. See [security-posture.md](security-posture.md) and the anchor ADR amendment (pcad.it-infra `decisions/2026-08-29-vps-to-bare-metal-luks-migration`, amendment 2026-09-21).
+**Rail amendment (2026-09-21):** the anchor's job expands from *tang + uptime monitor* to *tang + uptime monitor + list-only witness*. The rail stays "no sensitive data, ever": the witness sees metadata only — never content. See [security-posture.md](security-posture.md) and the anchor ADR amendment (the owner's 2026-08-29 VPS-to-bare-metal LUKS migration decision, amendment 2026-09-21, kept outside this repository).
 
 ## Strictly list-only
 

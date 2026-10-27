@@ -1530,11 +1530,804 @@ os_updates_first_report() { # after the run-once: the row's state in the run log
 }
 # --- END OS UPDATES ---
 
+# --- BEGIN IMG UPDATER (tests/img-updater extracts this span; keep markers) ---
+# A-IMG (#51, Lane A): the box moves its own Caddy and Gatus containers to
+# newer builds inside the APPROVED track, outside a dispatch. Everything that
+# decides WHAT may run is rendered here by the provision run (approval-gated):
+# the repository + track (the repo pin's major + suffix: caddy 2.x.y-alpine,
+# gatus v5.x.y), the soak, the run/validate args and this code. Only the
+# digest floats. Docs: docs/updaters.md; trust rule: docs/invariants.md.
+#
+# Precedence (load-bearing; tests/img-updater): the state file records the
+# current ref per container. A provision run uses max(repo pin, recorded)
+# inside the SAME track - it never downgrades below what the updater moved to;
+# a pin in another track (a Lane B major bump) resets the track; a recorded
+# bad digest is never selected; IMG_AUTO_UPDATES=off returns to the repo pin
+# (the dispatch-only manual rollback, docs/dr.md). The repo pin itself runs BY
+# DIGEST: provision resolves its tag once and records it (<name>.pin).
+#
+# Caddy availability outranks updating (tang's only listener is Caddy :80):
+# a failed candidate walks a ladder - restore the previous exact digest,
+# else the recorded pin digest, each verified tang-first - and when every
+# rung fails the updater alerts direct (ntfy) and disarms until the next
+# dispatch. Every status push is derived from checks run at push time.
+#
+# Paths are overridable for the offline harness only; the dispatch env never
+# exports these names, so on-box runs get the canonical defaults.
+IMG_STATE_DIR="${IMG_STATE_DIR:-/var/lib/piercloud-img}"
+IMG_ENV_FILE="${IMG_ENV_FILE:-/etc/piercloud-img/img-update.env}"
+IMG_SBIN="${IMG_SBIN:-/usr/local/sbin/piercloud-img-update}"
+IMG_SERVICE="${IMG_SERVICE:-/etc/systemd/system/piercloud-img-update.service}"
+IMG_TIMER="${IMG_TIMER:-/etc/systemd/system/piercloud-img-update.timer}"
+IMG_LOCK_FILE="${IMG_LOCK_FILE:-/run/piercloud-img-update.lock}"
+IMG_TOKEN_FILE="${IMG_TOKEN_FILE:-/etc/piercloud-img/status-token}"
+
+img_gatus_key() { # $1 = row name -> the Gatus endpoint key (group anchor; Gatus sanitizes / _ , . # + & and spaces to -)
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed 's#[/_,.\#+& ]#-#g')"
+  printf 'anchor_%s' "$s"
+}
+
+img_gatus_item() { # $1 = row name, $2 = push token -> one complete external-endpoints item (rendered by the shared span in the Gatus render)
+  printf '%s\n' "  - name: $1" "    group: anchor" "    token: \"$2\"" "    heartbeat:" \
+    "      interval: 24h  # the updater pushes every ~6 h; no push for 24 h records a failure (stale = down)"
+  if [ -n "${NTFY_TOPIC:-}" ]; then
+    printf '%s\n' "    alerts:" "      - type: ntfy" "        failure-threshold: 1" "        send-on-resolved: false" \
+      "        provider-override:" "          priority: 4  # once per bad candidate or missed heartbeat; routine success never notifies"
+  fi
+}
+
+img_status_items_add() { # on: regenerate the push token (0600, never printed) + append both rows to gatus_ext_items; off: drop the token
+  local dir tmp token
+  case "$(img_updater_mode)" in
+    on) ;;
+    off) rm -f "$IMG_TOKEN_FILE"; return 0 ;;
+    *) die "bad IMG_AUTO_UPDATES (want unset/on/off): ${IMG_AUTO_UPDATES:-}" ;;
+  esac
+  dir="$(dirname "$IMG_TOKEN_FILE")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  token="$(openssl rand -hex 32 2>/dev/null)" || die "could not generate the container-updater push token (openssl rand) - refusing to render a tokenless push row"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "container-updater push token is not 64 lowercase hex - refusing to render it"
+  tmp="$(mktemp "${dir}/.token.XXXXXX")"
+  printf '%s\n' "$token" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$IMG_TOKEN_FILE"
+  gatus_ext_items+=("$(img_gatus_item "caddy updates" "$token")" "$(img_gatus_item "gatus updates" "$token")")
+}
+
+img_updater_mode() { # on | off | bad - unset/empty = on (default ON, owner 2026-10-27)
+  case "${IMG_AUTO_UPDATES-}" in
+    ''|on) printf 'on' ;;
+    off) printf 'off' ;;
+    *) printf 'bad' ;;
+  esac
+}
+
+img_soak_hours() { # validated soak in hours (default 6); returns 1 on a bad value
+  local v="${IMG_UPDATE_SOAK_HOURS:-6}"
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#v}" -le 3 ] && [ "$((10#$v))" -le 720 ] || return 1
+  printf '%s' "$((10#$v))"
+}
+
+img_split_ref() { # $1 = repo:tag[@sha256:hex] -> "repo tag digest" (digest may be empty)
+  local r="$1" d=""
+  case "$r" in *@*) d="${r#*@}"; r="${r%%@*}" ;; esac
+  printf '%s %s %s' "${r%:*}" "${r##*:}" "$d"
+}
+
+img_ver_key() { # $1 = tag, $2 = pin tag -> "MAJ.MIN.PATCH" when $1 is in the pin's track; 1 otherwise
+  local re pfx maj sfx
+  # Strict numerals: no leading zeros (2.11.05 never aliases 2.11.5), at most 9 digits.
+  re="^(v?)(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})(-[a-z]+)?\$"
+  [[ "$2" =~ $re ]] || return 1
+  pfx="${BASH_REMATCH[1]}"; maj="${BASH_REMATCH[2]}"; sfx="${BASH_REMATCH[5]}"
+  [[ "$1" =~ $re ]] || return 1
+  [ "${BASH_REMATCH[1]}" = "$pfx" ] && [ "${BASH_REMATCH[2]}" = "$maj" ] && [ "${BASH_REMATCH[5]}" = "$sfx" ] || return 1
+  printf '%s.%s.%s' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+}
+
+img_ver_gt() { # $1 > $2 for MAJ.MIN.PATCH keys
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<<"$1"
+  IFS=. read -r b1 b2 b3 <<<"$2"
+  [ "$a1" -gt "$b1" ] && return 0
+  [ "$a1" -lt "$b1" ] && return 1
+  [ "$a2" -gt "$b2" ] && return 0
+  [ "$a2" -lt "$b2" ] && return 1
+  [ "$a3" -gt "$b3" ]
+}
+
+img_now() { # the clock (IMG_NOW pins it for the offline harness only)
+  printf '%s' "${IMG_NOW:-$(date +%s)}"
+}
+
+img_ref_write() { # $1 = file, $2 = repo:tag@sha256:hex -> atomic 0600 "ref=" record
+  local tmp
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  tmp="$(mktemp "${IMG_STATE_DIR}/.ref.XXXXXX")"
+  printf 'ref=%s\n' "$2" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$1"
+}
+
+img_ref_read() { # $1 = file -> its validated by-digest ref; 1 when absent/invalid
+  local v
+  [ -f "$1" ] || return 1
+  v="$(sed -n 's/^ref=//p' "$1" | head -n 1)"
+  [[ "$v" =~ ^[a-z0-9][a-z0-9./-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$v"
+}
+
+img_state_get() { # $1 = name -> the recorded current ref (validated); 1 when absent/invalid
+  img_ref_read "${IMG_STATE_DIR}/$1.state"
+}
+
+img_state_put() { # $1 = name, $2 = repo:tag@sha256:hex
+  img_ref_write "${IMG_STATE_DIR}/$1.state" "$2"
+}
+
+img_pin_get() { # $1 = name -> the provisioned repo pin BY DIGEST (resolved once per pin tag by a provision run); 1 when absent/invalid
+  img_ref_read "${IMG_STATE_DIR}/$1.pin"
+}
+
+img_bad_line() { # $1 = name, $2 = digest -> its hold line "digest version reason epoch"; 1 when not held
+  [ -n "$2" ] && [ -f "${IMG_STATE_DIR}/$1.bad" ] || return 1
+  awk -v d="$2" '$1 == d { print; f = 1; exit } END { if (!f) exit 1 }' "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_is_bad() { # $1 = name, $2 = digest -> 0 when the digest is held as bad
+  img_bad_line "$1" "$2" >/dev/null
+}
+
+img_version_mark_at() { # $1 = name, $2 = version key -> the newest hold time for ANY digest of that version; 1 when none
+  [ -f "${IMG_STATE_DIR}/$1.bad" ] || return 1
+  awk -v v="$2" '$2 == v && $4 ~ /^[0-9]+$/ { if ($4 + 0 > m) m = $4 + 0; f = 1 } END { if (!f) exit 1; print m }' "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_mark_bad() { # $1 = name, $2 = digest, $3 = version key, $4 = reason class -> hold (reason + time recorded)
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  img_is_bad "$1" "$2" || printf '%s %s %s %s\n' "$2" "$3" "$4" "$(img_now)" >>"${IMG_STATE_DIR}/$1.bad"
+  chmod 600 "${IMG_STATE_DIR}/$1.bad"
+}
+
+img_marks_expire() { # $1 = name, $2 = new pin version key: a pin change clears every hold at or below the new pin (the documented manual clear)
+  local f="${IMG_STATE_DIR}/$1.bad" tmp d v rest
+  [ -f "$f" ] || return 0
+  tmp="$(mktemp "${IMG_STATE_DIR}/.bad.XXXXXX")"
+  while read -r d v rest; do
+    if [[ "$v" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] && img_ver_gt "$v" "$2"; then printf '%s %s %s\n' "$d" "$v" "$rest"; fi
+  done <"$f" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$f"
+}
+
+img_pin_resolve() { # $1 = name, $2 = repo pin (repo:tag) -> the pin BY DIGEST: resolved once per pin tag, recorded, holds at/below it cleared (provision only)
+  local rec base repo tag dig pk
+  base="${2%%@*}"
+  if rec="$(img_pin_get "$1")" && [ "${rec%%@*}" = "$base" ]; then
+    case "$2" in *@sha256:*) [ "$rec" = "$2" ] && { printf '%s' "$rec"; return 0; } ;; *) printf '%s' "$rec"; return 0 ;; esac
+  fi
+  read -r repo tag dig <<<"$(img_split_ref "$2")"
+  if [ -z "$dig" ]; then
+    docker pull -q "$base" >/dev/null 2>&1 || return 1
+    dig="$(img_local_digest "$base" "$repo")"
+  fi
+  [[ "$dig" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  img_ref_write "${IMG_STATE_DIR}/$1.pin" "${base}@${dig}"
+  if pk="$(img_ver_key "$tag" "$tag")"; then img_marks_expire "$1" "$pk"; fi
+  printf '%s@%s' "$base" "$dig"
+}
+
+img_effective_ref() { # $1 = name, $2 = repo pin by digest -> the ref to run: max(pin, recorded) inside the pin's track
+  local rec prepo ptag rrepo rtag rdig pk rk
+  if [ "$(img_updater_mode)" != "on" ]; then printf '%s' "$2"; return 0; fi
+  rec="$(img_state_get "$1")" || { printf '%s' "$2"; return 0; }
+  read -r prepo ptag _ <<<"$(img_split_ref "$2")"
+  read -r rrepo rtag rdig <<<"$(img_split_ref "$rec")"
+  pk="$(img_ver_key "$ptag" "$ptag")" || { printf '%s' "$2"; return 0; }
+  if [ "$rrepo" != "$prepo" ] || ! rk="$(img_ver_key "$rtag" "$ptag")" || img_is_bad "$1" "$rdig" || img_ver_gt "$pk" "$rk"; then
+    printf '%s' "$2"
+    return 0
+  fi
+  printf '%s' "$rec"
+}
+
+img_reconcile_state() { # $1 = name, $2 = repo pin by digest: drop a record the pin no longer honours (off switch, other repo/track, bad, below the pin)
+  local rec
+  rec="$(img_state_get "$1")" || return 0
+  if [ "$(img_effective_ref "$1" "$2")" != "$rec" ]; then
+    rm -f "${IMG_STATE_DIR}/$1.state"
+    log "$1: updater record ${rec%%@*} is not honoured by the repo pin ${2%%@*} (off switch, another track, a bad digest or below the pin) - back on the pin"
+  fi
+}
+
+img_local_digest() { # $1 = local ref, $2 = repo -> the registry digest docker recorded for it (empty when unknown)
+  docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null \
+    | sed -n "s#^$2@\(sha256:[0-9a-f]\{64\}\)\$#\1#p" | head -n 1 || true
+}
+
+img_caddy_mount_args() { # $1 = host Caddyfile, $2 = its in-container path, $3 = optional host dir with a stand-in origin.crt/origin.key (validate) -> the bind mounts 010's validate AND run share
+  local a="-v $1:$2:ro" crt="${CADDY_ORIGIN_CRT}" key="${CADDY_ORIGIN_KEY}"
+  if [ -n "${3:-}" ]; then crt="$3/origin.crt"; key="$3/origin.key"; fi
+  if [ "${ORIGIN_TLS:-0}" = "1" ]; then
+    a="${a} -v ${crt}:${CADDY_ORIGIN_CRT}:ro -v ${key}:${CADDY_ORIGIN_KEY}:ro"
+  fi
+  if [ -n "${AOP_TLS:-}" ]; then
+    a="${a} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
+  fi
+  printf '%s' "$a"
+}
+
+img_caddy_validate() { # $1 = container ref (validated BY DIGEST, repo@sha256, when it carries one), $2 = Caddyfile -> 010's pre-install validate, confined, never shown the live origin key
+  local args ref="$1" repo dig eph="" rc=0
+  read -r repo _ dig <<<"$(img_split_ref "$1")"
+  [ -z "$dig" ] || ref="${repo}@${dig}"
+  if [ "${ORIGIN_TLS:-0}" = "1" ]; then
+    # The validated build never sees the live origin pair: `caddy validate`
+    # only loads the files at the Caddyfile's paths and pairs key with cert
+    # (no chain, name or expiry check), so every validate gets a fresh
+    # self-signed P-256 pair at the SAME in-container paths, minted in a 0700
+    # dir under the state dir (not /tmp: the updater runs with PrivateTmp,
+    # which dockerd cannot see) and removed right after. The trust-pool CA
+    # is public and mounts as is.
+    mkdir -p "$IMG_STATE_DIR" && chmod 700 "$IMG_STATE_DIR" || return 1
+    eph="$(mktemp -d "${IMG_STATE_DIR}/.validate.XXXXXX")" || return 1
+    chmod 700 "$eph"
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj "/CN=img-validate.invalid" \
+        -keyout "$eph/origin.key" -out "$eph/origin.crt" >/dev/null 2>&1; then
+      rm -rf "$eph"
+      printf 'img_caddy_validate: could not mint the ephemeral validate pair (openssl)\n' >&2
+      return 1
+    fi
+  fi
+  args="$(img_caddy_mount_args "$2" /tmp/Caddyfile.new "$eph")"
+  # No network, no capabilities, read-only root (scratch /config + /data):
+  # an unproven build sees the mounted files but cannot ship them anywhere.
+  # NET_BIND_SERVICE is the ONE capability kept: the build's /usr/bin/caddy
+  # carries the file capability cap_net_bind_service=ep, and execve refuses
+  # (EPERM, "exec /usr/bin/caddy: operation not permitted") a binary whose
+  # file capabilities the bounding set cannot grant. With --network none it
+  # binds nothing reachable.
+  # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
+  docker run --rm --network none --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /config --tmpfs /data $args "$ref" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || rc=$?
+  [ -z "$eph" ] || rm -rf "$eph"
+  return "$rc"
+}
+
+img_run_caddy() { # $1 = container ref -> create the caddy container (the ONE docker run 010 and the updater share)
+  local mounts
+  mounts="$(img_caddy_mount_args "${CADDY_CONFIG}" /etc/caddy/Caddyfile)"
+  # --network host (NOT -p publishing): Caddy dials 127.0.0.1:8081/:8080 for
+  # tangd/Gatus on the HOST loopback; see section e2.
+  # shellcheck disable=SC2086 # mount args are flag-or-path pairs, no spaces by construction.
+  docker run -d --name caddy --restart unless-stopped \
+    --network host \
+    --memory 256m \
+    -e GOMEMLIMIT=230MiB -e GOMAXPROCS=1 \
+    $mounts \
+    --mount type=volume,source=caddy-data,target=/data \
+    --mount type=volume,source=caddy-config,target=/config \
+    -v "${CADDY_CHALLENGE_DIR}:/var/lib/caddy/acme-challenge" \
+    "$1" >/dev/null
+}
+
+img_run_gatus() { # $1 = container ref -> create the gatus container (the ONE docker run 010 and the updater share)
+  docker run -d --name gatus --restart unless-stopped \
+    -p "127.0.0.1:${GATUS_PORT}:8080" \
+    --add-host=hostanchor:host-gateway \
+    -e GATUS_CONFIG_PATH=/config \
+    -v "$(dirname "${GATUS_CONFIG}")":/config:ro \
+    --mount type=volume,source=gatus-data,target=/data \
+    "$1" >/dev/null
+}
+
+certless_probe() { # $1 = status host -> sets CERTLESS_RC/CERTLESS_ERR; 0 = rejected at TLS with a client-auth alert
+  CERTLESS_RC=0
+  CERTLESS_ERR="$(curl -sSk --max-time 10 --resolve "$1:443:127.0.0.1" "https://$1/" -o /dev/null 2>&1)" || CERTLESS_RC=$?
+  case "$CERTLESS_RC" in
+    35|55|56) printf '%s' "$CERTLESS_ERR" | grep -qiE 'alert (certificate required|bad certificate)' ;;
+    *) return 1 ;;
+  esac
+}
+
+edge_pull_200() { # $1 = status host -> sets EDGE_RC/EDGE_CODE; 0 = the public edge answered HTTP 200 (3 attempts)
+  local attempt
+  for attempt in 1 2 3; do
+    EDGE_RC=0
+    EDGE_CODE="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$1/")" || EDGE_RC=$?
+    if [ "$EDGE_RC" -eq 0 ] && [ "$EDGE_CODE" = "200" ]; then return 0; fi
+    if [ "$attempt" -lt 3 ]; then
+      log "edge pull attempt ${attempt}/3 failed (curl exit ${EDGE_RC}, HTTP ${EDGE_CODE:-none}; 200 required); retrying in ${EDGE_PULL_RETRY_SLEEP:-5}s"
+      sleep "${EDGE_PULL_RETRY_SLEEP:-5}"
+    fi
+  done
+  return 1
+}
+
+img_try() { # $1 = probe -> 0 once it passes (IMG_CHECK_TRIES attempts, IMG_CHECK_SLEEP apart)
+  local i n="${IMG_CHECK_TRIES:-6}"
+  for i in $(seq 1 "$n"); do
+    if "$1"; then return 0; fi
+    [ "$i" -ge "$n" ] || sleep "${IMG_CHECK_SLEEP:-5}"
+  done
+  return 1
+}
+
+img_probe_tang_direct() { # tang answers on its own loopback socket
+  probe_tang_direct >/dev/null 2>&1
+}
+
+img_probe_caddy80() { # tang answers THROUGH Caddy :80 (the main box's unlock path)
+  local adv rc=1
+  adv="$(mktemp)"
+  if curl -sf --max-time 5 http://127.0.0.1/adv -o "$adv" && adv_ok "$adv" >/dev/null 2>&1; then rc=0; fi
+  rm -f "$adv"
+  return "$rc"
+}
+
+img_probe_gatus() { # the loopback Gatus serves its statuses
+  curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/statuses"
+}
+
+img_selfcheck() { # the converge self-checks, tang path FIRST; prints the failing reason class, returns 1 on failure
+  img_try img_probe_tang_direct || { printf 'tang-direct'; return 1; }
+  img_try img_probe_caddy80 || { printf 'caddy-80'; return 1; }
+  img_try img_probe_gatus || { printf 'gatus'; return 1; }
+  # No silent pass: without the status host the TLS/hardening half cannot
+  # be proven, so the check fails (the round never swaps on an unproven box).
+  [ -n "${STATUS_HOST:-}" ] || { printf 'no-status-host'; return 1; }
+  ( assert_caddyfile_hardened ) >/dev/null 2>&1 || { printf 'hardening'; return 1; }
+  if [ -n "${AOP_TLS:-}" ]; then
+    certless_probe "${STATUS_HOST}" || { printf 'certless'; return 1; }
+    edge_pull_200 "${STATUS_HOST}" >/dev/null 2>&1 || { printf 'edge'; return 1; }
+  elif [ "${ORIGIN_TLS:-0}" = "1" ]; then
+    curl -skf --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null \
+      || { printf 'local-443'; return 1; }
+  fi
+  return 0
+}
+
+img_running() { # $1 = name -> 0 when the container is up (reads the whole list: no early-exit pipe under pipefail)
+  local names
+  names="$(docker ps --format '{{.Names}}' 2>/dev/null)" || return 1
+  printf '%s\n' "$names" | grep -xF -- "$1" >/dev/null
+}
+
+img_running_digest_is() { # $1 = name, $2 = repo, $3 = digest -> 0 when the RUNNING container was created from repo@digest
+  local id ds
+  id="$(docker inspect --format '{{.Image}}' "$1" 2>/dev/null)" || return 1 # ci-allowlist: code — docker inspect field name, not a live reference.
+  [ -n "$id" ] || return 1
+  # docker inspect on the container's object id returns that build's RepoDigests.
+  ds="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$id" 2>/dev/null)" || return 1
+  printf '%s\n' "$ds" | grep -xF -- "$2@$3" >/dev/null
+}
+
+img_verify() { # $1 = name, $2 = repo by-digest ref -> prints the failing class; 0 when that exact digest runs and every self-check passes (computed now, never cached)
+  local repo dig
+  read -r repo _ dig <<<"$(img_split_ref "$2")"
+  img_running "$1" || { printf 'not-running'; return 1; }
+  img_running_digest_is "$1" "$repo" "$dig" || { printf 'digest'; return 1; }
+  img_selfcheck || return 1
+  # Drill-only fault (docs/updaters.md "Drill"): honoured only inside a root
+  # IMG_DRILL round for this very container, and only AFTER the real checks
+  # passed, so the drilled candidate is still verified for real.
+  if [ -n "${IMG_DRILL_FAULT:-}" ] && [ "${IMG_DRILL:-}" = "$1" ]; then printf 'drill-fault'; return 1; fi
+  return 0
+}
+
+img_hub_rows() { # stdin = tag list JSON -> "name digest pushed" lines (whitespace folded)
+  jq -r '.[] | [.name, .digest, .pushed] | map(tostring | gsub("[[:space:]]"; "_")) | join(" ")'
+}
+
+img_hub_tags() { # $1 = repo, $2 = current tag -> the COMPLETE tag list (JSON array) for the track's major; 1 on any page error or at the page cap (never a partial list)
+  local hubrepo prefix url page=0 body next acc
+  case "$1" in */*) hubrepo="$1" ;; *) hubrepo="library/$1" ;; esac
+  prefix="$(printf '%s' "$2" | sed -n 's/^\(v\{0,1\}[0-9]\{1,\}\.\).*/\1/p')"
+  [ -n "$prefix" ] || return 1
+  # name= is filtered server-side (the major prefix), so the pages stay few.
+  url="https://hub.docker.com/v2/repositories/${hubrepo}/tags?page_size=100&name=${prefix}"
+  acc='[]'
+  while :; do
+    page=$((page + 1))
+    [ "$page" -le 20 ] || return 1
+    body="$(curl -fsS --proto '=https' --max-time 30 "$url")" || return 1
+    acc="$(jq -c --argjson acc "$acc" '$acc + [.results[] | {name: (.name | tostring), digest: (.digest | tostring), pushed: (.tag_last_pushed | tostring)}]' <<<"$body")" || return 1
+    next="$(jq -r '.next | tostring' <<<"$body")" || return 1
+    case "$next" in
+      null) break ;;
+      "https://hub.docker.com/v2/repositories/${hubrepo}/tags?"*) url="$next" ;;
+      *) return 1 ;;
+    esac
+  done
+  printf '%s' "$acc"
+}
+
+img_pick_candidate() { # $1 = name, $2 = pin, $3 = current tag, $4 = current digest; stdin = tag list -> "tag digest" or nothing
+  local soak cutoff now ptag cur name digest pushed key at mat best="" best_key="" best_digest=""
+  soak="$(img_soak_hours)" || return 1
+  now="$(img_now)"
+  cutoff=$((now - soak * 3600))
+  read -r _ ptag _ <<<"$(img_split_ref "$2")"
+  cur="$(img_ver_key "$3" "$ptag")" || return 1
+  while read -r name digest pushed; do
+    key="$(img_ver_key "$name" "$ptag")" || continue
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+    at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
+    [ "$at" -le "$cutoff" ] || continue
+    img_is_bad "$1" "$digest" && continue
+    # A version that already had a bad digest: a re-pushed digest under it
+    # soaks again, counted from the hold.
+    if mat="$(img_version_mark_at "$1" "$key")" && [ "$mat" -gt "$cutoff" ]; then continue; fi
+    if img_ver_gt "$key" "$cur" || { [ "$key" = "$cur" ] && [ "$digest" != "$4" ]; }; then
+      if [ -z "$best" ] || img_ver_gt "$key" "$best_key"; then
+        best="$name"; best_key="$key"; best_digest="$digest"
+      fi
+    fi
+  done < <(img_hub_rows)
+  [ -z "$best" ] || printf '%s %s' "$best" "$best_digest"
+}
+
+img_behind() { # $1 = name, $2 = pin, $3 = current ref, $4 = this round's outcome class; stdin = tag list -> "behind:<tag> reason:<class>" (0) when the box trails the newest in-track build for longer than soak + one cycle; 1 otherwise
+  local soak now ptag ctag cdig ck name digest pushed key at nk="" ntag="" ndig="" nat=0 line cls
+  soak="$(img_soak_hours)" || return 1
+  now="$(img_now)"
+  read -r _ ptag _ <<<"$(img_split_ref "$2")"
+  read -r _ ctag cdig <<<"$(img_split_ref "$3")"
+  ck="$(img_ver_key "$ctag" "$ptag")" || return 1
+  while read -r name digest pushed; do
+    key="$(img_ver_key "$name" "$ptag")" || continue
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+    at="$(date -u -d "$pushed" +%s 2>/dev/null)" || continue
+    if [ -z "$nk" ] || img_ver_gt "$key" "$nk"; then nk="$key"; ntag="$name"; ndig="$digest"; nat="$at"; fi
+  done < <(img_hub_rows)
+  [ -n "$nk" ] || return 1
+  img_ver_gt "$ck" "$nk" && return 1
+  [ "$ck" = "$nk" ] && [ "$cdig" = "$ndig" ] && return 1
+  # One cycle = the 6 h timer + its 30 min jitter + 30 min slack.
+  [ $((now - nat)) -gt $(( (soak + 7) * 3600 )) ] || return 1
+  if line="$(img_bad_line "$1" "$ndig")"; then cls="bad-$(printf '%s' "$line" | awk '{print $3}')"; else cls="$4"; fi
+  printf 'behind:%s reason:%s' "$ntag" "$cls"
+}
+
+img_report() { # $1 = name, $2 = true|false, $3 = message (green: running:<tag>@sha256:<12 hex>; red: version/digest prefix/reason class only), $4 = seconds
+  local key tok q
+  key="$(img_gatus_key "$1 updates")"
+  tok="$(cat "$IMG_TOKEN_FILE" 2>/dev/null || true)"
+  [ -n "$tok" ] || return 1
+  q="success=$2&duration=${4:-0}s"
+  if [ -n "$3" ]; then q="${q}&error=$(jq -rn --arg e "$3" '$e | @uri')"; fi
+  curl -fsS --max-time 15 -X POST -K - -o /dev/null "http://127.0.0.1:${GATUS_PORT}/api/v1/endpoints/${key}/external?${q}" <<IMG_AUTH_EOF
+header = "Authorization: Bearer ${tok}"
+IMG_AUTH_EOF
+}
+
+img_alert_direct() { # $1 = message: the direct ntfy push (Gatus may be what broke); topic AND token ride curl stdin, never argv
+  [ -n "${NTFY_TOPIC:-}" ] || return 0
+  [[ "$NTFY_TOPIC" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { log "direct alert skipped: the ntfy topic is not a plain name"; return 0; }
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    curl -fsS --proto '=https' --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" <<IMG_NTFY_EOF || true
+url = "https://ntfy.sh/${NTFY_TOPIC}"
+header = "Authorization: Bearer ${NTFY_TOKEN}"
+IMG_NTFY_EOF
+  else
+    curl -fsS --proto '=https' --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" <<IMG_NTFY_EOF || true
+url = "https://ntfy.sh/${NTFY_TOPIC}"
+IMG_NTFY_EOF
+  fi
+}
+
+img_finish() { # $1 = name, $2 = true|false, $3 = message (bounded classes, version, 12-hex digest prefix), $4 = t0 -> push; a red result that cannot reach Gatus goes direct
+  local d=$(( $(date +%s) - $4 ))
+  if [ "$2" = "true" ]; then log "$1: green ${3}"; else log "$1: $3"; fi
+  img_report "$1" "$2" "$3" "$d" && return 0
+  log "$1: status push failed (Gatus unreachable?)"
+  [ "$2" = "true" ] || img_alert_direct "$1: $3"
+}
+
+img_swap() { # $1 = name, $2 = ref -> recreate the container on that ref with 010's args
+  docker rm -f "$1" >/dev/null 2>&1 || true
+  case "$1" in
+    caddy) img_run_caddy "$2" || return 1 ;;
+    gatus) img_run_gatus "$2" || return 1 ;;
+    *) return 1 ;;
+  esac
+  sleep "${IMG_START_SLEEP:-3}"
+  img_running "$1"
+}
+
+img_candidate() { # $1 = name, $2 = candidate ref -> swap to it and verify it; ONE re-check after a pause before it counts (a transient never holds a digest); prints the failing class
+  local r=""
+  if img_swap "$1" "$2" && r="$(img_verify "$1" "$2")"; then return 0; fi
+  log "$1: candidate check failed (${r:-start}) - one re-check in ${IMG_RECHECK_SLEEP:-20}s before it counts" >&2
+  sleep "${IMG_RECHECK_SLEEP:-20}"
+  r=""
+  if { img_running "$1" || img_swap "$1" "$2"; } && r="$(img_verify "$1" "$2")"; then
+    log "$1: candidate passed its re-check (the first failure was transient; nothing held)" >&2
+    return 0
+  fi
+  printf '%s' "${r:-start}"
+  return 1
+}
+
+img_ladder() { # $1 = name, $2 = previous ref (exact digest), $3 = provisioned pin ref -> after a failed candidate; prints rolled-back | fell-back-to-pin:<cls> | all-rungs-failed:<cls>/<cls>
+  local r1="" r2="" t d
+  read -r _ t d <<<"$(img_split_ref "$2")"
+  log "$1: ladder rung 1 - restoring the previous digest ${t} (${d:7:12})" >&2
+  if img_swap "$1" "$2" && r1="$(img_verify "$1" "$2")"; then log "$1: ladder rung 1 green - back on ${t} (${d:7:12})" >&2; printf 'rolled-back'; return 0; fi
+  r1="${r1:-start}"
+  read -r _ t d <<<"$(img_split_ref "$3")"
+  log "$1: restore of the previous digest failed (${r1}) - ladder rung 2: the provisioned repo pin ${t} (${d:7:12})" >&2
+  if img_swap "$1" "$3" && r2="$(img_verify "$1" "$3")"; then log "$1: ladder rung 2 green - on the pin" >&2; printf 'fell-back-to-pin:%s' "$r1"; return 0; fi
+  printf 'all-rungs-failed:%s/%s' "$r1" "${r2:-start}"
+  return 1
+}
+
+img_disarmed() { # -> the disarm reason class (0) while the updater is disarmed; cleared only by a provision run
+  local f="${IMG_STATE_DIR}/disarmed" r
+  [ -f "$f" ] || return 1
+  r="$(sed -n 's/^reason=//p' "$f" | head -n 1 | LC_ALL=C tr -cd 'a-z0-9:/-')"
+  printf '%s' "${r:-unknown}"
+}
+
+img_disarm() { # $1 = reason class -> stop updating until the next dispatch
+  mkdir -p "$IMG_STATE_DIR"
+  chmod 700 "$IMG_STATE_DIR"
+  printf 'reason=%s\nat=%s\n' "$1" "$(img_now)" >"${IMG_STATE_DIR}/disarmed"
+  chmod 600 "${IMG_STATE_DIR}/disarmed"
+}
+
+img_after_failure() { # $1 = name, $2 = previous ref, $3 = pin ref, $4 = message head, $5 = t0 -> run the ladder and report its outcome
+  local out msg
+  if out="$(img_ladder "$1" "$2" "$3")"; then
+    case "$out" in
+      rolled-back) msg="rolled-back $4" ;;
+      *) rm -f "${IMG_STATE_DIR}/$1.state"; msg="${out%%:*} $4 restore=${out#*:}" ;;
+    esac
+    img_finish "$1" false "$msg" "$5"
+    return 0
+  fi
+  # Every rung failed: leave the best-effort container running, alert NOW
+  # (direct ntfy - Gatus may be the thing that broke), disarm the updater.
+  msg="all-rungs-failed $4 restore=${out#*:} disarmed"
+  img_disarm "all-rungs-failed"
+  img_alert_direct "$1: ${msg}"
+  log "$1: ${msg}"
+  img_report "$1" false "$msg" "$(( $(date +%s) - $5 ))" || log "$1: status push failed (Gatus unreachable?)"
+}
+
+img_update_one() { # $1 = name, $2 = repo pin: one check (+ at most one swap) for one container; every report is derived from live checks run now
+  local t0 pin cur repo tag cdig tags cand ctag cnew ckey newref r outcome="none" msg
+  t0="$(date +%s)"
+  if ! pin="$(img_pin_get "$1")" || [ "${pin%%@*}" != "$2" ]; then
+    img_finish "$1" false "no-pin-record" "$t0"
+    return 0
+  fi
+  cur="$(img_effective_ref "$1" "$pin")"
+  read -r repo tag cdig <<<"$(img_split_ref "$cur")"
+  if r="$(img_disarmed)"; then
+    img_finish "$1" false "disarmed:${r}" "$t0"
+    return 0
+  fi
+  # Live health of what runs NOW first: an unhealthy box never swaps (a
+  # candidate would be blamed for the box) and never reports green.
+  if ! r="$(img_verify "$1" "$cur")"; then
+    img_finish "$1" false "unhealthy:${r} ver=${tag} dig=${cdig:7:12}" "$t0"
+    return 0
+  fi
+  if [ -n "${IMG_DRILL:-}" ] && [ "${IMG_DRILL}" = "$1" ]; then
+    # Drill (root on the box, under the updater lock; docs/updaters.md): the
+    # CURRENT digest is re-created as the candidate with a drill-only fault
+    # that fails its self-check after the real checks ran; the candidate path
+    # (re-check included) and the ladder then run for real. Nothing is held
+    # and no record changes: every rung is the current digest or the pin.
+    log "$1: DRILL rung 0 - candidate ${tag} (${cdig:7:12}) re-created with an injected self-check fault"
+    if r="$(IMG_DRILL_FAULT=1 img_candidate "$1" "$cur")"; then
+      img_finish "$1" false "drill-fault-not-injected ver=${tag} dig=${cdig:7:12}" "$t0"
+      return 0
+    fi
+    log "$1: DRILL rung 0 - the candidate failed as injected (${r}); walking the ladder"
+    img_after_failure "$1" "$cur" "$pin" "drill ver=${tag} dig=${cdig:7:12} reason=${r}" "$t0"
+    return 0
+  fi
+  if ! tags="$(img_hub_tags "$repo" "$tag")"; then
+    img_finish "$1" false "registry-listing-incomplete" "$t0"
+    return 0
+  fi
+  cand="$(img_pick_candidate "$1" "$pin" "$tag" "$cdig" <<<"$tags")" || cand=""
+  if [ -n "$cand" ]; then
+    read -r ctag cnew <<<"$cand"
+    ckey="$(img_ver_key "$ctag" "${tag}")" || ckey="0.0.0"
+    newref="${repo}:${ctag}@${cnew}"
+    if ! docker pull -q "${repo}@${cnew}" >/dev/null 2>&1; then
+      log "$1: pull of ${ctag} (${cnew:7:12}) failed - retried next round"
+      outcome="pull"
+    elif [ "$1" = "caddy" ] && ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1 \
+        && { log "$1: ${ctag} (${cnew:7:12}) failed validate - one re-check in ${IMG_RECHECK_SLEEP:-20}s before it counts"
+             sleep "${IMG_RECHECK_SLEEP:-20}"; ! img_caddy_validate "$newref" "${CADDY_CONFIG}" >/dev/null 2>&1; }; then
+      if img_caddy_validate "$cur" "${CADDY_CONFIG}" >/dev/null 2>&1; then
+        img_mark_bad "$1" "$cnew" "$ckey" "validate"
+        img_finish "$1" false "rejected ver=${ctag} dig=${cnew:7:12} reason=validate" "$t0"
+      else
+        img_finish "$1" false "validate-config ver=${ctag} dig=${cnew:7:12} (the running build rejects the live Caddyfile too; nothing held)" "$t0"
+      fi
+      return 0
+    else
+      log "$1: swapping ${tag} (${cdig:7:12}) -> ${ctag} (${cnew:7:12})"
+      if r="$(img_candidate "$1" "$newref")"; then
+        img_state_put "$1" "$newref"
+        log "$1: now on ${ctag} (${cnew:7:12}); self-checks passed"
+        cur="$newref"
+        outcome="updated"
+      else
+        img_mark_bad "$1" "$cnew" "$ckey" "$r"
+        img_after_failure "$1" "$cur" "$pin" "ver=${ctag} dig=${cnew:7:12} reason=${r}" "$t0"
+        return 0
+      fi
+    fi
+  fi
+  if msg="$(img_behind "$1" "$pin" "$cur" "$outcome" <<<"$tags")"; then
+    img_finish "$1" false "$msg" "$t0"
+  else
+    # Green carries what runs (the round's final ref, after any swap).
+    read -r _ tag cdig <<<"$(img_split_ref "$cur")"
+    img_finish "$1" true "running:${tag}@sha256:${cdig:7:12}" "$t0"
+  fi
+}
+
+img_drill_guard() { # IMG_DRILL is set: caddy|gatus only, root only, and only while it can take the updater lock itself (a live provision run or round refuses it)
+  case "$IMG_DRILL" in caddy|gatus) ;; *) die "IMG_DRILL must be caddy or gatus" ;; esac
+  [ "$(id -u)" = "0" ] || die "IMG_DRILL is honoured only for root on the box - drill refused"
+  exec {IMG_DRILL_LOCK_FD}>>"$IMG_LOCK_FILE" || die "cannot open ${IMG_LOCK_FILE} - drill refused"
+  flock -n "$IMG_DRILL_LOCK_FD" || die "${IMG_LOCK_FILE} is held (a provision run or an update round is live) - drill refused; retry once it is idle (do not wrap the drill in flock)"
+  log "DRILL ${IMG_DRILL}: holding ${IMG_LOCK_FILE} for the whole round"
+}
+
+img_updater_main() { # the on-box entry point (the rendered script calls only this)
+  [ "$(img_updater_mode)" = "on" ] || { log "IMG_AUTO_UPDATES is not on - nothing to do"; return 0; }
+  img_soak_hours >/dev/null || die "bad IMG_UPDATE_SOAK_HOURS in the rendered updater"
+  unset IMG_DRILL_FAULT
+  if [ -n "${IMG_DRILL:-}" ]; then img_drill_guard; fi
+  if [ -r "$IMG_ENV_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$IMG_ENV_FILE"
+  fi
+  img_update_one gatus "$GATUS_IMAGE"
+  img_update_one caddy "$CADDY_IMAGE"
+}
+
+render_img_updater() { # print the on-box updater: constants + the reused 010 functions + the entry call
+  local v fn
+  cat <<'IMG_UPDATER_HEAD_EOF'
+#!/usr/bin/env bash
+# piercloud-img-update - DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh).
+# DO NOT EDIT BY HAND - re-rendered on every provision run (A-IMG #51; docs/updaters.md).
+set -euo pipefail
+umask 077
+IMG_UPDATER_HEAD_EOF
+  for v in IMG_STATE_DIR IMG_ENV_FILE IMG_TOKEN_FILE IMG_LOCK_FILE GATUS_IMAGE CADDY_IMAGE GATUS_PORT GATUS_CONFIG TANG_PORT \
+    CADDY_CONFIG CADDY_ORIGIN_CRT CADDY_ORIGIN_KEY CADDY_AOP_CA CADDY_CHALLENGE_DIR ORIGIN_TLS AOP_TLS STATUS_HOST \
+    IMG_AUTO_UPDATES IMG_UPDATE_SOAK_HOURS; do
+    printf '%s=%q\n' "$v" "${!v-}"
+  done
+  for fn in log warn die adv_ok probe_tang_direct assert_caddyfile_hardened img_gatus_key \
+    img_updater_mode img_soak_hours img_split_ref img_ver_key img_ver_gt img_now img_ref_write img_ref_read \
+    img_state_get img_state_put img_pin_get img_bad_line img_is_bad img_version_mark_at img_mark_bad \
+    img_effective_ref img_caddy_mount_args img_caddy_validate img_run_caddy img_run_gatus \
+    certless_probe edge_pull_200 img_try img_probe_tang_direct img_probe_caddy80 img_probe_gatus img_selfcheck \
+    img_running img_running_digest_is img_verify img_hub_rows img_hub_tags img_pick_candidate img_behind img_report \
+    img_alert_direct img_finish img_swap img_candidate img_ladder img_disarmed img_disarm img_after_failure \
+    img_update_one img_drill_guard img_updater_main; do
+    declare -f "$fn" || return 1
+  done
+  printf '%s\n' 'img_updater_main "$@"'
+}
+
+render_img_updater_service() { # print the systemd service unit
+  cat <<IMG_SERVICE_EOF
+[Unit]
+Description=piercloud container updater (Caddy + Gatus inside the approved track; A-IMG #51)
+Documentation=https://github.com/piercloud-net/terraform-piercloud-anchor/blob/main/docs/updaters.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n -E 0 ${IMG_LOCK_FILE} ${IMG_SBIN}
+User=root
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+IMG_SERVICE_EOF
+}
+
+render_img_updater_timer() { # print the systemd timer unit (every 6 h + jitter)
+  cat <<'IMG_TIMER_EOF'
+[Unit]
+Description=Run the piercloud container updater every 6 hours
+
+[Timer]
+OnActiveSec=30min
+OnUnitInactiveSec=6h
+AccuracySec=1min
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
+IMG_TIMER_EOF
+}
+
+img_lock_acquire() { # serialize provision's container recreates against an in-flight update (held to the end of the run)
+  command -v flock >/dev/null 2>&1 || return 0
+  exec {IMG_LOCK_FD}>"$IMG_LOCK_FILE"
+  flock -w 900 "$IMG_LOCK_FD" || die "the container updater still holds ${IMG_LOCK_FILE} after 15 min - refusing to race it; re-dispatch"
+}
+
+img_updater_install() { # render + install the updater, its 0600 env file and units (IMG_AUTO_UPDATES on)
+  local tmp
+  mkdir -p "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")" "$(dirname "$IMG_SBIN")" "$(dirname "$IMG_SERVICE")" "$(dirname "$IMG_TIMER")"
+  chmod 700 "$IMG_STATE_DIR" "$(dirname "$IMG_ENV_FILE")"
+  tmp="$(mktemp)"
+  render_img_updater >"$tmp" || { rm -f "$tmp"; die "container updater render failed (a reused 010 helper is missing) - refusing to install"; }
+  bash -n "$tmp" || { rm -f "$tmp"; die "rendered container updater failed bash -n - refusing to install"; }
+  chmod 0755 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$IMG_SBIN"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh). 0600, root-only."
+    if [ -n "${NTFY_TOPIC:-}" ]; then printf 'NTFY_TOPIC=%q\n' "$NTFY_TOPIC"; fi
+    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'NTFY_TOKEN=%q\n' "$NTFY_TOKEN"; fi
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$IMG_ENV_FILE"
+  render_img_updater_service >"$IMG_SERVICE.tmp.$$"
+  chmod 0644 "$IMG_SERVICE.tmp.$$"
+  mv "$IMG_SERVICE.tmp.$$" "$IMG_SERVICE"
+  render_img_updater_timer >"$IMG_TIMER.tmp.$$"
+  chmod 0644 "$IMG_TIMER.tmp.$$"
+  mv "$IMG_TIMER.tmp.$$" "$IMG_TIMER"
+  # A dispatch re-arms an updater that disarmed itself (every rung failed).
+  rm -f "${IMG_STATE_DIR}/disarmed"
+  systemctl daemon-reload
+  systemctl enable piercloud-img-update.timer >/dev/null
+  systemctl restart piercloud-img-update.timer
+  log "container updater installed (6 h timer + jitter, soak ${IMG_SOAK:-6}h, track = the repo pin's major; env file 0600)"
+}
+
+img_updater_disable() { # IMG_AUTO_UPDATES=off: remove the updater + the current records (bad-digest holds and the by-digest pin records are kept)
+  rm -f "${IMG_STATE_DIR}/caddy.state" "${IMG_STATE_DIR}/gatus.state" "${IMG_STATE_DIR}/disarmed"
+  if [ ! -e "$IMG_SERVICE" ] && [ ! -e "$IMG_TIMER" ] && [ ! -e "$IMG_SBIN" ] && [ ! -e "$IMG_ENV_FILE" ]; then
+    return 0
+  fi
+  log "IMG_AUTO_UPDATES=off - removing the container updater (the containers run the repo pins from this run on)"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now piercloud-img-update.timer >/dev/null 2>&1 || true
+    systemctl stop piercloud-img-update.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$IMG_SERVICE" "$IMG_TIMER" "$IMG_SBIN" "$IMG_ENV_FILE"
+  if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+}
+# --- END IMG UPDATER ---
+
 # ---------------------------------------------------------------------------
 # a2) OS security updates + kernel reboot window (Lane A, #51; docs/updaters.md)
 # ---------------------------------------------------------------------------
 gatus_ext_items=()
 os_updates_apply
+
+# ---------------------------------------------------------------------------
+# a3) Container-updater status rows (A-IMG, #51; docs/updaters.md): one Gatus
+#    external row per auto-updated container + its push token, appended to
+#    the shared gatus_ext_items before the Gatus render (IMG UPDATER span).
+# ---------------------------------------------------------------------------
+img_status_items_add
 
 # ---------------------------------------------------------------------------
 # b) thumbprint — the ONE value you must save
@@ -1921,6 +2714,7 @@ else
   log "Gatus alert stanzas: 0 (no push channel configured)"
 fi
 if [ -f "${GATUS_CONFIG}" ] && cmp -s "${GATUS_CONFIG}" "$TMP_CFG"; then
+  chmod 600 "${GATUS_CONFIG}"
   log "Gatus config unchanged (identical re-render)"
   rm -f "$TMP_CFG"
 else
@@ -3301,6 +4095,18 @@ gatus_puller_disable() { # remove the puller artifacts + the puller-owned fragme
 }
 # --- END GATUS PULLER ---
 
+
+# ---------------------------------------------------------------------------
+# c0b) Container updater switch (A-IMG #51): validated here, before any
+#    container is (re)created; the precedence rule above picks the refs the
+#    d)/e2) docker runs use; the updater itself installs after the proofs.
+# ---------------------------------------------------------------------------
+case "$(img_updater_mode)" in
+  on|off) ;;
+  *) die "bad IMG_AUTO_UPDATES (want unset/on/off): ${IMG_AUTO_UPDATES:-}" ;;
+esac
+IMG_SOAK="$(img_soak_hours)" || die "bad IMG_UPDATE_SOAK_HOURS (want whole hours 0-720, default 6): ${IMG_UPDATE_SOAK_HOURS:-}"
+
 # ---------------------------------------------------------------------------
 # c0) Gatus dynamic-endpoints puller (optional; STATUS_PULLER=on)
 #    The fragment owns every watched HTTP row; on slice-managed anchors the
@@ -3359,6 +4165,18 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 #    config and the sqlite history volume survive the recreation)
 # ---------------------------------------------------------------------------
 log "Running Gatus monitor (bound to 127.0.0.1:${GATUS_PORT})"
+# A-IMG precedence (#51): hold the updater lock for the rest of the run, then
+# run max(repo pin, updater record) inside the pin's track.
+img_lock_acquire
+# No tag-only runs (#51 F4): the repo pin is resolved to a registry digest
+# once per pin tag and recorded; every path (no record, off, reconcile) runs
+# that digest.
+GATUS_PIN_REF="$(img_pin_resolve gatus "${GATUS_IMAGE}")" \
+  || die "could not resolve the Gatus repo pin ${GATUS_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only ref"
+img_reconcile_state gatus "${GATUS_PIN_REF}"
+GATUS_RUN_IMAGE="$(img_effective_ref gatus "${GATUS_PIN_REF}")"
+[ "${GATUS_RUN_IMAGE}" = "${GATUS_PIN_REF}" ] \
+  || log "Gatus: the updater moved to ${GATUS_RUN_IMAGE%%@*} (digest ${GATUS_RUN_IMAGE##*@sha256:}) - at or above the repo pin ${GATUS_IMAGE} in the same track, kept (no downgrade)"
 # Stale-mount guard: the container bind-mounts the config directory (D8:
 # /config), so the container's /config/config.yaml is compared through its
 # root to the rendered path; divergence = recreate once. Separately, the
@@ -3393,28 +4211,22 @@ if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
 fi
 if docker ps --format '{{.Names}}' | grep -qx "gatus"; then
   RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' gatus) # ci-allowlist: code — docker inspect field name, not a live reference.
-  if [ "${RUNNING_IMAGE}" = "${GATUS_IMAGE}" ]; then
+  if [ "${RUNNING_IMAGE}" = "${GATUS_RUN_IMAGE}" ]; then
     if docker inspect --format '{{json .HostConfig.ExtraHosts}}' gatus 2>/dev/null | grep -q hostanchor && [ "${GATUS_MOUNT_STALE}" = "0" ] && [ "${GATUS_SHAPE_STALE}" = "0" ]; then
-      log "Gatus already running on ${GATUS_IMAGE} (directory mount, GATUS_CONFIG_PATH=/config)"
+      log "Gatus already running on ${GATUS_RUN_IMAGE%%@*} (directory mount, GATUS_CONFIG_PATH=/config)"
     else
       log "Gatus container predates the hostanchor mapping, the directory mount or its mounted config diverged - recreating" # ci-allowlist: prose — container-flag change note, not a live reference.
       docker rm -f gatus >/dev/null
     fi
   else
-    log "Gatus image changed (${RUNNING_IMAGE} -> ${GATUS_IMAGE}) - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
+    log "Gatus image changed (${RUNNING_IMAGE%%@*} -> ${GATUS_RUN_IMAGE%%@*}) - recreating container" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f gatus >/dev/null
   fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "gatus"; then
   docker rm -f gatus >/dev/null   # stale stopped container; recreated below
 fi
 if ! docker ps --format '{{.Names}}' | grep -qx "gatus"; then
-  docker run -d --name gatus --restart unless-stopped \
-    -p 127.0.0.1:${GATUS_PORT}:8080 \
-    --add-host=hostanchor:host-gateway \
-    -e GATUS_CONFIG_PATH=/config \
-    -v "$(dirname "${GATUS_CONFIG}")":/config:ro \
-    --mount type=volume,source=gatus-data,target=/data \
-    "${GATUS_IMAGE}" >/dev/null
+  img_run_gatus "${GATUS_RUN_IMAGE}"   # the ONE gatus docker run (IMG UPDATER span), shared with the on-box updater
 fi
 # Always restart: the stale-mount guard compares the MOUNT's bytes, not what
 # the running Gatus loaded — an aborted restart (SSH drop, SIGKILL) would
@@ -3571,6 +4383,14 @@ else
   DASH_TLS_STANZA="	# No origin pair deployed: Caddy automatic HTTPS (HTTP-01 via :80 below)."
 fi
 TMP_CADDY="${CADDY_CONFIG}.new"
+# A-IMG precedence (#51): validate and run on max(repo pin, updater record)
+# inside the pin's track (the lock is held since section d).
+CADDY_PIN_REF="$(img_pin_resolve caddy "${CADDY_IMAGE}")" \
+  || die "could not resolve the Caddy repo pin ${CADDY_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only ref"
+img_reconcile_state caddy "${CADDY_PIN_REF}"
+CADDY_RUN_IMAGE="$(img_effective_ref caddy "${CADDY_PIN_REF}")"
+[ "${CADDY_RUN_IMAGE}" = "${CADDY_PIN_REF}" ] \
+  || log "Caddy: the updater moved to ${CADDY_RUN_IMAGE%%@*} (digest ${CADDY_RUN_IMAGE##*@sha256:}) - at or above the repo pin ${CADDY_IMAGE} in the same track, kept (no downgrade)"
 # Pre-create root-only BEFORE the render. The rendered Caddyfile carries no
 # credential since #202, but it still names the main-box address, so neither a
 # fail-closed render nor a validate rejection may leave it readable beyond
@@ -3596,15 +4416,10 @@ else
   # live (mounts mirror the run below; the file mounts at a scratch path so
   # a rejection never touches the serving config).
   log "Validating rendered Caddyfile in an ephemeral container"
-  CADDY_VAL_ARGS="-v ${TMP_CADDY}:/tmp/Caddyfile.new:ro"
-  if [ "${ORIGIN_TLS}" = "1" ]; then
-    CADDY_VAL_ARGS="${CADDY_VAL_ARGS} -v ${CADDY_ORIGIN_CRT}:${CADDY_ORIGIN_CRT}:ro -v ${CADDY_ORIGIN_KEY}:${CADDY_ORIGIN_KEY}:ro"
-  fi
-  if [ -n "${AOP_TLS}" ]; then
-    CADDY_VAL_ARGS="${CADDY_VAL_ARGS} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
-  fi
-  # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
-  docker run --rm $CADDY_VAL_ARGS "${CADDY_IMAGE}" caddy validate --config /tmp/Caddyfile.new --adapter caddyfile || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
+  # The validate args are img_caddy_validate's (IMG UPDATER span): the
+  # on-box updater validates the LIVE Caddyfile against a candidate with the
+  # same function, so the two can never drift.
+  img_caddy_validate "${CADDY_RUN_IMAGE}" "$TMP_CADDY" || { rm -f "$TMP_CADDY"; die "rendered Caddyfile failed validate — refusing to install it (serving config untouched)"; }
   # IN-PLACE install: the caddy container bind-mounts this FILE, and a file
   # bind mount pins the inode — `mv` swaps the inode, so the container keeps
   # reading the OLD bytes and `caddy reload` reports "config is unchanged"
@@ -3676,8 +4491,8 @@ if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
 fi
 if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
   CADDY_RUNNING_IMAGE=$(docker inspect --format '{{.Config.Image}}' caddy) # ci-allowlist: code — docker inspect field name, not a live reference.
-  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
-    log "Caddy already running on ${CADDY_IMAGE}"
+  if [ "${CADDY_RUNNING_IMAGE}" = "${CADDY_RUN_IMAGE}" ] && [ "${CADDY_HAVE_MOUNTS}" = "${CADDY_WANT_MOUNTS}" ] && [ "${CADDY_MOUNT_STALE}" = "0" ]; then
+    log "Caddy already running on ${CADDY_RUN_IMAGE%%@*}"
   else
     log "Caddy image, deployed-PEM set or mounted Caddyfile diverged - recreating container (stale bind-mount: ${CADDY_MOUNT_STALE_REASON:-image/mount-set})" # ci-allowlist: prose — container-tag change note, not a live reference.
     docker rm -f caddy >/dev/null
@@ -3685,30 +4500,15 @@ if docker ps --format '{{.Names}}' | grep -qx "caddy"; then
 elif docker ps -a --format '{{.Names}}' | grep -qx "caddy"; then
   docker rm -f caddy >/dev/null   # stale stopped container; recreated below
 fi
-CADDY_MOUNT_ARGS="-v ${CADDY_CONFIG}:/etc/caddy/Caddyfile:ro"
-if [ "${ORIGIN_TLS}" = "1" ]; then
-  CADDY_MOUNT_ARGS="${CADDY_MOUNT_ARGS} -v ${CADDY_ORIGIN_CRT}:${CADDY_ORIGIN_CRT}:ro -v ${CADDY_ORIGIN_KEY}:${CADDY_ORIGIN_KEY}:ro"
-fi
-if [ -n "${AOP_TLS}" ]; then
-  CADDY_MOUNT_ARGS="${CADDY_MOUNT_ARGS} -v ${CADDY_AOP_CA}:/etc/caddy/aop-ca.pem:ro"
-fi
 if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
-  # shellcheck disable=SC2086: mount args are flag-or-path pairs built above, no spaces by construction.
   # --network host (NOT -p publishing): Caddy dials 127.0.0.1:8081/:8080 for
   # tangd/Gatus on the HOST loopback — in the default bridge netns those dials
   # would hit the container's own loopback (502 everywhere, tang dead). Host
   # networking keeps the loopback dials valid; the netcup firewall policy
   # (main /32 + edge ranges) stays the ingress gate. Loopback admin :2019
   # likewise binds host loopback: `docker exec` reload works, outside cannot reach.
-  docker run -d --name caddy --restart unless-stopped \
-    --network host \
-    --memory 256m \
-    -e GOMEMLIMIT=230MiB -e GOMAXPROCS=1 \
-    $CADDY_MOUNT_ARGS \
-    --mount type=volume,source=caddy-data,target=/data \
-    --mount type=volume,source=caddy-config,target=/config \
-    -v "${CADDY_CHALLENGE_DIR}:/var/lib/caddy/acme-challenge" \
-    "${CADDY_IMAGE}" >/dev/null
+  # The mounts are img_caddy_mount_args (the same set the validate uses).
+  img_run_caddy "${CADDY_RUN_IMAGE}"   # the ONE caddy docker run (IMG UPDATER span), shared with the on-box updater
   printf '%s' "${CADDY_WANT_MOUNTS}" > /etc/caddy/.deployed-mounts
   sleep 3
   if ! docker ps --format '{{.Names}}' | grep -qx "caddy"; then
@@ -3911,9 +4711,11 @@ if [ -n "${STATUS_HOST:-}" ]; then
       pool_retry="the origin-mTLS CA is the only supported client-auth pool: provision with the committed CA and without CF_AOP_CA_PEM (docs/dr.md)"
       pool_cause="the origin trust bundle does not match Cloudflare's client cert"
     fi
-    neg_rc=0
-    neg_err=""
-    neg_err="$(curl -sSk --max-time 10 --resolve "${STATUS_HOST}:443:127.0.0.1" "https://${STATUS_HOST}/" -o /dev/null 2>&1)" || neg_rc=$?
+    # The probe itself is certless_probe (IMG UPDATER span): the on-box
+    # updater re-runs the same probe after a swap.
+    certless_probe "${STATUS_HOST}" || true
+    neg_rc="${CERTLESS_RC}"
+    neg_err="${CERTLESS_ERR}"
     case "${neg_rc}" in
       0)
         die "Caddy :443 answered a cert-less probe while client auth is deployed — client_auth is not enforcing; ${pool_rollback}" ;;
@@ -3934,18 +4736,13 @@ if [ -n "${STATUS_HOST:-}" ]; then
       *)
         die "Caddy :443 cert-less probe failed with curl exit ${neg_rc} (not a TLS-layer rejection) — cannot prove client_auth is enforcing; stderr: $(printf '%s' "${neg_err}" | tr '\n' ' ' | cut -c1-160); refusing to finish blind" ;;
     esac
+    # edge_pull_200 (IMG UPDATER span) is the same probe the on-box updater
+    # re-runs after a swap.
     edge_ok=0
-    edge_rc=0
-    edge_code=""
-    for attempt in 1 2 3; do
-      edge_rc=0
-      edge_code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://${STATUS_HOST}/")" || edge_rc=$?
-      if [ "${edge_rc}" -eq 0 ] && [ "${edge_code}" = "200" ]; then edge_ok=1; break; fi
-      if [ "${attempt}" -lt 3 ]; then
-        log "edge pull attempt ${attempt}/3 failed (curl exit ${edge_rc}, HTTP ${edge_code:-none}; 200 required); retrying in 5s"
-        sleep 5
-      fi
-    done
+    edge_pull_200 "${STATUS_HOST}" || true
+    edge_rc="${EDGE_RC}"
+    edge_code="${EDGE_CODE}"
+    if [ "${edge_rc}" -eq 0 ] && [ "${edge_code}" = "200" ]; then edge_ok=1; fi
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
         die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. ${pool_retry}; once the platform records converge the edge pull recovers (docs/dr.md)"
@@ -3996,6 +4793,21 @@ if [ -n "${STATUS_HOST:-}" ]; then
     die "Caddy :443 does not handshake for ${STATUS_HOST} — refusing to finish blind"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# e3) Container updater (A-IMG #51; IMG_AUTO_UPDATES unset/on = on). Installed
+#    only AFTER every proof above passed, so the updater's first baseline is a
+#    proven box; off removes it and the records (back on the repo pins).
+# ---------------------------------------------------------------------------
+case "$(img_updater_mode)" in
+  on)
+    log "Installing the container updater (Caddy + Gatus inside the repo pin's major track)"
+    img_updater_install
+    ;;
+  *)
+    img_updater_disable
+    ;;
+esac
 
 # --- BEGIN RECORDING WITNESS (tests/recording-witness extracts this span; keep markers) ---
 # Recording-completeness witness — optional component, dormant without env.
