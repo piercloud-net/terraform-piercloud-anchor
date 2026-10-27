@@ -650,7 +650,7 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # see an inserted step in the same job that rewrites a harness on the runner
 # before the pinned run step executes it (the static harnesses read the PR
 # tree, not the runner workspace). Any deliberate job edit updates this pin.
-is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "609b7c168fc082f717949910b6ed2bcb6b1be83363497749b8327697c20da34a" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "13a73975c814308c93f531669e0468544561b3417146694d3ad9b29e0f43fffb" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -903,8 +903,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "2aed346bd57bd6579ac9fb696ce3b5118f80e85cd47c80b01193eba40ea5405c" "$tests_digest_got"
-if [ "$tests_digest_got" != "2aed346bd57bd6579ac9fb696ce3b5118f80e85cd47c80b01193eba40ea5405c" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "478d97f3df83d676cee204baf813a52976c72c55b76453a690e655d26499f7ed" "$tests_digest_got"
+if [ "$tests_digest_got" != "478d97f3df83d676cee204baf813a52976c72c55b76453a690e655d26499f7ed" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
@@ -948,7 +948,7 @@ GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts
 GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
-  is "gate step blob hash (pin: update after a deliberate edit)" "a7b863c2995160442b1a1d6e4524efdf0fc4871fbfb67d40e811421169241978" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "gate step blob hash (pin: update after a deliberate edit)" "7e5faf545a0e6748474a56363d2fea6014e4978426e0daa07736bf1318aad55d" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "gate step span not found in ci.yml"
 fi

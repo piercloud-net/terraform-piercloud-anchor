@@ -53,7 +53,7 @@ if [ "$ARCH" = arm64 ]; then pk="qemu-system-arm qemu-efi-aarch64"; else pk="qem
 # shellcheck disable=SC2086
 apt-get install -y -qq --no-install-recommends $pk qemu-utils dosfstools mtools openssh-client curl ca-certificates >/dev/null
 source /w/base-image.sh # ci-allowlist: helper file name, not an image reference.
-BASE="$(vmtt_base_image "$ARCH" /cache 2>/w/base.err)" || { cat /w/base.err | tee -a /w/summary.log; say "FAIL: base qcow2 refused, VM not booted"; exit 1; }
+BASE="$(vmtt_stage_base "$ARCH" /cache /w/base.qcow2 2>/w/base.err)" || { cat /w/base.err | tee -a /w/summary.log; say "FAIL: base qcow2 refused, VM not booted"; exit 1; }
 qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" /w/vm.qcow2 8G
 ssh-keygen -q -t ed25519 -N '' -f /w/key
 printf 'instance-id: vmtt-1\nlocal-hostname: vmtt\n' >/w/meta-data
@@ -71,7 +71,7 @@ QPID=$!
 S=(ssh -q -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 debian@127.0.0.1)
 vm() { "${S[@]}" "sudo bash -c $(printf '%q' "$1")"; }
 wait_ssh() { local i; for i in $(seq 1 90); do kill -0 "$QPID" 2>/dev/null || return 1; "${S[@]}" true 2>/dev/null && return 0; sleep 4; done; return 1; }
-finish() { kill "$QPID" 2>/dev/null || true; }
+finish() { kill "$QPID" 2>/dev/null || true; [ -z "${VMTT_TMP:-}" ] || rm -f -- "$VMTT_TMP"; } # ci-allowlist: cleanup of the pinned base download's temp file, not a live reference.
 trap finish EXIT
 wait_ssh || { say "FAIL: VM never answered ssh"; tail -n 20 /w/console.log; exit 1; }
 say "booted: $(vm 'grep PRETTY /etc/os-release; uname -m')"

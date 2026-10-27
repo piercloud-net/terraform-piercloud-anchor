@@ -122,5 +122,101 @@ for arch in amd64 arm64; do
 done
 if [[ "$BUILD" =~ ^[0-9]{8}-[0-9]{4}$ ]]; then ok "build is a dated directory name"; else bad "build is a dated directory name"; fi
 
+# qemu-img stub: prints QEMU_INFO_JSON, or fails on QEMU_INFO_FAIL
+cat >"$TMP/bin/qemu-img" <<'STUB'
+#!/usr/bin/env bash
+[ -z "${QEMU_INFO_FAIL:-}" ] || exit 1
+printf '%s\n' "$QEMU_INFO_JSON"
+STUB
+chmod +x "$TMP/bin/qemu-img"
+QCOW2='{"virtual-size": 100, "filename": "x", "format": "qcow2"}'
+
+# stage_run CACHE DEST JSON: vmtt_stage_base for amd64 with the stub qemu-img
+stage_run() {
+  (
+    export PATH="$TMP/bin:$PATH" CURL_LOG="$TMP/curl.log" FAKE_BODY="$BODY" QEMU_INFO_JSON="$3"
+    # shellcheck source=/dev/null
+    . "$HELPER"
+    vmtt_pin_sha512() { if [ "$1" = amd64 ]; then echo "$GOOD"; else echo "no pinned qcow2 for arch '$1': refusing" >&2; return 1; fi; }
+    vmtt_stage_base amd64 "$1" "$2"
+  ) >"$TMP/out" 2>"$TMP/err"
+}
+
+# (h) staging: a verified private copy is made and printed
+C="$TMP/cache-h"; mkdir -p "$C"; cp "$BODY" "$C/$NAME"
+D="$TMP/staged-h.qcow2"
+rc=0; stage_run "$C" "$D" "$QCOW2" || rc=$?
+is "staging exits 0" "0" "$rc"
+is "staging prints the private copy" "$D" "$(cat "$TMP/out")"
+if cmp -s "$BODY" "$D"; then ok "staged copy carries the pinned bytes"; else bad "staged copy carries the pinned bytes"; fi
+
+# (i) staging verifies the COPY: a swap between copy and check is caught
+# (the copy is made from a cache file that is corrupted after the cache check)
+C="$TMP/cache-i"; mkdir -p "$C"; cp "$BODY" "$C/$NAME"
+D="$TMP/staged-i.qcow2"
+(
+  # a cp stub that writes the tampered body: the cache check passed, the copy is wrong
+  cat >"$TMP/bin/cp" <<'CP'
+#!/usr/bin/env bash
+for last; do :; done
+/bin/cp "$FAKE_BODY" "$last"
+CP
+  chmod +x "$TMP/bin/cp"
+  export PATH="$TMP/bin:$PATH" CURL_LOG="$TMP/curl.log" FAKE_BODY="$BAD" QEMU_INFO_JSON="$QCOW2"
+  # shellcheck source=/dev/null
+  . "$HELPER"
+  vmtt_pin_sha512() { if [ "$1" = amd64 ]; then echo "$GOOD"; else return 1; fi; }
+  vmtt_stage_base amd64 "$C" "$D"
+) >"$TMP/out" 2>"$TMP/err" || rc=$?
+if [ "$rc" != "0" ]; then ok "a copy that does not match the pin is refused"; else bad "a copy that does not match the pin is refused"; fi
+if grep -qF "checksum mismatch after staging: $D" "$TMP/err"; then ok "the staged-copy mismatch names the file"; else bad "the staged-copy mismatch names the file"; fi
+if [ ! -e "$D" ]; then ok "a refused staged copy is removed"; else bad "a refused staged copy is removed"; fi
+rm -f "$TMP/bin/cp"
+
+# (j) staging refuses a copy qemu-img cannot read
+C="$TMP/cache-j"; mkdir -p "$C"; cp "$BODY" "$C/$NAME"
+D="$TMP/staged-j.qcow2"
+rc=0
+( export PATH="$TMP/bin:$PATH" QEMU_INFO_FAIL=1; stage_run "$C" "$D" "$QCOW2" ) || rc=$?
+if [ "$rc" != "0" ] && [ ! -e "$D" ]; then ok "an unreadable staged copy is refused and removed"; else bad "an unreadable staged copy is refused and removed"; fi
+
+# (k) staging refuses a non-qcow2 and a qcow2 with a backing file
+for json in '{"format": "raw"}' '{"format": "qcow2", "backing-filename": "base.qcow2"}'; do
+  C="$TMP/cache-k"; mkdir -p "$C"; cp "$BODY" "$C/$NAME"
+  D="$TMP/staged-k.qcow2"
+  rc=0; stage_run "$C" "$D" "$json" || rc=$?
+  if [ "$rc" != "0" ] && [ ! -e "$D" ]; then ok "staged copy refused: $json"; else bad "staged copy refused: $json"; fi
+done
+if grep -qF "carries a backing file" "$TMP/err"; then ok "the backing-file refusal says why"; else bad "the backing-file refusal says why"; fi
+
+# (l) chmod or rename failing after a good download is reported, and the temp is removed
+mkdir -p "$TMP/binl" "$TMP/binc"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/binl/mv"; chmod +x "$TMP/binl/mv"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/binc/chmod"; chmod +x "$TMP/binc/chmod"
+for case in mv chmod; do
+  C="$TMP/cache-l-$case"; mkdir -p "$C"
+  rc=0
+  (
+    export PATH="$TMP/binl:$TMP/binc:$TMP/bin:$PATH" CURL_LOG="$TMP/curl.log" FAKE_BODY="$BODY"
+    # shellcheck source=/dev/null
+    . "$HELPER"
+    vmtt_pin_sha512() { if [ "$1" = amd64 ]; then echo "$GOOD"; else return 1; fi; }
+    vmtt_base_image amd64 "$C"
+  ) >"$TMP/out" 2>"$TMP/err" || rc=$?
+  if [ "$rc" != "0" ]; then ok "a failing $case after the download exits non-zero"; else bad "a failing $case after the download exits non-zero"; fi
+  if grep -qE "could not be (stored as|made readable)" "$TMP/err"; then ok "a failing $case says what failed"; else bad "a failing $case says what failed"; fi
+  if [ -z "$(ls -A "$C")" ]; then ok "a failing $case leaves no temp file in the cache"; else bad "a failing $case leaves no temp file in the cache"; fi
+  rm -rf "$C"
+done
+
+# (m) the call sites: both VM proofs stage a verified copy before they boot
+for script in run.sh img-drill.sh; do
+  f="$REPO_ROOT/tools/vm-timetravel/$script"
+  if grep -qF 'cp "$ROOT/tools/vm-timetravel/base-image.sh" "$WORK/base-image.sh"' "$f" && grep -qF 'source /w/base-image.sh' "$f"; then ok "$script ships and sources the pinned helper"; else bad "$script ships and sources the pinned helper"; fi
+  if grep -qF 'vmtt_stage_base "$ARCH" /cache /w/base.qcow2' "$f"; then ok "$script stages a private verified copy"; else bad "$script stages a private verified copy"; fi
+  if grep -qF -- '-b "$BASE" /w/vm.qcow2' "$f"; then ok "$script boots from the staged copy"; else bad "$script boots from the staged copy"; fi
+  if ! grep -qE 'cloud/trixie/latest|\[ -s "\$BASE" \]' "$f"; then ok "$script trusts no unpinned download"; else bad "$script trusts no unpinned download"; fi
+done
+
 echo "vm-base-pin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

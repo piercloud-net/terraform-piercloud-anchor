@@ -1,22 +1,33 @@
 #!/usr/bin/env bash
-# tools/vm-timetravel/base-image.sh - the pinned, SHA512-verified Debian base # ci-allowlist: the file name in this header, not a live image reference.
-# qcow2 for the manual VM proofs (run.sh and img-drill.sh). Both copy this file
-# into their work dir and source it INSIDE the debian:trixie-slim container. It
-# runs nothing at source time and sets no shell options.
+# tools/vm-timetravel/base-image.sh - the pinned, SHA512-verified Debian base qcow2 for the manual VM proofs (run.sh, img-drill.sh). # ci-allowlist: this header names the file and its subject, not a live reference.
+# Both copy this file into their work dir and source it INSIDE the
+# debian:trixie-slim container. It runs nothing at source time and sets no
+# shell options.
 #
-# The pin is the trust anchor. VMTT_BUILD and the SHA512 per arch are copied from
-# that dated directory's SHA512SUMS and are never fetched or trusted at run time
-# (Debian publishes no detached signature for the cloud qcow2 files). Every use
-# of a cached file re-verifies it; a mismatch refuses and the file is NOT
-# deleted. An unknown arch refuses.
+# The pin is the trust anchor. VMTT_BUILD and the SHA512 per arch are copied
+# from that dated directory's SHA512SUMS and are never fetched or trusted at
+# run time. Every use of a cached file re-verifies it; a mismatch refuses and
+# the file is NOT deleted. An unknown arch refuses.
 #
-# To bump the pin: list the trixie/ directory on cloud.debian.org, take the
-# newest dated build, copy its SHA512SUMS lines for
-# debian-13-genericcloud-<arch>-<build>.qcow2 into vmtt_pin_sha512 and set
-# VMTT_BUILD. The next cache miss then fetches the new build.
+# TOFU, stated plainly: Debian publishes NO detached signature for these
+# files (SHA512SUMS[.sign] is absent from the build directory), so the pin is
+# trust-on-first-use over HTTPS against the Debian publisher. What a bump can
+# still detect is a substituted mirror or CDN: fetch SHA512SUMS TWICE, from
+# two different hostnames - https://cloud.debian.org/images/cloud/<release>/<build>/
+# and https://cdimage.debian.org/images/cloud/<release>/<build>/ - confirm the
+# two files are byte-identical (sha256sum of the file matches), and only then
+# copy the per-arch lines. Record both hostnames, the sha256 of SHA512SUMS and
+# the exact lines in the commit message. This catches a bad mirror; it cannot
+# catch a compromise of Debian itself, and the docs say so.
+#
+# To bump the pin: list the release directory on cloud.debian.org, take the
+# newest dated build, run the two-source check above, then set VMTT_BUILD and
+# the SHA512 values in vmtt_pin_sha512. The next cache miss fetches the new
+# build (the cache name carries the build id, so an old file is never reused).
 
 VMTT_BUILD=20261026-2643
 VMTT_BASE_DIR="https://cloud.debian.org/images/cloud/trixie/${VMTT_BUILD}" # ci-allowlist: pinned Debian cloud build directory for the manual VM proof, not an SCP reference.
+export VMTT_TMP="" # set while a download is in flight, so a caller's EXIT trap can clean it up
 
 vmtt_pin_sha512() { # $1 arch -> the pinned SHA512 of its qcow2; an unknown arch refuses
   case "$1" in
@@ -45,17 +56,62 @@ vmtt_base_image() { # $1 arch, $2 cache dir -> prints the verified cached path, 
     return 0
   fi
   tmp="$(mktemp "${cache}/.${name}.XXXXXX")" || return 1
-  if ! curl -fsSL -o "$tmp" "${VMTT_BASE_DIR}/${name}"; then
-    rm -f "$tmp"
+  VMTT_TMP="$tmp"
+  if ! curl --proto '=https' --proto-redir '=https' -fsSL -o "$tmp" "${VMTT_BASE_DIR}/${name}"; then
+    rm -f -- "$tmp"; VMTT_TMP=""
     echo "base qcow2 download failed: ${name}" >&2
     return 1
   fi
   if ! vmtt_verify "$sum" "$tmp"; then
-    rm -f "$tmp"
+    rm -f -- "$tmp"; VMTT_TMP=""
     echo "base qcow2 checksum mismatch on download, nothing cached: ${name}" >&2
     return 1
   fi
-  chmod 0644 "$tmp"
-  mv -f "$tmp" "$path"
+  if ! chmod 0644 "$tmp"; then
+    rm -f -- "$tmp"; VMTT_TMP=""
+    echo "base qcow2 could not be made readable: ${tmp}" >&2
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"; VMTT_TMP=""
+    echo "base qcow2 could not be stored as ${path}" >&2
+    return 1
+  fi
+  VMTT_TMP=""
   printf '%s\n' "$path"
+}
+
+vmtt_stage_base() { # $1 arch, $2 cache dir, $3 destination -> prints $3, a verified private copy the caller boots from
+  # Verify the CACHE file, copy it to a path only this run writes, verify the
+  # COPY and only then hand it to qemu. A swap or an in-place edit of the
+  # shared cache after the check cannot reach the guest, and qemu's lazy read
+  # reads a file nobody else owns.
+  local arch="$1" cache="$2" dest="$3" src sum info
+  sum="$(vmtt_pin_sha512 "$arch")" || return 1
+  src="$(vmtt_base_image "$arch" "$cache")" || return 1
+  if ! cp -- "$src" "$dest"; then
+    echo "base copy failed: ${src} -> ${dest}" >&2
+    return 1
+  fi
+  if ! vmtt_verify "$sum" "$dest"; then
+    rm -f -- "$dest"
+    echo "base image checksum mismatch after staging: ${dest}" >&2
+    return 1
+  fi
+  if ! info="$(qemu-img info --output=json "$dest" 2>/dev/null)"; then
+    rm -f -- "$dest"
+    echo "staged base is not readable by qemu-img: ${dest}" >&2
+    return 1
+  fi
+  case "$info" in
+    *'"format": "qcow2"'*|*'"format":"qcow2"'*) ;;
+    *) rm -f -- "$dest"; echo "staged base is not a qcow2: ${dest}" >&2; return 1 ;;
+  esac
+  case "$info" in
+    *'"backing-filename"'*)
+      rm -f -- "$dest"
+      echo "staged base carries a backing file: ${dest}" >&2
+      return 1 ;;
+  esac
+  printf '%s\n' "$dest"
 }
