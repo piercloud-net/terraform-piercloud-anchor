@@ -202,6 +202,7 @@ GATED_NAMES = {
         "RECORDING_WITNESS_QUIET_SIGNATURE", "RECORDING_WITNESS_ACK_IDENTITIES",
         "RECORDING_WITNESS_COLD_START_SECONDS", "RECORDING_WITNESS_SWEEP_SECONDS",
         "OS_AUTO_UPDATES", "OS_AUTO_REBOOT_TIME",
+        "IMG_AUTO_UPDATES", "IMG_UPDATE_SOAK_HOURS",
     ],
 }
 GATED = [
@@ -245,7 +246,7 @@ WORKFLOW_KEYS = {"name", "run-name", "on", "concurrency", "permissions", "jobs"}
 # GITHUB_ENV / GITHUB_PATH ahead of them.
 PINNED_STEPS = [
     (PREFLIGHT_STEP, "a458a87c5a790ee8a3e160dec75d6dc8dda09075d542f6f762fff7de42e7e46a"),
-    (SCOPE_STEP, "f7b8b2709ee2114b1f5586092bc9ebe592112993b0477c237ae0cbaad7a582a6"),
+    (SCOPE_STEP, "6269abc691d998a9fff6d88951b7db8fc66cb462dd5351e03c020a4e3de74622"),
 ]
 # Managed alias = the validated tenant input: a managed run never reaches the
 # TENANT_USER read, so the form is allowed in any job.

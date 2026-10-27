@@ -481,5 +481,21 @@ mutant "push token world-readable" token '  chmod 600 "$tmp"
   mv "$tmp" "$IMG_TOKEN_FILE"'
 mutant "env file world-readable" install "  chmod 0600 \"\$tmp\"${NL}" "  chmod 0644 \"\$tmp\"${NL}"
 
+# ---- dispatch plumbing: provision.yml A1 env -> 020 ENV_PREFIX -> 010 -----
+PROV_YML="$ROOT/.github/workflows/provision.yml"
+for v in IMG_AUTO_UPDATES IMG_UPDATE_SOAK_HOURS; do
+  # shellcheck disable=SC2016 # literal workflow expression
+  if grep -qxF "          ${v}: \${{ vars.${v} }}" "$PROV_YML"; then ok "plumbing: provision.yml A1 env reads vars.${v}"; else bad "plumbing: provision.yml lost vars.${v}"; fi
+  # shellcheck disable=SC2016 # literal workflow expression
+  if grep -qxF "          REPO_SCOPE_${v}: \${{ vars.${v} != '' }}" "$PROV_YML"; then ok "plumbing: banner probes ${v} at repo scope"; else bad "plumbing: banner lost the ${v} repo-scope probe"; fi
+done
+( q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
+  export IMG_AUTO_UPDATES="off" IMG_UPDATE_SOAK_HOURS="12"
+  eval "$(sed -n 's/^  \(ENV_PREFIX=.*\)$/\1/p' "$ROOT/.github/scripts/020-provision-anchor.sh")"
+  unset IMG_AUTO_UPDATES IMG_UPDATE_SOAK_HOURS
+  eval "$ENV_PREFIX"
+  printf '%s|%s\n' "${IMG_AUTO_UPDATES:-}" "${IMG_UPDATE_SOAK_HOURS:-}" ) >"$WORK/prefix.out" 2>/dev/null || true
+is "plumbing: 020 ENV_PREFIX passes IMG_AUTO_UPDATES / IMG_UPDATE_SOAK_HOURS through" "off|12" "$(cat "$WORK/prefix.out")"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
