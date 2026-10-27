@@ -1645,11 +1645,12 @@ img_running() { # $1 = name -> 0 when the container is up (reads the whole list:
   printf '%s\n' "$names" | grep -xF -- "$1" >/dev/null
 }
 
-img_running_digest_is() { # $1 = name, $2 = repo, $3 = digest -> 0 when the RUNNING container's image carries repo@digest
+img_running_digest_is() { # $1 = name, $2 = repo, $3 = digest -> 0 when the RUNNING container was created from repo@digest
   local id ds
-  id="$(docker inspect --format '{{.Image}}' "$1" 2>/dev/null)" || return 1
+  id="$(docker inspect --format '{{.Image}}' "$1" 2>/dev/null)" || return 1 # ci-allowlist: code — docker inspect field name, not a live reference.
   [ -n "$id" ] || return 1
-  ds="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$id" 2>/dev/null)" || return 1
+  # docker inspect on the container's object id returns that build's RepoDigests.
+  ds="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$id" 2>/dev/null)" || return 1
   printf '%s\n' "$ds" | grep -xF -- "$2@$3" >/dev/null
 }
 
@@ -1750,10 +1751,16 @@ IMG_AUTH_EOF
 img_alert_direct() { # $1 = message: the direct ntfy push (Gatus may be what broke); topic AND token ride curl stdin, never argv
   [ -n "${NTFY_TOPIC:-}" ] || return 0
   [[ "$NTFY_TOPIC" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { log "direct alert skipped: the ntfy topic is not a plain name"; return 0; }
-  {
-    printf 'url = "https://ntfy.sh/%s"\n' "$NTFY_TOPIC"
-    if [ -n "${NTFY_TOKEN:-}" ]; then printf 'header = "Authorization: Bearer %s"\n' "$NTFY_TOKEN"; fi
-  } | curl -fsS --proto '=https' --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" || true
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    curl -fsS --proto '=https' --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" <<IMG_NTFY_EOF || true
+url = "https://ntfy.sh/${NTFY_TOPIC}"
+header = "Authorization: Bearer ${NTFY_TOKEN}"
+IMG_NTFY_EOF
+  else
+    curl -fsS --proto '=https' --max-time 15 -K - -o /dev/null -H 'Title: anchor container updater' -H 'Priority: 4' --data-binary "$1" <<IMG_NTFY_EOF || true
+url = "https://ntfy.sh/${NTFY_TOPIC}"
+IMG_NTFY_EOF
+  fi
 }
 
 img_finish() { # $1 = name, $2 = true|false, $3 = message (bounded classes, version, 12-hex digest prefix), $4 = t0 -> push; a red result that cannot reach Gatus goes direct
@@ -3863,7 +3870,7 @@ img_lock_acquire
 # once per pin tag and recorded; every path (no record, off, reconcile) runs
 # that digest.
 GATUS_PIN_REF="$(img_pin_resolve gatus "${GATUS_IMAGE}")" \
-  || die "could not resolve the Gatus repo pin ${GATUS_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only image"
+  || die "could not resolve the Gatus repo pin ${GATUS_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only ref"
 img_reconcile_state gatus "${GATUS_PIN_REF}"
 GATUS_RUN_IMAGE="$(img_effective_ref gatus "${GATUS_PIN_REF}")"
 [ "${GATUS_RUN_IMAGE}" = "${GATUS_PIN_REF}" ] \
@@ -4076,7 +4083,7 @@ TMP_CADDY="${CADDY_CONFIG}.new"
 # A-IMG precedence (#51): validate and run on max(repo pin, updater record)
 # inside the pin's track (the lock is held since section d).
 CADDY_PIN_REF="$(img_pin_resolve caddy "${CADDY_IMAGE}")" \
-  || die "could not resolve the Caddy repo pin ${CADDY_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only image"
+  || die "could not resolve the Caddy repo pin ${CADDY_IMAGE} to a registry digest (pull failed?) - refusing to run a tag-only ref"
 img_reconcile_state caddy "${CADDY_PIN_REF}"
 CADDY_RUN_IMAGE="$(img_effective_ref caddy "${CADDY_PIN_REF}")"
 [ "${CADDY_RUN_IMAGE}" = "${CADDY_PIN_REF}" ] \

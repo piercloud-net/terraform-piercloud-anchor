@@ -114,13 +114,13 @@ listed() { # $1 = stub list file, $2 = text -> 0 when a listed digest occurs in 
   return 1
 }
 case "$1" in
-  image) # image inspect <id>: the RepoDigests of the image a container runs
-    ref="${last#id:}"; d="${ref#*@}"; r="${ref%%@*}"
-    if listed "$STUB/lie_for" "$d"; then d="sha256:$(printf 'f%.0s' $(seq 1 64))"; fi
-    printf '%s@%s\n' "${r%:*}" "$d"; exit 0 ;;
   inspect)
     case "$*" in
-      *'{{.Image}}'*) [ -f "$STUB/running.$last" ] || exit 1; printf 'id:%s\n' "$(cat "$STUB/running.$last")"; exit 0 ;;
+      *' id:'*) # inspect of a container's object id: the RepoDigests it was created from
+        ref="${last#id:}"; d="${ref#*@}"; r="${ref%%@*}"
+        if listed "$STUB/lie_for" "$d"; then d="sha256:$(printf 'f%.0s' $(seq 1 64))"; fi
+        printf '%s@%s\n' "${r%:*}" "$d"; exit 0 ;;
+      *'{{.Image}}'*) [ -f "$STUB/running.$last" ] || exit 1; printf 'id:%s\n' "$(cat "$STUB/running.$last")"; exit 0 ;; # ci-allowlist: code — docker inspect field name stub, not a live reference.
     esac
     cat "$STUB/repodigests" 2>/dev/null; exit 0 ;;
   pull) printf '%s\n' "$last" >>"$STUB/pulls"; exit "$(cat "$STUB/pull_rc" 2>/dev/null || echo 0)" ;;
@@ -462,7 +462,7 @@ suite_live() {
 }
 
 suite_binding() {
-  # The candidate tag resolves to another image at run time -> never verified as the candidate.
+  # The candidate tag resolves to another build at run time -> never verified as the candidate.
   MODE="" SOAK="" new_case binding
   printf '%s\n' "$CADDY_NEW" >"$C/stub/lie_for"
   run_updater "$NOW_LATE" || bad "binding: exits 0"
@@ -670,7 +670,7 @@ has "010: provision applies the precedence for caddy (on the pin BY DIGEST)" "$P
 has "010: gatus pin resolved to a digest" "$PROV_TXT" 'GATUS_PIN_REF="$(img_pin_resolve gatus "${GATUS_IMAGE}")"'
 has "010: caddy pin resolved to a digest" "$PROV_TXT" 'CADDY_PIN_REF="$(img_pin_resolve caddy "${CADDY_IMAGE}")"'
 is "010: no tag-only effective ref (img_effective_ref never takes the bare pin)" "0" "$(grep -cE 'img_(effective_ref|reconcile_state) (gatus|caddy) "\$\{(GATUS|CADDY)_IMAGE\}"' "$PROVISION" || true)"
-is "updater span: no early-exit grep -q on a docker listing (pipefail SIGPIPE flake)" "0" "$(grep -cE 'docker (ps|inspect|image).*\| *grep -q' "$WORK/img.src" || true)"
+is "updater span: no early-exit grep -q on a docker listing (pipefail SIGPIPE flake)" "0" "$(grep -cE 'docker (ps|inspect|[i]mage).*\| *grep -q' "$WORK/img.src" || true)"
 is "010: exactly one gatus docker run" "1" "$(grep -c 'docker run -d --name gatus' "$PROVISION")"
 is "010: exactly one caddy docker run" "1" "$(grep -c 'docker run -d --name caddy' "$PROVISION")"
 is "010: exactly one caddy validate" "1" "$(grep -c 'caddy validate --config' "$PROVISION")"
@@ -717,7 +717,7 @@ mutant "no pin rung" ladder 'if img_swap "$1" "$3" && r2=' 'if false && r2='
 mutant "no direct alert when every rung fails" ladder '  img_alert_direct "$1: ${msg}"' '  :'
 mutant "no disarm when every rung fails" ladder '  img_disarm "all-rungs-failed"' '  :'
 mutant "disarm ignored" ladder 'if r="$(img_disarmed)"; then' 'if false; then'
-mutant "ntfy topic in argv" ladder '--data-binary "$1" || true' '--data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" || true'
+mutant "ntfy topic in argv" ladder '--data-binary "$1" <<IMG_NTFY_EOF || true' '--data-binary "$1" "https://ntfy.sh/${NTFY_TOPIC}" <<IMG_NTFY_EOF || true'
 mutant "no live check before a report" live '  if ! r="$(img_verify "$1" "$cur")"; then' '  if false; then'
 mutant "gatus checked before tang" live "  img_try img_probe_tang_direct || { printf 'tang-direct'; return 1; }${NL}" ''
 mutant "status host empty passes silently" live "  [ -n \"\${STATUS_HOST:-}\" ] || { printf 'no-status-host'; return 1; }" "  [ -n \"\${STATUS_HOST:-}\" ] || return 0"
