@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Update policy (rationale: docs/updaters.md). Advisory fixes (Dependabot alerts plus OSV) for minor and patch updates automerge with no soak. Routine minor and patch updates automerge after a 7-day soak once CI is green. Digest moves (same tag, new digest), initial pins and majors always wait for a human, routine or advisory. Netcup-touching paths (scripts/**, .github/scripts/**, **/*.tf, examples/**) never automerge, security or not. Their routine updates group into one netcup-touching batch PR, except the Gatus and Caddy images in scripts/010-provision.sh, which sit outside the batch and follow the routine soak; their advisory fixes automerge with no soak. Gatus and Caddy on any other netcup-touching path never automerge. cad0p/semver-calver-release is operator-owned and never automerges. The OpenTofu pins (.opentofu-version and provision.yml tofu_version) move as one group. lockFileMaintenance is off; notifications use Renovate defaults.",
+  "description": "Update policy (rationale: docs/updaters.md). Advisory fixes (Dependabot alerts plus OSV) for minor and patch updates automerge with no soak. Routine minor and patch updates automerge after a 7-day soak once CI is green. Digest moves (same tag, new digest), initial pins and majors always wait for a human, routine or advisory. Netcup-touching paths (scripts/**, .github/scripts/**, **/*.tf, examples/**) never automerge, security or not. .github/workflows/provision.yml never automerges either, any update type, advisory included (its anchor environment is unprotected, so its bumps are human). Their routine updates group into one netcup-touching batch PR, except the Gatus and Caddy images in scripts/010-provision.sh, which sit outside the batch and follow the routine soak; their advisory fixes automerge with no soak. Gatus and Caddy on any other netcup-touching path never automerge. cad0p/semver-calver-release is operator-owned and never automerges. The OpenTofu pins (.opentofu-version and provision.yml tofu_version) move as one group that never automerges. lockFileMaintenance is off; notifications use Renovate defaults.",
   "enabledManagers": [
     "github-actions",
     "custom.regex",
@@ -159,11 +159,26 @@
       "automerge": false
     },
     {
-      "description": "R7 OpenTofu CLI pins (.opentofu-version and provision.yml tofu_version) move together",
+      "description": "R7 OpenTofu CLI pins (.opentofu-version and provision.yml tofu_version) move together as one group and never automerge (the provision.yml member is human, R6c)",
       "matchPackageNames": [
         "opentofu/opentofu"
       ],
-      "groupName": "opentofu"
+      "groupName": "opentofu",
+      "automerge": false
+    },
+    {
+      "description": "R6c provision.yml: never automerge, any update type, advisory included. Its bumps join the netcup-touching batch (label netcup-touching). Placed after R7 and excludes opentofu/opentofu so R7 keeps the opentofu group name (one PR for all three pins, issue #248). The legacy anchor environment has no protection rules, so these bumps are human",
+      "matchFileNames": [
+        ".github/workflows/provision.yml"
+      ],
+      "matchPackageNames": [
+        "!opentofu/opentofu"
+      ],
+      "groupName": "netcup-touching batch",
+      "addLabels": [
+        "netcup-touching"
+      ],
+      "automerge": false
     },
     {
       "description": "R8 pin GitHub Actions to commit digests; the # vX.Y.Z comment is the version Renovate tracks",

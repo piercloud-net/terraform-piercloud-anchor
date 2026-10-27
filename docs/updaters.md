@@ -8,10 +8,10 @@ Renovate (`renovate.json`) keeps the pins in this repo current. This page is the
 - Routine minor and patch bumps automerge after a 7-day soak (`minimumReleaseAge`, R1). The status check stays pending until the age passes (`internalChecksFilter: strict`).
 - Digest moves (the same tag re-pointed to a new digest) and initial pins (`pin`, `pinDigest`) never automerge, routine or advisory (R2b). A moved tag is the hijack signature, so a human reviews it.
 - Majors, routine and advisory, are a PR for human review (R2).
-- Netcup-touching paths (`scripts/**`, `.github/scripts/**`, `**/*.tf`, `examples/**`) never automerge, advisory or not (R4, R6). Routine bumps group into one `netcup-touching batch` PR labelled `netcup-touching`. Advisory fixes there open individual PRs, each needing review.
+- Netcup-touching paths (`scripts/**`, `.github/scripts/**`, `**/*.tf`, `examples/**`) never automerge, advisory or not (R4, R6). Routine and advisory bumps there group into one `netcup-touching batch` PR labelled `netcup-touching`. `.github/workflows/provision.yml` follows the same batch for every update type, advisory included (R6c): the legacy `anchor` environment is unprotected (see Residual below), so those bumps are human.
 - The Gatus and Caddy images pinned in `scripts/010-provision.sh` sit outside that batch (R5). Minor and patch bumps follow the routine soak, advisory fixes automerge with no soak (R3), and majors wait. Gatus and Caddy on any other netcup-touching path never automerge (R6b).
 - `cad0p/semver-calver-release` is operator-owned: it runs with `contents: write` in the release workflows. It never automerges, any update type, advisory included, and is labelled `operator-owned` (R10, last).
-- OpenTofu: `.opentofu-version` and the `tofu_version` input of `opentofu/setup-opentofu` in `provision.yml` are one group `opentofu` (R7). An update rewrites all three locations: two in `provision.yml`, one in `.opentofu-version`. Each pin is extracted once: the github-actions manager reads the `provision.yml` inputs and one regex reads `.opentofu-version`. `tests/opentofu-pin` fails if the files disagree.
+- OpenTofu: `.opentofu-version` and the `tofu_version` input of `opentofu/setup-opentofu` in `provision.yml` are one group `opentofu` (R7). The group never automerges (R7, `automerge: false`), so `.opentofu-version` bumps are human too: the group contains the `provision.yml` input, which is human (R6c), and Renovate automerges a group only when every member does (`workers/repository/updates/generate.js:251` in the 44.184.1 dist). An update rewrites all three locations: two in `provision.yml`, one in `.opentofu-version`. Each pin is extracted once: the github-actions manager reads the `provision.yml` inputs and one regex reads `.opentofu-version`. `tests/opentofu-pin` fails if the files disagree.
 - GitHub Actions pins are commit SHAs with an exact-version comment (`# v7.0.1`), which Renovate tracks (R8). A pin whose comment Renovate cannot parse (for example `# tag: v7`) is skipped as `unversioned-reference`, so every pin uses the exact-version form.
 - The `tofu_version` input is a version string, not a digest (R9, `pinDigests: false`).
 - `lockFileMaintenance` is off, and no rule targets `.terraform.lock.hcl`: no tracked file matches it, so there is no lock-file update path.
@@ -27,8 +27,8 @@ The soak compares `minimumReleaseAge` with a timestamp that depends on the datas
 
 | Datasource | Pins | Timestamp used | Backdatable by the publisher? |
 |---|---|---|---|
-| `github-tags` | GitHub Actions `uses:` with `# vX.Y.Z` | The later of the tag date and the GitHub Release `publishedAt`, when a release exists (`github-tags/index.js:60-61`). Tag date: a lightweight tag uses the target commit's `committedDate`; an annotated tag uses the tagger date | Yes, while no GitHub Release exists. Commit and tagger dates are author-set |
-| `github-releases` | `opentofu/opentofu` (`.opentofu-version`, `provision.yml`) | `publishedAt` from the GitHub API | No, when set: server time |
+| `github-tags` | GitHub Actions `uses:` with `# vX.Y.Z` | The later of the tag date and the GitHub Release timestamp, when a release exists (`github-tags/index.js:60-61`). The release timestamp is the GraphQL `publishedAt`, which Renovate stores as `releaseTimestamp` (`releases-query-adapter.js:18`). Tag date: a lightweight tag uses the target commit's `committedDate`; an annotated tag uses the tagger date (`tags-query-adapter.js:41`, `:56`) | Yes, while no GitHub Release exists. Commit and tagger dates are author-set |
+| `github-releases` | `opentofu/opentofu` (`.opentofu-version`, `provision.yml`) | The release's `releaseTimestamp`, from the GraphQL `publishedAt` (`github-releases/index.js:58-62`, `releases-query-adapter.js:18`) | No, when set: server time |
 | `github-digest` | not used (every action pin is versioned) | commit date (`index.js:15`) | Yes |
 | `docker` | Gatus, Caddy (Docker Hub only) | `tag_last_pushed` (`docker/index.js:627-628`) | Registry push time, not the upstream release time |
 
@@ -36,8 +36,9 @@ Residual: the soak measures the age of that timestamp, not the age of the releas
 
 - required checks: `unit-tests (scripts)` and `bind-proof e2e (Caddy fronting mock tang)` must pass before automerge (not enforced on `main` until the ruleset is applied after merge);
 - SHA pinning: a moved tag shows as a visible SHA diff in the PR;
-- least-permission workflow tokens;
-- `provision.yml` only runs on a tenant-approved dispatch.
+- least-permission workflow tokens.
+
+`provision.yml` is not a defence. Its `workflow_dispatch` is not an approval gate: the legacy default `anchor` environment (`environment:` at `provision.yml:404`) has no protection rules, and the device-flow job runs with `NTFY_TOKEN` and `SCP_USER_ID` in scope. Its bumps are therefore human (R6c), routine and advisory alike.
 
 ## Advisory data
 
