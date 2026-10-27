@@ -59,16 +59,23 @@ staged/approved path). Enforced by: the puller's file ownership (it never
 writes `config.yaml`), the systemd unit's `ReadWritePaths`, and
 `tests/gatus-pull` (validation + the two-writer boundary).
 
-### Scoped amendment — unattended OS security updates (2026-10-27, issue #51)
+### Scoped amendment — unattended OS security updates and container digests (2026-10-27, issue #51)
 
 > Invariant 2's "admin is dispatch-only" is amended for exactly one scoped
 > component: the box may install its own OS packages outside a dispatch,
 > only from the running release's security origin, only through the policy
 > (origin, reboot window, schedule, report script) that the last approved
-> dispatch rendered. It gains no credential beyond a loopback-only status
-> token, and every other admin action stays dispatch-only.
+> dispatch rendered. Likewise the box may move its Caddy and Gatus
+> containers to another digest outside a dispatch, only within the approved
+> major track derived from the repo pin, only after the approved soak, only
+> with the self-checks passing (else it rolls back), and never below a
+> recorded version on a later dispatch. It gains no credential beyond
+> loopback-only status tokens, and every other admin action stays
+> dispatch-only.
 
 **Rationale.** The trust rule is pcad.it-infra decision 2026-09-08 (every anchor change arrives through a per-run approved dispatch), as amended 2026-10-27: unattended applies to bits neither the operator nor the tenant chooses, and what may install stays approval-gated. Security patches for the distribution are such bits: waiting for a dispatch leaves a known-vulnerable, always-on box. The policy is rendered by `010` on every `mode=apply` (`OS_AUTO_UPDATES`, `OS_AUTO_REBOOT_TIME` are approval-gated variables); the box cannot widen it (the converge check refuses a run where apt sees any other origin). The updater reaches no user box and holds nothing that does; the status token can only push results for one row on the loopback-bound Gatus. Enforced by: the rendered `52piercloud-unattended-upgrades` file with `#clear` of the distro defaults, the converge self-checks (`apt-config` origin equality, `unattended-upgrade --dry-run`, `tangd.socket` enabled, timers + drop-ins), and `tests/os-updates`. Off switch: `OS_AUTO_UPDATES=off` + re-dispatch ([dr.md](dr.md)). Design: [updaters.md](updaters.md).
+
+**Containers (slice A-IMG).** Under the same rule, a newer build of the two pinned containers is such a bit; a new major, repository or registry is not (only a repo pin change brings it). The track, the soak (`IMG_AUTO_UPDATES`, `IMG_UPDATE_SOAK_HOURS`, approval-gated variables) and the updater code are rendered by `010`; the payload is pulled by exact digest. Enforced by: the strict track filter, `caddy validate` of the live Caddyfile, recreation with the exact provision `docker run` arguments, the converge self-checks with automatic rollback and a never-retried bad-digest hold, the provision precedence rule (max(pin, recorded) within the track), and `tests/img-updater`. Off switch: `IMG_AUTO_UPDATES=off` + re-dispatch (back to the repo pins, [dr.md](dr.md)).
 
 ## Invariant 3 — one netcup account per anchor; one writer per account
 
