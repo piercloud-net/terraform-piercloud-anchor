@@ -352,7 +352,7 @@ is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (
 # structural line of the top level (on/env/permissions children plus the job
 # keys). A
 # duplicate or decoy job key in ANY spelling adds one.
-is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
+is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "14" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 gate_line="$(grep -m1 -F "elif grep -qE '^(\.github/scripts/" <<<"$ci_unit" || true)"
 [ -n "$gate_line" ] || bad "ci.yml unit-tests gate line not found"
 is "exactly one gate elif in the unit-tests job" "1" "$(printf '%s\n' "$ci_unit" | grep -cE 'elif grep -qE')"

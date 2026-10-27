@@ -223,7 +223,7 @@ green_case "secrets.GITHUB_TOKEN" release.yml 's.replace("jobs:\n", "jobs:\n  g3
 green_case "a shell variable spelled vars" release.yml 's.replace("jobs:\n", "jobs:\n  g4:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          vars=()\n          for vars in a; do echo \"$vars\"; done\n", 1)'
 # The narrowing is not a hole: a REAL reference in the same places is red.
 mutant_why "bare secret inside a run: block" release.yml 's.replace("jobs:\n", "jobs:\n  g5:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{ secrets.NTFY_TOPIC }}\"\n", 1)' "ungated 'secrets' reference"
-mutant_why "unterminated expression" ci.yml 's.replace("  TOFU_VERSION: \"1.12.2\"\n", "  TOFU_VERSION: \"${{ vars.ANCHOR_ROLE \"\n", 1)' "unterminated"
+mutant_why "unterminated expression" ci.yml 's.replace("tofu_version_file: .opentofu-version\n", "tofu_version_file: \"${{ vars.ANCHOR_ROLE \"\n", 1)' "unterminated"
 
 # --- the expression slice follows the runner's string lexer -----------------
 # actions/runner (TemplateReader.cs) closes an expression only at a `}}`
@@ -236,7 +236,7 @@ mutant_why "quoted }} hides a bare vars reference" release.yml "s.replace(\"jobs
 mutant_why "quoted }} hides a bare secret in format()" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q2:\\n    runs-on: ubuntu-latest\\n    env:\\n      T: \${{ format('}} {0}', secrets.NTFY_TOKEN) }}\\n    steps:\\n      - run: echo hi\\n\", 1)" "ungated 'secrets' reference"
 green_case "a quoted }} hiding no context word" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q3:\\n    runs-on: ubuntu-latest\\n    env:\\n      X: \${{ '}}' == '}}' }}\\n    steps:\\n      - run: echo hi\\n\", 1)"
 mutant_why "a string left open (odd quote count)" release.yml "s.replace(\"jobs:\\n\", \"jobs:\\n  q4:\\n    runs-on: ubuntu-latest\\n    env:\\n      X: \${{ 'vars.NTFY_TOPIC }}\\n    steps:\\n      - run: echo hi\\n\", 1)" "unterminated"
-mutant_why "a nested \${{ inside a running expression" ci.yml 's.replace("  TOFU_VERSION: \"1.12.2\"\n", "  TOFU_VERSION: \"${{ vars.ANCHOR_ROLE ${{ vars.X }} }}\"\n", 1)' "unterminated"
+mutant_why "a nested \${{ inside a running expression" ci.yml 's.replace("tofu_version_file: .opentofu-version\n", "tofu_version_file: \"${{ vars.ANCHOR_ROLE ${{ vars.X }} }}\"\n", 1)' "unterminated"
 
 # --- issue #203 (seeded verify F1): a bare `if:` value is an expression ----
 # GitHub evaluates the whole `if:` value as an expression, bare or wrapped, so a
