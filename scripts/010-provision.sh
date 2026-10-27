@@ -1321,7 +1321,7 @@ now="$(/usr/bin/date +%s)"
 if [ "${1:-}" = --after-run ]; then
   up="$(mtime "$UPGRADE_STAMP")"
   if [ "${SERVICE_RESULT:-}" = success ] && [ "$up" -gt 0 ] && [ $((now - up)) -lt "$GRACE" ]; then
-    /usr/bin/touch "$RUN_MARKER"
+    /usr/bin/touch "$RUN_MARKER" || printf 'os-updates report: cannot write the run marker\n'
   else
     printf 'os-updates report: apt-daily-upgrade result=%s upgrade-stamp-age-h=%s - run marker NOT refreshed\n' "${SERVICE_RESULT:-unknown}" "$(hours "$up")"
   fi
@@ -1390,6 +1390,26 @@ os_updates_install_file() { # $1 dest, $2 mode; content on stdin (atomic replace
   mv -f "$tmp" "$1"
 }
 
+os_updates_render_units() { # $1 root prefix ("" = this box): scripts, drop-ins, reboot timer + service
+  local r="$1"
+  render_os_updates_report | os_updates_install_file "${r}${OS_UPD_SBIN}" 0700
+  render_os_updates_gate | os_updates_install_file "${r}${OS_UPD_GATE}" 0700
+  render_os_updates_timer_dropin "$OS_UPD_LISTS_AT" | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/apt-daily.timer.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_timer_dropin "$OS_UPD_UPGRADE_AT" | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/apt-daily-upgrade.timer.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_service_dropin | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/apt-daily-upgrade.service.d/${OS_UPD_DROPIN_NAME}" 0644
+  render_os_updates_reboot_timer "$OSU_REBOOT" | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.timer" 0644
+  render_os_updates_reboot_service | os_updates_install_file "${r}${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.service" 0644
+}
+
+os_updates_render_tree() { # $1 root dir: every mode=on artifact under it, nothing on this box (tools/vm-timetravel)
+  os_updates_validate
+  [ "$OSU_MODE" = on ] || die "os_updates_render_tree: OS_AUTO_UPDATES=off renders nothing"
+  render_os_updates_apt_conf on "$OSU_PATTERN" | os_updates_install_file "${1}${OS_UPD_APT_CONF}" 0644
+  mkdir -p "${1}${OS_UPD_STATE_DIR}"
+  chmod 700 "${1}${OS_UPD_STATE_DIR}"
+  os_updates_render_units "$1"
+}
+
 os_updates_apply() { # validate -> pre-arm checks -> arm -> converge checks; appends the status item
   local got want svc_dropin u
   os_updates_validate
@@ -1424,13 +1444,7 @@ os_updates_apply() { # validate -> pre-arm checks -> arm -> converge checks; app
   chmod 700 "$OS_UPD_STATE_DIR"
   # Grace for a fresh (or re-enabled) install: until the first real run or 26 h.
   if [ ! -e "$svc_dropin" ] || [ ! -e "$OS_UPD_MARKER" ]; then touch "$OS_UPD_MARKER"; fi
-  render_os_updates_report | os_updates_install_file "$OS_UPD_SBIN" 0700
-  render_os_updates_gate | os_updates_install_file "$OS_UPD_GATE" 0700
-  render_os_updates_timer_dropin "$OS_UPD_LISTS_AT" | os_updates_install_file "${OS_UPD_UNIT_DIR}/apt-daily.timer.d/${OS_UPD_DROPIN_NAME}" 0644
-  render_os_updates_timer_dropin "$OS_UPD_UPGRADE_AT" | os_updates_install_file "${OS_UPD_UNIT_DIR}/apt-daily-upgrade.timer.d/${OS_UPD_DROPIN_NAME}" 0644
-  render_os_updates_service_dropin | os_updates_install_file "$svc_dropin" 0644
-  render_os_updates_reboot_timer "$OSU_REBOOT" | os_updates_install_file "${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.timer" 0644
-  render_os_updates_reboot_service | os_updates_install_file "${OS_UPD_UNIT_DIR}/${OS_UPD_REBOOT_UNIT}.service" 0644
+  os_updates_render_units ""
   systemctl daemon-reload
   systemctl enable apt-daily.timer apt-daily-upgrade.timer "${OS_UPD_REBOOT_UNIT}.timer" >/dev/null 2>&1 || true
   systemctl restart apt-daily.timer apt-daily-upgrade.timer "${OS_UPD_REBOOT_UNIT}.timer" >/dev/null 2>&1 || true

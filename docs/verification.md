@@ -188,12 +188,15 @@ Staged proof; the producers (slice `pc-status.json`, pc-control platform manifes
 
 ### Unattended OS security updates (slice A-OS, issue #51)
 
-Harness: `tests/os-updates` (per-distro origin + refusal, off switch, reboot window, token, staleness, converge checks, the shared `GATUS EXTERNAL` render, mutants). Container proof: the rendered policy under `debian:trixie-slim` and `ubuntu:24.04` shows `unattended-upgrade --dry-run --debug` allowing only the security origin.
+Harness: `tests/os-updates` (per-distro origin + refusal, disarm on every refusal, off switch, UTC enforcement, reboot window mapped 1:1 onto the UTC timer under `TZ=Europe/Rome`, token commit order, the green matrix, the real-run marker, env-override immunity, swap wait, reboot gate, run-once warnings, Gatus config 0600, the shared `GATUS EXTERNAL` render, mutants). Container proof: the rendered policy under `debian:trixie-slim` and `ubuntu:24.04` shows `unattended-upgrade --dry-run --debug` allowing only the security origin.
 
-- [ ] Dispatch (`mode=apply`, reviewed SHA, variables unset): the run log shows `OS updates: mode=on, reboot window 03:30 UTC` with the Debian security origin, the four converge lines (origin policy, `--dry-run`, `tangd.socket` enabled, timers + drop-ins) with `(OK)`, then `first status push landed`.
-- [ ] The `os-security-updates` row (group `anchor`) is green after the dispatch and again after the first nightly run (`journalctl -u apt-daily-upgrade` shows the `os-updates report:` line with `push=HTTP 200`).
-- [ ] A reboot at the window (a kernel update, or one hand-scheduled `shutdown -r` at the window from the console) brings tang back by itself: the `tang (via Caddy)` row recovers within minutes and `/adv` answers 200.
-- [ ] An `OS_AUTO_UPDATES=off` dispatch renders `Unattended-Upgrade "0"` and the row disappears; unsetting it brings both back.
+VM time-travel proof (manual, NOT in CI): `bash tools/vm-timetravel/run.sh` on a host with docker and `/dev/kvm` (no qemu or sudo needed on the host). It renders only the OS-updates artifacts from the real span (`os_updates_render_tree`), boots the Debian trixie genericcloud qcow2 for the host arch under qemu + KVM inside a `debian:trixie-slim` container, applies them, disables NTP, sets the clock to 02:29:30 UTC (jumping to 02:45:05 if the 15 min jitter has not elapsed) and waits for `apt-daily-upgrade` and its report hook in the journal, then sets `/run/reboot-required` and 03:29:30 UTC and waits for the gated reboot (boot_id changes, the previous boot's gate line), then checks the three timers are enabled and active after the boot. Summary in `$VMTT_LOG` (default `/tmp/vm-timetravel.log`); ends `RESULT: PASS`. About 3 min with a cached qcow2.
+
+- [ ] Dispatch (`mode=apply`, reviewed SHA, variables unset): the run log shows `OS updates: mode=on, reboot window 03:30 UTC` with the Debian security origin, the converge lines (`tangd.socket` enabled, box timezone UTC, origin policy, `--dry-run`, timers + drop-ins + report hook, gated reboot timer, Gatus config mode 0600, Caddy refuses the push API) with `(OK)`, then `run-once: apt-daily-upgrade.service completed (OK)` and `status push landed, row green` (no `WARNING: OS updates` line).
+- [ ] The `os-security-updates` row (group `anchor`) is green after the dispatch and again after the first nightly run (`journalctl -u apt-daily-upgrade` shows `os-updates report: success=true ... push=HTTP 200`).
+- [ ] From outside, `POST https://<tenant>.status.piercloud.net/api/v1/endpoints/anchor_os-security-updates/external` is aborted by Caddy (no response), while the dashboard still loads.
+- [ ] A manual reboot from the netcup SCP console brings tang, the status rows, the three timers (`systemctl list-timers`) and the edge leg back by themselves; a reboot at the window (a kernel update) does the same, and the previous boot's `journalctl -b -1 -u piercloud-os-reboot` shows the gate line.
+- [ ] An `OS_AUTO_UPDATES=off` dispatch logs `OS updates: DISABLED by the approval-gated variable`, renders `Unattended-Upgrade "0"` and the row disappears; unsetting it brings both back.
 
 ### Docs-only
 
