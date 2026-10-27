@@ -234,7 +234,9 @@ if render bad_pair; then bad "malformed pair fails closed"; else ok "malformed p
 # exceeds the tracked intent (3) and the render must refuse to install.
 fixture_env
 export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
-INTENT_LINE="$(grep -nF 'alert_intent ' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+# Target main's call by name: the GATUS EXTERNAL sub-span (#51) carries an
+# earlier, item-driven alert_intent call that a first-match pick would hit.
+INTENT_LINE="$(grep -nxF '    alert_intent main' "${WORK}/span.src" | head -1 | cut -d: -f1)"
 [ -n "$INTENT_LINE" ] || { printf 'FAIL harness could not find an intent call\n'; exit 1; }
 sed "${INTENT_LINE}d" "${WORK}/span.src" >"${WORK}/span-teeth.src"
 SPAN="${WORK}/span-teeth.src"

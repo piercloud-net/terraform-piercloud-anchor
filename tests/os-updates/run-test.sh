@@ -33,7 +33,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
-MIN_CHECKS=70
+MIN_CHECKS=79
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 has()   { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1 (missing: $3)" ;; esac; }
@@ -349,6 +349,20 @@ mutant "staleness 72 h" chk_stale "s.replace('MAX_AGE=172800', 'MAX_AGE=259200',
 mutant "staleness ignores the stamp age" chk_stale "s.replace('[ \"\$age\" -lt \"\$MAX_AGE\" ]', 'true', 1)"
 mutant "#clear Origins-Pattern removed" chk_debian "s.replace('printf \'%s\\\\n\' \"#clear Unattended-Upgrade::Origins-Pattern;\"', ':', 1)"
 mutant "#clear Allowed-Origins removed" chk_clear "s.replace('printf \'%s\\\\n\' \"#clear Unattended-Upgrade::Allowed-Origins;\"', ':', 1)"
+
+# ---- (j) dispatch plumbing: provision.yml A1 env -> 020 ENV_PREFIX -> 010 --
+PROV_YML="$ROOT/.github/workflows/provision.yml"
+for v in OS_AUTO_UPDATES OS_AUTO_REBOOT_TIME; do
+  # shellcheck disable=SC2016 # literal workflow expression
+  if grep -qxF "          ${v}: \${{ vars.${v} }}" "$PROV_YML"; then ok "(j) provision.yml A1 env reads vars.${v}"; else bad "(j) provision.yml lost vars.${v}"; fi
+done
+( q() { printf %s "$1" | sed "s/'/'\\\\''/g"; }
+  export OS_AUTO_UPDATES="off" OS_AUTO_REBOOT_TIME="04:15"
+  eval "$(sed -n 's/^  \(ENV_PREFIX=.*\)$/\1/p' "$ROOT/.github/scripts/020-provision-anchor.sh")"
+  unset OS_AUTO_UPDATES OS_AUTO_REBOOT_TIME
+  eval "$ENV_PREFIX"
+  printf '%s|%s\n' "${OS_AUTO_UPDATES:-}" "${OS_AUTO_REBOOT_TIME:-}" ) >"$WORK/prefix.out" 2>/dev/null || true
+is "(j) 020 ENV_PREFIX passes OS_AUTO_UPDATES / OS_AUTO_REBOOT_TIME through" "off|04:15" "$(cat "$WORK/prefix.out")"
 
 total=$((pass + fail))
 printf '\n%d passed, %d failed (%d checks)\n' "$pass" "$fail" "$total"
