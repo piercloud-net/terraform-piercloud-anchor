@@ -1416,8 +1416,8 @@ GATUS_EXT_YAML=""
 for _ext_item in "${gatus_ext_items[@]}"; do
   _ext_name="$(printf '%s\n' "$_ext_item" | sed -n '1s/^  - name: //p')"
   [ -n "$_ext_name" ] || die "Gatus external item does not start with '  - name: ' - refusing to render"
-  case "$_ext_item" in *$'\n    alerts:\n'*) alert_intent "$_ext_name" ;; esac
-  GATUS_EXT_YAML="${GATUS_EXT_YAML}${_ext_item}"$'\n'
+  if printf '%s\n' "$_ext_item" | grep -qx '    alerts:'; then alert_intent "$_ext_name"; fi
+  printf -v GATUS_EXT_YAML '%s%s\n' "$GATUS_EXT_YAML" "$_ext_item"
 done
 # --- END GATUS EXTERNAL ---
 if [ "$PULLER_MODE" -eq 1 ]; then
