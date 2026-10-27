@@ -30,6 +30,7 @@ All notable changes to this project will be documented in this file.
 - *(witness)* Ack the finding identity set, page on a new identity (closes #223)
 - *(edge)* Verify the CloudFront origin client certificate (closes #235)
 - *(edge)* Retire the shared origin header now that mTLS gates the edge (closes #202)
+- *(edge)* Echo the verified edge client-certificate fingerprint for the platform's rotation check (closes #240)
 
 ### 🐛 Bug Fixes
 
@@ -135,6 +136,8 @@ All notable changes to this project will be documented in this file.
 - *(allowlist)* Permit the pc-control broker report endpoint (closes #181)
 - *(external-watch)* Per-tenant targets for managed anchors (closes #207)
 - Allow the provider-release host in the endpoint allowlist (closes #221)
+- *(provider)* Move to netcup provider v2.1.1 and drop the prebuilt stopgap (closes #238)
+- *(renovate)* Advisory fast lane, soaked automerge, pinned digests (closes #243, closes #248)
 
 
 ## [Unreleased]
