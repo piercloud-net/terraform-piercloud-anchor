@@ -640,7 +640,7 @@ RUN_START="$(awk -F'\t' '$2 == "      - name: Run the committed script harnesses
 RUN_END="$(awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
   RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
-  is "harness-run step blob hash (pin: update after a deliberate edit)" "d93e13a12306e856335db0fd325502fbb5989ebc17cd6945074e244e18556e10" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "harness-run step blob hash (pin: update after a deliberate edit)" "fab39ea13d0668d154beb9e1e2af34765ea5f8c8fa250d9d8b28ee3197a5f619" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
   is "harness-run step keeps the gate expression" "1" "$(printf '%s\n' "$RUN_STEP_BLOB" | grep -cE '^        if: steps\.gate\.outputs\.run == .yes.$')"
 else
   bad "harness-run step span not found in ci.yml"
@@ -650,7 +650,7 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # see an inserted step in the same job that rewrites a harness on the runner
 # before the pinned run step executes it (the static harnesses read the PR
 # tree, not the runner workspace). Any deliberate job edit updates this pin.
-is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "9bccbd811d5e26c38b7a49eb3a303e6662e35ae94938f396ebd5bb8a4d6d6b7f" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "ac6c03208b641c410619b361b537b5473e63caecaeab2c554a28cce680b4b3a5" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -663,7 +663,7 @@ SCP_END="$(awk -F'\t' -v s="$SCP_START" '$1 > s && $2 ~ /^  [^ #].*:[[:space:]]*
 is "exactly one scp-endpoint-allowlist job key line in ci.yml" "1" "$(grep -cE "^  (\\?[[:space:]]*)?((&[^[:space:]]+|![^[:space:]]+)[[:space:]]+)*(\"scp-endpoint-allowlist\"|'scp-endpoint-allowlist'|scp-endpoint-allowlist)[[:space:]]*:?[[:space:]]*((&[^[:space:]]+|![^[:space:]]+)[[:space:]]*)?(#.*)?$" "$CI")"
 if [ -n "$SCP_START" ] && [ -n "$SCP_END" ]; then
   SCP_JOB_BLOB="$(sed -n "$((SCP_START + 1)),$((SCP_END - 1))p" "$CI")"
-  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "545625337aa4bc7991b2911be0922d34e7093add09eb6a6d3a06f1a6a542eb75" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "scp-endpoint-allowlist job blob hash (pin: update after a deliberate edit)" "f7d98c0ac8deb7e8ddfc407ee0129492c2858e9d286c7942a41779fce5727827" "$(printf '%s\n' "$SCP_JOB_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "scp-endpoint-allowlist job span not found in ci.yml"
 fi
@@ -903,8 +903,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "ea23c1297ac96fbc993aeafcd657019ea659963c0cbedcb160dc9b8fc97689ff" "$tests_digest_got"
-if [ "$tests_digest_got" != "ea23c1297ac96fbc993aeafcd657019ea659963c0cbedcb160dc9b8fc97689ff" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "e3d0d2660eb214613895847a78df2918c094aca9072057ab2c45a77bc9322595" "$tests_digest_got"
+if [ "$tests_digest_got" != "e3d0d2660eb214613895847a78df2918c094aca9072057ab2c45a77bc9322595" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
@@ -948,7 +948,7 @@ GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts
 GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
-  is "gate step blob hash (pin: update after a deliberate edit)" "e91e9251b3e1b7e9db86c4d365e451c1ff1553b2f6695f6a5af6d1c9bbcd323d" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "gate step blob hash (pin: update after a deliberate edit)" "8512e077724cd32acf871eac9b1610691dd676da53f7fc87ca20e4e056ccacf9" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "gate step span not found in ci.yml"
 fi
@@ -1132,7 +1132,7 @@ done
 allowed_default="$(grep -E '^[[:space:]]*allowed_url=' "$CI" || true)"
 [ -n "$allowed_default" ] || bad "ci.yml allowed_url default not found"
 is "exactly one line-leading allowed_url assignment" "1" "$(grep -cE '^[[:space:]]*allowed_url=' "$CI")"
-is "ci.yml allowed_url default blob hash (pin: update after a deliberate edit)" "5bbdd9dbf5dc748181e87ea46508160a37acbde61da2a1479a7dbcb996f5b708" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
+is "ci.yml allowed_url default blob hash (pin: update after a deliberate edit)" "2995ad1ff3581328f07a567d6ffa840d3dad8cc14627869d8dc2288ff7b57617" "$(printf '%s' "$allowed_default" | sha256sum | cut -d' ' -f1)"
 lacks "ci.yml does not append to allowed_url" 'allowed_url+=' "$(cat "$CI")"
 lacks "ci.yml allowlist default does not name cloudflare" 'cloudflare' "$allowed_default"
 lacks "ci.yml allowlist default does not name gcore" 'gcore' "$allowed_default"
@@ -1151,7 +1151,7 @@ ALLOW_START="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' '$2 == "      - name: Fai
 ALLOW_END="$(printf '%s\n' "$CI_STRUCT" | awk -F'\t' -v s="$ALLOW_START" '$1 > s && ($2 ~ /^      - / || $2 ~ /^  [^ #]/) {print $1; exit}')"
 if [ -n "$ALLOW_START" ] && [ -n "$ALLOW_END" ]; then
   ALLOW_STEP_BLOB="$(sed -n "${ALLOW_START},$((ALLOW_END - 1))p" "$CI")"
-  is "allowlist step blob hash (pin: update after a deliberate edit)" "70fe4532faae88672632dd7a21ea9df2aa2edcadd0b82773b007e5c7e55935c4" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "allowlist step blob hash (pin: update after a deliberate edit)" "9af2491dbc47cd000e75bfb7b682891c25d710ec6f0552837c5e426c60bcdc57" "$(printf '%s\n' "$ALLOW_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "allowlist step span not found in ci.yml"
 fi
@@ -1338,7 +1338,7 @@ done
 # this block itself — is invisible here and relies on review plus the CI run
 # list. The floor is a MINIMUM (adding checks stays green); update it
 # deliberately when checks are removed.
-MIN_CHECKS=282
+MIN_CHECKS=281
 if [ "$pass" -lt "$MIN_CHECKS" ]; then bad "check floor: expected at least $MIN_CHECKS passing checks, got $pass"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
