@@ -63,7 +63,7 @@ vmtt_base_image() { # $1 arch, $2 cache dir -> prints the verified cached path, 
   # file is removed on a failure, SIGINT, SIGTERM or SIGHUP, whatever the
   # caller does with traps (callers invoke this helper inside $(...), where a
   # caller's EXIT trap never sees a variable set here). SIGKILL runs no trap
-  # and leaves the .XXXXXX temp behind; it is never used as a cached image
+  # and leaves the .XXXXXX temp behind; it is never used as the cached file
   # (the cache name differs) and can be removed by hand. After the mv the temp
   # name no longer exists, so the EXIT trap is a no-op on success.
   (
