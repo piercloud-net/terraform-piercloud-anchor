@@ -640,7 +640,7 @@ RUN_START="$(awk -F'\t' '$2 == "      - name: Run the committed script harnesses
 RUN_END="$(awk -F'\t' -v s="$RUN_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$RUN_START" ] && [ -n "$RUN_END" ]; then
   RUN_STEP_BLOB="$(sed -n "${RUN_START},$((RUN_END - 1))p" "$CI")"
-  is "harness-run step blob hash (pin: update after a deliberate edit)" "d93e13a12306e856335db0fd325502fbb5989ebc17cd6945074e244e18556e10" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "harness-run step blob hash (pin: update after a deliberate edit)" "fa422666553d21befa7a7f8e45f570629af43a7928fb8f60a4e5f097debc1c24" "$(printf '%s\n' "$RUN_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
   is "harness-run step keeps the gate expression" "1" "$(printf '%s\n' "$RUN_STEP_BLOB" | grep -cE '^        if: steps\.gate\.outputs\.run == .yes.$')"
 else
   bad "harness-run step span not found in ci.yml"
@@ -650,7 +650,7 @@ is "exactly one harness-run step header" "1" "$(grep -cE '^      - name: Run the
 # see an inserted step in the same job that rewrites a harness on the runner
 # before the pinned run step executes it (the static harnesses read the PR
 # tree, not the runner workspace). Any deliberate job edit updates this pin.
-is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "9bccbd811d5e26c38b7a49eb3a303e6662e35ae94938f396ebd5bb8a4d6d6b7f" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
+is "unit-tests-scripts job blob hash (pin: update after a deliberate edit)" "9a8e2fa0ad06ee67d949f4fc32970f189931d2d40fe622655274e39b69cb8d60" "$(printf '%s\n' "$ci_unit_raw" | sha256sum | cut -d' ' -f1)"
 # The whole scp-endpoint-allowlist job body is byte-pinned: the allowlist
 # step pin hashes the consumer, not the producer of its contract source
 # (`/tmp/contract-ci.yml` is written by an earlier step in the same job), so
@@ -673,7 +673,7 @@ is "exactly one unit-tests-scripts job key line in ci.yml" "1" "$(grep -cE "^  (
 # structural line of the top level (on/env/permissions children plus the job
 # keys). A
 # duplicate or decoy job key in ANY spelling adds one.
-is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "15" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
+is "ci.yml structural indent-2 line count (pin: update for a new top-level line)" "14" "$(printf '%s\n' "$CI_STRUCT" | cut -f2- | grep -cE '^  [^[:space:]#]')"
 # The job SET is pinned by name too: the census is a count, so a new job
 # added while a semantic-neutral indent-2 line is removed (`permissions:
 # { contents: read }` replacing the block form) keeps the count green — and
@@ -866,8 +866,8 @@ if [ "$job_digest_got" != "82d9736c9fd1b0dde8cfc0aee235310e463a1b58e89b68bc183b0
   printf '   job-set parts (to update the pin):\n'; printf '%s' "$wf_job_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
 fi
 top_digest_got="$(printf '%s' "$wf_top_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow top-level key sequence is pinned (pin: update for a deliberate top-level key change)" "79697d40de1560fdff6c3c014c5f023e93fde0425295d70438f98baa985b4618" "$top_digest_got"
-if [ "$top_digest_got" != "79697d40de1560fdff6c3c014c5f023e93fde0425295d70438f98baa985b4618" ]; then
+is "workflow top-level key sequence is pinned (pin: update for a deliberate top-level key change)" "40e369af614be5b7ff55895b0a0f75b8cc3ade17087b67f5301b032fc118350d" "$top_digest_got"
+if [ "$top_digest_got" != "40e369af614be5b7ff55895b0a0f75b8cc3ade17087b67f5301b032fc118350d" ]; then
   printf '   top-level key parts (to update the pin):\n'; printf '%s' "$wf_top_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   top-level line content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
@@ -903,8 +903,8 @@ for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
   wf_tests_digest="$wf_tests_digest|$wf:$(grep -E "$TESTS_REF_RE" "$wf" | sha256sum | cut -d' ' -f1 || true)"
 done
 tests_digest_got="$(printf '%s' "$wf_tests_digest" | sha256sum | cut -d' ' -f1)"
-is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "ea23c1297ac96fbc993aeafcd657019ea659963c0cbedcb160dc9b8fc97689ff" "$tests_digest_got"
-if [ "$tests_digest_got" != "ea23c1297ac96fbc993aeafcd657019ea659963c0cbedcb160dc9b8fc97689ff" ]; then
+is "workflow tests-reference set is pinned (pin: update for a deliberate change)" "b75221db7cbbc40d9cbd7f0b7bda223b042ecb5b06e8fca42c0cbf6bb8ee5756" "$tests_digest_got"
+if [ "$tests_digest_got" != "b75221db7cbbc40d9cbd7f0b7bda223b042ecb5b06e8fca42c0cbf6bb8ee5756" ]; then
   printf '   tests-reference parts (to update the pin):\n'; printf '%s' "$wf_tests_digest" | tr '|' '\n' | sed 's/^/     /'; printf '\n'
   printf '   tests-reference content (each workflow, hashed as-is; strip the "     | " prefix):\n'
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
@@ -948,7 +948,7 @@ GATE_START="$(awk -F'\t' '$2 == "      - name: Gate on changed paths (CI scripts
 GATE_END="$(awk -F'\t' -v s="$GATE_START" '$1 > s && $2 ~ /^      - name: / {print $1; exit}' <<<"$CI_STRUCT")"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ]; then
   GATE_STEP_BLOB="$(sed -n "${GATE_START},$((GATE_END - 1))p" "$CI")"
-  is "gate step blob hash (pin: update after a deliberate edit)" "e91e9251b3e1b7e9db86c4d365e451c1ff1553b2f6695f6a5af6d1c9bbcd323d" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
+  is "gate step blob hash (pin: update after a deliberate edit)" "030f8d1714b5c15320daec3551cf147b5b3ca5269131a7b8e1ce8e99063af76f" "$(printf '%s\n' "$GATE_STEP_BLOB" | sha256sum | cut -d' ' -f1)"
 else
   bad "gate step span not found in ci.yml"
 fi

@@ -12,9 +12,6 @@ on:
 permissions:
   contents: read
 
-env:
-  TOFU_VERSION: "1.12.2"
-
 jobs:
   fmt:
     name: tofu fmt
@@ -23,7 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # tag: v2
         with:
-          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_version_file: .opentofu-version
       - name: tofu fmt -check -recursive
         run: tofu fmt -check -recursive
 
@@ -34,7 +31,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # tag: v2
         with:
-          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_version_file: .opentofu-version
       - name: tofu init -backend=false
         run: tofu init -backend=false
       - name: tofu validate
@@ -652,7 +649,7 @@ jobs:
             # cloudfront_ranges.tf sync tooth and the firewall-wiring
             # assertions live in tests/edge-origin-auth, so a ranges
             # refresh or rule edit must not skip them.
-            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh|origin-mtls-ca\.pem)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|provider-stopgap|public-log-safety|gatus-render|gatus-pull|external-watch|managed-inputs|managed-operator-plane|broker-dns|broker-provision-dns|edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/|.*\.tf$)' <<<"$changed"; then
+            elif grep -qE '^(\.github/scripts/|\.github/workflows/|scripts/(lib/|010-provision\.sh|origin-mtls-ca\.pem)|tests/(banner-workflow-diff|anchor-ip-selection|scp-token-refresh|config-file-mounts|sweep-pre-classify|sweep-post-shapes|naming-scheme|ntfy-token-handrun|retention-cap|policy-naming|provider-stopgap|public-log-safety|gatus-render|gatus-pull|external-watch|managed-inputs|managed-operator-plane|broker-dns|broker-provision-dns|edge-origin-auth|origin-mtls|origin-ca|recording-witness|broker-report)/|tests/opentofu-pin/|\.opentofu-version$|.*\.tf$)' <<<"$changed"; then
               echo "run=yes" >> "$GITHUB_OUTPUT"
             else
               echo "run=no" >> "$GITHUB_OUTPUT"
@@ -692,6 +689,7 @@ jobs:
           bash tests/broker-report/run-test.sh
           bash tests/broker-dns/run-test.sh
           bash tests/broker-provision-dns/run-test.sh
+          bash tests/opentofu-pin/run-test.sh
       - name: bash -n + shellcheck -S warning over the CI-called scripts
         if: steps.gate.outputs.run == 'yes'
         run: |

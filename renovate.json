@@ -1,14 +1,20 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Auto-bump pins so exact versions never rot: GitHub Actions (@v1 pins incl. semver-calver-release), the Gatus docker image pinned inside scripts/010-provision.sh, the OpenTofu version pinned in .opentofu-version (both via regex custom managers), and the netcup Terraform provider (rixlhq/netcup) constraints in versions.tf and examples/**/*.tf plus its lock file .terraform.lock.hcl (terraform manager). Minor/patch bumps automerge once CI is green; MAJOR bumps always land as PRs for human review. Exception (M4): netcup-touching paths never automerge — they queue under the netcup-touching label as one batch PR (one approval per batch), via the packageRule below (placed after the automerge rule so it wins on overlap). The batch covers the provider constraints and the lock file alike, so a lock-only bump cannot automerge either. lockFileMaintenance is disabled explicitly: a lock refresh would re-resolve every provider hash with no constraint change, outside the batch review; Renovate's default is also off, and the explicit setting keeps it off if that default changes. The .opentofu-version bump stays auto-apply: CI-plane toolchain, inert until dispatch. Requires the Renovate GitHub App installed on this repo. Note: hosted-app commits are unsigned (signing is self-hosted-only), but squash merges produce GitHub web-flow-signed commits on main, so required_signatures holds; if platformAutomerge ever trips on the signature check, add renovate[bot] to the main-ruleset bypass list.",
-  "enabledManagers": ["github-actions", "custom.regex", "terraform"],
+  "description": "Update policy (rationale: docs/updaters.md). Advisory fixes (Dependabot alerts plus OSV) for minor, patch, pin and digest updates automerge with no soak. Routine minor, patch, pin and digest updates automerge after a 7-day soak once CI is green. Major updates always wait for a human. Netcup-touching paths (scripts/**, .github/scripts/**, **/*.tf, **/.terraform.lock.hcl, examples/**) never automerge, security or not. Their routine updates group into one netcup-touching batch PR, except the Gatus and Caddy images in scripts/010-provision.sh, which sit outside the batch, follow the routine soak, and still never automerge when advisory. The OpenTofu pins (.opentofu-version and provision.yml tofu_version) move as one group. lockFileMaintenance is off; notifications use Renovate defaults.",
+  "enabledManagers": [
+    "github-actions",
+    "custom.regex",
+    "terraform"
+  ],
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Gatus + Caddy docker images pinned in the provisioning script",
-      "managerFilePatterns": ["/^scripts/010-provision\\.sh$/"],
+      "description": "Gatus and Caddy docker images pinned in the provisioning script",
+      "managerFilePatterns": [
+        "/^scripts/010-provision\\.sh$/"
+      ],
       "matchStrings": [
-        "\\s*# renovate: depName=(?<depName>\\S+) datasource=(?<datasource>\\S+)\\s*\\n\\s*[A-Z_]+=\"${depName}:(?<currentValue>[^\\s\"]+)\""
+        "# renovate: depName=(?<depName>\\S+) datasource=(?<datasource>\\S+)\\s*\\n\\s*[A-Z_]+=\"[^\"\\s]+:(?<currentValue>[^\\s\"]+)\""
       ],
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker"
@@ -16,32 +22,152 @@
     {
       "customType": "regex",
       "description": "OpenTofu CLI version pinned in .opentofu-version",
-      "managerFilePatterns": ["/^\\.opentofu-version$/"],
+      "managerFilePatterns": [
+        "/^\\.opentofu-version$/"
+      ],
       "matchStrings": [
-        "^(?<currentValue>\\d+\\.\\d+\\.\\d+)$"
+        "^(?<currentValue>\\d+\\.\\d+\\.\\d+)\\s*$"
       ],
       "depNameTemplate": "opentofu/opentofu",
       "datasourceTemplate": "github-releases",
-      "versioningTemplate": "semver-coerced"
+      "versioningTemplate": "semver-coerced",
+      "extractVersionTemplate": "^v?(?<version>\\d+\\.\\d+\\.\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "OpenTofu CLI version pinned in provision.yml (setup-opentofu tofu_version input)",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/provision\\.yml$/"
+      ],
+      "matchStrings": [
+        "tofu_version: \"v(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "opentofu/opentofu",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver-coerced",
+      "extractVersionTemplate": "^v?(?<version>\\d+\\.\\d+\\.\\d+)$"
     }
   ],
   "lockFileMaintenance": {
     "enabled": false
   },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": [
+      "security"
+    ],
+    "minimumReleaseAge": null
+  },
+  "internalChecksFilter": "strict",
   "packageRules": [
     {
-      "description": "Auto-merge minor and patch bumps (Gatus image, action pins, tofu patch) once CI is green",
-      "matchUpdateTypes": ["minor", "patch"],
+      "description": "R1 routine: minor, patch, pin and digest updates automerge after a 7-day soak (strict internalChecksFilter holds the PR until the age passes)",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest",
+        "pinDigest"
+      ],
+      "minimumReleaseAge": "7 days",
       "automerge": true,
       "automergeType": "pr",
       "platformAutomerge": true
     },
     {
-      "description": "Netcup-touching bumps queue under one label as one batch PR (one approval per batch); never automerge — they only take effect at dispatch",
-      "matchPaths": ["scripts/**", ".github/scripts/**", "**/*.tf", "**/.terraform.lock.hcl", "examples/**"],
-      "groupName": "netcup-touching batch",
-      "addLabels": ["netcup-touching"],
+      "description": "R2 majors (routine and advisory): human review, never automerged",
+      "matchUpdateTypes": [
+        "major"
+      ],
       "automerge": false
+    },
+    {
+      "description": "R3 advisory fast lane: advisory minor, patch, pin and digest updates automerge with no soak. Soak removal comes from vulnerabilityAlerts (minimumReleaseAge null, force-applied). automerge cannot live in vulnerabilityAlerts because force keys win over every later rule, which would override the netcup deny rules (R4, R6)",
+      "matchJsonata": [
+        "isVulnerabilityAlert = true"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest",
+        "pinDigest"
+      ],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "R4 netcup-touching batch: routine and advisory bumps group into one PR with a label, never automerge. Gatus and Caddy are excluded here (R5)",
+      "matchFileNames": [
+        "scripts/**",
+        ".github/scripts/**",
+        "**/*.tf",
+        "**/.terraform.lock.hcl",
+        "examples/**"
+      ],
+      "matchDepNames": [
+        "!twinproduction/gatus",
+        "!caddy"
+      ],
+      "groupName": "netcup-touching batch",
+      "addLabels": [
+        "netcup-touching"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "R5 Gatus and Caddy images (scripts/010-provision.sh): outside the netcup batch; minor and patch automerge after the 7-day soak, majors human (R2)",
+      "matchDepNames": [
+        "twinproduction/gatus",
+        "caddy"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "minimumReleaseAge": "7 days",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "R6 deny: advisory updates on netcup-touching paths never automerge, including Gatus and Caddy (placed after R3 and R5, so it wins)",
+      "matchJsonata": [
+        "isVulnerabilityAlert = true"
+      ],
+      "matchFileNames": [
+        "scripts/**",
+        ".github/scripts/**",
+        "**/*.tf",
+        "**/.terraform.lock.hcl",
+        "examples/**"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "R7 OpenTofu CLI pins (.opentofu-version and provision.yml tofu_version) move together",
+      "matchPackageNames": [
+        "opentofu/opentofu"
+      ],
+      "groupName": "opentofu"
+    },
+    {
+      "description": "R8 pin GitHub Actions to commit digests (digest updates keep the # v1 comment pins current)",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "pinDigests": true
+    },
+    {
+      "description": "R9 OpenTofu setup-opentofu tofu_version input: a version string, never a digest (the github-actions manager reads it as a uses-with dep whose digest would not be a version)",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "opentofu/opentofu"
+      ],
+      "pinDigests": false
     }
   ]
 }
