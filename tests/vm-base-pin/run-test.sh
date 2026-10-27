@@ -209,10 +209,39 @@ for case in mv chmod; do
   rm -rf "$C"
 done
 
+# (n) an interrupt mid-download removes the temp file, even when the caller runs
+# the helper inside $(...) (where a caller's EXIT trap cannot see a variable
+# set by the helper): the download subshell owns its own traps
+mkdir -p "$TMP/bini"
+cat >"$TMP/bini/curl" <<'STUB'
+#!/usr/bin/env bash
+out=""
+while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+printf 'partial' >"$out"
+kill -"$SIG" "$PPID"
+sleep 5
+STUB
+chmod +x "$TMP/bini/curl"
+for sig in INT TERM; do
+  C="$TMP/cache-n-$sig"; mkdir -p "$C"
+  rc=0
+  (
+    export PATH="$TMP/bini:$PATH" SIG="$sig"
+    # shellcheck source=/dev/null
+    . "$HELPER"
+    vmtt_pin_sha512() { if [ "$1" = amd64 ]; then echo "$GOOD"; else return 1; fi; }
+    got="$(vmtt_base_image amd64 "$C")" || exit 1
+    printf '%s\n' "$got"
+  ) >"$TMP/out" 2>"$TMP/err" || rc=$?
+  if [ "$rc" != "0" ]; then ok "SIG$sig during the download exits non-zero"; else bad "SIG$sig during the download exits non-zero"; fi
+  if [ -z "$(ls -A "$C")" ]; then ok "SIG$sig during the download leaves no temp file in the cache"; else bad "SIG$sig during the download leaves no temp file in the cache"; fi
+  rm -rf "$C"
+done
+
 # (m) the call sites: both VM proofs stage a verified copy before they boot
 for script in run.sh img-drill.sh; do
   f="$REPO_ROOT/tools/vm-timetravel/$script"
-  if grep -qF 'cp "$ROOT/tools/vm-timetravel/base-image.sh" "$WORK/base-image.sh"' "$f" && grep -qF 'source /w/base-image.sh' "$f"; then ok "$script ships and sources the pinned helper"; else bad "$script ships and sources the pinned helper"; fi
+  if grep -qF 'cp "$ROOT/tools/vm-timetravel/base-image.sh" "$WORK/base-image.sh"' "$f" && grep -qF 'source /w/base-image.sh' "$f"; then ok "$script ships and sources the pinned helper"; else bad "$script ships and sources the pinned helper"; fi # ci-allowlist: asserts the helper file name at the call site, not a live reference.
   if grep -qF 'vmtt_stage_base "$ARCH" /cache /w/base.qcow2' "$f"; then ok "$script stages a private verified copy"; else bad "$script stages a private verified copy"; fi
   if grep -qF -- '-b "$BASE" /w/vm.qcow2' "$f"; then ok "$script boots from the staged copy"; else bad "$script boots from the staged copy"; fi
   if ! grep -qE 'cloud/trixie/latest|\[ -s "\$BASE" \]' "$f"; then ok "$script trusts no unpinned download"; else bad "$script trusts no unpinned download"; fi

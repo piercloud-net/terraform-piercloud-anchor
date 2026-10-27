@@ -12,13 +12,17 @@
 # TOFU, stated plainly: Debian publishes NO detached signature for these
 # files (SHA512SUMS[.sign] is absent from the build directory), so the pin is
 # trust-on-first-use over HTTPS against the Debian publisher. What a bump can
-# still detect is a substituted mirror or CDN: fetch SHA512SUMS TWICE, from
-# two different hostnames - https://cloud.debian.org/images/cloud/<release>/<build>/
-# and https://cdimage.debian.org/images/cloud/<release>/<build>/ - confirm the
-# two files are byte-identical (sha256sum of the file matches), and only then
-# copy the per-arch lines. Record both hostnames, the sha256 of SHA512SUMS and
-# the exact lines in the commit message. This catches a bad mirror; it cannot
-# catch a compromise of Debian itself, and the docs say so.
+# still do is a consistency check: fetch SHA512SUMS TWICE, from the same
+# build directory on two hostnames, cloud.debian.org and cdimage.debian.org
+# (same path below the host), confirm the two files are byte-identical
+# (sha256sum of the file matches), and only then copy the per-arch lines.
+# Record both hostnames, the sha256 of SHA512SUMS and the exact lines in the
+# commit message. LIMIT: both names are served by the same Debian mirror
+# network today (same addresses, same redirect target), so the two fetches
+# are NOT independent: the check catches a truncated or transient bad
+# response, not a substituted mirror or CDN, and not a compromise of Debian
+# itself. A fetch from an independent vantage (another network, or the
+# reviewer's own) is what would catch a substituted mirror.
 #
 # To bump the pin: list the release directory on cloud.debian.org, take the
 # newest dated build, run the two-source check above, then set VMTT_BUILD and
@@ -27,7 +31,6 @@
 
 VMTT_BUILD=20261026-2643
 VMTT_BASE_DIR="https://cloud.debian.org/images/cloud/trixie/${VMTT_BUILD}" # ci-allowlist: pinned Debian cloud build directory for the manual VM proof, not an SCP reference.
-export VMTT_TMP="" # set while a download is in flight, so a caller's EXIT trap can clean it up
 
 vmtt_pin_sha512() { # $1 arch -> the pinned SHA512 of its qcow2; an unknown arch refuses
   case "$1" in
@@ -56,29 +59,32 @@ vmtt_base_image() { # $1 arch, $2 cache dir -> prints the verified cached path, 
     return 0
   fi
   tmp="$(mktemp "${cache}/.${name}.XXXXXX")" || return 1
-  VMTT_TMP="$tmp"
-  if ! curl --proto '=https' --proto-redir '=https' -fsSL -o "$tmp" "${VMTT_BASE_DIR}/${name}"; then
-    rm -f -- "$tmp"; VMTT_TMP=""
-    echo "base qcow2 download failed: ${name}" >&2
-    return 1
-  fi
-  if ! vmtt_verify "$sum" "$tmp"; then
-    rm -f -- "$tmp"; VMTT_TMP=""
-    echo "base qcow2 checksum mismatch on download, nothing cached: ${name}" >&2
-    return 1
-  fi
-  if ! chmod 0644 "$tmp"; then
-    rm -f -- "$tmp"; VMTT_TMP=""
-    echo "base qcow2 could not be made readable: ${tmp}" >&2
-    return 1
-  fi
-  if ! mv -f -- "$tmp" "$path"; then
-    rm -f -- "$tmp"; VMTT_TMP=""
-    echo "base qcow2 could not be stored as ${path}" >&2
-    return 1
-  fi
-  VMTT_TMP=""
-  printf '%s\n' "$path"
+  # The download runs in its own subshell with its own EXIT trap, so the temp
+  # file is removed on every exit path, SIGINT/SIGTERM included, whatever the
+  # caller does with traps (callers invoke this helper inside $(...), where a
+  # caller's EXIT trap never sees a variable set here). After the mv the temp
+  # name no longer exists, so the EXIT trap is a no-op on success.
+  (
+    trap 'rm -f -- "$tmp"' EXIT
+    if ! curl --proto '=https' --proto-redir '=https' -fsSL -o "$tmp" "${VMTT_BASE_DIR}/${name}"; then
+      echo "base qcow2 download failed: ${name}" >&2
+      exit 1
+    fi
+    if ! vmtt_verify "$sum" "$tmp"; then
+      echo "base qcow2 checksum mismatch on download, nothing cached: ${name}" >&2
+      exit 1
+    fi
+    if ! chmod 0644 "$tmp"; then
+      echo "base qcow2 could not be made readable: ${tmp}" >&2
+      exit 1
+    fi
+    if ! mv -f -- "$tmp" "$path"; then
+      echo "base qcow2 could not be stored as ${path}" >&2
+      exit 1
+    fi
+  ) || return 1
+  printf '%s
+' "$path"
 }
 
 vmtt_stage_base() { # $1 arch, $2 cache dir, $3 destination -> prints $3, a verified private copy the caller boots from
@@ -95,7 +101,7 @@ vmtt_stage_base() { # $1 arch, $2 cache dir, $3 destination -> prints $3, a veri
   fi
   if ! vmtt_verify "$sum" "$dest"; then
     rm -f -- "$dest"
-    echo "base image checksum mismatch after staging: ${dest}" >&2
+    echo "base qcow2 checksum mismatch after staging: ${dest}" >&2
     return 1
   fi
   if ! info="$(qemu-img info --output=json "$dest" 2>/dev/null)"; then

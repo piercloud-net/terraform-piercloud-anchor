@@ -280,7 +280,7 @@ fi
 QPID=$!
 S=(ssh -q -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ServerAliveInterval=30 debian@127.0.0.1)
 wait_ssh() { local i; for i in $(seq 1 90); do kill -0 "$QPID" 2>/dev/null || return 1; "${S[@]}" true 2>/dev/null && return 0; sleep 4; done; return 1; }
-finish() { kill "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; [ -z "${VMTT_TMP:-}" ] || rm -f -- "$VMTT_TMP"; } # ci-allowlist: cleanup of the pinned base download's temp file, not a live reference.
+finish() { kill "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }
 trap finish EXIT
 wait_ssh || { echo "FAIL: VM never answered ssh" | tee /w/summary.log; tail -n 20 /w/console.log; exit 1; }
 "${S[@]}" "sudo mkdir -p /opt/imgdrill && sudo tar -C /opt/imgdrill --no-same-owner -xf -" </w/payload.tar

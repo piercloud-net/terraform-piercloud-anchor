@@ -71,7 +71,7 @@ QPID=$!
 S=(ssh -q -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 debian@127.0.0.1)
 vm() { "${S[@]}" "sudo bash -c $(printf '%q' "$1")"; }
 wait_ssh() { local i; for i in $(seq 1 90); do kill -0 "$QPID" 2>/dev/null || return 1; "${S[@]}" true 2>/dev/null && return 0; sleep 4; done; return 1; }
-finish() { kill "$QPID" 2>/dev/null || true; [ -z "${VMTT_TMP:-}" ] || rm -f -- "$VMTT_TMP"; } # ci-allowlist: cleanup of the pinned base download's temp file, not a live reference.
+finish() { kill "$QPID" 2>/dev/null || true; }
 trap finish EXIT
 wait_ssh || { say "FAIL: VM never answered ssh"; tail -n 20 /w/console.log; exit 1; }
 say "booted: $(vm 'grep PRETTY /etc/os-release; uname -m')"
