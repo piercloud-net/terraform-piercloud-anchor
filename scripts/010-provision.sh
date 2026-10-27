@@ -30,7 +30,7 @@ TANG_KEYS_DIR="/var/db/tang"
 LEGACY_TANG_KEYS_DIR="/var/db/tang"
 TANG_PORT="8081"
 # renovate: depName=twinproduction/gatus datasource=docker
-GATUS_IMAGE="twinproduction/gatus:v5.36.0"
+GATUS_IMAGE="twinproduction/gatus:v5.37.0"
 GATUS_PORT="8080"
 GATUS_CONFIG="/etc/gatus/config.yaml"
 # renovate: depName=caddy datasource=docker
