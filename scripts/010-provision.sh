@@ -3997,9 +3997,10 @@ if [ -n "${STATUS_HOST:-}" ]; then
     # edge_pull_200 (IMG UPDATER span) is the same probe the on-box updater
     # re-runs after a swap.
     edge_ok=0
-    if edge_pull_200 "${STATUS_HOST}"; then edge_ok=1; fi
+    edge_pull_200 "${STATUS_HOST}" || true
     edge_rc="${EDGE_RC}"
     edge_code="${EDGE_CODE}"
+    if [ "${edge_rc}" -eq 0 ] && [ "${edge_code}" = "200" ]; then edge_ok=1; fi
     if [ "$edge_ok" -ne 1 ]; then
       if [ "${edge_rc}" -eq 6 ]; then
         die "edge pull failed: https://${STATUS_HOST}/ does not resolve yet (curl exit 6). The dashboard name is written by this run's anchor-dns job (explicit per-tenant CNAME; the platform *.status wildcard carries the rest) — after this probe — so on a first-time/DR dispatch before those records exist this probe cannot pass. Let the run finish (anchor-dns writes them), then re-dispatch. ${pool_retry}; once the platform records converge the edge pull recovers (docs/dr.md)"

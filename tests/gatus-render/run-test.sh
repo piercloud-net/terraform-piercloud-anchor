@@ -76,7 +76,7 @@ EOF
 render() { # $1 = case label; the caller exports the env for the case
   local dir="$WORK/$1"
   mkdir -p "$dir"
-  { cat "${WORK}/stubs.src"; printf 'GATUS_CONFIG=%q\n' "$dir/config.yaml"; cat "${SPAN:-${WORK}/span.src}"; } >"$dir/run.sh"
+  { cat "${WORK}/stubs.src"; printf 'GATUS_CONFIG=%q\nGATUS_EXT_TOKEN_FILE=%q\n' "$dir/config.yaml" "$dir/ext-token"; cat "${SPAN:-${WORK}/span.src}"; } >"$dir/run.sh"
   ( cd "$dir"; bash run.sh >"$dir/stdout.log" 2>"$dir/stderr.log" )
 }
 
@@ -84,7 +84,8 @@ fixture_env() { # common fixture env; per-case vars are set by the case itself
   export TENANT_USER=pier \
          ANCHOR_HOSTNAME=anchor-01-pier.piercloud.net \
          STATUS_HOST=status-pier.piercloud.net \
-         NTFY_TOKEN=""
+         NTFY_TOKEN="" \
+         IMG_AUTO_UPDATES=off   # the legacy shapes below; case (h) proves the default-on external rows
   unset ANCHOR_ROLE NTFY_TOPIC GATUS_ENDPOINTS
 }
 
@@ -234,7 +235,10 @@ if render bad_pair; then bad "malformed pair fails closed"; else ok "malformed p
 # exceeds the tracked intent (3) and the render must refuse to install.
 fixture_env
 export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
-INTENT_LINE="$(grep -nF 'alert_intent ' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+# The first ledger call AFTER the shared GATUS EXTERNAL sub-span (its rows are
+# off in fixture_env; case (h) covers them).
+EXT_END_LINE="$(grep -nF -- '# --- GATUS EXTERNAL:end ---' "${WORK}/span.src" | cut -d: -f1)"
+INTENT_LINE="$(grep -nF 'alert_intent ' "${WORK}/span.src" | awk -F: -v m="${EXT_END_LINE:-0}" '$1 > m { print $1; exit }')"
 [ -n "$INTENT_LINE" ] || { printf 'FAIL harness could not find an intent call\n'; exit 1; }
 sed "${INTENT_LINE}d" "${WORK}/span.src" >"${WORK}/span-teeth.src"
 SPAN="${WORK}/span-teeth.src"
@@ -299,6 +303,44 @@ fixture_env
 export STATUS_PULLER=maybe
 if render bad_switch; then bad "bad STATUS_PULLER fails closed"; else ok "bad STATUS_PULLER fails closed"; fi
 has "bad switch names the accepted values" "$(cat "$WORK/bad_switch/stderr.log")" "bad STATUS_PULLER"
+
+# ---- (h) shared GATUS EXTERNAL rows (A-IMG #51, IMG_AUTO_UPDATES) ---------
+fixture_env
+unset IMG_AUTO_UPDATES STATUS_PULLER
+export NTFY_TOPIC=pc-test-topic
+if render ext_on; then ok "external rows: default-on render"; else bad "external rows: default-on render"; sed -n '1,3p' "$WORK/ext_on/stderr.log"; fi
+CFG="$WORK/ext_on/config.yaml"
+yaml_ok "external rows: YAML parses" "$CFG"
+is "external rows: one external-endpoints root" "1" "$(grep -cx 'external-endpoints:' "$CFG" || true)"
+tok="$(cat "$WORK/ext_on/ext-token" 2>/dev/null || true)"
+is "external rows: token is 64 lowercase hex" "1" "$(printf '%s' "$tok" | grep -cE '^[0-9a-f]{64}$' || true)"
+is "external rows: token file is 0600" "600" "$(stat -c %a "$WORK/ext_on/ext-token" 2>/dev/null || true)"
+is "external rows: config file is 0600" "600" "$(stat -c %a "$CFG" 2>/dev/null || true)"
+for row in "caddy updates" "gatus updates"; do
+  rb="$(block "$row" "$CFG")"
+  has "external rows: $row grouped anchor" "$rb" "group: anchor"
+  has "external rows: $row heartbeat 26h" "$rb" "interval: 26h"
+  has "external rows: $row carries the box token" "$rb" "token: \"${tok}\""
+  has "external rows: $row alerts once (threshold 1)" "$rb" "failure-threshold: 1"
+  has "external rows: $row never notifies on resolve" "$rb" "send-on-resolved: false"
+  has "external rows: $row class 4" "$rb" "priority: 4"
+done
+has "external rows: ledger counts both rows" "$(cat "$WORK/ext_on/stderr.log")" "caddy updates,gatus updates"
+lacks "external rows: token never printed (stderr)" "$(cat "$WORK/ext_on/stderr.log")" "$tok"
+lacks "external rows: token never printed (stdout)" "$(cat "$WORK/ext_on/stdout.log")" "$tok"
+cp "$WORK/ext_on/ext-token" "$WORK/ext_on/ext-token.before"
+render ext_on >/dev/null 2>&1 || true
+if cmp -s "$WORK/ext_on/ext-token" "$WORK/ext_on/ext-token.before"; then bad "external rows: token regenerated on every run"; else ok "external rows: token regenerated on every run"; fi
+fixture_env
+export IMG_AUTO_UPDATES=off NTFY_TOPIC=pc-test-topic
+mkdir -p "$WORK/ext_off" && printf 'stale\n' >"$WORK/ext_off/ext-token"
+if render ext_off; then ok "external rows: off renders"; else bad "external rows: off renders"; fi
+lacks "external rows: off renders no external-endpoints" "$(cat "$WORK/ext_off/config.yaml")" "external-endpoints:"
+if [ -e "$WORK/ext_off/ext-token" ]; then bad "external rows: off removes the token"; else ok "external rows: off removes the token"; fi
+export IMG_AUTO_UPDATES=yes
+if render ext_bad; then bad "external rows: a bad IMG_AUTO_UPDATES fails closed"; else ok "external rows: a bad IMG_AUTO_UPDATES fails closed"; fi
+has "external rows: bad switch names the accepted values" "$(cat "$WORK/ext_bad/stderr.log")" "bad IMG_AUTO_UPDATES"
+unset IMG_AUTO_UPDATES
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
