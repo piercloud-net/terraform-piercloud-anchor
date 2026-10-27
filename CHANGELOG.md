@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
 - *(edge)* Verify the CloudFront origin client certificate (closes #235)
 - *(edge)* Retire the shared origin header now that mTLS gates the edge (closes #202)
 - *(edge)* Echo the verified edge client-certificate fingerprint for the platform's rotation check (closes #240)
+- *(os)* Unattended security updates + kernel reboot window on the status page (closes #252)
+- *(img)* On-box Gatus/Caddy updates inside the pinned major, with rollback (closes #253)
 
 ### 🐛 Bug Fixes
 
