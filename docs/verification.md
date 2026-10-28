@@ -1,6 +1,10 @@
 # Verification — CI gates, review, live proof
 
+<!-- shared verification base checked: cad0p/pc-host docs/verification.md sha256=1db63b78c8b6b14efec621863f7d665985ac6fdde0e392aed43fc5a504df3c5b (1041 lines, 2026-10-28) -->
+
 This is the verification checklist `/impl` looks for: what CI proves on every PR, how independent review works in this repo, and what must be proven live (with which authoritative signal) before a change counts as done.
+
+This repo keeps its own checklist on purpose: the pc-* family shares one verification base in the private `cad0p/pc-host` repo, and a public repo cannot fetch it. The HTML comment above records the revision of that base this file was last compared against, by content hash — a hand-check record, not a dependency: nothing here is fetched, vendored or checked by CI, and a later base revision does not invalidate this file until someone compares them and updates the line.
 
 Read it together with [conventions.md](conventions.md) (review + public-safety rules) and [invariants.md](invariants.md) (S1 / C-A review blockers). The device-flow approval mechanics live in [tools/verification-browser/README.md](../tools/verification-browser/README.md).
 
