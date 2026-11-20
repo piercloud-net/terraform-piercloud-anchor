@@ -5511,6 +5511,19 @@ ERROR_CAUSE_CLASSES = (
 ERROR_CAUSE_MAX = 16
 
 
+def error_cause_token_ok(token):
+    """True for a cause token the record may carry (the closed enum + fallback).
+
+    `exception:<TypeName>` is the documented fallback for an unclassified
+    exception, so the trust gate must accept it too: rejecting it would make
+    every generic-failure episode page on every run (the #281 regression this
+    rule exists to remove).
+    """
+    if token in ERROR_CAUSE_CLASSES:
+        return True
+    return bool(re.fullmatch(r"exception:[A-Za-z_][A-Za-z0-9_]*", token))
+
+
 def error_cause_for(exc, performed_sweep=False):
     """The sorted cause-class set for a run_checks exception ('' cause = generic).
 
@@ -5579,13 +5592,20 @@ def clock_offset_seconds():
 
 
 def render_clock_offset(offset):
-    """`N s behind` / `N s ahead` / `0 s` / `unknown` (never a raw float)."""
+    """`N s behind` / `N s ahead of` / `0 s off` / `unknown` (never a float).
+
+    The render carries its own preposition so the sentence "anchor is <render>
+    B2" reads correctly in every case: "400 s behind B2", "400 s ahead of B2",
+    "0 s off B2".
+    """
     if offset is None:
         return "unknown"
     seconds = int(round(abs(offset)))
     if seconds == 0:
-        return "0 s"
-    return "%d s %s" % (seconds, "behind" if offset < 0 else "ahead")
+        return "0 s off"
+    if offset < 0:
+        return "%d s behind" % seconds
+    return "%d s ahead of" % seconds
 
 
 def env(name, default=""):
@@ -6651,6 +6671,12 @@ def new_session_summary():
     return {
         "start": None, "start_mode": None, "end": None, "end_mode": None,
         "coverage": [], "identities": [], "count": 0, "newest": "",
+        # Identities of this session's keys BELOW the hot floor, kept for the
+        # length of one fold only. PER SESSION on purpose: a seq is a
+        # per-session counter, so two sessions can legitimately share
+        # (ts, type, seq) - a global set would suppress the second session's
+        # coverage claim and leave it with no intervals at all.
+        "transient": set(),
         "folded": False,
     }
 
@@ -6736,12 +6762,10 @@ class AuditFold(object):
         self.drift = {"contract": [], "unrecognized": []}
         self.drift_coarse = {"contract": None, "unrecognized": None}
         self.cursors = {"audit_heartbeat": "", "audit_session": "", "audit_session_dated": ""}
-        self.page_first_keys = []
-        # Identities of keys OUTSIDE the hot window, kept for the length of one
-        # fold only: a sweep then absorbs a base/variant pair exactly like the
-        # pre-#281 code did, without serializing per-key state. A delta never
-        # needs them (it only ever sees hot keys).
-        self._transient_identities = set()
+        # A bounded sample of the keys this fold saw, one first-and-last pair
+        # per page: the next sweep's split boundaries are picked from it, and a
+        # page-per-key sample would be the full key list this change removes.
+        self.page_sample_keys = []
 
     # -- folding ----------------------------------------------------------
     def fold_page(self, entries, config, now, candidate_floor):
@@ -6755,6 +6779,14 @@ class AuditFold(object):
         # holds for every key, including exec sessions and completed tars that
         # never reach a per-session age check.
         age_seconds(now, moment, "object %s" % key, config.clock_skew_tolerance)
+        if key in self.hot:
+            # A RE-LISTED key (the delta's bounded overlap window re-offers the
+            # hot tail, and the listing's LastModified may have moved): refresh
+            # the moment and return. Re-counting it would inflate the audit
+            # count, and re-claiming its identity would fabricate a
+            # sequence-duplicate out of a re-read.
+            self.hot[key] = moment
+            return
         self.count += 1
         if key.startswith(config.heartbeat_prefix):
             basename = key[len(config.heartbeat_prefix):]
@@ -6826,7 +6858,7 @@ class AuditFold(object):
         if match.group("ts") > summary["newest"]:
             summary["newest"] = match.group("ts")
         identity = (match.group("ts"), event_type, seq, seq_end)
-        known = identity in summary["identities"] or identity in self._transient_identities
+        known = identity in summary["identities"] or identity in summary["transient"]
         if not known:
             # One coverage claim per event identity: a base key and its
             # replay-conflict variant share (ts, canonical type, start, end),
@@ -6835,9 +6867,11 @@ class AuditFold(object):
             # still lands as one.
             summary["coverage"] = fold_coverage(summary["coverage"], seq, seq_end)
             if candidate_floor is not None and match.group("ts") >= candidate_floor:
-                summary["identities"].append(list(identity))
+                # Tuples in memory (a JSON round-trip stores lists; the
+                # reader converts back) so the membership test above matches.
+                summary["identities"].append(identity)
             else:
-                self._transient_identities.add(identity)
+                summary["transient"].add(identity)
         if is_variant:
             # Variants drop the mode marker by contract and must not
             # re-resolve the lifecycle marker: the base key (which the
@@ -6923,15 +6957,17 @@ class AuditFold(object):
         for name, value in other.cursors.items():
             if value and (not self.cursors[name] or value > self.cursors[name]):
                 self.cursors[name] = value
-        self.page_first_keys.extend(other.page_first_keys)
-        self._transient_identities.update(other._transient_identities)
+        self.page_sample_keys.extend(other.page_sample_keys)
+        for sid, summary in other.sessions.items():
+            if sid in self.sessions:
+                self.sessions[sid]["transient"].update(summary["transient"])
 
     def _merge_session(self, sid, summary):
         mine = self.sessions.get(sid)
         if mine is None:
             copy = new_session_summary()
             copy["coverage"] = [list(segment) for segment in summary["coverage"]]
-            copy["identities"] = [list(identity) for identity in summary["identities"]]
+            copy["identities"] = [tuple(identity) for identity in summary["identities"]]
             copy["count"] = summary["count"]
             copy["newest"] = summary["newest"]
             copy["start"], copy["start_mode"] = summary["start"], summary["start_mode"]
@@ -6946,22 +6982,40 @@ class AuditFold(object):
             else:
                 return
         mine["coverage"] = add_coverage(mine["coverage"], summary["coverage"])
+        # A range branch and another range branch can hold the SAME event
+        # identity (a base key and its replay-conflict variant, or a same-ts
+        # mode pair, straddling the boundary): each branch claims the coverage
+        # once, so the merged count would read as a duplicate. The identity set
+        # is what makes the claim unique, so cancel one layer per identity both
+        # sides claimed. (Branches partition the KEY space, so no key is folded
+        # twice; only a shared identity can double-count.)
+        shared = (set(mine["identities"]) | mine["transient"]) & (
+            {tuple(identity) for identity in summary["identities"]} | summary["transient"])
+        if shared:
+            mine["coverage"] = add_coverage(
+                mine["coverage"], [[identity[2], identity[3], -1] for identity in shared])
         for identity in summary["identities"]:
-            if list(identity) not in mine["identities"]:
-                mine["identities"].append(list(identity))
+            if tuple(identity) not in mine["identities"]:
+                mine["identities"].append(tuple(identity))
         mine["count"] += summary["count"]
         if summary["newest"] > mine["newest"]:
             mine["newest"] = summary["newest"]
-        mine["start"], mine["start_mode"] = resolve_lifecycle_marker(
-            mine["start"], mine["start_mode"], summary["start"], summary["start_mode"])
-        mine["end"], mine["end_mode"] = resolve_lifecycle_marker(
-            mine["end"], mine["end_mode"], summary["end"], summary["end_mode"])
+        if summary["start"] is not None:
+            mine["start"], mine["start_mode"] = resolve_lifecycle_marker(
+                mine["start"], mine["start_mode"], summary["start"], summary["start_mode"])
+        if summary["end"] is not None:
+            mine["end"], mine["end_mode"] = resolve_lifecycle_marker(
+                mine["end"], mine["end_mode"], summary["end"], summary["end_mode"])
 
     def finalize(self, now, config, cursors):
         """Prune to the retained window and fold settled closed-clean sessions.
 
         Deterministic given (key set, cursors, now): the hot floor comes from
-        the cursors, so a sweep fold and a prefix+delta fold agree.
+        the cursors, so a sweep fold and a prefix+delta fold agree. A session
+        with no retained `session.start` is NEVER folded: the stub carries no
+        start, so folding it would drop the `session-start-missing` finding
+        that the next sweep is owed (fail-closed; such a session is a shipper
+        bug, not settled history).
         """
         floor = hot_tail_floor(cursors, config)
         if floor:
@@ -6979,24 +7033,27 @@ class AuditFold(object):
             if key.startswith(config.recordings_prefix):
                 recorded_sids.add(key[len(config.recordings_prefix):].lower())
         for sid, summary in list(self.sessions.items()):
-            if summary.get("folded") or summary["end"] is None or not summary["newest"]:
+            if (summary.get("folded") or summary["start"] is None
+                    or summary["end"] is None or not summary["newest"]):
                 continue
             if summary["newest"] >= horizon:
                 continue
             duplicates = coverage_duplicates(summary["coverage"])
             intervals = coverage_intervals(summary["coverage"])
-            if duplicates or len(intervals) != 1 or intervals[0][0] > 1:
-                continue  # unsettled: a gap or an overlap keeps it exact
+            if not intervals or duplicates or len(intervals) != 1 or intervals[0][0] > 1:
+                continue  # unsettled (or no coverage): a gap/overlap keeps it exact
             mode = "exec" if summary["end_mode"] == "exec" else "shell"
             if mode == "shell" and (sid + ".tar") not in recorded_sids:
                 continue  # a shell session with no tar is a live finding, not clean
             self.sessions[sid] = {
                 "folded": True, "end": summary["end"], "mode": mode,
                 "newest": summary["newest"], "count": summary["count"],
-                "coverage": [], "identities": [], "start": None, "start_mode": None,
+                "coverage": [], "identities": [], "transient": set(),
+                "start": None, "start_mode": None,
                 "end_mode": summary["end_mode"],
             }
-        self._transient_identities = set()
+        for summary in self.sessions.values():
+            summary["transient"] = set()
 
     # -- serialization ----------------------------------------------------
     def to_summary(self, observed_out, hidden):
@@ -7019,7 +7076,11 @@ class AuditFold(object):
                 entry["end"] = stamp(summary["end"]) if summary["end"] is not None else None
                 entry["end_mode"] = summary["end_mode"]
                 entry["coverage"] = summary["coverage"]
-                entry["identities"] = summary["identities"]
+                # Sorted: the listing order is not a contract, so two folds
+                # of the same key set must serialize identically (a delta and
+                # a sweep are compared against each other).
+                entry["identities"] = [
+                    list(identity) for identity in sorted(summary["identities"])]
             sessions[sid] = entry
         drift = {}
         for kind in ("contract", "unrecognized"):
@@ -7101,8 +7162,13 @@ def _collect_families(config, boundaries, now, fold):
     # Retention bound for the hot tail during the fold. The exact floor is
     # cursor-derived and applied in finalize(); this only bounds the transient
     # set (a wall-clock over-approximation cannot change what is retained).
-    candidate_floor = (now - timedelta(
-        seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        candidate_floor = (now - timedelta(
+            seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
+    except OverflowError:
+        # An absurd operator tolerance must not take the witness down: fall
+        # back to the epoch start, so the fold simply retains everything.
+        candidate_floor = "19700101T000000Z"
     branches = 0
     if boundaries and config.list_workers > 1:
         branches = min(max(1, config.list_workers // 2), len(boundaries) + 1)
@@ -7120,7 +7186,12 @@ def _collect_families(config, boundaries, now, fold):
 
         def sink(entries):
             if entries:
-                branch.page_first_keys.append(entries[0][0])
+                # First and last key of every page: the boundary sampler needs
+                # spread across the whole key space, and the page bounds are a
+                # bounded stand-in for the full list (<= 2 per page).
+                branch.page_sample_keys.append(entries[0][0])
+                if len(entries) > 1:
+                    branch.page_sample_keys.append(entries[-1][0])
             branch.fold_page(entries, config, now, candidate_floor)
 
         list_objects_range(config, config.audit_prefix, after, until, on_page=sink)
@@ -7203,9 +7274,10 @@ def _cursors_from_listings(config, fold, recording_objects, now):
 def _sample_boundaries(keys, workers):
     """Pick the next sweep's audit-key boundaries (<= 31, ~evenly spaced).
 
-    Boundaries come from the previous sweep's already-materialized key list;
-    no extra listing calls. A missing/short list falls back to one unsplit
-    branch, and a deleted boundary key can only empty one range.
+    Boundaries come from the previous sweep's page-bound sample (the first and
+    last key of every page it folded) - no extra listing calls and no retained
+    per-key list. A missing/short sample falls back to one unsplit branch, and
+    a deleted boundary key can only empty one range.
     """
     ordered = sorted(keys)
     count = min(31, max(0, min(workers, 8) - 1))
@@ -7445,8 +7517,11 @@ def run_checks(config, now, plan):
     now_epoch = int(now.timestamp())
     # Retention bound for the hot tail during the fold; the exact floor is
     # cursor-derived and applied by finalize() (see _collect_families).
-    candidate_floor = (now - timedelta(
-        seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        candidate_floor = (now - timedelta(
+            seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
+    except OverflowError:
+        candidate_floor = "19700101T000000Z"
     fold = None
     # The recordings-discovery watermark (issue #228, red-team F1): a delta
     # lists the whole random-keyed prefix at most once per
@@ -7470,9 +7545,11 @@ def run_checks(config, now, plan):
         else:
             fold = AuditFold()
             fold.fold_page(sorted(seed_objects.items()), config, now, candidate_floor)
-    if fold is None:
+    if run_mode == "seed" and fold is None:
         # A seed plan without a window (never produced by main(), defensive)
-        # is an exact sweep.
+        # is an exact sweep. A DELTA also reaches here with no fold yet - it
+        # builds one from the retained summary below - so this fallback must
+        # never touch it (that would turn every delta into a sweep).
         run_mode = "sweep"
     if run_mode == "sweep":
         # A sweep that starts and then fails must latch, so record that the
@@ -7745,11 +7822,11 @@ def run_checks(config, now, plan):
     clock_offset = clock_offset_seconds()
     if clock_offset is not None and abs(clock_offset) > config.clock_skew_tolerance:
         raise ClockSkewError(
-            "witness clock: anchor is %s of B2 (tolerance %ds) - the anchor clock is not disciplined"
+            "witness clock: anchor is %s B2 (tolerance %ds) - the anchor clock is not disciplined"
             % (render_clock_offset(clock_offset), config.clock_skew_tolerance))
     if clock_offset is not None and abs(clock_offset) > CLOCK_DRIFT_BAND_SECONDS:
         alerts.append(
-            "clock-drift: the anchor clock is %s of B2 (band %ds, tolerance %ds) - "
+            "clock-drift: the anchor clock is %s B2 (band %ds, tolerance %ds) - "
             "the anchor clock is drifting and verdict freshness depends on it"
             % (render_clock_offset(clock_offset), CLOCK_DRIFT_BAND_SECONDS, config.clock_skew_tolerance))
         finding_ids.append("clock-drift")
@@ -8000,7 +8077,7 @@ def run_checks(config, now, plan):
         # Origin and gap are INDEPENDENT of the overlap: a concurrent hole (or
         # an out-of-range first seq) must still be named, not swallowed by a
         # duplicate finding's former short-circuit (round-1 red-team FIX-3).
-        if intervals[0][0] > 1:
+        if intervals and intervals[0][0] > 1:
             alerts.append(
                 "sequence-origin: session %s starts at <seq> %d (the first seq must be 0 or 1)"
                 % (sid, intervals[0][0])
@@ -8073,10 +8150,10 @@ def run_checks(config, now, plan):
             "window-bounded view cannot certify history before the window" % (window_text or "unknown"))
         finding_ids.append("cold-start")
     if run_mode == "sweep":
-        # Boundaries are sampled from the first key of every folded page (the
-        # full key list is no longer materialized); they are a fan-out knob,
-        # never a correctness input.
-        boundaries_out = _sample_boundaries(fold.page_first_keys, config.list_workers)
+        # Boundaries are sampled from the first and last key of every folded
+        # page (the full key list is no longer materialized); they are a
+        # fan-out knob, never a correctness input.
+        boundaries_out = _sample_boundaries(fold.page_sample_keys, config.list_workers)
     else:
         boundaries_out = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
     # ACK SPACE (#223), computed ONCE for the whole run: every finding id -
@@ -8118,7 +8195,7 @@ def run_checks(config, now, plan):
         "ack_ids": ack_ids,
         "ack_folded": ack_folded,
     }
-    clock_line = "witness clock: anchor is %s of B2" % render_clock_offset(clock_offset)
+    clock_line = "witness clock: anchor is %s B2" % render_clock_offset(clock_offset)
     if alerts:
         return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
     detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s; %s" % (
@@ -8704,7 +8781,8 @@ def fold_from_summary(summary, config):
                 "end_mode": None, "mode": entry.get("mode") or "shell",
                 "newest": str(entry.get("newest") or ""),
                 "count": int(entry.get("count") or 0),
-                "coverage": [], "identities": [], "start": None, "start_mode": None,
+                "coverage": [], "identities": [], "transient": set(),
+                "start": None, "start_mode": None,
             }
             continue
         coverage = []
@@ -8721,7 +8799,7 @@ def fold_from_summary(summary, config):
                     or not all(isinstance(part, int) and not isinstance(part, bool) and part >= 0
                                for part in identity[2:])):
                 raise WitnessError("summary session %r identity is invalid" % (sid,))
-            identities.append(list(identity))
+            identities.append(tuple(identity))
         fold.sessions[sid] = {
             "folded": False,
             "start": parse_timestamp(entry["start"]) if entry.get("start") else None,
@@ -8730,6 +8808,7 @@ def fold_from_summary(summary, config):
             "end_mode": entry.get("end_mode"),
             "coverage": coverage,
             "identities": identities,
+            "transient": set(),
             "count": int(entry.get("count") or 0),
             "newest": str(entry.get("newest") or ""),
         }
@@ -8976,16 +9055,18 @@ def main():
         error_causes = sorted(set(list(error_causes) + forced_causes))
         signature = finding_signature("error", error_causes)
 
-    # The Q2 trust gate: the previous record's bookkeeping (state, the notify
-    # epoch/signature and the notified cause set) is used ONLY when the record
-    # parsed and its bookkeeping fields validate. Otherwise behave like the
-    # pre-#281 code: page once, and the repaired record written below is valid,
-    # so the next run is governed by the episode window. The verdict-side
-    # distrust is unchanged - only the notify comparison may read these fields.
+    # The Q2 trust gate: the notify bookkeeping (previous state, the notify
+    # epoch/signature and the notified cause set) is read from the previous
+    # record ONLY when the record parsed and its bookkeeping fields validate.
+    # Otherwise the notify comparison behaves as if the record were empty
+    # (page once on an error entry), while the repaired record written below
+    # is valid so the next run is governed by the episode window. The gate
+    # touches ONLY the notify comparison: the observed block, the baseline and
+    # the numeric counters keep their own fail-closed rules.
     bookkeeping_trusted = not state_bad_reason
     previous_causes = previous.get("error_causes_notified")
     if (not isinstance(previous_causes, list) or len(previous_causes) > ERROR_CAUSE_MAX
-            or not all(isinstance(entry, str) and entry in ERROR_CAUSE_CLASSES
+            or not all(isinstance(entry, str) and error_cause_token_ok(entry)
                        for entry in previous_causes)):
         bookkeeping_trusted = False
         previous_causes = []
@@ -8993,11 +9074,14 @@ def main():
     if not isinstance(stored_signature, str) or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", stored_signature or ""):
         bookkeeping_trusted = False
-    if not bookkeeping_trusted:
-        # An untrusted record is not a trustworthy previous state: the error
-        # verdict must push instead of comparing against it.
-        previous = {}
-        previous_causes = []
+    if bookkeeping_trusted:
+        notify_previous_state = previous.get("state")
+        notify_last_signature = stored_signature
+        notified_causes = set(previous_causes)
+    else:
+        notify_previous_state = None
+        notify_last_signature = ""
+        notified_causes = set()
 
     renotify = config.renotify if config is not None else 1800
     quiet_renotify = config.quiet_renotify if config is not None else 86400
@@ -9045,13 +9129,15 @@ def main():
     previous_state = previous.get("state")
     # Arm the transition marker only when a PERSISTED previous state changed:
     # a first-ever run (previous_state None) must not arm it, or the next
-    # green run looks like an un-landed recovery and pushes a spurious ok.
+    # green run looks like an un-landed recovery and pushes a spurious ok. The
+    # notify comparison uses the GATE-GATED state (untrusted bookkeeping reads
+    # as no previous state), while the marker itself arms on the real persisted
+    # state - a valid record with forged bookkeeping still transitions.
     if previous_state is not None and previous_state != state:
         state_since_run = run_seq
         state_since_epoch = now_epoch
-    notified_causes = set(previous_causes)
-    if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify,
-                     state_since_run, last_notify_run, signature, last_notify_signature,
+    if should_notify(notify_previous_state, last_notify_epoch, state, now_epoch, renotify,
+                     state_since_run, last_notify_run, signature, notify_last_signature,
                      quiet_signatures, quiet_renotify,
                      ack_ids, ack_identities, ack_configured,
                      error_causes, notified_causes):
@@ -9510,8 +9596,8 @@ recording_witness_run_once() { # run one check now and surface the verdict
       clock_word="$(python3 -c 'import sys
 value = float(sys.argv[1])
 seconds = int(round(abs(value)))
-print("0 s" if seconds == 0 else "%d s %s" % (seconds, "behind" if value < 0 else "ahead"))' "${clock_offset}" 2>/dev/null || true)"
-      log "witness clock: anchor is ${clock_word:-${clock_offset} s} of B2 (median over this run of B2 Date headers)"
+print("0 s off" if seconds == 0 else ("%d s behind" % seconds if value < 0 else "%d s ahead of" % seconds))' "${clock_offset}" 2>/dev/null || true)"
+      log "witness clock: anchor is ${clock_word:-${clock_offset} s off} B2 (median over this run of B2 Date headers)"
       ;;
   esac
 }
@@ -9579,9 +9665,12 @@ time_sync_synchronized() { # 0 when chrony reports a disciplined clock
     *) return 1 ;;
   esac
   reference="$(printf '%s\n' "$tracking" | sed -n 's/^Reference ID[[:space:]]*:[[:space:]]*//p' | head -n 1)"
-  # An all-zero reference means chrony has no usable source yet, however
-  # healthy the leap line reads.
-  case "$reference" in
+  # An all-zero reference ID means chrony has no usable source yet, however
+  # healthy the leap line reads. `chronyc -n` prints it as `00000000 ()`
+  # (the ID, then the unresolved host in parentheses), so compare the ID
+  # token only - matching the whole line would read "no source" as healthy.
+  reference_id="${reference%%[[:space:]]*}"
+  case "$reference_id" in
     ""|0.0.0.0|00000000) return 1 ;;
   esac
   return 0
@@ -9614,14 +9703,18 @@ time_sync_install() { # install + enable chrony and render the config
 }
 
 time_sync_converge() { # wait (bounded) for a disciplined clock, then refuse
-  local attempt
+  local waited=0
   time_sync_install
-  for ((attempt = 0; attempt < TIME_SYNC_WAIT_SECONDS; attempt++)); do
+  # A while loop on purpose: the run-once acceptance pins exactly ONE C-style
+  # arithmetic loop header in this script (the timer-drain loop, issue #143),
+  # so the clock wait must not add a second one.
+  while [ "$waited" -lt "$TIME_SYNC_WAIT_SECONDS" ]; do
     if time_sync_synchronized; then
       log "clock: synchronized (chrony, NTS sources); offset: $(time_sync_offset)"
       return 0
     fi
     /usr/bin/env sleep 1
+    waited=$((waited + 1))
   done
   die "clock: chrony did not synchronize within ${TIME_SYNC_WAIT_SECONDS}s - refusing to provision with an undisciplined clock (the witness's skew bound, freshness clocks and ack windows all read it; check egress UDP/123 and TCP/4460 for NTS-KE)"
 }
