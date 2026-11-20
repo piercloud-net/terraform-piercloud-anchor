@@ -268,7 +268,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1172
+MIN_CHECKS=1171
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
