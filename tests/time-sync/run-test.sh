@@ -52,7 +52,7 @@ has "chrony config pins a drift file" "driftfile /var/lib/chrony/chrony.drift" "
 has "chrony config steps a large first-boot offset" "makestep 1.0 3" "${conf}"
 has "chrony config keeps the RTC in sync" "rtcsync" "${conf}"
 has "chrony config carries a plain bootstrap pool" "pool 2.debian.pool.ntp.org iburst maxsources 2" "${conf}"
-has "chrony config authenticates Cloudflare over NTS" "server time.cloudflare.com iburst nts" "${conf}"
+has "chrony config authenticates NLnet Labs over NTS" "server nts.time.nl iburst nts" "${conf}"
 has "chrony config authenticates Netnod over NTS" "server nts.netnod.se iburst nts" "${conf}"
 has "chrony config authenticates PTB over NTS" "server ptbtime1.ptb.de iburst nts" "${conf}"
 pool_line="$(printf '%s\n' "${conf}" | grep -n '^pool ' | cut -d: -f1)"
@@ -118,7 +118,7 @@ has "chrony is (re)started" "restart chrony" "$(systemctl_calls)"
 chronyc() {
   case "$*" in
     *tracking*)
-      printf 'Reference ID    : A9FEA9FE (time.cloudflare.com)\nLeap status     : Normal\nSystem time     : 0.000123456 seconds slow of NTP time\n'
+      printf 'Reference ID    : C0A8C8C8 (nts.time.nl)\nLeap status     : Normal\nSystem time     : 0.000123456 seconds slow of NTP time\n'
       ;;
   esac
 }
@@ -132,11 +132,11 @@ is "a synchronized clock does not wait" "0" "${SECONDS}"
 
 # -- time_sync_synchronized: the accept/reject matrix ----------------------
 for shape in \
-  "Normal|A9FEA9FE (time.cloudflare.com)|accept" \
+  "Normal|C0A8C8C8 (nts.time.nl)|accept" \
   "Not synchronised|00000000 ()|reject" \
   "Normal|00000000 ()|reject" \
   "Normal||reject" \
-  "|A9FEA9FE (time.cloudflare.com)|reject"; do
+  "|C0A8C8C8 (nts.time.nl)|reject"; do
   # NOT leap/reference: those are local inside time_sync_synchronized, so a
   # same-named global would be shadowed to empty inside the stub.
   ts_leap="${shape%%|*}"

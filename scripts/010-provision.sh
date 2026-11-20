@@ -9657,7 +9657,10 @@ makestep 1.0 3
 pool 2.debian.pool.ntp.org iburst maxsources 2
 # Authenticated sources (NTS): server-authenticated, multi-source, with
 # chrony's outlier rejection. These take over once the bootstrap step landed.
-server time.cloudflare.com iburst nts
+# Three independent operators on purpose: NLnet Labs (NL), Netnod (SE) and
+# the German national metrology institute (PTB). None of them is a hosting
+# or edge provider, which the provisioning-surface grep also enforces.
+server nts.time.nl iburst nts
 server nts.netnod.se iburst nts
 server ptbtime1.ptb.de iburst nts
 TIME_SYNC_CONF_EOF
