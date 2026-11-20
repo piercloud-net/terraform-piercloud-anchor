@@ -47,6 +47,11 @@ The fixture is JSON:
                                           # must fail closed on the missing
                                           # key marker)
       "fail_uploads": null | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
+      "date_offset_seconds": 0,             # optional; shifts the served Date
+                                            # header (the #281 clock self-check:
+                                            # +400 must read as clock-skew, +150
+                                            # as the clock-drift band, 0 as no
+                                            # finding)
       "signature": {                       # optional; when present every
         "key_id": "...", "key": "...", "region": "..."
       },                                   # request is SigV4-verified
@@ -64,6 +69,7 @@ element (a hidden object); the other entries are `<Version>` elements.
 """
 
 import base64
+import email.utils
 import hashlib
 import hmac
 import json
@@ -142,6 +148,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # keep the harness output quiet
         pass
+
+    def date_time_string(self, timestamp=None):
+        """Serve the Date header with an optional fixture offset (#281).
+
+        `date_offset_seconds` shifts the served Date (positive = the server
+        clock reads ahead of the harness clock), so the witness's B2
+        Date-header self-check can be driven end to end: the 400 s fixture must
+        produce cause clock-skew even though every object's LastModified is in
+        the past, the 150 s fixture the ackable clock-drift band, and the 0 s
+        fixture no finding at all.
+        """
+        if timestamp is None:
+            timestamp = time.time() + float(FIXTURE.get("date_offset_seconds", 0) or 0)
+        return email.utils.formatdate(timestamp, usegmt=True)
 
     def record(self, method, ok, note):
         authorization = self.headers.get("Authorization") or ""

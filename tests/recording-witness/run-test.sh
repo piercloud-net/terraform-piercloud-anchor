@@ -1263,7 +1263,7 @@ cursors = existing.get("cursors") if isinstance(existing.get("cursors"), dict) e
 if not keep_cursors:
     cursors = {"audit_heartbeat": "", "audit_session": "", "recordings": ""}
 data["observed"] = {
-    "cursor_version": 1,
+    "cursor_version": 2,
     "generation": 1,
     "written_run_seq": run_seq,
     "last_sweep_ok_epoch": 0,
@@ -4726,7 +4726,7 @@ view_dir="${WORK}/state-badview"
 start_mock
 run_delta "${view_dir}"
 is "bad view: the warm sweep is green" "ok" "${CASE_STATE}"
-python3 - "${view_dir}/view.json" <<'PY'
+python3 - "${view_dir}/summary.json" <<'PY'
 import json
 import sys
 
@@ -4741,7 +4741,7 @@ run_delta "${view_dir}"
 is "bad view: exit 2 (repair, never green)" "2" "${CASE_RC}"
 is "bad view: error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in
-  *"view.generation"*) ok "bad view: detail names the sidecar generation mismatch" ;;
+  *"summary.generation"*) ok "bad view: detail names the sidecar generation mismatch" ;;
   *) bad "bad view detail: ${CASE_DETAIL}" ;;
 esac
 is "bad view: the record is marked repaired" "True" "$(state_field repaired)"
@@ -5606,7 +5606,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
-data["observed"]["cursor_version"] = 2
+data["observed"]["cursor_version"] = 9
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(data, handle)
 PY
@@ -5902,7 +5902,7 @@ JSON
 start_mock
 run_delta "${delta_age_dir}"
 is "delta age: the warm sweep is green" "ok" "${CASE_STATE}"
-python3 - "${delta_age_dir}/view.json" <<'PY'
+python3 - "${delta_age_dir}/summary.json" <<'PY'
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -5910,9 +5910,9 @@ from datetime import datetime, timedelta, timezone
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 old = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()  # ci-allowlist: datetime.isoformat() is a stdlib call, not an SCP image reference.
-for key in list(data.get("audit_objects", {})):
-    if key.startswith("audit/heartbeat/"):
-        data["audit_objects"][key] = old
+# The retained summary carries the newest heartbeat (key + LastModified), not
+# a per-key heartbeat map (#281): age that one and the next delta reads it.
+data["heartbeat"]["last_modified"] = old
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(data, handle)
 PY
@@ -6609,12 +6609,12 @@ case "${CASE_DETAIL}" in
   *) bad "overlap disabled detail: ${CASE_DETAIL}" ;;
 esac
 is "overlap disabled: the run is still a delta (no repair)" "delta" "$(state_field observed.coverage.mode)"
-if python3 - "${late_off_dir}/view.json" "${LATE_START}" <<'PY'
+if python3 - "${late_off_dir}/summary.json" "${LATE_START}" <<'PY'
 import json
 import sys
 
 data = json.load(open(sys.argv[1], encoding="utf-8"))
-if sys.argv[2] in data.get("audit_objects", {}):
+if sys.argv[2] in data.get("hot", {}):
     raise SystemExit("the disabled overlap still merged the late key into the view")
 print("overlap disabled: the view never learned the late key")
 PY
@@ -11138,9 +11138,11 @@ def _fake_run_checks(config, now, plan):
             "dirty": True,
             "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
             "boundaries": [],
-            "audit_objects": {},
-            "recording_objects": {},
+            # A real (empty) fold: the #281 summary bookkeeping main() writes
+            # stays valid across the repeated main() calls this block drives.
+            "fold": module.AuditFold(),
             "hidden": [],
+            "clock_offset_seconds": None,
             "ack_ids": ack_ids,
             "ack_folded": ack_folded,
         },
