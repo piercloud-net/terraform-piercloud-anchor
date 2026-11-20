@@ -4904,6 +4904,7 @@ oversized state file is preserved as `state.json.corrupt` - or a timestamped
 reports `baseline: null` - it could not be read and is never fabricated);
 alerts exit 1; green exits 0.
 """
+import email.utils
 import hashlib
 import hmac
 import http.client
@@ -4923,7 +4924,14 @@ from datetime import datetime, timedelta, timezone
 STATE_VERSION = 3
 # The observed/coverage block's own schema version; bumped only when the
 # block layout changes incompatibly (a mismatch is fail-closed repair + sweep).
-CURSOR_VERSION = 1
+# Version 2 is the #281 summary-view migration: a version-1 block is a KNOWN
+# legacy shape, so it takes the one-off migration sweep (its own verdict, no
+# repair marker, notify bookkeeping kept) instead of the fail-closed repair
+# path. See docs/recording-witness.md (migration).
+CURSOR_VERSION = 2
+# The highest cursor version this code accepts as a known legacy shape (the
+# #281 upgrade). Anything else is a fail-closed repair.
+LEGACY_CURSOR_VERSIONS = (1,)
 # A state record is a few KB; an oversized file is invalid input, never a reason
 # to allocate it. The bounded read keeps a planted huge state.json from raising
 # an uncaught MemoryError before any verdict (round-7 R2).
@@ -4937,11 +4945,40 @@ MAX_SUCCESS_BODY = 16 * 1024 * 1024
 # A delta tail is bounded: an overflow abandons the delta and runs an exact
 # sweep, so a post-downtime backlog can never read as a truncated view.
 DELTA_MAX_PAGES = 50
-# The observed view sidecar: the merged key maps live here (not in state.json,
-# whose 1 MiB bound and preserve-and-repair semantics stay untouched). The cap
-# is fail-closed: an oversized or unreadable view takes the repair-sweep path.
-VIEW_VERSION = 1
-VIEW_MAX_BYTES = 64 << 20
+# The bounded summary sidecar (#281): per-session coverage, the recordings map,
+# a hot tail of recent audit keys, the drift sets and the hidden set live here
+# (not in state.json, whose 1 MiB bound and preserve-and-repair semantics stay
+# untouched). The old per-key map (view.json) is gone: it was a delta cache,
+# never a deletion commitment, and it grew with the bucket's whole history
+# until it crossed the 64 MiB cap.
+SUMMARY_VERSION = 2
+SUMMARY_NAME = "summary.json"
+# The retired per-key sidecar (#281). Never read by this code; removed after
+# the migration run lands its replacement.
+LEGACY_VIEW_NAME = "view.json"
+# Fail-closed guard against pathological input, not the steady-state limiter:
+# the summary is O(sessions) + a ~2 day hot tail, so this bound is reached
+# only by a flood (a marker flood errs closed on purpose).
+SUMMARY_MAX_BYTES = 16 << 20
+# The hot tail: audit keys whose <ts> is at or after the fold floor. It covers
+# every key a delta overlap re-list can hand back, so base/variant and
+# overlap dedup stay exact. Older keys are folded into their session summary.
+HOT_TAIL_MAX_KEYS = 200000
+# The drift sets stay exact up to this many keys per class; above it the class
+# switches to a disclosed coarse mode (a count plus an order-independent
+# digest) so a drift flood cannot overflow the sidecar while the alert still
+# fires and is never silently green.
+DRIFT_KEY_CAP = 4096
+# Said out loud when a drift class crossed the cap: the exact key names are no
+# longer retained (the alert and the count still are).
+COARSE_NOTE = " (coarse: exact key names above the cap are not retained)"
+# A B2 `Date` header bracket wider than this is skipped: a slow response
+# carries no usable clock information.
+CLOCK_BRACKET_MAX_SECONDS = 10.0
+# The clock-drift band: above this (and at/below the tolerance) the witness
+# raises the ackable `clock-drift` alert, so drift shows up before it reaches
+# the skew edge that makes verdicts a coin-flip.
+CLOCK_DRIFT_BAND_SECONDS = 120
 VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
@@ -5248,7 +5285,7 @@ ACK_FALLBACK_CLASS = "finding"
 # never a digest. Any class-only finding a future check emits must be added
 # here (the harness pins this tuple against the class-only finding ids the
 # checks actually append).
-ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale")
+ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale", "clock-drift")
 # Per-run budget for the hidden-object identities. One id per delete-marker
 # identity is what makes the ack work on marker CHURN (a new marker is a new
 # id); a pathological marker set folds into ONE overflow id computed over the
@@ -5442,6 +5479,115 @@ class DeltaTooLong(WitnessError):
     """A bounded delta listing overflowed; the caller falls back to a sweep."""
 
 
+class ClockSkewError(WitnessError):
+    """The anchor clock is beyond the skew tolerance (cause `clock-skew`).
+
+    Raised by the B2 `Date`-header self-check whether or not a listed object
+    is in the future, so the skew verdict is deterministic instead of a
+    coin-flip that only trips when an object was uploaded inside the window.
+    """
+
+
+class ListingFailedError(WitnessError):
+    """An S3 listing call failed (cause `listing-failed`)."""
+
+
+# The closed enum of `error` cause classes (#281 Q2). Each `error` verdict
+# carries a sorted set of these, and the episode pages once per NEW class
+# instead of on every run. Classification is by exception TYPE (and by the
+# main() branch that raised it), never by parsing message text.
+ERROR_CAUSE_CLASSES = (
+    "state-unreadable",
+    "observed-invalid",
+    "view-invalid",
+    "cursor-nonconformance",
+    "clock-skew",
+    "listing-failed",
+    "sweep-latched",
+    "config",
+)
+# `error_causes_notified` is bounded: a record with more entries than this is
+# not trusted (it could otherwise grow without limit).
+ERROR_CAUSE_MAX = 16
+
+
+def error_cause_for(exc, performed_sweep=False):
+    """The sorted cause-class set for a run_checks exception ('' cause = generic).
+
+    A failed PLANNED sweep also sets the persisted sweep latch, so
+    `sweep-latched` joins the set: the next run is forced to sweep again.
+    """
+    causes = []
+    if isinstance(exc, ClockSkewError):
+        causes.append("clock-skew")
+    elif isinstance(exc, ListingFailedError):
+        causes.append("listing-failed")
+    else:
+        causes.append("exception:%s" % type(exc).__name__)
+    if performed_sweep:
+        causes.append("sweep-latched")
+    return sorted(set(causes))
+
+
+# The B2 `Date`-header clock bracket (#281 Q3). signed_get() records one
+# midpoint per 2xx response; the offset is the MEDIAN over the run, so a
+# single slow call cannot move it. B2 is not the threat actor here (the
+# response is TLS-authenticated); the account admin is.
+_CLOCK_LOCK = threading.Lock()
+_CLOCK_SAMPLES = []
+
+
+def reset_clock_samples():
+    with _CLOCK_LOCK:
+        del _CLOCK_SAMPLES[:]
+
+
+def observe_clock(date_header, started, finished):
+    """Record one `Date` bracket: offset = anchor clock - B2 clock.
+
+    The true offset lies in `[Date - finished, Date + 1 - started]`; the
+    midpoint of that bracket is recorded. A bracket wider than
+    `CLOCK_BRACKET_MAX_SECONDS` (a slow response) is skipped: it carries no
+    usable clock information. Date has 1 s resolution, hence the +1 s.
+    """
+    if not date_header:
+        return
+    try:
+        server = email.utils.parsedate_to_datetime(date_header)
+    except (TypeError, ValueError):
+        return
+    if server is None:
+        return
+    if server.tzinfo is None:
+        server = server.replace(tzinfo=timezone.utc)
+    width = float(finished) - float(started)
+    if width < 0 or width > CLOCK_BRACKET_MAX_SECONDS:
+        return
+    midpoint = (float(started) + float(finished)) / 2.0 - server.timestamp()
+    with _CLOCK_LOCK:
+        _CLOCK_SAMPLES.append(midpoint)
+
+
+def clock_offset_seconds():
+    """The run's median anchor-vs-B2 offset, or None when no bracket was usable."""
+    with _CLOCK_LOCK:
+        samples = list(_CLOCK_SAMPLES)
+    if not samples:
+        return None
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+def render_clock_offset(offset):
+    """`N s behind` / `N s ahead` / `0 s` / `unknown` (never a raw float)."""
+    if offset is None:
+        return "unknown"
+    seconds = int(round(abs(offset)))
+    if seconds == 0:
+        return "0 s"
+    return "%d s %s" % (seconds, "behind" if offset < 0 else "ahead")
+
+
 def env(name, default=""):
     value = os.environ.get(name, "")
     return value if value else default
@@ -5556,6 +5702,15 @@ class Config(object):
         self.completer_lag = env_int("RECORDING_WITNESS_COMPLETER_LAG_SECONDS", 900)
         self.open_upload_max_age = env_int("RECORDING_WITNESS_OPEN_UPLOAD_MAX_AGE_SECONDS", 43200)
         self.clock_skew_tolerance = env_int("RECORDING_WITNESS_CLOCK_SKEW_TOLERANCE_SECONDS", 300)
+        # The settle horizon (#281): a day (or a closed-clean session) older
+        # than this is settled - longer than the maximum legitimate late
+        # arrival, so nothing legitimately moves it any more. The summary view
+        # folds a closed-clean session whose newest key is older than this into
+        # a stub (its keys are re-derived by every sweep).
+        self.settle_horizon = env_int("RECORDING_WITNESS_SETTLE_HORIZON_SECONDS", 7 * 86400)
+        if not 3600 <= self.settle_horizon <= 90 * 86400:
+            log("WARNING: RECORDING_WITNESS_SETTLE_HORIZON_SECONDS=%d is outside [3600, 7776000]; using the default 604800" % self.settle_horizon)
+            self.settle_horizon = 7 * 86400
         # Bounded listing fan-out; 1 keeps the historical serial behavior and
         # gives the offline harness a deterministic seam. Out of range falls
         # back to the default (a cadence/perf knob must not take the witness
@@ -5821,12 +5976,18 @@ def signed_get(config, params):
     for _attempt in (0, 1):
         try:
             connection = _pooled_connection(config)
+            started = time.time()
             connection.request("GET", request_path, headers=request_headers)
             response = connection.getresponse()
+            date_header = response.getheader("Date")
             if 200 <= response.status < 300:
                 body = _read_body(response, MAX_SUCCESS_BODY, False)
             else:
                 body = _read_body(response, MAX_ERROR_BODY, True)
+            finished = time.time()
+            # The B2 Date header is a clock CROSS-CHECK, never the clock root:
+            # it feeds the skew verdict and the drift band only (#281 Q3).
+            observe_clock(date_header, started, finished)
             return response.status, body
         except WitnessError:
             _drop_connection()
@@ -5841,8 +6002,15 @@ def signed_get(config, params):
         "S3 request failed after one reconnect: %s: %s" % (type(last_error).__name__, last_error))
 
 
-def list_objects(config, prefix, start_after="", max_pages=1000, until=None, above_bound_stop=False):
+def list_objects(config, prefix, start_after="", max_pages=1000, until=None, above_bound_stop=False,
+                 on_page=None):
     """ListObjectsV2 -> {key: last_modified}. List-only; never fetches content.
+
+    `on_page`, when given, is called once per page with that page's
+    `[(key, last_modified)]` and the returned map stays empty: the full-sweep
+    fold (#281) consumes the audit family page by page instead of
+    materializing ~528k keys, so peak memory is the summaries plus the pages
+    in flight.
 
     `start_after` seeds the first page (exclusive, live-verified on B2); it is
     never combined with a continuation token. `until` is an exclusive upper
@@ -5887,11 +6055,11 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
             params["continuation-token"] = token
         status, body = signed_get(config, params)
         if status != 200:
-            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+            raise ListingFailedError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+            raise ListingFailedError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
         root_name = local_name(root.tag)
         if root_name != "ListBucketResult":
             # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
@@ -5936,6 +6104,7 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
             and keys[-1] >= until
             and (not truncated or keys[0] < until or above_bound_stop)
         )
+        page = []
         for key, last_modified in entries:
             if until is not None and key >= until:
                 if crossed:
@@ -5947,12 +6116,20 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
                     # pages (a nonconformant server can hide an in-bound key
                     # behind the bound) and keeps paginating; an unordered
                     # page is filtered entry-by-entry.
+                    if on_page is not None and page:
+                        on_page(page)
                     return objects
                 continue
             try:
-                objects[key] = parse_timestamp(last_modified)
+                moment = parse_timestamp(last_modified)
             except ValueError:
                 raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+            if on_page is None:
+                objects[key] = moment
+            else:
+                page.append((key, moment))
+        if on_page is not None and page:
+            on_page(page)
         if not truncated:
             return objects
         if not next_token:
@@ -5990,11 +6167,11 @@ def list_objects_delimited(config, prefix, start_after="", until=None, max_pages
             params["continuation-token"] = token
         status, body = signed_get(config, params)
         if status != 200:
-            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+            raise ListingFailedError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+            raise ListingFailedError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
         root_name = local_name(root.tag)
         if root_name != "ListBucketResult":
             raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
@@ -6068,7 +6245,7 @@ def list_objects_delimited(config, prefix, start_after="", until=None, max_pages
     raise DeltaTooLong("ListObjectsV2 %s exceeded %d pages" % (prefix, max_pages))
 
 
-def list_objects_range(config, prefix, after, until, max_pages=1000):
+def list_objects_range(config, prefix, after, until, max_pages=1000, on_page=None):
     """ListObjectsV2 over the half-open key range (after, until].
 
     `after` seeds the first page; continuation pages follow the token only.
@@ -6089,11 +6266,11 @@ def list_objects_range(config, prefix, after, until, max_pages=1000):
             params["continuation-token"] = token
         status, body = signed_get(config, params)
         if status != 200:
-            raise WitnessError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+            raise ListingFailedError("ListObjectsV2 %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            raise WitnessError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
+            raise ListingFailedError("ListObjectsV2 %s returned unparseable XML: %s" % (prefix, exc))
         root_name = local_name(root.tag)
         if root_name != "ListBucketResult":
             raise WitnessError("ListObjectsV2 %s returned %s (expected ListBucketResult)" % (prefix, root_name))
@@ -6124,13 +6301,20 @@ def list_objects_range(config, prefix, after, until, max_pages=1000):
         keys = [key for key, _ in entries]
         ordered = all(before <= current for before, current in zip(keys, keys[1:]))
         crossed = until is not None and bool(keys) and ordered and keys[-1] > until
+        page = []
         for key, last_modified in entries:
             if until is not None and key > until:
                 continue
             try:
-                objects[key] = parse_timestamp(last_modified)
+                moment = parse_timestamp(last_modified)
             except ValueError:
                 raise WitnessError("object %s has unparseable LastModified %r" % (key, last_modified))
+            if on_page is None:
+                objects[key] = moment
+            else:
+                page.append((key, moment))
+        if on_page is not None and page:
+            on_page(page)
         if crossed or not truncated:
             return objects
         if not next_token:
@@ -6160,11 +6344,11 @@ def list_object_versions(config, prefix):
             params["version-id-marker"] = version_marker
         status, body = signed_get(config, params)
         if status != 200:
-            raise WitnessError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+            raise ListingFailedError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+            raise ListingFailedError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
         root_name = local_name(root.tag)
         if root_name != "ListVersionsResult":
             # A parseable non-list document at HTTP 200 (e.g. an S3 <Error>
@@ -6218,7 +6402,7 @@ def list_object_versions(config, prefix):
             raise WitnessError("ListObjectVersions %s truncated without a key/version marker" % prefix)
         key_marker = next_key
         version_marker = next_version
-    raise WitnessError("ListObjectVersions %s exceeded 1000 pages" % prefix)
+    raise ListingFailedError("ListObjectVersions %s exceeded 1000 pages" % prefix)
 
 
 def list_object_versions_range(config, prefix, after, until, max_pages=1000):
@@ -6242,11 +6426,11 @@ def list_object_versions_range(config, prefix, after, until, max_pages=1000):
             params["version-id-marker"] = version_marker
         status, body = signed_get(config, params)
         if status != 200:
-            raise WitnessError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+            raise ListingFailedError("ListObjectVersions %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            raise WitnessError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
+            raise ListingFailedError("ListObjectVersions %s returned unparseable XML: %s" % (prefix, exc))
         root_name = local_name(root.tag)
         if root_name != "ListVersionsResult":
             raise WitnessError("ListObjectVersions %s returned %s (expected ListVersionsResult)" % (prefix, root_name))
@@ -6317,11 +6501,11 @@ def list_uploads(config, prefix):
             params["upload-id-marker"] = upload_marker
         status, body = signed_get(config, params)
         if status != 200:
-            raise WitnessError("ListMultipartUploads %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
+            raise ListingFailedError("ListMultipartUploads %s failed: HTTP %s %s" % (prefix, status, clip(body, 200)))
         try:
             root = ET.fromstring(body)
         except ET.ParseError as exc:
-            raise WitnessError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
+            raise ListingFailedError("ListMultipartUploads %s returned unparseable XML: %s" % (prefix, exc))
         root_name = local_name(root.tag)
         if root_name != "ListMultipartUploadsResult":
             # Same fail-closed rule as the other two listings: a parseable
@@ -6366,7 +6550,7 @@ def list_uploads(config, prefix):
             raise WitnessError("ListMultipartUploads %s truncated without a key/upload marker" % prefix)
         key_marker = next_key
         upload_marker = next_upload
-    raise WitnessError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
+    raise ListingFailedError("ListMultipartUploads %s exceeded 1000 pages" % prefix)
 
 
 def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candidate_mode):
@@ -6387,8 +6571,518 @@ def resolve_lifecycle_marker(current_time, current_mode, candidate_time, candida
     return current_time, current_mode
 
 
-def _collect_families(config, boundaries=None):
-    """Run the five list families, bounded-parallel when workers > 1.
+# ---------------------------------------------------------------------------
+# The bounded summary view (#281)
+# ---------------------------------------------------------------------------
+def add_coverage(coverage, other):
+    """Add one coverage layer to a multiplicity coverage list (pure).
+
+    `coverage` and `other` are lists of `[low, high, count]` segments
+    (inclusive, disjoint). The result is CANONICAL: segments split exactly at
+    the input boundaries and adjacent segments with equal counts coalesce, so
+    the same input set yields the same segments whatever the insertion order.
+    That is what makes a page-by-page sweep fold and a delta fold agree
+    (#281 Q5 test 2) and what gives duplicates an order-independent meaning.
+    """
+    events = []
+    for low, high, count in coverage:
+        events.append((low, count))
+        events.append((high + 1, -count))
+    for low, high, count in other:
+        events.append((low, count))
+        events.append((high + 1, -count))
+    events.sort()
+    segments = []
+    total = 0
+    cursor = None
+    index = 0
+    while index < len(events):
+        position = events[index][0]
+        delta = 0
+        while index < len(events) and events[index][0] == position:
+            delta += events[index][1]
+            index += 1
+        if total > 0 and cursor is not None and position > cursor:
+            segments.append([cursor, position - 1, total])
+        total += delta
+        cursor = position
+    if total != 0:
+        # Only a corrupt (unbalanced) input can land here: fail closed rather
+        # than emit a coverage that silently over- or under-counts.
+        raise WitnessError("coverage fold produced an unbalanced segment list")
+    merged = []
+    for low, high, count in segments:
+        if merged and merged[-1][2] == count and merged[-1][1] + 1 >= low:
+            merged[-1][1] = max(merged[-1][1], high)
+        else:
+            merged.append([low, high, count])
+    return merged
+
+
+def fold_coverage(coverage, start, end):
+    """Add one event identity's inclusive `[start, end]` coverage."""
+    return add_coverage(coverage, [[start, end, 1]])
+
+
+def coverage_intervals(coverage):
+    """The merged coverage (every claimed seq segment, any identity)."""
+    return [(low, high) for low, high, _count in coverage]
+
+
+def coverage_duplicates(coverage):
+    """Segments covered by two or more identities - the canonical D9 duplicates.
+
+    Order-independent by construction (see add_coverage), so a fold gives the
+    same duplicate set as a sweep whatever the listing order.
+    """
+    out = []
+    for low, high, count in coverage:
+        if count < 2:
+            continue
+        if out and out[-1][1] + 1 >= low:
+            out[-1][1] = max(out[-1][1], high)
+        else:
+            out.append([low, high])
+    return [(low, high) for low, high in out]
+
+
+def new_session_summary():
+    """A fresh per-session summary (the unit the summary view keeps)."""
+    return {
+        "start": None, "start_mode": None, "end": None, "end_mode": None,
+        "coverage": [], "identities": [], "count": 0, "newest": "",
+        "folded": False,
+    }
+
+
+def _ts_of_key(config, key):
+    """The `<ts>` of a shaped audit key ('' when the key carries none)."""
+    relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
+    basename, _day = strip_date_segment(relative)
+    if basename is None:
+        return ""
+    match = SESSION_KEY_RE.match(basename) or NON_SESSION_KEY_RE.match(basename) or HEARTBEAT_KEY_RE.match(basename)
+    return match.group("ts") if match else ""
+
+
+def hot_tail_floor(cursors, config):
+    """The oldest `<ts>` a delta overlap re-list can hand back ('' = unknown).
+
+    Derived from the CURSOR, never from the wall clock: the cursor is the last
+    key that was listed, so its own timestamp cannot drift with a clock step
+    or a midnight boundary. The floor is the earlier of
+    `cursor_ts - delta_overlap` (the flat window) and the start of the dated
+    cursor's previous day (the dated window's one-extra-day rule).
+    """
+    stamps = []
+
+    def overlap_start(stamp):
+        try:
+            moment = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+        except (ValueError, OverflowError):
+            return None
+        try:
+            return moment - timedelta(seconds=config.delta_overlap)
+        except OverflowError:
+            return None
+
+    flat_ts = _audit_key_ts(config.audit_prefix, cursors.get("audit_session") or "")
+    flat_start = overlap_start(flat_ts) if flat_ts else None
+    if flat_start is not None:
+        stamps.append(flat_start.strftime("%Y%m%dT%H%M%SZ"))
+    dated_ts = _audit_key_ts(config.audit_prefix, cursors.get("audit_session_dated") or "")
+    dated_start = overlap_start(dated_ts) if dated_ts else None
+    dated_day = _audit_key_day(config.audit_prefix, cursors.get("audit_session_dated") or "")
+    if dated_day:
+        try:
+            previous_day = (datetime.strptime(dated_day, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            stamps.append(previous_day + "T000000Z")
+        except (ValueError, OverflowError):
+            pass
+    if dated_start is not None:
+        stamps.append(dated_start.strftime("%Y%m%dT%H%M%SZ"))
+    return min(stamps) if stamps else ""
+
+
+class AuditFold(object):
+    """Bounded accumulator over audit keys - the retained summary view.
+
+    The retired view kept a `key -> LastModified` map for EVERY audit key
+    (heartbeats included), which grew with the bucket's whole history until it
+    crossed the 64 MiB cap. Nothing ever read that map back as an expectation:
+    the sweep rebuilds from listings and the delta used it as a cache. This
+    fold keeps exactly what the checks read:
+
+      * per-session coverage (merged intervals + canonical duplicate segments),
+        lifecycle markers, key count, newest key ts, and the identity set of
+        the HOT tail (so base/variant and overlap dedup stay exact);
+      * the newest heartbeat and the heartbeat drift keys;
+      * the drift sets (contract / unrecognized), exact up to DRIFT_KEY_CAP;
+      * the hot tail (`key -> LastModified`) for the delta's overlap re-list;
+      * the audit key count (the detail line's identity count).
+
+    A closed-clean session whose newest key is older than the settle horizon
+    folds into a stub: every sweep re-derives it from the listing, so a later
+    deletion still surfaces there as sequence-gap/recording-gap, while the
+    retained view stops carrying its interval structure.
+    """
+
+    def __init__(self):
+        self.sessions = {}
+        self.heartbeat = {"key": "", "last_modified": None, "drift": []}
+        self.hot = {}
+        self.recordings = {}
+        self.count = 0
+        self.drift = {"contract": [], "unrecognized": []}
+        self.drift_coarse = {"contract": None, "unrecognized": None}
+        self.cursors = {"audit_heartbeat": "", "audit_session": "", "audit_session_dated": ""}
+        self.page_first_keys = []
+        # Identities of keys OUTSIDE the hot window, kept for the length of one
+        # fold only: a sweep then absorbs a base/variant pair exactly like the
+        # pre-#281 code did, without serializing per-key state. A delta never
+        # needs them (it only ever sees hot keys).
+        self._transient_identities = set()
+
+    # -- folding ----------------------------------------------------------
+    def fold_page(self, entries, config, now, candidate_floor):
+        for key, moment in entries:
+            self.fold_key(key, moment, config, now, candidate_floor)
+
+    def fold_key(self, key, moment, config, now, candidate_floor):
+        """Fold one audit key: classify it, validate its clock, accumulate."""
+        # Every S3 timestamp the checks can read is validated once here, so
+        # "any S3 timestamp more than the tolerance in the future -> error"
+        # holds for every key, including exec sessions and completed tars that
+        # never reach a per-session age check.
+        age_seconds(now, moment, "object %s" % key, config.clock_skew_tolerance)
+        self.count += 1
+        if key.startswith(config.heartbeat_prefix):
+            basename = key[len(config.heartbeat_prefix):]
+            match = HEARTBEAT_KEY_RE.match(basename)
+            if not match:
+                self._drift_add("unrecognized", key)
+                return
+            if not key_ts_is_future(now, basename, config.clock_skew_tolerance):
+                if not self.cursors["audit_heartbeat"] or key > self.cursors["audit_heartbeat"]:
+                    self.cursors["audit_heartbeat"] = key
+            current = self.heartbeat["last_modified"]
+            if current is None or moment > current:
+                self.heartbeat["key"] = key
+                self.heartbeat["last_modified"] = moment
+            return
+        relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
+        basename, _day = strip_date_segment(relative)
+        if basename is None:
+            self._drift_add("contract", relative)
+            return
+        match = SESSION_KEY_RE.match(basename)
+        if match:
+            self._fold_session_key(key, relative, basename, match, moment, config, now, candidate_floor)
+            return
+        generic = NON_SESSION_KEY_RE.match(basename)
+        if generic:
+            event_type, _ = canonical_conflict_type(generic.group("etype"))
+            if _audit_range_is_drift(
+                    generic.group("seq"), generic.group("seq_end"), event_type, ""):
+                self._drift_add("contract", relative)
+                return
+            self._note_hot(key, generic.group("ts"), moment, candidate_floor)
+            self._note_audit_cursor(key, relative, now, config)
+            if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
+                return  # documented non-session (or known sid-less session) event
+        # Drift is judged by shape (a UUID-shaped sid or a session.* event
+        # type), not by one literal substring: a rename that drops
+        # "-session." but keeps the sid still fails closed.
+        if UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
+            self._drift_add("contract", relative)
+        else:
+            self._drift_add("unrecognized", key)
+
+    def _fold_session_key(self, key, relative, basename, match, moment, config, now, candidate_floor):
+        event_type, is_variant = canonical_conflict_type(match.group("etype"))
+        sid = match.group("sid").lower()
+        mode = match.group("mode")
+        seq_text = match.group("seq")
+        seq_end_text = match.group("seq_end")
+        seq = int(seq_text)
+        seq_end = int(seq_end_text) if seq_end_text is not None else seq
+        if _audit_range_is_drift(seq_text, seq_end_text, event_type, mode):
+            # A range on a lifecycle type, a mode marker on a range or a
+            # reversed range is naming/contract drift (D1/D5), judged before
+            # collection: the malformed key never creates session state and
+            # never enters the interval coverage math.
+            self._drift_add("contract", relative)
+            return
+        self._note_hot(key, match.group("ts"), moment, candidate_floor)
+        self._note_audit_cursor(key, relative, now, config)
+        summary = self.sessions.get(sid)
+        if summary is None or summary.get("folded"):
+            # A late key for a folded (settled) session: rebuild a fresh
+            # summary. With no session.start retained it fails safe as
+            # session-start-missing and the next sweep reconciles it.
+            summary = new_session_summary()
+            self.sessions[sid] = summary
+        summary["count"] += 1
+        if match.group("ts") > summary["newest"]:
+            summary["newest"] = match.group("ts")
+        identity = (match.group("ts"), event_type, seq, seq_end)
+        known = identity in summary["identities"] or identity in self._transient_identities
+        if not known:
+            # One coverage claim per event identity: a base key and its
+            # replay-conflict variant share (ts, canonical type, start, end),
+            # so the variant is absorbed (never a false sequence-duplicate)
+            # while a genuine same-seq duplicate from a different timestamp
+            # still lands as one.
+            summary["coverage"] = fold_coverage(summary["coverage"], seq, seq_end)
+            if candidate_floor is not None and match.group("ts") >= candidate_floor:
+                summary["identities"].append(list(identity))
+            else:
+                self._transient_identities.add(identity)
+        if is_variant:
+            # Variants drop the mode marker by contract and must not
+            # re-resolve the lifecycle marker: the base key (which the
+            # producer only variants because it exists) is authoritative.
+            if mode:
+                self._drift_add("contract", relative)
+            return
+        if event_type == "session.start":
+            summary["start"], summary["start_mode"] = resolve_lifecycle_marker(
+                summary["start"], summary["start_mode"], moment, mode)
+        elif event_type == "session.end":
+            summary["end"], summary["end_mode"] = resolve_lifecycle_marker(
+                summary["end"], summary["end_mode"], moment, mode)
+        elif mode:
+            self._drift_add("contract", relative)
+
+    def _note_hot(self, key, ts, moment, candidate_floor):
+        if not ts or candidate_floor is None:
+            return
+        if ts >= candidate_floor and len(self.hot) < HOT_TAIL_MAX_KEYS:
+            self.hot[key] = moment
+
+    def _note_audit_cursor(self, key, relative, now, config):
+        tolerance = config.clock_skew_tolerance
+        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix):
+            if not key_ts_is_future(now, relative, tolerance) and key > self.cursors["audit_session"]:
+                self.cursors["audit_session"] = key
+        elif is_audit_session_dated_key(key, config.audit_prefix, config.heartbeat_prefix):
+            if not key_ts_is_future(now, relative, tolerance) and key > self.cursors["audit_session_dated"]:
+                self.cursors["audit_session_dated"] = key
+
+    def _drift_add(self, kind, value):
+        entries = self.drift[kind]
+        coarse = self.drift_coarse[kind]
+        if coarse is not None:
+            coarse["count"] += 1
+            coarse["digest"] = _digest_add(coarse["digest"], value)
+            return
+        if value in entries:
+            return
+        entries.append(value)
+        if len(entries) > DRIFT_KEY_CAP:
+            # Above the cap the class switches to a disclosed coarse mode: a
+            # count plus an order-independent digest, so a drift flood cannot
+            # overflow the sidecar while the alert still fires.
+            digest = "0" * 64
+            for entry in entries:
+                digest = _digest_add(digest, entry)
+            self.drift_coarse[kind] = {"count": len(entries), "digest": digest}
+            self.drift[kind] = []
+
+    # -- merging / finalizing ---------------------------------------------
+    def merge(self, other):
+        """Fold another fold into this one (page branches, or a retained view)."""
+        for sid, summary in other.sessions.items():
+            self._merge_session(sid, summary)
+        current = self.heartbeat["last_modified"]
+        incoming = other.heartbeat["last_modified"]
+        if incoming is not None and (current is None or incoming > current):
+            self.heartbeat["key"] = other.heartbeat["key"]
+            self.heartbeat["last_modified"] = incoming
+        for key, moment in other.hot.items():
+            if key not in self.hot:
+                self.hot[key] = moment
+        for key, moment in other.recordings.items():
+            self.recordings[key] = moment
+        self.count += other.count
+        for kind in ("contract", "unrecognized"):
+            for value in other.drift[kind]:
+                self._drift_add(kind, value)
+            coarse = other.drift_coarse[kind]
+            if coarse is not None:
+                mine = self.drift_coarse[kind]
+                if mine is None:
+                    digest = "0" * 64
+                    for entry in self.drift[kind]:
+                        digest = _digest_add(digest, entry)
+                    mine = {"count": len(self.drift[kind]), "digest": digest}
+                    self.drift[kind] = []
+                    self.drift_coarse[kind] = mine
+                mine["count"] += coarse["count"]
+                mine["digest"] = _digest_add(mine["digest"], coarse["digest"], raw=True)
+        for name, value in other.cursors.items():
+            if value and (not self.cursors[name] or value > self.cursors[name]):
+                self.cursors[name] = value
+        self.page_first_keys.extend(other.page_first_keys)
+        self._transient_identities.update(other._transient_identities)
+
+    def _merge_session(self, sid, summary):
+        mine = self.sessions.get(sid)
+        if mine is None:
+            copy = new_session_summary()
+            copy["coverage"] = [list(segment) for segment in summary["coverage"]]
+            copy["identities"] = [list(identity) for identity in summary["identities"]]
+            copy["count"] = summary["count"]
+            copy["newest"] = summary["newest"]
+            copy["start"], copy["start_mode"] = summary["start"], summary["start_mode"]
+            copy["end"], copy["end_mode"] = summary["end"], summary["end_mode"]
+            copy["folded"] = bool(summary.get("folded"))
+            self.sessions[sid] = copy
+            return
+        if mine.get("folded") or summary.get("folded"):
+            # A stub carries no coverage: keep whichever side has structure.
+            if mine.get("folded") and not summary.get("folded"):
+                self.sessions[sid] = mine = new_session_summary()
+            else:
+                return
+        mine["coverage"] = add_coverage(mine["coverage"], summary["coverage"])
+        for identity in summary["identities"]:
+            if list(identity) not in mine["identities"]:
+                mine["identities"].append(list(identity))
+        mine["count"] += summary["count"]
+        if summary["newest"] > mine["newest"]:
+            mine["newest"] = summary["newest"]
+        mine["start"], mine["start_mode"] = resolve_lifecycle_marker(
+            mine["start"], mine["start_mode"], summary["start"], summary["start_mode"])
+        mine["end"], mine["end_mode"] = resolve_lifecycle_marker(
+            mine["end"], mine["end_mode"], summary["end"], summary["end_mode"])
+
+    def finalize(self, now, config, cursors):
+        """Prune to the retained window and fold settled closed-clean sessions.
+
+        Deterministic given (key set, cursors, now): the hot floor comes from
+        the cursors, so a sweep fold and a prefix+delta fold agree.
+        """
+        floor = hot_tail_floor(cursors, config)
+        if floor:
+            self.hot = {key: moment for key, moment in self.hot.items()
+                        if (_ts_of_key(config, key) or floor) >= floor}
+            for summary in self.sessions.values():
+                if summary.get("folded"):
+                    continue
+                kept = [identity for identity in summary["identities"] if identity[0] >= floor]
+                if len(kept) != len(summary["identities"]):
+                    summary["identities"] = kept
+        horizon = (now - timedelta(seconds=config.settle_horizon)).strftime("%Y%m%dT%H%M%SZ")
+        recorded_sids = set()
+        for key in self.recordings:
+            if key.startswith(config.recordings_prefix):
+                recorded_sids.add(key[len(config.recordings_prefix):].lower())
+        for sid, summary in list(self.sessions.items()):
+            if summary.get("folded") or summary["end"] is None or not summary["newest"]:
+                continue
+            if summary["newest"] >= horizon:
+                continue
+            duplicates = coverage_duplicates(summary["coverage"])
+            intervals = coverage_intervals(summary["coverage"])
+            if duplicates or len(intervals) != 1 or intervals[0][0] > 1:
+                continue  # unsettled: a gap or an overlap keeps it exact
+            mode = "exec" if summary["end_mode"] == "exec" else "shell"
+            if mode == "shell" and (sid + ".tar") not in recorded_sids:
+                continue  # a shell session with no tar is a live finding, not clean
+            self.sessions[sid] = {
+                "folded": True, "end": summary["end"], "mode": mode,
+                "newest": summary["newest"], "count": summary["count"],
+                "coverage": [], "identities": [], "start": None, "start_mode": None,
+                "end_mode": summary["end_mode"],
+            }
+        self._transient_identities = set()
+
+    # -- serialization ----------------------------------------------------
+    def to_summary(self, observed_out, hidden):
+        def stamp(moment):
+            return moment.astimezone(timezone.utc).isoformat()
+
+        sessions = {}
+        for sid, summary in self.sessions.items():
+            entry = {
+                "folded": bool(summary.get("folded")),
+                "count": summary["count"],
+                "newest": summary["newest"],
+            }
+            if summary.get("folded"):
+                entry["end"] = stamp(summary["end"]) if summary["end"] is not None else None
+                entry["mode"] = summary["mode"]
+            else:
+                entry["start"] = stamp(summary["start"]) if summary["start"] is not None else None
+                entry["start_mode"] = summary["start_mode"]
+                entry["end"] = stamp(summary["end"]) if summary["end"] is not None else None
+                entry["end_mode"] = summary["end_mode"]
+                entry["coverage"] = summary["coverage"]
+                entry["identities"] = summary["identities"]
+            sessions[sid] = entry
+        drift = {}
+        for kind in ("contract", "unrecognized"):
+            coarse = self.drift_coarse[kind]
+            if coarse is None:
+                drift[kind] = {"keys": sorted(self.drift[kind]), "coarse": False}
+            else:
+                drift[kind] = {"keys": [], "coarse": True,
+                               "count": coarse["count"], "digest": coarse["digest"]}
+        return {
+            "summary_version": SUMMARY_VERSION,
+            "generation": observed_out["generation"],
+            "written_run_seq": observed_out["written_run_seq"],
+            "count": self.count,
+            "heartbeat": {
+                "key": self.heartbeat["key"],
+                "last_modified": stamp(self.heartbeat["last_modified"])
+                if self.heartbeat["last_modified"] is not None else None,
+            },
+            "sessions": sessions,
+            "recordings": {key: stamp(moment) for key, moment in self.recordings.items()},
+            "hot": {key: stamp(moment) for key, moment in self.hot.items()},
+            "drift": drift,
+            "hidden": [
+                {"key": marker["key"], "version_id": marker["version_id"],
+                 "last_modified": stamp(marker["last_modified"])}
+                for marker in hidden
+            ],
+        }
+
+
+def _digest_add(digest, value, raw=False):
+    """Order-independent 256-bit accumulator (sum of per-value sha256, mod 2^256).
+
+    Used only by the drift sets' coarse mode: exact key names above
+    DRIFT_KEY_CAP would be the per-key growth this change exists to remove,
+    and the class is already an alert. A sum (not an XOR) so a duplicate
+    re-list shifts the digest once instead of cancelling itself out.
+    """
+    if raw:
+        chunk = int(value, 16)
+    else:
+        chunk = int.from_bytes(hashlib.sha256(str(value).encode("utf-8")).digest(), "big")
+    return "%064x" % ((int(digest, 16) + chunk) % (1 << 256))
+
+
+def drift_finding_id(kind, keys, coarse):
+    """The finding identity for a drift class (exact or coarse mode)."""
+    if coarse is None:
+        return identity_digest(sorted(keys))
+    return identity_digest(["coarse", str(coarse["count"]), coarse["digest"]])
+
+
+def drift_entries(fold, kind):
+    """`(entries, coarse)` for one drift class of a fold or a summary."""
+    coarse = fold.drift_coarse[kind]
+    if coarse is not None:
+        return [], coarse
+    return sorted(fold.drift[kind]), None
+
+
+def _collect_families(config, boundaries, now, fold):
+    """Run the five list families, folding the audit family page by page.
 
     On a sweep with persisted `boundaries` and workers > 1, the two audit
     families split into key-range branches (R = min(workers // 2,
@@ -6398,8 +7092,17 @@ def _collect_families(config, boundaries=None):
     shapes the sequential code produced; a worker failure propagates here and
     main() turns it into the `error` verdict. Results merge in submission
     order (never completion order) so the checks stay deterministic.
+
+    The audit keys are consumed PAGE BY PAGE into an AuditFold (#281) instead
+    of a full `key -> LastModified` map: the sweep's peak memory is the
+    summary plus the pages in flight, not ~528k keys.
     """
     boundaries = [boundary for boundary in (boundaries or []) if isinstance(boundary, str)]
+    # Retention bound for the hot tail during the fold. The exact floor is
+    # cursor-derived and applied in finalize(); this only bounds the transient
+    # set (a wall-clock over-approximation cannot change what is retained).
+    candidate_floor = (now - timedelta(
+        seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
     branches = 0
     if boundaries and config.list_workers > 1:
         branches = min(max(1, config.list_workers // 2), len(boundaries) + 1)
@@ -6412,15 +7115,25 @@ def _collect_families(config, boundaries=None):
         return (boundaries[index - 1] if index > 0 else "",
                 boundaries[index] if index < len(boundaries) else None)
 
+    def audit_branch(after, until):
+        branch = AuditFold()
+
+        def sink(entries):
+            if entries:
+                branch.page_first_keys.append(entries[0][0])
+            branch.fold_page(entries, config, now, candidate_floor)
+
+        list_objects_range(config, config.audit_prefix, after, until, on_page=sink)
+        return branch
+
     work = []
     if branches <= 1:
-        work.append(("audit_objects", lambda: list_objects(config, config.audit_prefix)))
+        work.append(("audit", lambda: audit_branch("", None)))
         work.append(("audit_hidden", lambda: list_object_versions(config, config.audit_prefix)))
     else:
         for index in range(branches):
             after, until = range_at(index)
-            work.append(("audit_objects",
-                         lambda a=after, u=until: list_objects_range(config, config.audit_prefix, a, u)))
+            work.append(("audit", lambda a=after, u=until: audit_branch(a, u)))
             work.append(("audit_hidden",
                          lambda a=after, u=until: list_object_versions_range(config, config.audit_prefix, a, u)))
     work.append(("recordings", lambda: list_objects(config, config.recordings_prefix)))
@@ -6432,14 +7145,13 @@ def _collect_families(config, boundaries=None):
         with ThreadPoolExecutor(max_workers=config.list_workers) as executor:
             futures = [executor.submit(fetch) for _, fetch in work]
             results = [future.result() for future in futures]
-    audit_objects = {}
     audit_hidden = []
     recording_objects = None
     uploads = None
     recording_hidden = None
     for (kind, _), result in zip(work, results):
-        if kind == "audit_objects":
-            audit_objects.update(result)
+        if kind == "audit":
+            fold.merge(result)
         elif kind == "audit_hidden":
             audit_hidden.extend(result)
         elif kind == "recordings":
@@ -6448,10 +7160,10 @@ def _collect_families(config, boundaries=None):
             uploads = result
         else:
             recording_hidden = result
-    return audit_objects, recording_objects, uploads, audit_hidden, recording_hidden
+    return recording_objects, uploads, audit_hidden, recording_hidden
 
 
-def _cursors_from_listings(config, audit_objects, recording_objects, now):
+def _cursors_from_listings(config, fold, recording_objects, now):
     """High-water keys for the dual-layout audit streams + recordings.
 
     ``audit_session`` is the **flat-layout** high-water key and
@@ -6476,23 +7188,14 @@ def _cursors_from_listings(config, audit_objects, recording_objects, now):
     exact `audit/heartbeat` object (or any key after it) is not a session
     key.
     """
-    heartbeat_keys = [
-        key for key in audit_objects
-        if is_audit_heartbeat_key(key, config.heartbeat_prefix)
-        and not key_ts_is_future(now, key[len(config.heartbeat_prefix):], config.clock_skew_tolerance)]
-    session_keys = [
-        key for key in audit_objects
-        if is_audit_session_key(key, config.audit_prefix, config.heartbeat_prefix)
-        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
-    dated_session_keys = [
-        key for key in audit_objects
-        if is_audit_session_dated_key(key, config.audit_prefix, config.heartbeat_prefix)
-        and not key_ts_is_future(now, key[len(config.audit_prefix):], config.clock_skew_tolerance)]
+    # The three audit cursors are accumulated during the fold (each over its
+    # OWN layout's grammar-matching, non-future keys - never one max across
+    # layouts), so a page-by-page sweep yields exactly what a full map did.
     recording_keys = [key for key in recording_objects if is_recording_key(key, config.recordings_prefix)]
     return {
-        "audit_heartbeat": max(heartbeat_keys) if heartbeat_keys else "",
-        "audit_session": max(session_keys) if session_keys else "",
-        "audit_session_dated": max(dated_session_keys) if dated_session_keys else "",
+        "audit_heartbeat": fold.cursors["audit_heartbeat"],
+        "audit_session": fold.cursors["audit_session"],
+        "audit_session_dated": fold.cursors["audit_session_dated"],
         "recordings": max(recording_keys) if recording_keys else "",
     }
 
@@ -6708,20 +7411,24 @@ def _delta_overlap_listings(config, session_cursor, dated_cursor):
 def _delta_repair_sweep(config, observed, now):
     """Full sweep for a delta recovery (page overflow or cursor nonconformance).
 
-    Returns the same shapes as the sweep branch of `run_checks`: a fresh
-    object/upload/hidden view and fresh cursors, so the delta's untrusted
-    state is discarded rather than merged. `now` bounds the fresh cursors:
-    a future-dated key must not re-pin the rebuilt cursor (round-4 RT4.1).
+    Returns the same shapes as the sweep branch of `run_checks`: a fresh fold,
+    upload/hidden view and fresh cursors, so the delta's untrusted state is
+    discarded rather than merged. `now` bounds the fresh cursors: a
+    future-dated key must not re-pin the rebuilt cursor (round-4 RT4.1).
     """
     boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
-    audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
+    fold = AuditFold()
+    recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries, now, fold)
     hidden_objects = [
         marker
         for marker in audit_hidden + recording_hidden
         if marker["key"].startswith(config.audit_prefix)
         or marker["key"].startswith(config.recordings_prefix)
     ]
-    return audit_objects, recording_objects, uploads, hidden_objects, _cursors_from_listings(config, audit_objects, recording_objects, now)
+    fold.recordings = dict(recording_objects or {})
+    cursors = _cursors_from_listings(config, fold, recording_objects or {}, now)
+    fold.finalize(now, config, cursors)
+    return fold, recording_objects, uploads, hidden_objects, cursors
 
 
 def run_checks(config, now, plan):
@@ -6729,13 +7436,18 @@ def run_checks(config, now, plan):
     # the run mode needs its own name.
     run_mode = plan.get("mode", "sweep")
     observed = plan.get("observed") if isinstance(plan.get("observed"), dict) else {}
-    view = plan.get("view") if isinstance(plan.get("view"), dict) else {}
+    summary = plan.get("summary") if isinstance(plan.get("summary"), dict) else {}
     window_start = plan.get("window_start")
     window_text = None
     view_dirty = False
     new_audit = {}
     new_recordings = {}
     now_epoch = int(now.timestamp())
+    # Retention bound for the hot tail during the fold; the exact floor is
+    # cursor-derived and applied by finalize() (see _collect_families).
+    candidate_floor = (now - timedelta(
+        seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
+    fold = None
     # The recordings-discovery watermark (issue #228, red-team F1): a delta
     # lists the whole random-keyed prefix at most once per
     # `recordings_list_seconds`, so a per-run full listing cannot become an
@@ -6747,7 +7459,7 @@ def run_checks(config, now, plan):
     cursors = dict(observed.get("cursors")) if isinstance(observed.get("cursors"), dict) else {}
     if run_mode == "seed" and window_start is not None:
         window_text = utc_stamp(window_start)
-        audit_objects, heartbeat_objects = _list_cold_start_streams(config, window_start)
+        seed_objects, heartbeat_objects = _list_cold_start_streams(config, window_start)
         if not heartbeat_objects:
             # A window with no heartbeat at all: either the shipper is dead
             # (exactly what the sweep is owed for) or the bucket is empty and
@@ -6755,13 +7467,23 @@ def run_checks(config, now, plan):
             log("WARNING: cold-start window found no heartbeat; falling back to a full sweep")
             run_mode = "sweep"
             window_text = None
+        else:
+            fold = AuditFold()
+            fold.fold_page(sorted(seed_objects.items()), config, now, candidate_floor)
+    if fold is None:
+        # A seed plan without a window (never produced by main(), defensive)
+        # is an exact sweep.
+        run_mode = "sweep"
     if run_mode == "sweep":
         # A sweep that starts and then fails must latch, so record that the
         # sweep was actually attempted (a planned sweep or an internal
         # seed/delta fallback), not merely that the plan said "sweep".
         plan["performed_sweep"] = True
         boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
-        audit_objects, recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries)
+        fold = AuditFold()
+        recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(
+            config, boundaries, now, fold)
+        fold.recordings = dict(recording_objects or {})
         hidden_objects = [
             marker
             for marker in audit_hidden + recording_hidden
@@ -6769,14 +7491,17 @@ def run_checks(config, now, plan):
             or marker["key"].startswith(config.recordings_prefix)
         ]
         view_dirty = True
-        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+        cursors = _cursors_from_listings(config, fold, recording_objects, now)
+        fold.finalize(now, config, cursors)
         recordings_listed_epoch = now_epoch
     elif run_mode == "seed":
         recording_objects = list_objects(config, config.recordings_prefix)
         uploads = list_uploads(config, config.recordings_prefix)
         hidden_objects = []
         view_dirty = True
-        cursors = _cursors_from_listings(config, audit_objects, recording_objects, now)
+        fold.recordings = dict(recording_objects)
+        cursors = _cursors_from_listings(config, fold, recording_objects, now)
+        fold.finalize(now, config, cursors)
         recordings_listed_epoch = now_epoch
     else:
         # Delta: the retained view plus the dual-layout audit tail (the flat
@@ -6793,9 +7518,9 @@ def run_checks(config, now, plan):
         # instead: that prefix grows forever, so degrading it to a sweep is
         # precisely the 288x/day regression this bound exists to prevent, and
         # the audit/heartbeat/session discovery in this run is unaffected.
-        audit_objects = dict(view.get("audit_objects") or {})
-        recording_objects = dict(view.get("recording_objects") or {})
-        hidden_objects = list(view.get("hidden") or [])
+        fold = fold_from_summary(summary, config)
+        recording_objects = fold.recordings
+        hidden_objects = list(summary.get("hidden") or [])
         uploads = list_uploads(config, config.recordings_prefix)
         heartbeat_cursor = cursors.get("audit_heartbeat") or ""
         session_cursor = cursors.get("audit_session") or ""
@@ -6875,7 +7600,7 @@ def run_checks(config, now, plan):
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
             plan["performed_sweep"] = True
-            audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+            fold, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
             new_audit = {}
             new_recordings = {}
             recordings_listed_epoch = now_epoch
@@ -6915,7 +7640,7 @@ def run_checks(config, now, plan):
             if violation:
                 log("WARNING: %s; repairing with a full sweep" % violation)
                 plan["performed_sweep"] = True
-                audit_objects, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+                fold, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
                 new_audit = {}
                 new_recordings = {}
                 recordings_listed_epoch = now_epoch
@@ -6934,8 +7659,12 @@ def run_checks(config, now, plan):
                 # classifier raises naming-contract/contract-mismatch.
                 for prefix in drift_prefixes:
                     new_audit[prefix] = now
-                audit_objects.update(new_audit)
-                recording_objects.update(new_recordings)
+                # Fold the new keys into the retained summary. The fold's
+                # identity set (hot tail) absorbs a re-listed base/variant
+                # pair exactly like the retired full map did.
+                fold.fold_page(sorted(new_audit.items()), config, now, candidate_floor)
+                for key, moment in new_recordings.items():
+                    recording_objects[key] = moment
                 # The overlap keys land here, after the fail-closed check: a
                 # pre-cursor key is exactly what the re-list is FOR, so it is
                 # never a conformance violation. Only keys that actually
@@ -6944,8 +7673,8 @@ def run_checks(config, now, plan):
                 # merge keeps them for the NEXT run's classification too.
                 overlap_new = {
                     key: moment for key, moment in overlap_audit.items()
-                    if audit_objects.get(key) != moment}
-                audit_objects.update(overlap_new)
+                    if fold.hot.get(key) != moment}
+                fold.fold_page(sorted(overlap_new.items()), config, now, candidate_floor)
                 # Same grammar + future filter as _cursors_from_listings: an
                 # unshaped key returned by a tail (an acceptance probe,
                 # drift), or a shaped key dated in the future (sorting above
@@ -6981,6 +7710,8 @@ def run_checks(config, now, plan):
                     newest = max(recording_new)
                     if newest > (cursors.get("recordings") or ""):
                         cursors["recordings"] = newest
+                fold.recordings = recording_objects
+                fold.finalize(now, config, cursors)
                 view_dirty = bool(new_audit or new_recordings or overlap_new)
     # Overlapping watched prefixes report one marker twice (same key + version
     # id in both listings); count each hidden version once.
@@ -7000,21 +7731,28 @@ def run_checks(config, now, plan):
     # -> error" holds for every key - including exec sessions that are later
     # exempt from the gap clock and completed tars whose session.end is
     # present, which never reach a per-session age check otherwise.
-    if run_mode == "delta":
-        # Every NEW timestamp is validated at collection; the retained view
-        # was validated when each key first entered it, so a delta does not
-        # re-parse the whole retained map.
-        for key, last_modified in new_audit.items():
-            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
-        for key, last_modified in overlap_audit.items():
-            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
-        for key, last_modified in new_recordings.items():
-            age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
-    else:
-        for key, last_modified in audit_objects.items():
-            age_seconds(now, last_modified, "object %s" % key, config.clock_skew_tolerance)
-        for key, last_modified in recording_objects.items():
-            age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    # Audit-key timestamps are validated where the key is folded (fold_key):
+    # every key of a sweep, and every NEW or overlap key of a delta - the
+    # retained summary was validated when each key first entered it. The
+    # recordings map is re-read in full by a delta's discovery listing, so it
+    # is validated here either way.
+    for key, last_modified in recording_objects.items():
+        age_seconds(now, last_modified, "recording %s" % key, config.clock_skew_tolerance)
+    # The B2 Date-header self-check (#281 Q3): the median bracket over the
+    # run's calls. Beyond the tolerance the verdict is a deterministic error
+    # (never a coin-flip that only trips when an object is in the future);
+    # inside the tolerance but above the drift band it is an ackable alert.
+    clock_offset = clock_offset_seconds()
+    if clock_offset is not None and abs(clock_offset) > config.clock_skew_tolerance:
+        raise ClockSkewError(
+            "witness clock: anchor is %s of B2 (tolerance %ds) - the anchor clock is not disciplined"
+            % (render_clock_offset(clock_offset), config.clock_skew_tolerance))
+    if clock_offset is not None and abs(clock_offset) > CLOCK_DRIFT_BAND_SECONDS:
+        alerts.append(
+            "clock-drift: the anchor clock is %s of B2 (band %ds, tolerance %ds) - "
+            "the anchor clock is drifting and verdict freshness depends on it"
+            % (render_clock_offset(clock_offset), CLOCK_DRIFT_BAND_SECONDS, config.clock_skew_tolerance))
+        finding_ids.append("clock-drift")
     for upload in uploads:
         age_seconds(now, upload["initiated"], "upload %s initiated" % upload["key"], config.clock_skew_tolerance)
     for marker in hidden_objects:
@@ -7080,23 +7818,13 @@ def run_checks(config, now, plan):
         )
         finding_ids.extend(hidden_ids)
 
-    heartbeat_times = []
-    unrecognized = []
-    for key, last_modified in audit_objects.items():
-        if not key.startswith(config.heartbeat_prefix):
-            continue
-        if HEARTBEAT_KEY_RE.match(key[len(config.heartbeat_prefix):]):
-            heartbeat_times.append(last_modified)
-        else:
-            unrecognized.append(key)
-
     heartbeat_age = None
-    if not heartbeat_times:
+    if fold.heartbeat["last_modified"] is None:
         alerts.append("heartbeat-missing: no objects under %s" % config.heartbeat_prefix)
         finding_ids.append("heartbeat-missing")
     else:
         heartbeat_age = age_seconds(
-            now, max(heartbeat_times), "newest heartbeat", config.clock_skew_tolerance)
+            now, fold.heartbeat["last_modified"], "newest heartbeat", config.clock_skew_tolerance)
         if heartbeat_age > config.heartbeat_max_age:
             alerts.append(
                 "heartbeat-stale: newest heartbeat is %ds old (limit %ds)"
@@ -7104,119 +7832,30 @@ def run_checks(config, now, plan):
             )
             finding_ids.append("heartbeat-stale")
 
-    sessions = {}
-    contract_bad_keys = []
-    for key, last_modified in audit_objects.items():
-        if key.startswith(config.heartbeat_prefix):
-            continue
-        relative = key[len(config.audit_prefix):] if key.startswith(config.audit_prefix) else key
-        # One optional valid `YYYYMMDD/` day segment: both layouts classify
-        # through the same basename grammar. A malformed day segment
-        # (non-calendar 8 digits) is refused by the helper, and a segment of
-        # any other shape (wrong digit count, a `session.*`-named segment)
-        # stays unstripped, so neither can impersonate a valid dated/flat
-        # key; the drift paths below judge such a key like any other unshaped
-        # one.
-        basename, _day = strip_date_segment(relative)
-        match = SESSION_KEY_RE.match(basename) if basename is not None else None
-        if match:
-            event_type, is_variant = canonical_conflict_type(match.group("etype"))
-            sid = match.group("sid").lower()
-            mode = match.group("mode")
-            seq_text = match.group("seq")
-            seq_end_text = match.group("seq_end")
-            seq = int(seq_text)
-            seq_end = int(seq_end_text) if seq_end_text is not None else seq
-            if _audit_range_is_drift(seq_text, seq_end_text, event_type, mode):
-                # A range on a lifecycle type, a mode marker on a range or a
-                # reversed range is naming/contract drift (D1/D5), judged
-                # before collection: the malformed key never creates session
-                # state and never enters the interval coverage math.
-                contract_bad_keys.append(relative)
-                continue
-            state = sessions.setdefault(
-                sid, {"intervals": [], "duplicates": [], "start": None, "end": None,
-                      "start_mode": None, "end_mode": None, "identities": set()})
-            # A base key and its replay-conflict variant share one identity
-            # (ts, canonical type, start, end): count the interval once so a
-            # legitimate variant cannot read as a `sequence-duplicate`, while
-            # a genuine duplicate from a different timestamp still does. The
-            # identity is for sequence counting ONLY - it must not skip
-            # lifecycle resolution: a same-ts `.exec`/`.shell` marker pair
-            # also shares the identity (the mode is not part of it), so
-            # forcing the second key to skip would let whichever key the
-            # listing returns first win regardless of LastModified (a
-            # stale/equal-LM `.exec` silently exempting a shell session).
-            # Only a key whose type `canonical_conflict_type` actually flags
-            # as a replay-conflict variant skips resolution; every canonical
-            # key reaches `resolve_lifecycle_marker` and the newest marker (or
-            # the conservative conflicting tie) wins in either listing order.
-            identity = (match.group("ts"), event_type, seq, seq_end)
-            if identity not in state["identities"]:
-                state["identities"].add(identity)
-                merged, overlaps = merge_coverage_interval(state["intervals"], seq, seq_end)
-                state["intervals"] = merged
-                state["duplicates"].extend(overlaps)
-            if is_variant:
-                # Variants drop the mode marker by contract and must not
-                # re-resolve the lifecycle marker: the base key (which the
-                # producer only variants because it exists) is authoritative.
-                # A mode marker on a variant is naming drift exactly like a
-                # mode marker on any non-lifecycle base shape.
-                if mode:
-                    contract_bad_keys.append(relative)
-                continue
-            # Duplicate starts and ends resolve by the newest LastModified,
-            # exactly like each other: a re-PUT / replayed marker must not win
-            # just because its key sorts first, or a stale `.exec` start could
-            # silently exempt a session whose newest marker says shell. An
-            # exact tie with conflicting declared modes fails closed to the
-            # conservative `shell` (see resolve_lifecycle_marker).
-            if event_type == "session.start":
-                state["start"], state["start_mode"] = resolve_lifecycle_marker(
-                    state["start"], state["start_mode"], last_modified, mode)
-            elif event_type == "session.end":
-                state["end"], state["end_mode"] = resolve_lifecycle_marker(
-                    state["end"], state["end_mode"], last_modified, mode)
-            elif mode:
-                # The mode marker is contract-defined on start/end only; a
-                # marker anywhere else is naming drift.
-                contract_bad_keys.append(relative)
-            continue
-        generic = NON_SESSION_KEY_RE.match(basename) if basename is not None else None
-        if generic:
-            # A replay-conflict variant (`session.rejected_<hash16>`) is the
-            # same documented event as its base type, never naming drift.
-            event_type, _ = canonical_conflict_type(generic.group("etype"))
-            if _audit_range_is_drift(
-                    generic.group("seq"), generic.group("seq_end"), event_type, ""):
-                # A reversed range (or a range on a lifecycle type) on the
-                # sid-less shape is contract drift (D1/D5), never a documented
-                # event: fail closed before the classification.
-                contract_bad_keys.append(relative)
-                continue
-            if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
-                continue  # documented non-session (or known sid-less session) event
-        # Drift is judged by shape (a UUID-shaped sid or a session.* event
-        # type), not by one literal substring: a rename that drops
-        # "-session." but keeps the sid still fails closed.
-        if basename is None or UUID_RE.search(relative) or re.search(r"(?:^|[-.])session[.]", relative):
-            contract_bad_keys.append(relative)
-        else:
-            unrecognized.append(key)
+    # The per-session summaries and the drift sets the fold accumulated. The
+    # checks below read exactly what the retired per-key map fed them - the
+    # resolved lifecycle markers, the merged coverage, the canonical duplicate
+    # segments and an identity count - and nothing per key.
+    sessions = fold.sessions
+    contract_bad_keys, contract_coarse = drift_entries(fold, "contract")
+    unrecognized, unrecognized_coarse = drift_entries(fold, "unrecognized")
 
-    if contract_bad_keys:
+    if contract_bad_keys or contract_coarse is not None:
+        contract_count = len(contract_bad_keys) if contract_coarse is None else contract_coarse["count"]
         alerts.append(
-            "naming-contract: %d audit key(s) look like session events but do not match the shipper naming contract"
-            % len(contract_bad_keys)
+            "naming-contract: %d audit key(s) look like session events but do not match the shipper naming contract%s"
+            % (contract_count, COARSE_NOTE if contract_coarse is not None else "")
         )
-        finding_ids.append("naming-contract:" + identity_digest(contract_bad_keys))
-    if unrecognized:
+        finding_ids.append(
+            "naming-contract:" + drift_finding_id("contract", contract_bad_keys, contract_coarse))
+    if unrecognized or unrecognized_coarse is not None:
+        unrecognized_count = len(unrecognized) if unrecognized_coarse is None else unrecognized_coarse["count"]
         alerts.append(
-            "contract-mismatch: %d audit object(s) match no documented shipper key shape"
-            % len(unrecognized)
+            "contract-mismatch: %d audit object(s) match no documented shipper key shape%s"
+            % (unrecognized_count, COARSE_NOTE if unrecognized_coarse is not None else "")
         )
-        finding_ids.append("contract-mismatch:" + identity_digest(unrecognized))
+        finding_ids.append(
+            "contract-mismatch:" + drift_finding_id("unrecognized", unrecognized, unrecognized_coarse))
 
     # Completed recordings and in-progress uploads keyed by lowercased sid:
     # sessions are grouped case-insensitively, so an uppercase-sid tar or
@@ -7244,12 +7883,17 @@ def run_checks(config, now, plan):
             upload_sids.add(match.group("sid").lower())
     for sid in sorted(sessions):
         state = sessions[sid]
+        if state.get("folded"):
+            # A settled, closed-clean session: the retained view carries only
+            # its stub (the sweep re-derives it from the listing, so a later
+            # deletion still surfaces as sequence-gap/recording-gap there).
+            continue
         if state["start"] is None:
             # Stream closure: session events with no session.start can never
             # be gap-checked, so they must alert on their own.
             alerts.append(
                 "session-start-missing: session %s has %d audit event(s) but no session.start"
-                % (sid, len(state["identities"]))
+                % (sid, state["count"])
             )
             finding_ids.append("session-start-missing:events:" + sid)
             continue
@@ -7333,8 +7977,10 @@ def run_checks(config, now, plan):
             finding_ids.append("session-start-missing:orphan-tar:" + sid)
 
     for sid in sorted(sessions):
-        intervals = sessions[sid]["intervals"]
-        duplicates = sessions[sid]["duplicates"]
+        if sessions[sid].get("folded"):
+            continue
+        intervals = coverage_intervals(sessions[sid]["coverage"])
+        duplicates = coverage_duplicates(sessions[sid]["coverage"])
         if duplicates:
             # Overlap detection (D9): merged coverage flags any interval claim
             # that intersects coverage already declared by another identity -
@@ -7427,7 +8073,10 @@ def run_checks(config, now, plan):
             "window-bounded view cannot certify history before the window" % (window_text or "unknown"))
         finding_ids.append("cold-start")
     if run_mode == "sweep":
-        boundaries_out = _sample_boundaries(audit_objects, config.list_workers)
+        # Boundaries are sampled from the first key of every folded page (the
+        # full key list is no longer materialized); they are a fan-out knob,
+        # never a correctness input.
+        boundaries_out = _sample_boundaries(fold.page_first_keys, config.list_workers)
     else:
         boundaries_out = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
     # ACK SPACE (#223), computed ONCE for the whole run: every finding id -
@@ -7457,9 +8106,11 @@ def run_checks(config, now, plan):
         "recordings_listed_epoch": recordings_listed_epoch,
         "boundaries": boundaries_out,
         "dirty": view_dirty,
-        "audit_objects": audit_objects if view_dirty else None,
-        "recording_objects": recording_objects if view_dirty else None,
+        # The bounded summary (never a per-key map) plus the hidden set and
+        # the run's clock reading.
+        "fold": fold if view_dirty else None,
         "hidden": hidden_objects,
+        "clock_offset_seconds": clock_offset,
         # The run's ACK identities (never the raw finding ids: those carry
         # session ids and key names). The rule consumes exactly this list and
         # the record stores it for the acceptance print, so there is one
@@ -7467,11 +8118,12 @@ def run_checks(config, now, plan):
         "ack_ids": ack_ids,
         "ack_folded": ack_folded,
     }
+    clock_line = "witness clock: anchor is %s of B2" % render_clock_offset(clock_offset)
     if alerts:
         return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
-    detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s" % (
-        len(sessions), len(uploads), len(audit_objects), len(recording_objects),
-        ("%ds" % heartbeat_age) if heartbeat_age is not None else "none")
+    detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s; %s" % (
+        len(sessions), len(uploads), fold.count, len(recording_objects),
+        ("%ds" % heartbeat_age) if heartbeat_age is not None else "none", clock_line)
     return "ok", detail, finding_signature("ok", []), payload
 
 
@@ -7661,7 +8313,8 @@ def notify(config, state, detail):
 def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
                   state_since_run=0, last_notify_run=0, signature="", last_signature="",
                   quiet_signatures=frozenset(), quiet_renotify=86400,
-                  ack_ids=(), ack_identities=frozenset(), ack_configured=False):
+                  ack_ids=(), ack_identities=frozenset(), ack_configured=False,
+                  error_causes=(), causes_notified=frozenset()):
     """Notification bookkeeping.
 
     Non-green states push on transition and whenever the finding signature
@@ -7709,6 +8362,23 @@ def should_notify(previous_state, last_epoch, state, now_epoch, renotify,
         if previous_state == "ok":
             return int(state_since_run) > int(last_notify_run)
         return False  # a first-ever green run has nothing to recover from
+    if state == "error":
+        # ONE PAGE PER ERROR EPISODE (#281 Q2). An episode starts when the
+        # previous state was not error, and a genuinely NEW failure cause
+        # (a cause class not yet announced in this episode) is new information
+        # and pushes immediately. Otherwise the episode is governed by the
+        # renotify window, so a persistent invalid sidecar or an unreadable
+        # record no longer pages every ~12 minutes. A cause set that shrinks
+        # or flips back to a subset is quiet: that is what absorbs the
+        # clock-skew coin-flip ({skew, view} -> {view} -> {skew, view}).
+        if previous_state != "error":
+            return True
+        if not set(error_causes) <= set(causes_notified):
+            return True
+        last_epoch = int(last_epoch)
+        if last_epoch > now_epoch:
+            return True
+        return now_epoch - last_epoch >= int(renotify)
     if state != previous_state:
         return True
     last_epoch = int(last_epoch)
@@ -7934,99 +8604,165 @@ def build_observed(previous_observed, payload, now_epoch, run_seq, config):
     return observed
 
 
-def read_view(path):
-    """Read + parse the observed-view sidecar (timestamp strings -> datetimes)."""
+def read_summary(path):
+    """Read + parse the bounded summary sidecar (timestamp strings -> datetimes).
+
+    Fail-closed on every shape violation: the summary is the delta's cache, so
+    an unreadable or oversized one takes the repair-sweep path (never a
+    truncated or partially trusted read).
+    """
     try:
         with open(path, "rb") as handle:
-            raw_bytes = handle.read(VIEW_MAX_BYTES + 1)
+            raw_bytes = handle.read(SUMMARY_MAX_BYTES + 1)
     except FileNotFoundError:
-        raise WitnessError("observed view is missing")
+        raise WitnessError("summary is missing")
     except (OSError, ValueError, RecursionError) as exc:
-        raise WitnessError("observed view unreadable: %s" % exc)
-    if len(raw_bytes) > VIEW_MAX_BYTES:
-        raise WitnessError("observed view exceeds %d bytes" % VIEW_MAX_BYTES)
+        raise WitnessError("summary unreadable: %s" % exc)
+    if len(raw_bytes) > SUMMARY_MAX_BYTES:
+        raise WitnessError("summary exceeds %d bytes" % SUMMARY_MAX_BYTES)
     try:
         raw = raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise WitnessError("observed view is not valid UTF-8: %s" % exc)
+        raise WitnessError("summary is not valid UTF-8: %s" % exc)
     try:
         data = json.loads(raw)
     except (ValueError, RecursionError) as exc:
-        raise WitnessError("observed view unreadable: %s" % exc)
+        raise WitnessError("summary unreadable: %s" % exc)
     if not isinstance(data, dict):
-        raise WitnessError("observed view is not a JSON object")
-    if not isinstance(data.get("audit_objects"), dict) or not isinstance(data.get("recording_objects"), dict):
-        raise WitnessError("observed view maps are not JSON objects")
+        raise WitnessError("summary is not a JSON object")
+    if not isinstance(data.get("sessions"), dict):
+        raise WitnessError("summary sessions are not a JSON object")
+    if not isinstance(data.get("recordings"), dict) or not isinstance(data.get("hot"), dict):
+        raise WitnessError("summary maps are not JSON objects")
+    if not isinstance(data.get("drift"), dict):
+        raise WitnessError("summary drift sets are not a JSON object")
     if not isinstance(data.get("hidden"), list):
-        raise WitnessError("observed view hidden set is not a JSON array")
+        raise WitnessError("summary hidden set is not a JSON array")
+    heartbeat = data.get("heartbeat")
+    if not isinstance(heartbeat, dict) or not isinstance(heartbeat.get("key"), str):
+        raise WitnessError("summary heartbeat is not a JSON object")
     try:
-        data["audit_objects"] = {
-            key: parse_timestamp(value) for key, value in data["audit_objects"].items()}
-        data["recording_objects"] = {
-            key: parse_timestamp(value) for key, value in data["recording_objects"].items()}
+        data["recordings"] = {
+            key: parse_timestamp(value) for key, value in data["recordings"].items()}
+        data["hot"] = {key: parse_timestamp(value) for key, value in data["hot"].items()}
         data["hidden"] = [
             {"key": entry["key"], "version_id": entry["version_id"],
              "last_modified": parse_timestamp(entry["last_modified"])}
             for entry in data["hidden"]
         ]
+        if heartbeat.get("last_modified") is not None:
+            heartbeat["last_modified"] = parse_timestamp(heartbeat["last_modified"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise WitnessError("observed view entry invalid: %s" % exc)
+        raise WitnessError("summary entry invalid: %s" % exc)
     return data
 
 
-def view_problem(view, observed):
+def summary_problem(summary, observed):
     """The sidecar must belong to exactly this observed block ('' = valid)."""
-    if not isinstance(view, dict):
-        return "view is not a JSON object"
-    if view.get("view_version") != VIEW_VERSION:
-        return "view schema version is not %d" % VIEW_VERSION
+    if not isinstance(summary, dict):
+        return "summary is not a JSON object"
+    if summary.get("summary_version") != SUMMARY_VERSION:
+        return "summary schema version is not %d" % SUMMARY_VERSION
     for name in ("generation", "written_run_seq"):
-        value = view.get(name)
+        value = summary.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            return "view.%s is invalid: %r" % (name, value)
-    if view.get("generation") != observed.get("generation"):
-        return "view.generation %r does not match observed.generation %r" % (
-            view.get("generation"), observed.get("generation"))
-    if view.get("written_run_seq") != observed.get("written_run_seq"):
-        return "view.written_run_seq %r does not match observed.written_run_seq %r" % (
-            view.get("written_run_seq"), observed.get("written_run_seq"))
+            return "summary.%s is invalid: %r" % (name, value)
+    if summary.get("generation") != observed.get("generation"):
+        return "summary.generation %r does not match observed.generation %r" % (
+            summary.get("generation"), observed.get("generation"))
+    if summary.get("written_run_seq") != observed.get("written_run_seq"):
+        return "summary.written_run_seq %r does not match observed.written_run_seq %r" % (
+            summary.get("written_run_seq"), observed.get("written_run_seq"))
     return ""
 
 
-def write_view(path, data):
+def write_summary(path, data):
     tmp = path + ".tmp"
     with _open_state_file(tmp, "w") as handle:
-        json.dump(data, handle, sort_keys=True)
+        json.dump(data, handle, sort_keys=True, separators=(",", ":"))
         handle.write("\n")
         os.fchmod(handle.fileno(), 0o600)
     os.replace(tmp, path)
 
 
-def view_record(observed_out, payload):
-    """Serialize the merged view for the sidecar (exact timestamp round-trip)."""
-    def stamp(moment):
-        return moment.astimezone(timezone.utc).isoformat()  # ci-allowlist: datetime.isoformat() is a stdlib call, not an SCP image reference.
-    return {
-        "view_version": VIEW_VERSION,
-        "generation": observed_out["generation"],
-        "written_run_seq": observed_out["written_run_seq"],
-        "audit_objects": {
-            key: stamp(moment) for key, moment in (payload.get("audit_objects") or {}).items()},
-        "recording_objects": {
-            key: stamp(moment) for key, moment in (payload.get("recording_objects") or {}).items()},
-        "hidden": [
-            {"key": marker["key"], "version_id": marker["version_id"],
-             "last_modified": stamp(marker["last_modified"])}
-            for marker in (payload.get("hidden") or [])
-        ],
-    }
+def fold_from_summary(summary, config):
+    """Rebuild the retained fold from a parsed summary (validated, fail-closed)."""
+    fold = AuditFold()
+    fold.count = int(summary.get("count") or 0)
+    heartbeat = summary.get("heartbeat") or {}
+    fold.heartbeat["key"] = str(heartbeat.get("key") or "")
+    fold.heartbeat["last_modified"] = heartbeat.get("last_modified")
+    fold.recordings = dict(summary.get("recordings") or {})
+    fold.hot = dict(summary.get("hot") or {})
+    for sid, entry in (summary.get("sessions") or {}).items():
+        if not isinstance(entry, dict):
+            raise WitnessError("summary session %r is not a JSON object" % (sid,))
+        if entry.get("folded"):
+            fold.sessions[sid] = {
+                "folded": True,
+                "end": parse_timestamp(entry["end"]) if entry.get("end") else None,
+                "end_mode": None, "mode": entry.get("mode") or "shell",
+                "newest": str(entry.get("newest") or ""),
+                "count": int(entry.get("count") or 0),
+                "coverage": [], "identities": [], "start": None, "start_mode": None,
+            }
+            continue
+        coverage = []
+        for segment in entry.get("coverage") or []:
+            if (not isinstance(segment, list) or len(segment) != 3
+                    or not all(isinstance(part, int) and not isinstance(part, bool) and part >= 0
+                               for part in segment)):
+                raise WitnessError("summary session %r coverage segment is invalid" % (sid,))
+            coverage.append(list(segment))
+        identities = []
+        for identity in entry.get("identities") or []:
+            if (not isinstance(identity, list) or len(identity) != 4
+                    or not isinstance(identity[0], str) or not isinstance(identity[1], str)
+                    or not all(isinstance(part, int) and not isinstance(part, bool) and part >= 0
+                               for part in identity[2:])):
+                raise WitnessError("summary session %r identity is invalid" % (sid,))
+            identities.append(list(identity))
+        fold.sessions[sid] = {
+            "folded": False,
+            "start": parse_timestamp(entry["start"]) if entry.get("start") else None,
+            "start_mode": entry.get("start_mode"),
+            "end": parse_timestamp(entry["end"]) if entry.get("end") else None,
+            "end_mode": entry.get("end_mode"),
+            "coverage": coverage,
+            "identities": identities,
+            "count": int(entry.get("count") or 0),
+            "newest": str(entry.get("newest") or ""),
+        }
+    for kind in ("contract", "unrecognized"):
+        entry = (summary.get("drift") or {}).get(kind)
+        if not isinstance(entry, dict):
+            raise WitnessError("summary drift.%s is not a JSON object" % kind)
+        if entry.get("coarse"):
+            count = entry.get("count")
+            digest = entry.get("digest")
+            if (isinstance(count, bool) or not isinstance(count, int) or count < 0
+                    or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                raise WitnessError("summary drift.%s coarse mode is invalid" % kind)
+            fold.drift_coarse[kind] = {"count": count, "digest": digest}
+        else:
+            keys = entry.get("keys")
+            if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+                raise WitnessError("summary drift.%s keys are invalid" % kind)
+            fold.drift[kind] = list(keys)
+    return fold
+
+
+def summary_record(observed_out, fold, hidden):
+    """Serialize the bounded summary for the sidecar (exact timestamp round-trip)."""
+    return fold.to_summary(observed_out, hidden)
 
 
 def main():
     now = datetime.now(timezone.utc)
     now_epoch = int(now.timestamp())
     config = None
-    signature = finding_signature("error", [])
+    error_causes = ["exception:NotRun"]
+    signature = finding_signature("error", error_causes)
     state = "error"
     detail = "error: witness did not run"
     payload = None
@@ -8037,7 +8773,8 @@ def main():
     # record must be read before any listing.
     state_dir = env("RECORDING_WITNESS_STATE_DIR", "/var/lib/piercloud/recording-witness")
     state_path = os.path.join(state_dir, "state.json")
-    view_path = os.path.join(state_dir, "view.json")
+    summary_path = os.path.join(state_dir, SUMMARY_NAME)
+    legacy_view_path = os.path.join(state_dir, LEGACY_VIEW_NAME)
     verdict_path = os.path.join(state_dir, "verdict.log")
     try:
         os.makedirs(state_dir, mode=0o700, exist_ok=True)
@@ -8092,7 +8829,8 @@ def main():
         config = None
         state = "error"
         detail = "error: %s: %s" % (type(exc).__name__, exc)
-        signature = finding_signature("error", [])
+        error_causes = ["config"]
+        signature = finding_signature("error", error_causes)
 
     # The observed/coverage block decides the run mode. A version-3 record
     # must carry a valid block: any violation is a fail-closed repair + sweep
@@ -8101,7 +8839,25 @@ def main():
     previous_observed = previous.get("observed") if isinstance(previous.get("observed"), dict) else None
     observed_reason = ""
     cold_start_reason = ""
-    if previous and previous.get("version") == STATE_VERSION:
+    # The #281 migration: a KNOWN legacy cursor version is not corruption. Its
+    # block is otherwise validated (against the current schema), the run is a
+    # one-off full sweep that reports its OWN verdict, and the notify
+    # bookkeeping is kept - so the upgrade adds no page and needs one dispatch.
+    migration = False
+    if previous_observed is not None and previous_observed.get("cursor_version") in LEGACY_CURSOR_VERSIONS:
+        probe = dict(previous_observed)
+        probe["cursor_version"] = CURSOR_VERSION
+        migration_reason = observed_problem(probe, previous.get("run_seq"), config, now)
+        if migration_reason:
+            observed_reason = migration_reason
+        else:
+            migration = True
+            log("WARNING: observed cursor version %r is the pre-#281 layout; running the one-off migration sweep"
+                % (previous_observed.get("cursor_version"),))
+            previous_observed = None
+    if migration:
+        pass
+    elif previous and previous.get("version") == STATE_VERSION:
         if previous_observed is None:
             # A missing block after a non-error verdict means the cursor/view
             # was lost or tampered with: fail-closed repair + sweep. After an
@@ -8134,9 +8890,17 @@ def main():
         # Nothing read from the stale view survives the repair: this run
         # rebuilds the block from a full sweep and never reports green.
         previous_observed = None
+    forced_causes = []
+    if state_bad_reason:
+        forced_causes.append("state-unreadable")
+    if observed_reason:
+        forced_causes.append("observed-invalid")
 
     plan = {"mode": "sweep"}
-    if config is not None and not forced_reason:
+    if migration:
+        # A migration sweep is the sweep's own verdict, never a forced error.
+        plan = {"mode": "sweep"}
+    elif config is not None and not forced_reason:
         # `previous_observed` is None here only for a first run, a v3 error
         # record with no block, or a foreign-version record (which took the
         # repair path above): all three are cold starts.
@@ -8154,31 +8918,38 @@ def main():
                 plan = {"mode": "sweep", "observed": observed}
             else:
                 try:
-                    view = read_view(view_path)
-                    view_reason = view_problem(view, observed)
-                    if view_reason:
-                        raise WitnessError(view_reason)
+                    summary = read_summary(summary_path)
+                    summary_reason = summary_problem(summary, observed)
+                    if summary_reason:
+                        raise WitnessError(summary_reason)
                 except WitnessError as exc:
-                    log("WARNING: observed view unusable (%s); falling back to a repair sweep" % clip(exc, 200))
-                    observed_reason = "observed view is invalid: %s" % exc
+                    log("WARNING: observed summary unusable (%s); falling back to a repair sweep" % clip(exc, 200))
+                    observed_reason = "observed summary is invalid: %s" % exc
                     forced_reason = observed_reason
+                    forced_causes.append("view-invalid")
                     previous_observed = None
                     plan = {"mode": "sweep"}
                 else:
-                    plan = {"mode": "delta", "observed": observed, "view": view}
+                    plan = {"mode": "delta", "observed": observed, "summary": summary}
 
+    # One clock sample store per run: the offset is the median over THIS
+    # run's B2 calls.
+    reset_clock_samples()
+    clock_offset = None
     if config is not None:
         try:
             state, detail, signature, payload = run_checks(config, now, plan)
         except Exception as exc:  # fail-closed by design: any failure => error
             state = "error"
             detail = "error: %s: %s" % (type(exc).__name__, exc)
-            signature = finding_signature("error", [])
+            error_causes = error_cause_for(exc, bool(plan.get("performed_sweep")))
+            signature = finding_signature("error", error_causes)
             payload = None
         finally:
             # Drop this thread's pooled S3 connection: the process is one run,
             # so a stale cross-run socket must not survive a systemd retry.
             close_connections()
+        clock_offset = clock_offset_seconds()
     detail = clip(detail, 1000)
 
     if payload is not None and plan.get("cursor_repair_reason"):
@@ -8190,7 +8961,11 @@ def main():
         if state != "error":
             state = "error"
             detail = clip("error: %s" % observed_reason, 1000)
-        signature = finding_signature("error", [])
+        error_causes = ["cursor-nonconformance"]
+        if plan.get("performed_sweep"):
+            error_causes.append("sweep-latched")
+        error_causes = sorted(set(error_causes))
+        signature = finding_signature("error", error_causes)
 
     if forced_reason:
         if state != "error":
@@ -8198,10 +8973,31 @@ def main():
             detail = clip("error: %s" % forced_reason, 1000)
         else:
             detail = clip("%s (state record also invalid: %s)" % (detail, forced_reason), 1000)
-        # An invalid record is not a trustworthy previous state: the error
+        error_causes = sorted(set(list(error_causes) + forced_causes))
+        signature = finding_signature("error", error_causes)
+
+    # The Q2 trust gate: the previous record's bookkeeping (state, the notify
+    # epoch/signature and the notified cause set) is used ONLY when the record
+    # parsed and its bookkeeping fields validate. Otherwise behave like the
+    # pre-#281 code: page once, and the repaired record written below is valid,
+    # so the next run is governed by the episode window. The verdict-side
+    # distrust is unchanged - only the notify comparison may read these fields.
+    bookkeeping_trusted = not state_bad_reason
+    previous_causes = previous.get("error_causes_notified")
+    if (not isinstance(previous_causes, list) or len(previous_causes) > ERROR_CAUSE_MAX
+            or not all(isinstance(entry, str) and entry in ERROR_CAUSE_CLASSES
+                       for entry in previous_causes)):
+        bookkeeping_trusted = False
+        previous_causes = []
+    stored_signature = previous.get("last_notify_signature")
+    if not isinstance(stored_signature, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", stored_signature or ""):
+        bookkeeping_trusted = False
+    if not bookkeeping_trusted:
+        # An untrusted record is not a trustworthy previous state: the error
         # verdict must push instead of comparing against it.
-        signature = finding_signature("error", [])
         previous = {}
+        previous_causes = []
 
     renotify = config.renotify if config is not None else 1800
     quiet_renotify = config.quiet_renotify if config is not None else 86400
@@ -8253,20 +9049,28 @@ def main():
     if previous_state is not None and previous_state != state:
         state_since_run = run_seq
         state_since_epoch = now_epoch
+    notified_causes = set(previous_causes)
     if should_notify(previous_state, last_notify_epoch, state, now_epoch, renotify,
                      state_since_run, last_notify_run, signature, last_notify_signature,
                      quiet_signatures, quiet_renotify,
-                     ack_ids, ack_identities, ack_configured):
+                     ack_ids, ack_identities, ack_configured,
+                     error_causes, notified_causes):
         if config is not None and notify(config, state, detail):
             last_notify_epoch = now_epoch
             last_notify_run = run_seq
             last_notify_signature = signature
+            if state == "error":
+                # A LANDED push records the causes it announced; a failed push
+                # leaves the set unchanged so the next run retries (exactly
+                # how last_notify_signature behaves).
+                notified_causes = notified_causes | set(error_causes)
     observed_out = previous_observed
-    view_to_write = None
+    summary_to_write = None
     if payload is not None:
         observed_out = build_observed(previous_observed, payload, now_epoch, run_seq, config)
         if payload.get("dirty"):
-            view_to_write = view_record(observed_out, payload)
+            summary_to_write = summary_record(
+                observed_out, payload["fold"], payload.get("hidden") or [])
     elif observed_out is not None:
         # The checks could not run: the previous view is unchanged. A sweep
         # that actually ran (planned or an internal delta/seed fallback) and
@@ -8289,6 +9093,12 @@ def main():
         "last_notify_epoch": last_notify_epoch,
         "signature": signature,
         "last_notify_signature": last_notify_signature,
+        # The causes that landed in pushes during the CURRENT error episode;
+        # cleared whenever the state is not error (Q2).
+        "error_causes_notified": sorted(notified_causes) if state == "error" else [],
+        # The run's median anchor-vs-B2 clock offset (None when no bracket was
+        # usable). Recorded so the acceptance can print it.
+        "clock_offset_seconds": clock_offset,
     }
     if observed_out is not None:
         record["observed"] = observed_out
@@ -8333,17 +9143,29 @@ def main():
     else:
         record["baseline"] = {"state": state, "detail": detail, "updated_at": utc_stamp(now)}
     view_written = True
-    if view_to_write is not None:
+    if summary_to_write is not None:
         try:
-            write_view(view_path, view_to_write)
+            write_summary(summary_path, summary_to_write)
         except OSError as exc:
             view_written = False
-            log("WARNING: cannot write observed view: %s" % clip(exc, 200))
+            log("WARNING: cannot write observed summary: %s" % clip(exc, 200))
     if view_written:
         try:
             write_state(state_path, record)
         except OSError as exc:
             log("WARNING: cannot write state file: %s" % clip(exc, 200))
+        else:
+            if migration:
+                # The #281 migration: only after BOTH new files landed, drop
+                # the retired per-key sidecar (never read by this code).
+                try:
+                    os.unlink(legacy_view_path)
+                    log("observed cursor version migrated to %d; removed the retired %s"
+                        % (CURSOR_VERSION, LEGACY_VIEW_NAME))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log("WARNING: cannot remove the retired %s: %s" % (LEGACY_VIEW_NAME, clip(exc, 200)))
     try:
         append_verdict(verdict_path, state, detail)
     except OSError as exc:
@@ -8677,6 +9499,21 @@ recording_witness_run_once() { # run one check now and surface the verdict
     # sweep; a sweep run closes the disclosure; a delta run is a fast refresh.
     log "witness coverage: mode=${coverage_mode}"
   fi
+  # The run's B2 Date-header clock self-check (#281): the median bracket over
+  # this run's calls, printed so the operator sees the anchor's clock error
+  # even on a green run. The witness never stops on clock trouble - the record
+  # carries the offset and the verdict carries cause clock-skew.
+  clock_offset="$(jq -r '.clock_offset_seconds // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
+  case "${clock_offset}" in
+    ""|null) ;;
+    *)
+      clock_word="$(python3 -c 'import sys
+value = float(sys.argv[1])
+seconds = int(round(abs(value)))
+print("0 s" if seconds == 0 else "%d s %s" % (seconds, "behind" if value < 0 else "ahead"))' "${clock_offset}" 2>/dev/null || true)"
+      log "witness clock: anchor is ${clock_word:-${clock_offset} s} of B2 (median over this run of B2 Date headers)"
+      ;;
+  esac
 }
 
 recording_witness_disable() { # remove a previously installed component
@@ -8694,6 +9531,102 @@ recording_witness_disable() { # remove a previously installed component
 }
 # --- END RECORDING WITNESS ---
 
+# --- BEGIN CLOCK DISCIPLINE (tests/time-sync extracts this span; keep markers) ---
+# Clock discipline (#281): chrony with NTS sources.
+#
+# The witness's verdicts depend on the anchor clock - the S3 skew bound, the
+# heartbeat/freshness clocks, the session grace windows, ack expiry and (under
+# CC) the dead-man windows - so the box must discipline it. chrony with NTS
+# AUTHENTICATES its sources and uses several with outlier rejection; plain
+# NTP (systemd-timesyncd) is one unauthenticated source at a time and can be
+# shifted by anyone on-path. A plain bootstrap pool is kept FIRST: on a first
+# boot with a badly wrong clock, NTS-KE cannot validate the server certificate
+# chain, so the clock must be steppable before the authenticated sources can
+# run. Provisioning fails ONLY if the clock has not synchronized within
+# TIME_SYNC_WAIT_SECONDS; at runtime the witness never stops on clock trouble,
+# it reports cause clock-skew (docs/recording-witness.md).
+TIME_SYNC_WAIT_SECONDS=300
+CHRONY_CONF="/etc/chrony/chrony.conf"
+
+time_sync_render_conf() { # print the chrony configuration to stdout
+  cat <<'TIME_SYNC_CONF_EOF'
+# DISPATCH-MANAGED by terraform-piercloud-anchor (scripts/010-provision.sh, #281).
+# Re-rendered on every provision run; hand edits are overwritten.
+driftfile /var/lib/chrony/chrony.drift
+logdir /var/log/chrony
+rtcsync
+# Step a large first-boot offset instead of slewing it (the first sync may move
+# the clock by minutes; the witness logs the one heartbeat that can read old).
+makestep 1.0 3
+# Bootstrap: plain NTP, so a wrong first-boot clock can still be stepped -
+# NTS-KE cannot validate a server certificate chain while the clock is wrong.
+pool 2.debian.pool.ntp.org iburst maxsources 2
+# Authenticated sources (NTS): server-authenticated, multi-source, with
+# chrony's outlier rejection. These take over once the bootstrap step landed.
+server time.cloudflare.com iburst nts
+server nts.netnod.se iburst nts
+server ptbtime1.ptb.de iburst nts
+TIME_SYNC_CONF_EOF
+}
+
+time_sync_synchronized() { # 0 when chrony reports a disciplined clock
+  local tracking leap reference
+  tracking="$(chronyc -n tracking 2>/dev/null || true)"
+  [ -n "$tracking" ] || return 1
+  leap="$(printf '%s\n' "$tracking" | sed -n 's/^Leap status[[:space:]]*:[[:space:]]*//p' | head -n 1)"
+  case "$leap" in
+    Normal|"Insert second"|"Delete second") ;;
+    *) return 1 ;;
+  esac
+  reference="$(printf '%s\n' "$tracking" | sed -n 's/^Reference ID[[:space:]]*:[[:space:]]*//p' | head -n 1)"
+  # An all-zero reference means chrony has no usable source yet, however
+  # healthy the leap line reads.
+  case "$reference" in
+    ""|0.0.0.0|00000000) return 1 ;;
+  esac
+  return 0
+}
+
+time_sync_offset() { # the measured system offset as chrony prints it
+  chronyc -n tracking 2>/dev/null | sed -n 's/^System time[[:space:]]*:[[:space:]]*//p' | head -n 1
+}
+
+time_sync_install() { # install + enable chrony and render the config
+  local tmp
+  if ! command -v chronyc >/dev/null 2>&1; then
+    log "Installing chrony (authenticated time sync: the anchor clock is a trust input, #281)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq chrony >/dev/null || die "clock: apt-get install chrony failed - the anchor clock cannot be disciplined (#281)"
+  fi
+  tmp="$(mktemp)"
+  time_sync_render_conf >"$tmp"
+  chmod 0644 "$tmp"
+  if [ "$(id -u)" -eq 0 ]; then chown root:root "$tmp"; fi
+  mv "$tmp" "$CHRONY_CONF"
+  # chrony and systemd-timesyncd both want the clock: mask the unauthenticated
+  # one so a later package action cannot put it back in charge.
+  systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
+  systemctl mask systemd-timesyncd >/dev/null 2>&1 || true
+  systemctl enable chrony >/dev/null 2>&1 || systemctl enable chronyd >/dev/null 2>&1 \
+    || die "clock: cannot enable chrony - the anchor clock cannot be disciplined (#281)"
+  systemctl restart chrony >/dev/null 2>&1 || systemctl restart chronyd >/dev/null 2>&1 \
+    || die "clock: cannot start chrony - the anchor clock cannot be disciplined (#281)"
+}
+
+time_sync_converge() { # wait (bounded) for a disciplined clock, then refuse
+  local attempt
+  time_sync_install
+  for ((attempt = 0; attempt < TIME_SYNC_WAIT_SECONDS; attempt++)); do
+    if time_sync_synchronized; then
+      log "clock: synchronized (chrony, NTS sources); offset: $(time_sync_offset)"
+      return 0
+    fi
+    /usr/bin/env sleep 1
+  done
+  die "clock: chrony did not synchronize within ${TIME_SYNC_WAIT_SECONDS}s - refusing to provision with an undisciplined clock (the witness's skew bound, freshness clocks and ack windows all read it; check egress UDP/123 and TCP/4460 for NTS-KE)"
+}
+# --- END CLOCK DISCIPLINE ---
+
 # ---------------------------------------------------------------------------
 # g) Recording-completeness witness (list-only; optional)
 #    Renders + enables the 5-minute witness timer when the RECORDING_WITNESS_*
@@ -8704,6 +9637,7 @@ recording_witness_disable() { # remove a previously installed component
 #    _RECORDINGS_PREFIX / _KEY_ID / _KEY (list-only), plus the existing
 #    NTFY_TOPIC / NTFY_TOKEN for alert pushes. Docs: docs/recording-witness.md.
 # ---------------------------------------------------------------------------
+time_sync_converge
 case "$(recording_witness_state)" in
   on)
     log "Installing the list-only recording-completeness witness (B2 metadata checks)"
