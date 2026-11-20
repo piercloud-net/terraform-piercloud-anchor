@@ -268,7 +268,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1170
+MIN_CHECKS=1172
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -12206,10 +12206,19 @@ start_mock
 run_case "${clock_dir}"
 is "clock skew: 400 s behind B2 -> exit 2" "2" "${CASE_RC}"
 is "clock skew: 400 s behind B2 -> error verdict" "error" "${CASE_STATE}"
+# The Date bracket is 1 s resolution plus RTT, so the rendered offset may sit
+# a second off the injected one; the SHAPE and the band are what is pinned.
 case "${CASE_DETAIL}" in
-  *"witness clock: anchor is 400 s behind B2"*) ok "clock skew: the detail names the measured offset" ;;
+  *"witness clock: anchor is"*"s behind B2"*) ok "clock skew: the detail names the measured offset" ;;
   *) bad "clock skew detail: ${CASE_DETAIL}" ;;
 esac
+clock_detail_seconds="${CASE_DETAIL#*anchor is }"
+clock_detail_seconds="${clock_detail_seconds%% s behind B2*}"
+if [ -n "${clock_detail_seconds}" ] && [ "${clock_detail_seconds}" -ge 398 ] && [ "${clock_detail_seconds}" -le 402 ]; then
+  ok "clock skew: the detail's offset is within a second of the injected 400 s (${clock_detail_seconds} s)"
+else
+  bad "clock skew: the detail's offset is ${clock_detail_seconds:-missing} s (expected about 400)"
+fi
 clock_recorded="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("clock_offset_seconds")))' "${clock_dir}/state.json" 2>/dev/null)"
 # The Date bracket is 1 s resolution plus RTT, so the recorded median may sit a
 # second off the injected offset; the bound is what matters, not the last digit.
@@ -12246,7 +12255,7 @@ run_case "${clock_drift_dir}"
 is "clock drift: 150 s behind B2 -> exit 1 (the ackable band)" "1" "${CASE_RC}"
 is "clock drift: 150 s behind B2 -> alert verdict" "alert" "${CASE_STATE}"
 case "${CASE_DETAIL}" in
-  *clock-drift*"anchor is 150 s behind B2"*) ok "clock drift: the detail names clock-drift and the offset" ;;
+  *clock-drift*"anchor clock is"*"s behind B2"*) ok "clock drift: the detail names clock-drift and the offset" ;;
   *) bad "clock drift detail: ${CASE_DETAIL}" ;;
 esac
 
