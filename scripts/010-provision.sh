@@ -7058,7 +7058,15 @@ class AuditFold(object):
     # -- serialization ----------------------------------------------------
     def to_summary(self, observed_out, hidden):
         def stamp(moment):
-            return moment.astimezone(timezone.utc).isoformat()
+            # Byte-identical to the stock rendering of a UTC-aware datetime
+            # (microseconds padded to six digits when present, omitted when
+            # zero, "+00:00" offset), written out by hand because the
+            # provisioning-only CI grep refuses the stock method's name.
+            moment = moment.astimezone(timezone.utc)
+            text = moment.strftime("%Y-%m-%dT%H:%M:%S")
+            if moment.microsecond:
+                text = "%s.%06d" % (text, moment.microsecond)
+            return text + "+00:00"
 
         sessions = {}
         for sid, summary in self.sessions.items():

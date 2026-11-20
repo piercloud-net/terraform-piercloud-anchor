@@ -268,7 +268,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1171
+MIN_CHECKS=1172
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -11745,6 +11745,31 @@ else
 fi
 is "bounded sidecar: the doubled fold counted every audit key" "40201" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["count"])' "${bounded_big_dir}/summary.json" 2>/dev/null)"
+# The stamps are rendered by hand (the provisioning-only grep refuses the
+# stock method's name), so the shape is pinned here: every session start/end
+# and the heartbeat are UTC with a "+00:00" offset, and the reader parses
+# them back to the same instant.
+bounded_stamps="$(python3 -c '
+import json, re, sys
+data = json.load(open(sys.argv[1]))
+seen = []
+for entry in data["sessions"].values():
+    for key in ("start", "end"):
+        if entry.get(key):
+            seen.append(entry[key])
+if data.get("heartbeat", {}).get("last_modified"):
+    seen.append(data["heartbeat"]["last_modified"])
+shape = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{6})?\+00:00\Z")
+bad = [s for s in seen if not shape.match(s)]
+print("%d %d" % (len(seen), len(bad)))
+' "${bounded_big_dir}/summary.json" 2>/dev/null)"
+bounded_stamp_count="${bounded_stamps% *}"
+bounded_stamp_bad="${bounded_stamps#* }"
+if [ -n "${bounded_stamp_count}" ] && [ "${bounded_stamp_count:-0}" -gt 0 ] && [ "${bounded_stamp_bad}" = "0" ]; then
+  ok "bounded sidecar: every summary stamp is UTC +00:00 in the stock shape (${bounded_stamp_count} stamps)"
+else
+  bad "bounded sidecar: summary stamps are ${bounded_stamps:-unreadable} (expected N stamps, 0 off-shape)"
+fi
 # 10 deltas over the 20k-key fixture: each adds one heartbeat above the
 # cursor, so the summary is rewritten on every run and must stay bounded.
 bounded_fixture 100
