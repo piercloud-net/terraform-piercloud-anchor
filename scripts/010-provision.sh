@@ -4999,7 +4999,7 @@ COMMITMENT_MAX_LEAVES = 4096
 COMMITMENT_FINDING_MAX = 64
 REWRITE_FINDING_MAX = 64
 VANISHED_FINDING_MAX = 64
-# A version listing's ETag is a content hash only for a single-part upload
+# A version listing's ETag is a content digest only for a single-part upload
 # (the MD5 hex). A multipart upload appends `-<parts>`, which commits to the
 # part boundaries too, so it is compared at (ETag, Size) level only and the
 # detail says so - the cheapest honest option that never GETs an object.
@@ -5750,7 +5750,7 @@ def merkle_prefix_intact(old_leaves, new_leaves, old_root, old_size):
 
     This is the append-only property the CT shape rests on, checked from the
     leaves the witness already holds: the committed prefix must be unchanged
-    and must still hash to the committed root. The anchor-side exchange
+    and must still digest to the committed root. The anchor-side exchange
     (an O(log n) consistency proof carried on a signed heartbeat, verified
     against the stored O(1) root+size) belongs to the CC phase; this is the
     property that proof will carry, proven here against the real tree.
@@ -7146,7 +7146,7 @@ class AuditFold(object):
         # A sweep's range branches each hold part of a day's keys: the count
         # adds and the digest sums, so the merged bucket is exactly the bucket a
         # single unsplit fold would have produced (the digest is a multiset
-        # hash for this reason).
+        # sum for this reason).
         for bucket_key, bucket in other.buckets.items():
             mine = self.buckets.get(bucket_key)
             if mine is None:
@@ -8586,7 +8586,7 @@ def run_checks(config, now, plan):
     # before PUT and writes a variant key on conflict, so a second version of
     # one key is never a legitimate event. A retry after a lost PUT response
     # leaves two versions with IDENTICAL content (an info-level duplicate-write
-    # record); anything else is a rewrite. The comparison is by content hash:
+    # record); anything else is a rewrite. The comparison is by content digest:
     # a single-part upload's ETag IS the MD5 of the bytes, so it is
     # content-exact; a multipart ETag appends `-<parts>` and commits to the
     # part boundaries too, so those (and a missing/opaque ETag) are compared at

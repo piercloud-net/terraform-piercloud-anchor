@@ -1240,15 +1240,25 @@ print(node)
 force_sweep_state() { # rewrite a readable state.json into a valid, sweep-due observed block
   # Optional second argument `keep-cursors` preserves the persisted cursors
   # (the below-cursor replay tooth: the forced sweep must be able to catch a
-  # key below its own cursor, so it cannot be handed blank cursors).
+  # key below its own cursor, so it cannot be handed blank cursors), and
+  # `keep-commitment` preserves the retained day commitment.
+  #
+  # The retained commitment (#281 PR 2) is DROPPED by default, because every
+  # historical scenario replaces the whole fixture: a different bucket is not
+  # a day that changed, so the forced sweep must re-baseline the commitment
+  # from the listing (exactly the migration rule, "history is committed as
+  # found"). The teeth that DO keep it across runs pass `keep-commitment`.
   local state_path="$1/state.json"
   [ -f "${state_path}" ] || return 0
   python3 - "${state_path}" "${2:-}" <<'PY'
 import json
+import os
 import sys
 
 path = sys.argv[1]
-keep_cursors = len(sys.argv) > 2 and sys.argv[2] == "keep-cursors"
+flags = sys.argv[2].split(",") if len(sys.argv) > 2 and sys.argv[2] else []
+keep_cursors = "keep-cursors" in flags
+keep_commitment = "keep-commitment" in flags
 try:
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
@@ -1281,6 +1291,17 @@ data["observed"] = {
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(data, handle)
+if not keep_commitment:
+    summary_path = os.path.join(os.path.dirname(path), "summary.json")
+    try:
+        with open(summary_path, encoding="utf-8") as handle:
+            summary = json.load(handle)
+    except (OSError, ValueError, RecursionError):
+        summary = None
+    if isinstance(summary, dict) and "commitment" in summary:
+        del summary["commitment"]
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, sort_keys=True, separators=(",", ":"))
 PY
 }
 
@@ -1322,6 +1343,15 @@ run_case() { # fixture at ${FIXTURE} ($1 = optional state dir); sets CASE_RC / C
   # sweep by forcing the observed block sweep-due (0), even after a previous
   # run advanced its cursors. Delta teeth use run_delta, which skips this.
   force_sweep_state "${CASE_STATE_DIR}"
+  run_case_raw "${CASE_STATE_DIR}"
+}
+
+run_case_keep_commitment() { # a forced sweep that keeps the retained day commitment
+  # The #281 PR 2 teeth replace the fixture between runs on purpose: in
+  # production the bucket only grows, so the committed leaves stay the
+  # expectation the next sweep compares against.
+  CASE_STATE_DIR="${1:-${WORK}/state}"
+  force_sweep_state "${CASE_STATE_DIR}" keep-commitment
   run_case_raw "${CASE_STATE_DIR}"
 }
 
@@ -12466,27 +12496,32 @@ def event_key(seq, stamp):
     return audit_key("user.login", day + "T" + stamp + "Z", "", seq, flat=True)
 
 
+# The exact keys the variants move or drop (the shipper pads <seq> to six
+# digits, so a suffix guess would silently match nothing and leave the
+# fixture unchanged).
+event_five = event_key(5, "120100")
+session_data = audit_key("session.data", day + "T120100Z", sid, 2, flat=True)
 objects = [
     {"key": "audit/heartbeat/%sT120000Z.json" % day, "at": at("120000")},
     {"key": audit_key("session.start", day + "T120000Z", sid, 1, "shell", flat=True), "at": at("120000")},
-    {"key": audit_key("session.data", day + "T120100Z", sid, 2, flat=True), "at": at("120100")},
+    {"key": session_data, "at": at("120100")},
     {"key": audit_key("session.end", day + "T120200Z", sid, 3, "shell", flat=True), "at": at("120200")},
     {"key": "recordings/%s.tar" % sid, "at": at("120300")},
-    {"key": event_key(5, "120100"), "at": at("120100")},
+    {"key": event_five, "at": at("120100")},
     {"key": event_key(6, "120200"), "at": at("120200")},
 ]
 if variant == "drop-event":
-    objects = [entry for entry in objects if not entry["key"].endswith("-user.login.5.json")]
+    objects = [entry for entry in objects if entry["key"] != event_five]
 elif variant == "moved-lm":
     for entry in objects:
-        if entry["key"].endswith("-user.login.5.json"):
+        if entry["key"] == event_five:
             entry["at"] = at("120900")
 elif variant == "grow":
     objects.append({"key": event_key(9, "121000"), "at": at("121000")})
 elif variant == "drop-tar":
     objects = [entry for entry in objects if not entry["key"].startswith("recordings/")]
 elif variant == "drop-session-key":
-    objects = [entry for entry in objects if ".%s.2.json" % sid not in entry["key"]]
+    objects = [entry for entry in objects if entry["key"] != session_data]
 elif variant == "late":
     recent = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
     day_before = (recent - datetime.timedelta(days=1)).strftime("%Y%m%d")
@@ -12496,7 +12531,7 @@ elif variant == "late":
     })
 versions = []
 if variant in ("rewrite", "duplicate"):
-    key = event_key(5, "120100")
+    key = event_five
     if variant == "duplicate":
         etags = ("d41d8cd98f00b204e9800998ecf8427e", "d41d8cd98f00b204e9800998ecf8427e")
     else:
@@ -12514,7 +12549,8 @@ PY
 commit_run() { # $1 = state dir, $2 = variant; one sweep over that variant
   commit_fixture "$2"
   start_mock
-  RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS=3456000' run_case "$1"
+  RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS=3456000' \
+    run_case_keep_commitment "$1"
 }
 commit_size() { # $1 = state dir; prints the committed leaf count
   python3 -c '
@@ -12652,7 +12688,7 @@ is "commitment: the delta keeps the leaf list" "3" "$(commit_size "$commit_dir")
 commit_run "$commit_dir" rewrite
 is "commitment: a rewritten object version alerts" "alert" "$CASE_STATE"
 case "$CASE_DETAIL" in
-  *"object-rewritten: audit/$commit_day"*"-user.login.5.json"*)
+  *"object-rewritten: audit/$commit_day"*"-user.login.000005.json"*)
     ok "commitment: object-rewritten names the key" ;;
   *) bad "commitment: the object-rewritten detail reads: $CASE_DETAIL" ;;
 esac
