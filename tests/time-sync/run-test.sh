@@ -135,7 +135,15 @@ has "chrony is enabled" "enable chrony" "$(systemctl_calls)"
 has "chrony is (re)started" "restart chrony" "$(systemctl_calls)"
 
 # -- (d) a synchronized clock passes and logs the offset --------------------
+# "Does not wait" is counted, not timed: the converge checks the clock,
+# succeeds and returns BEFORE the loop's sleep, so the success path is exactly
+# two chronyc reads (one check + one offset log) and zero sleeps. The old
+# `SECONDS == 0` assertion raced a second boundary and went red on the #283 CI
+# runner (SECONDS=1); owner rule: timing tests get fixed, never re-run.
+CHRONYC_CALLS="${WORK}/chronyc-calls.txt"
+: >"${CHRONYC_CALLS}"
 chronyc() {
+  printf 'call\n' >>"${CHRONYC_CALLS}"
   case "$*" in
     *tracking*)
       printf 'Reference ID    : C0A8C8C8 (nts.time.nl)\nLeap status     : Normal\nSystem time     : 0.000123456 seconds slow of NTP time\n'
@@ -144,11 +152,10 @@ chronyc() {
 }
 TIME_SYNC_WAIT_SECONDS=3
 rc=0
-SECONDS=0
 converge_out="$(time_sync_converge 2>&1)" || rc=$?
 is "a synchronized clock passes provisioning" "0" "${rc}"
 has "the pass logs the measured offset" "offset: 0.000123456 seconds slow of NTP time" "${converge_out}"
-is "a synchronized clock does not wait" "0" "${SECONDS}"
+is "a synchronized clock checks once and never sleeps (no wall clock)" "2" "$(wc -l <"${CHRONYC_CALLS}" | tr -d ' ')"
 
 # -- time_sync_synchronized: the accept/reject matrix ----------------------
 for shape in \
