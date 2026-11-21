@@ -12669,7 +12669,7 @@ esac
 commit_run "$commit_dir" drop-session-key
 is "commitment: a deleted settled session key alerts" "alert" "$CASE_STATE"
 case "$CASE_DETAIL" in
-  *"sequence-gap: session $SID missing <seq> 2-2"*) ok "commitment: the deleted session key is named by sid and seq" ;;
+  *"sequence-gap: session $SID missing <seq> 2;"*) ok "commitment: the deleted session key is named by sid and seq" ;;
   *) bad "commitment: the deleted session key detail reads: $CASE_DETAIL" ;;
 esac
 
