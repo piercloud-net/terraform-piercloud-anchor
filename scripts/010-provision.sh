@@ -8341,7 +8341,18 @@ def run_checks(config, now, plan):
     if run_mode == "sweep" and isinstance(retained, dict):
         retained_recordings = retained.get("recordings")
         if isinstance(retained_recordings, dict):
-            vanished = [key for key in retained_recordings if key not in recording_objects]
+            # Only SETTLED recordings: inside Object Lock retention a permanent
+            # version delete is impossible, so a younger tar that is missing
+            # from a listing is a listing/consistency anomaly, and the ordinary
+            # recording checks (recording-gap, session-end-missing) already
+            # cover it. The settle horizon is the same boundary the day leaves
+            # use, so a settled recording is exactly the population a
+            # post-retention delete can reach.
+            vanished = [
+                key for key in retained_recordings
+                if key not in recording_objects
+                and isinstance(retained_recordings[key], datetime)
+                and (now - retained_recordings[key]).total_seconds() > config.settle_horizon]
             for key in vanished:
                 # Keep the expectation in the view: the finding then repeats
                 # every sweep with the same identity until the object is back
@@ -8355,6 +8366,7 @@ def run_checks(config, now, plan):
         sid_match = None
         if key.startswith(config.recordings_prefix):
             sid_match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        # (a settled recording only, see above)
         subject = sid_match.group("sid").lower() if sid_match else identity_digest([key])[:16]
         alerts.append(
             "recording-vanished: %s (last listed %s) is gone from the listing with no delete marker - "
@@ -8634,6 +8646,10 @@ def run_checks(config, now, plan):
     if run_mode == "sweep":
         commitment, commitment_findings, commitment_alerts, commitment_infos = build_commitment(
             fold, retained.get("commitment") if isinstance(retained, dict) else None, now, config)
+        # The sidecar is where the leaves live: a sweep that kept them only in
+        # the payload would rebuild the log from scratch every run and never
+        # compare anything.
+        fold.commitment = commitment
         alerts.extend(commitment_alerts)
         finding_ids.extend(commitment_findings)
         for line in commitment_infos:

@@ -4080,8 +4080,13 @@ then ok "stale pooled connection: one dropped attempt is followed by a served re
 # set is the stable identity, so normalize the age fragment and the clock
 # fragment before comparing; the clock's own teeth pin the wording.
 norm_detail() {
+  # The commitment root is a run-time value too on a fixture that stamps its
+  # objects with `ago`: a settled leaf commits LastModified, which moves by a
+  # second or two between two runs, so the root moves with it. In production
+  # LastModified is fixed per object and the root is stable; here it is
+  # normalized like the age and the clock.
   printf '%s' "$1" |
-    sed -e 's/heartbeat_age=[0-9]*s/heartbeat_age=X/' -e 's/; witness clock: anchor is [^;]*$//'
+    sed -e 's/heartbeat_age=[0-9]*s/heartbeat_age=X/' -e 's/; witness clock: anchor is [^;]*//'         -e 's/; commitment root=[0-9a-f]* size=[0-9]*//'
 }
 
 # Worker parity: the parallel family fan-out must not change the verdict,
@@ -12463,9 +12468,9 @@ def event_key(seq, stamp):
 
 objects = [
     {"key": "audit/heartbeat/%sT120000Z.json" % day, "at": at("120000")},
-    {"key": audit_key("session.start", day + "T120000Z", sid, 0, "shell", flat=True), "at": at("120000")},
-    {"key": audit_key("session.data", day + "T120100Z", sid, 1, flat=True), "at": at("120100")},
-    {"key": audit_key("session.end", day + "T120200Z", sid, 2, "shell", flat=True), "at": at("120200")},
+    {"key": audit_key("session.start", day + "T120000Z", sid, 1, "shell", flat=True), "at": at("120000")},
+    {"key": audit_key("session.data", day + "T120100Z", sid, 2, flat=True), "at": at("120100")},
+    {"key": audit_key("session.end", day + "T120200Z", sid, 3, "shell", flat=True), "at": at("120200")},
     {"key": "recordings/%s.tar" % sid, "at": at("120300")},
     {"key": event_key(5, "120100"), "at": at("120100")},
     {"key": event_key(6, "120200"), "at": at("120200")},
@@ -12481,7 +12486,7 @@ elif variant == "grow":
 elif variant == "drop-tar":
     objects = [entry for entry in objects if not entry["key"].startswith("recordings/")]
 elif variant == "drop-session-key":
-    objects = [entry for entry in objects if ".%s.1.json" % sid not in entry["key"]]
+    objects = [entry for entry in objects if ".%s.2.json" % sid not in entry["key"]]
 elif variant == "late":
     recent = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
     day_before = (recent - datetime.timedelta(days=1)).strftime("%Y%m%d")
@@ -12628,7 +12633,7 @@ esac
 commit_run "$commit_dir" drop-session-key
 is "commitment: a deleted settled session key alerts" "alert" "$CASE_STATE"
 case "$CASE_DETAIL" in
-  *"sequence-gap: session $SID missing <seq> 1-1"*) ok "commitment: the deleted session key is named by sid and seq" ;;
+  *"sequence-gap: session $SID missing <seq> 2-2"*) ok "commitment: the deleted session key is named by sid and seq" ;;
   *) bad "commitment: the deleted session key detail reads: $CASE_DETAIL" ;;
 esac
 
