@@ -9633,13 +9633,19 @@ recording_witness_disable() { # remove a previously installed component
 # CC) the dead-man windows - so the box must discipline it. chrony with NTS
 # AUTHENTICATES its sources and uses several with outlier rejection; plain
 # NTP (systemd-timesyncd) is one unauthenticated source at a time and can be
-# shifted by anyone on-path. A plain bootstrap pool is kept FIRST: on a first
-# boot with a badly wrong clock, NTS-KE cannot validate the server certificate
-# chain, so the clock must be steppable before the authenticated sources can
-# run. Provisioning fails ONLY if the clock has not synchronized within
+# shifted by anyone on-path. NO plaintext NTP server or pool is rendered at
+# all: a plain source left in the config stays a standing unauthenticated
+# clock for the life of the box. The first-boot problem it used to solve is
+# solved by nocerttimecheck below (a wrong clock cannot validate the NTS-KE
+# certificate chain; chrony can relax that check for the first updates only).
+# Provisioning fails ONLY if the clock has not synchronized within
 # TIME_SYNC_WAIT_SECONDS; at runtime the witness never stops on clock trouble,
 # it reports cause clock-skew (docs/recording-witness.md).
 TIME_SYNC_WAIT_SECONDS=300
+# The oldest chrony that documents nocerttimecheck (chrony.conf(5), 4.0).
+# Debian 13 trixie ships 4.6.1 (4.6.1-3+deb13u2); an older box is refused
+# instead of being rendered a directive its chrony does not know.
+TIME_SYNC_NOCERTTIMECHECK_MIN_MAJOR=4
 CHRONY_CONF="/etc/chrony/chrony.conf"
 
 time_sync_render_conf() { # print the chrony configuration to stdout
@@ -9652,11 +9658,15 @@ rtcsync
 # Step a large first-boot offset instead of slewing it (the first sync may move
 # the clock by minutes; the witness logs the one heartbeat that can read old).
 makestep 1.0 3
-# Bootstrap: plain NTP, so a wrong first-boot clock can still be stepped -
-# NTS-KE cannot validate a server certificate chain while the clock is wrong.
-pool 2.debian.pool.ntp.org iburst maxsources 2
+# A first boot may carry a badly wrong clock, and NTS-KE validates the server
+# certificate chain (its activation/expiration times). chrony 4.0+ relaxes
+# exactly that check for the first clock updates: the first authenticated
+# sample is accepted, and every later sample is fully checked. This is why NO
+# plaintext NTP source is configured - the clock is authenticated from the
+# first sample, not after a plaintext bootstrap.
+nocerttimecheck 1
 # Authenticated sources (NTS): server-authenticated, multi-source, with
-# chrony's outlier rejection. These take over once the bootstrap step landed.
+# chrony's outlier rejection.
 # Three independent operators on purpose: NLnet Labs (NL), Netnod (SE) and
 # the German national metrology institute (PTB). None of them is a hosting
 # or edge provider, which the provisioning-surface grep also enforces.
@@ -9691,12 +9701,22 @@ time_sync_offset() { # the measured system offset as chrony prints it
   chronyc -n tracking 2>/dev/null | sed -n 's/^System time[[:space:]]*:[[:space:]]*//p' | head -n 1
 }
 
+time_sync_nocerttimecheck_supported() { # 0 when the installed chrony documents it
+  local version major
+  version="$(chronyd --version 2>/dev/null | head -n 1 || true)"
+  major="$(printf '%s\n' "${version}" | sed -n 's/.*version[[:space:]]\{1,\}\([0-9][0-9]*\)\..*/\1/p')"
+  [ -n "${major}" ] && [ "${major}" -ge "${TIME_SYNC_NOCERTTIMECHECK_MIN_MAJOR}" ]
+}
+
 time_sync_install() { # install + enable chrony and render the config
   local tmp
   if ! command -v chronyc >/dev/null 2>&1; then
     log "Installing chrony (authenticated time sync: the anchor clock is a trust input, #281)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y -qq chrony >/dev/null || die "clock: apt-get install chrony failed - the anchor clock cannot be disciplined (#281)"
+  fi
+  if ! time_sync_nocerttimecheck_supported; then
+    die "clock: the installed chrony ($(chronyd --version 2>/dev/null | head -n 1 || true)) predates nocerttimecheck (chrony ${TIME_SYNC_NOCERTTIMECHECK_MIN_MAJOR}.0) - refusing to render a config it cannot honour (#281)"
   fi
   tmp="$(mktemp)"
   time_sync_render_conf >"$tmp"

@@ -3,10 +3,10 @@
 #
 # Extracts the REAL CLOCK DISCIPLINE span from scripts/010-provision.sh (never
 # a copy; same pattern as tests/os-updates) and proves:
-#   (a) the rendered chrony config authenticates its sources (NTS) and uses
-#       several of them, with a plain bootstrap pool FIRST so a wrong
-#       first-boot clock can still be stepped before NTS-KE needs a valid
-#       certificate chain;
+#   (a) the rendered chrony config authenticates EVERY source (NTS, several
+#       of them) and renders no plaintext NTP server or pool at all; the
+#       first-boot certificate-time problem is solved by nocerttimecheck, not
+#       by an unauthenticated source (chrony >= 4.0, refused otherwise);
 #   (b) provisioning refuses when the clock does not synchronize within
 #       TIME_SYNC_WAIT_SECONDS (300 s), and says why;
 #   (c) the wait is bounded by that constant (the loop never spins past it);
@@ -51,19 +51,25 @@ conf="$(time_sync_render_conf)"
 has "chrony config pins a drift file" "driftfile /var/lib/chrony/chrony.drift" "${conf}"
 has "chrony config steps a large first-boot offset" "makestep 1.0 3" "${conf}"
 has "chrony config keeps the RTC in sync" "rtcsync" "${conf}"
-has "chrony config carries a plain bootstrap pool" "pool 2.debian.pool.ntp.org iburst maxsources 2" "${conf}"
 has "chrony config authenticates NLnet Labs over NTS" "server nts.time.nl iburst nts" "${conf}"
 has "chrony config authenticates Netnod over NTS" "server nts.netnod.se iburst nts" "${conf}"
 has "chrony config authenticates PTB over NTS" "server ptbtime1.ptb.de iburst nts" "${conf}"
-pool_line="$(printf '%s\n' "${conf}" | grep -n '^pool ' | cut -d: -f1)"
-first_nts="$(printf '%s\n' "${conf}" | grep -n '^server .* nts$' | head -n 1 | cut -d: -f1)"
-if [ -n "${pool_line}" ] && [ -n "${first_nts}" ] && [ "${pool_line}" -lt "${first_nts}" ]; then
-  ok "the bootstrap pool is rendered before the NTS sources (first-boot certificate time)"
+has "chrony config relaxes the certificate time check for the first updates only" "nocerttimecheck 1" "${conf}"
+# TM-1/RT-3: a plaintext NTP source left in the config is a PERMANENT
+# unauthenticated clock (nothing retires it), so no pool or server line may
+# exist without nts. This fails at 941a4ec (the pool line is unconditional).
+plain_sources="$(printf '%s\n' "${conf}" | grep -E '^(pool|server|peer)[[:space:]]' | grep -v '[[:space:]]nts$' || true)"
+is "chrony config renders no plaintext NTP server or pool" "" "${plain_sources}"
+if printf '%s\n' "${conf}" | grep -qE '^pool[[:space:]]'; then
+  bad "chrony config still carries a plain NTP pool (a permanent unauthenticated source)"
 else
-  bad "the bootstrap pool is not before the NTS sources (pool=${pool_line:-none}, first nts=${first_nts:-none})"
+  ok "chrony config carries no plain NTP pool"
 fi
 nts_count="$(printf '%s\n' "${conf}" | grep -c '^server .* nts$' || true)"
 is "the config uses several authenticated sources (outlier rejection)" "3" "${nts_count}"
+# The first-boot relaxation is chrony 4.0+ only: an older box must be REFUSED
+# rather than rendered a directive its chrony silently ignores.
+is "the nocerttimecheck floor is the chrony version that documents it" "4" "${TIME_SYNC_NOCERTTIMECHECK_MIN_MAJOR}"
 is "the provisioning wait is the decided 300 s" "300" "${TIME_SYNC_WAIT_SECONDS}"
 
 # -- (b)/(c) the refusal and its bound -------------------------------------
@@ -78,6 +84,7 @@ chronyc() {
 }
 apt-get() { return 0; }
 systemctl() { return 0; }
+chronyd() { printf 'chronyd (chrony) version 4.6.1 (+CMDMON +NTP +NTS)\n'; }
 CHRONY_CONF="${WORK}/chrony.conf"
 # The span waits with the absolute `/usr/bin/env sleep 1`, so the wait is
 # measured, not stubbed: it must be bounded by the constant and never spin.
@@ -96,6 +103,16 @@ else
 fi
 is "the config was rendered to the pinned path" "yes" \
   "$([ -s "${CHRONY_CONF}" ] && echo yes || echo no)"
+
+# -- (a2) an older chrony is refused, never rendered a directive it lacks ---
+chronyd() { printf 'chronyd (chrony) version 3.4 (+CMDMON +NTP +RTC)\n'; }
+TIME_SYNC_WAIT_SECONDS=0
+rc=0
+old_out="$(time_sync_converge 2>&1)" || rc=$?
+is "a chrony older than nocerttimecheck refuses the provision" "1" "${rc}"
+has "the refusal names the installed chrony version" "version 3.4" "${old_out}"
+has "the refusal names the required directive" "nocerttimecheck" "${old_out}"
+chronyd() { printf 'chronyd (chrony) version 4.6.1 (+CMDMON +NTP +NTS)\n'; }
 
 # -- (e) install/enable posture --------------------------------------------
 # A file, not a variable: the converge runs in a subshell (its die exits).
