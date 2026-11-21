@@ -59,13 +59,17 @@ The fixture is JSON:
                                             # ISO stamp, stable across runs
                                             # (two-run view teeth)
       "versions": [{"key": "...", "version_id": "v1", "is_latest": true,
-                    "delete_marker": false, "ago": 60}],
+                    "delete_marker": false, "ago": 60,
+                    "etag": "d41d8cd98f00b204e9800998ecf8427e", "size": 100}],
       "uploads": [{"key": "...", "upload_id": "u1", "ago": 3600}]
     }
 
 `ago` is seconds before serve time, so the harness never does clock math.
 A `versions` entry with `delete_marker: true` is served as a `<DeleteMarker>`
-element (a hidden object); the other entries are `<Version>` elements.
+element (a hidden object); the other entries are `<Version>` elements, and
+their `etag`/`size` fields (default `mock`/1) are what the witness's
+object-rewritten comparison reads: two versions of one key with equal content
+hashes are a duplicate write, differing ones a rewrite.
 """
 
 import base64
@@ -578,7 +582,8 @@ class Handler(BaseHTTPRequestHandler):
         for entry in page:
             tag = "DeleteMarker" if entry.get("delete_marker") else "Version"
             extra = "" if tag == "DeleteMarker" else (
-                "<ETag>&quot;mock&quot;</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass>")
+                "<ETag>&quot;%s&quot;</ETag><Size>%s</Size><StorageClass>STANDARD</StorageClass>"
+                % (xml_escape(entry.get("etag", "mock")), xml_escape(entry.get("size", 1))))
             rows += (
                 "<%s><Key>%s</Key><VersionId>%s</VersionId><IsLatest>%s</IsLatest>"
                 "<LastModified>%s</LastModified>%s</%s>"
