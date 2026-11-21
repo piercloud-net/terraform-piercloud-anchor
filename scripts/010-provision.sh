@@ -4979,6 +4979,31 @@ CLOCK_BRACKET_MAX_SECONDS = 10.0
 # raises the ackable `clock-drift` alert, so drift shows up before it reaches
 # the skew edge that makes verdicts a coin-flip.
 CLOCK_DRIFT_BAND_SECONDS = 120
+# The day-bucketed commitment (#281 PR 2): one leaf per (family, UTC day) over
+# the audit families, so a day's evidence is committed by count plus a
+# mergeable digest, and an RFC 6962 root over the settled leaves is the O(1)
+# (root, size) pair the record carries. A day settles once it is older than the
+# settle horizon, so no legitimate late arrival can still move it; anything
+# that moves it afterwards is history-changed. Recordings carry no <ts>, so
+# they are covered by the exact recordings map instead (recording-vanished).
+COMMITMENT_VERSION = 1
+COMMITMENT_FAMILIES = ("event", "heartbeat", "session")
+# Bounded commitment state: 4096 leaves is ~3.7 years at three families a day.
+# Above the cap the log stops appending (loudly) instead of growing the sidecar
+# without bound; the already-committed history keeps being verified.
+COMMITMENT_MAX_LEAVES = 4096
+# Finding budgets: a day mismatch is one ackable identity per leaf, a rewrite
+# one per key, a vanished tar one per recording key. Above the budget the tail
+# folds into ONE overflow identity, so the signature still moves on an addition
+# inside the fold and the operator can ack the fold as one identity.
+COMMITMENT_FINDING_MAX = 64
+REWRITE_FINDING_MAX = 64
+VANISHED_FINDING_MAX = 64
+# A version listing's ETag is a content hash only for a single-part upload
+# (the MD5 hex). A multipart upload appends `-<parts>`, which commits to the
+# part boundaries too, so it is compared at (ETag, Size) level only and the
+# detail says so - the cheapest honest option that never GETs an object.
+CONTENT_ETAG_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 VERDICT_LOG_MAX_BYTES = 1 << 20  # verdict.log rotates once at 1 MiB (previous kept as .1)
 UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # The shipper's list-parseable UTC timestamp (pc-admin audit_ts: %Y%m%dT%H%M%SZ).
@@ -5671,6 +5696,72 @@ def utc_stamp(instant):
     return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def canonical_stamp(moment):
+    """The byte-stable UTC rendering the summary stores for an instant.
+
+    Byte-identical to the stock rendering of a UTC-aware datetime
+    (microseconds padded to six digits when present, omitted when zero,
+    "+00:00" offset), written out by hand because the provisioning-only CI
+    grep refuses the stock method's name. Shared by the summary serializer and
+    the commitment leaf input, so a re-serialized view hashes the same.
+    """
+    moment = moment.astimezone(timezone.utc)
+    text = moment.strftime("%Y-%m-%dT%H:%M:%S")
+    if moment.microsecond:
+        text = "%s.%06d" % (text, moment.microsecond)
+    return text + "+00:00"
+
+
+def _merkle_leaf_hash(data):
+    """RFC 6962 leaf hash: sha256(0x00 || data)."""
+    return hashlib.sha256(b"\x00" + data).digest()
+
+
+def _merkle_node_hash(left, right):
+    """RFC 6962 node hash: sha256(0x01 || left || right)."""
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+def _merkle_split(size):
+    """RFC 6962: the largest power of two strictly smaller than `size`."""
+    power = 1
+    while power * 2 < size:
+        power *= 2
+    return power
+
+
+def _merkle_root_of(hashes):
+    """Merkle tree hash over precomputed leaf hashes (RFC 6962 §2.1)."""
+    if not hashes:
+        return hashlib.sha256(b"").digest()
+    if len(hashes) == 1:
+        return hashes[0]
+    split = _merkle_split(len(hashes))
+    return _merkle_node_hash(_merkle_root_of(hashes[:split]), _merkle_root_of(hashes[split:]))
+
+
+def merkle_root(leaf_inputs):
+    """The RFC 6962 root over a list of leaf input bytes."""
+    return _merkle_root_of([_merkle_leaf_hash(data) for data in leaf_inputs])
+
+
+def merkle_prefix_intact(old_leaves, new_leaves, old_root, old_size):
+    """True when `new_leaves` only appended to `old_leaves`.
+
+    This is the append-only property the CT shape rests on, checked from the
+    leaves the witness already holds: the committed prefix must be unchanged
+    and must still hash to the committed root. The anchor-side exchange
+    (an O(log n) consistency proof carried on a signed heartbeat, verified
+    against the stored O(1) root+size) belongs to the CC phase; this is the
+    property that proof will carry, proven here against the real tree.
+    """
+    if old_size != len(old_leaves) or old_size > len(new_leaves):
+        return False
+    if list(new_leaves[:old_size]) != list(old_leaves):
+        return False
+    return merkle_root(old_leaves) == old_root
+
+
 def age_seconds(now, moment, label, skew_tolerance):
     """Signed age in seconds; a future timestamp beyond tolerance is an error."""
     age = int((now - moment).total_seconds())
@@ -6094,14 +6185,20 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
             if name == "Contents":
                 key = ""
                 last_modified = ""
+                size_text = ""
                 for field in child:
                     field_name = local_name(field.tag)
                     if field_name == "Key":
                         key = field.text or ""
                     elif field_name == "LastModified":
                         last_modified = field.text or ""
+                    elif field_name == "Size":
+                        size_text = (field.text or "").strip()
                 if key:
-                    entries.append((key, last_modified))
+                    # Size rides the page (the sweep's day buckets commit it);
+                    # the key->moment map stays two-element, because every
+                    # consumer of it (recordings, tails) reads only the clock.
+                    entries.append((key, last_modified, size_text))
             elif name == "IsTruncated":
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextContinuationToken":
@@ -6115,7 +6212,7 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
             # IsTruncated=false. Follow the token instead of reading the short
             # page as complete; the token-required guard below still applies.
             truncated = True
-        keys = [key for key, _ in entries]
+        keys = [entry[0] for entry in entries]
         ordered = all(before <= current for before, current in zip(keys, keys[1:]))
         crossed = (
             until is not None
@@ -6125,7 +6222,7 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
             and (not truncated or keys[0] < until or above_bound_stop)
         )
         page = []
-        for key, last_modified in entries:
+        for key, last_modified, size_text in entries:
             if until is not None and key >= until:
                 if crossed:
                     # The bound is proven exhausted: a complete ordered page
@@ -6147,7 +6244,7 @@ def list_objects(config, prefix, start_after="", max_pages=1000, until=None, abo
             if on_page is None:
                 objects[key] = moment
             else:
-                page.append((key, moment))
+                page.append((key, moment, int(size_text) if size_text.isdigit() else None))
         if on_page is not None and page:
             on_page(page)
         if not truncated:
@@ -6344,14 +6441,23 @@ def list_objects_range(config, prefix, after, until, max_pages=1000, on_page=Non
 
 
 def list_object_versions(config, prefix):
-    """ListObjectVersions -> [{key, version_id, last_modified}] delete markers.
+    """ListObjectVersions -> one entry per <Version>/<DeleteMarker>.
 
     Under B2 Object Lock a delete is a HIDE MARKER: the current object
     disappears from ListObjectsV2 while the locked version survives. The
     pipeline never deletes, so a delete marker under a watched prefix is
-    tamper evidence by construction. Noncurrent versions from legitimate
-    re-PUTs are not findings, and IsLatest is deliberately ignored: ANY delete
-    marker (not only the latest) means a delete happened. Metadata-only.
+    tamper evidence by construction. IsLatest is deliberately ignored for the
+    hide check: ANY delete marker (not only the latest) means a delete
+    happened.
+
+    Noncurrent <Version> elements are returned too (#281 PR 2). They are not
+    findings by themselves - a shipper retry after a lost PUT response leaves
+    two versions with identical content - but a second write of a key is never
+    legitimate (the shipper HEADs before PUT and writes a variant key on
+    conflict), so the caller compares the versions' content hashes: identical
+    content is an info-level duplicate write, differing content is an
+    object-rewritten alert. The listing carries ETag and Size, which is what
+    makes that comparison possible without GETting an object. Metadata-only.
     """
     markers = []
     key_marker = ""
@@ -6384,6 +6490,9 @@ def list_object_versions(config, prefix):
                 key = ""
                 version_id = ""
                 last_modified = ""
+                etag = ""
+                size_text = ""
+                is_latest = False
                 for field in child:
                     field_name = local_name(field.tag)
                     if field_name == "Key":
@@ -6392,13 +6501,29 @@ def list_object_versions(config, prefix):
                         version_id = field.text or ""
                     elif field_name == "LastModified":
                         last_modified = field.text or ""
-                if name == "DeleteMarker" and key:
-                    try:
-                        moment = parse_timestamp(last_modified)
-                    except ValueError:
-                        raise WitnessError(
-                            "delete marker %s has unparseable LastModified %r" % (key, last_modified))
-                    markers.append({"key": key, "version_id": version_id, "last_modified": moment})
+                    elif field_name == "ETag":
+                        etag = (field.text or "").strip().strip('"')
+                    elif field_name == "Size":
+                        size_text = (field.text or "").strip()
+                    elif field_name == "IsLatest":
+                        is_latest = (field.text or "").strip().lower() == "true"
+                if not key:
+                    continue
+                try:
+                    moment = parse_timestamp(last_modified)
+                except ValueError:
+                    raise WitnessError(
+                        "%s %s has unparseable LastModified %r"
+                        % ("delete marker" if name == "DeleteMarker" else "version", key, last_modified))
+                markers.append({
+                    "key": key,
+                    "version_id": version_id,
+                    "last_modified": moment,
+                    "delete_marker": name == "DeleteMarker",
+                    "is_latest": is_latest,
+                    "etag": etag,
+                    "size": int(size_text) if size_text.isdigit() else None,
+                })
             elif name == "IsTruncated":
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextKeyMarker":
@@ -6464,6 +6589,9 @@ def list_object_versions_range(config, prefix, after, until, max_pages=1000):
                 key = ""
                 version_id = ""
                 last_modified = ""
+                etag = ""
+                size_text = ""
+                is_latest = False
                 for field in child:
                     field_name = local_name(field.tag)
                     if field_name == "Key":
@@ -6472,8 +6600,15 @@ def list_object_versions_range(config, prefix, after, until, max_pages=1000):
                         version_id = field.text or ""
                     elif field_name == "LastModified":
                         last_modified = field.text or ""
+                    elif field_name == "ETag":
+                        etag = (field.text or "").strip().strip('"')
+                    elif field_name == "Size":
+                        size_text = (field.text or "").strip()
+                    elif field_name == "IsLatest":
+                        is_latest = (field.text or "").strip().lower() == "true"
                 if key:
-                    entries.append((name == "DeleteMarker", key, version_id, last_modified))
+                    entries.append((name == "DeleteMarker", key, version_id, last_modified,
+                                    etag, size_text, is_latest))
             elif name == "IsTruncated":
                 truncated = (child.text or "").strip().lower() == "true"
             elif name == "NextKeyMarker":
@@ -6484,19 +6619,27 @@ def list_object_versions_range(config, prefix, after, until, max_pages=1000):
                 raise WitnessError("ListObjectVersions %s returned an <Error> child (expected list entries)" % prefix)
         if not truncated and (next_key or next_version):
             truncated = True
-        keys = [key for _, key, _, _ in entries]
+        keys = [entry[1] for entry in entries]
         ordered = all(before <= current for before, current in zip(keys, keys[1:]))
         crossed = until is not None and bool(keys) and ordered and keys[-1] > until
-        for is_marker, key, version_id, last_modified in entries:
+        for is_marker, key, version_id, last_modified, etag, size_text, is_latest in entries:
             if until is not None and key > until:
                 continue
-            if is_marker:
-                try:
-                    moment = parse_timestamp(last_modified)
-                except ValueError:
-                    raise WitnessError(
-                        "delete marker %s has unparseable LastModified %r" % (key, last_modified))
-                markers.append({"key": key, "version_id": version_id, "last_modified": moment})
+            try:
+                moment = parse_timestamp(last_modified)
+            except ValueError:
+                raise WitnessError(
+                    "%s %s has unparseable LastModified %r"
+                    % ("delete marker" if is_marker else "version", key, last_modified))
+            markers.append({
+                "key": key,
+                "version_id": version_id,
+                "last_modified": moment,
+                "delete_marker": is_marker,
+                "is_latest": is_latest,
+                "etag": etag,
+                "size": int(size_text) if size_text.isdigit() else None,
+            })
         if crossed or not truncated:
             return markers
         if not next_key or not next_version:
@@ -6753,12 +6896,21 @@ class AuditFold(object):
     retained view stops carrying its interval structure.
     """
 
-    def __init__(self):
+    def __init__(self, commit=True):
         self.sessions = {}
         self.heartbeat = {"key": "", "last_modified": None, "drift": []}
         self.hot = {}
         self.recordings = {}
         self.count = 0
+        # The day-bucketed commitment (#281 PR 2): (family, UTC day) -> count
+        # plus an order-independent digest over the day's (key, LastModified,
+        # Size) triples. Only a SWEEP folds a listing from scratch, so only a
+        # sweep may build buckets (`commit`); a delta fold carries the retained
+        # commitment unchanged (`self.commitment`) because a delta never sees a
+        # deletion and must not rewrite what a sweep committed.
+        self.buckets = {}
+        self.commit = commit
+        self.commitment = None
         self.drift = {"contract": [], "unrecognized": []}
         self.drift_coarse = {"contract": None, "unrecognized": None}
         self.cursors = {"audit_heartbeat": "", "audit_session": "", "audit_session_dated": ""}
@@ -6769,10 +6921,38 @@ class AuditFold(object):
 
     # -- folding ----------------------------------------------------------
     def fold_page(self, entries, config, now, candidate_floor):
-        for key, moment in entries:
-            self.fold_key(key, moment, config, now, candidate_floor)
+        for entry in entries:
+            # A sweep's listing pages carry (key, LastModified, Size); the
+            # delta paths and the tests hand back (key, LastModified) pairs.
+            key, moment = entry[0], entry[1]
+            size = entry[2] if len(entry) > 2 else None
+            self.fold_key(key, moment, config, now, candidate_floor, size)
 
-    def fold_key(self, key, moment, config, now, candidate_floor):
+    def _bucket_add(self, family, day, key, moment, size):
+        """Commit one audit key into its (family, day) bucket.
+
+        The digest is a SUM of per-key sha256 values mod 2^256 (the same
+        mergeable, order-independent accumulator the drift coarse mode uses),
+        not a sha256 over a sorted key list: the sweep folds page by page and
+        range-splits across workers, so a day's keys arrive out of order and in
+        pieces, and materializing each day's key list is exactly the unbounded
+        memory this change removes. A sum still commits every key, its
+        LastModified and its Size: any re-PUT moves LastModified, and a swapped
+        pair of moments shifts the sum.
+        """
+        if not self.commit or not day:
+            return
+        canonical = "%s\x00%s\x00%s" % (
+            key, canonical_stamp(moment), "" if size is None else str(size))
+        chunk = int.from_bytes(hashlib.sha256(canonical.encode("utf-8")).digest(), "big")
+        bucket = self.buckets.get((family, day))
+        if bucket is None:
+            self.buckets[(family, day)] = {"count": 1, "digest": "%064x" % chunk}
+            return
+        bucket["count"] += 1
+        bucket["digest"] = "%064x" % ((int(bucket["digest"], 16) + chunk) % (1 << 256))
+
+    def fold_key(self, key, moment, config, now, candidate_floor, size=None):
         """Fold one audit key: classify it, validate its clock, accumulate."""
         # Every S3 timestamp the checks can read is validated once here, so
         # "any S3 timestamp more than the tolerance in the future -> error"
@@ -6797,6 +6977,7 @@ class AuditFold(object):
             if not key_ts_is_future(now, basename, config.clock_skew_tolerance):
                 if not self.cursors["audit_heartbeat"] or key > self.cursors["audit_heartbeat"]:
                     self.cursors["audit_heartbeat"] = key
+            self._bucket_add("heartbeat", match.group("ts")[:8], key, moment, size)
             current = self.heartbeat["last_modified"]
             if current is None or moment > current:
                 self.heartbeat["key"] = key
@@ -6809,6 +6990,7 @@ class AuditFold(object):
             return
         match = SESSION_KEY_RE.match(basename)
         if match:
+            self._bucket_add("session", match.group("ts")[:8], key, moment, size)
             self._fold_session_key(key, relative, basename, match, moment, config, now, candidate_floor)
             return
         generic = NON_SESSION_KEY_RE.match(basename)
@@ -6821,7 +7003,11 @@ class AuditFold(object):
             self._note_hot(key, generic.group("ts"), moment, candidate_floor)
             self._note_audit_cursor(key, relative, now, config)
             if not event_type.startswith("session.") or event_type in SID_LESS_SESSION_EVENTS:
-                return  # documented non-session (or known sid-less session) event
+                # A documented non-session (or known sid-less session) event:
+                # it has no per-session structure to check, so the day bucket
+                # is the only place its existence is committed.
+                self._bucket_add("event", generic.group("ts")[:8], key, moment, size)
+                return
         # Drift is judged by shape (a UUID-shaped sid or a session.* event
         # type), not by one literal substring: a rename that drops
         # "-session." but keeps the sid still fails closed.
@@ -6957,6 +7143,18 @@ class AuditFold(object):
         for name, value in other.cursors.items():
             if value and (not self.cursors[name] or value > self.cursors[name]):
                 self.cursors[name] = value
+        # A sweep's range branches each hold part of a day's keys: the count
+        # adds and the digest sums, so the merged bucket is exactly the bucket a
+        # single unsplit fold would have produced (the digest is a multiset
+        # hash for this reason).
+        for bucket_key, bucket in other.buckets.items():
+            mine = self.buckets.get(bucket_key)
+            if mine is None:
+                self.buckets[bucket_key] = {"count": bucket["count"], "digest": bucket["digest"]}
+                continue
+            mine["count"] += bucket["count"]
+            mine["digest"] = "%064x" % (
+                (int(mine["digest"], 16) + int(bucket["digest"], 16)) % (1 << 256))
         self.page_sample_keys.extend(other.page_sample_keys)
         for sid, summary in other.sessions.items():
             if sid in self.sessions:
@@ -7057,16 +7255,7 @@ class AuditFold(object):
 
     # -- serialization ----------------------------------------------------
     def to_summary(self, observed_out, hidden):
-        def stamp(moment):
-            # Byte-identical to the stock rendering of a UTC-aware datetime
-            # (microseconds padded to six digits when present, omitted when
-            # zero, "+00:00" offset), written out by hand because the
-            # provisioning-only CI grep refuses the stock method's name.
-            moment = moment.astimezone(timezone.utc)
-            text = moment.strftime("%Y-%m-%dT%H:%M:%S")
-            if moment.microsecond:
-                text = "%s.%06d" % (text, moment.microsecond)
-            return text + "+00:00"
+        stamp = canonical_stamp
 
         sessions = {}
         for sid, summary in self.sessions.items():
@@ -7117,6 +7306,10 @@ class AuditFold(object):
                  "last_modified": stamp(marker["last_modified"])}
                 for marker in hidden
             ],
+            # The committed day leaves (family, day, count, digest) in day
+            # order, with the O(1) root+size pair the record carries. A delta
+            # carries the retained commitment unchanged; a sweep replaces it.
+            "commitment": self.commitment,
         }
 
 
@@ -7148,6 +7341,185 @@ def drift_entries(fold, kind):
     if coarse is not None:
         return [], coarse
     return sorted(fold.drift[kind]), None
+
+
+def _day_settled(day, now, config):
+    """True when a UTC day is older than the settle horizon ('' day: False)."""
+    if not day or len(day) != 8 or not day.isdigit():
+        return False
+    try:
+        moment = datetime.strptime(day, "%Y%m%d").replace(tzinfo=timezone.utc)
+        end = moment + timedelta(days=1)
+        return end + timedelta(seconds=config.settle_horizon) <= now
+    except (ValueError, OverflowError):
+        return False
+
+
+def _commitment_leaf_input(family, day, count, digest):
+    """The bytes one leaf commits to (the day's count and its key digest)."""
+    return ("%d|%s|%s|%d|%s" % (COMMITMENT_VERSION, family, day, count, digest)).encode("utf-8")
+
+
+def _commitment_leaves(retained):
+    """The committed leaves of a retained commitment: {(family, day): {count, digest}}."""
+    leaves = {}
+    if not isinstance(retained, dict):
+        return leaves
+    for entry in retained.get("leaves") or []:
+        if (not isinstance(entry, list) or len(entry) != 4
+                or not isinstance(entry[0], str) or entry[0] not in COMMITMENT_FAMILIES
+                or not isinstance(entry[1], str)
+                or isinstance(entry[2], bool) or not isinstance(entry[2], int) or entry[2] < 0
+                or not isinstance(entry[3], str) or not re.fullmatch(r"[0-9a-f]{64}", entry[3])):
+            continue
+        leaves[(entry[0], entry[1])] = {"count": entry[2], "digest": entry[3]}
+    return leaves
+
+
+def _versions_identical(newest, older):
+    """`(basis, identical)` for two versions of one key, from the listing alone.
+
+    A single-part upload's ETag is the MD5 of the bytes, so two equal
+    single-part ETags prove identical content. A multipart ETag (`<hex>-<n>`)
+    commits to the part boundaries as well, and an opaque/absent ETag proves
+    nothing, so those are compared at (ETag, Size) level and the basis is
+    reported as such: the cheapest honest comparison that never reads an
+    object.
+    """
+    newest_etag = (newest.get("etag") or "").lower()
+    older_etag = (older.get("etag") or "").lower()
+    newest_size = newest.get("size")
+    older_size = older.get("size")
+    size_known = newest_size is not None and older_size is not None
+    if CONTENT_ETAG_RE.match(newest_etag) and CONTENT_ETAG_RE.match(older_etag):
+        basis = "content-exact (single-part ETag)"
+    else:
+        basis = "ETag and Size only (multipart or opaque ETag)"
+    if newest_etag and newest_etag == older_etag and (not size_known or newest_size == older_size):
+        return basis, True
+    return basis, False
+
+
+def build_commitment(fold, retained, now, config):
+    """Compare a sweep's day buckets with the committed leaves (#281 PR 2).
+
+    Returns `(commitment, finding_ids, alerts, infos)`. The commitment is the
+    leaf list (family, day, count, digest) in day order plus its RFC 6962 root
+    and size; the findings are the ackable `history-changed` identities of the
+    settled days that no longer match; the infos are operator-facing
+    disclosures (a cap freeze, a folded day).
+
+    A day is committed once it is older than the settle horizon, so no
+    legitimate late arrival (the shipper's retry hold is hours, the horizon is
+    7 days) can still move it. Anything that moves it afterwards is
+    history-changed: a count drop with no delete marker is a permanent version
+    delete after the Object Lock retention, a changed digest at the same count
+    is a rewrite (a re-PUT moves LastModified) or a swap, and GROWTH on a
+    settled day is a late arrival past the horizon - conservative on purpose,
+    evidence arriving more than a week late deserves a page. Sid-less events
+    and heartbeats can only be named at count level (the owner's call: no
+    per-day key archive on the anchor); session evidence is named precisely by
+    the same run's session checks.
+    """
+    observed = fold.buckets
+    committed = _commitment_leaves(retained)
+    finding_ids = []
+    alerts = []
+    infos = []
+    mismatches = []
+    for leaf_key in sorted(committed):
+        family, day = leaf_key
+        expected = committed[leaf_key]
+        seen = observed.get(leaf_key) or {"count": 0, "digest": "0" * 64}
+        if seen["count"] == expected["count"] and seen["digest"] == expected["digest"]:
+            continue
+        mismatches.append((family, day, expected, seen))
+    # New settled days append; an unsettled day is recomputed freely and never
+    # committed, so a normal late arrival inside the horizon is silent.
+    fresh = {}
+    for leaf_key, bucket in observed.items():
+        if leaf_key in committed:
+            continue
+        if not _day_settled(leaf_key[1], now, config):
+            continue
+        fresh[leaf_key] = bucket
+    days = {day for (_family, day) in committed} | {day for (_family, day) in fresh}
+    leaves = dict(committed)
+    for leaf_key, bucket in fresh.items():
+        leaves[leaf_key] = {"count": bucket["count"], "digest": bucket["digest"]}
+    if days:
+        # Gap-fill: every day in the committed range gets all three family
+        # slots, even at count 0. That is what keeps the log APPEND-ONLY - a
+        # late arrival on a day that held no keys of some family then updates
+        # an existing leaf (and alerts) instead of inserting a leaf in the
+        # middle of the tree, which would invalidate every later root. The
+        # walk is bounded to the last COMMITMENT_MAX_LEAVES // 3 days, so a
+        # forged ancient key cannot explode the sidecar.
+        cap_days = max(1, COMMITMENT_MAX_LEAVES // len(COMMITMENT_FAMILIES))
+        try:
+            newest = datetime.strptime(max(days), "%Y%m%d")
+        except (ValueError, OverflowError):
+            newest = None
+        if newest is not None:
+            oldest_allowed = (newest - timedelta(days=cap_days - 1)).strftime("%Y%m%d")
+            skipped = sorted(day for day in days if day < oldest_allowed)
+            if skipped:
+                infos.append(
+                    "commitment: %d day(s) older than %s are outside the committed window and were not gap-filled"
+                    % (len(skipped), oldest_allowed))
+            day = oldest_allowed if oldest_allowed > min(days) else min(days)
+            while day <= max(days) and len(leaves) < COMMITMENT_MAX_LEAVES:
+                for family in COMMITMENT_FAMILIES:
+                    leaves.setdefault((family, day), {"count": 0, "digest": "0" * 64})
+                try:
+                    day = (datetime.strptime(day, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+                except (ValueError, OverflowError):
+                    break
+    ordered = sorted(leaves.items())
+    if len(ordered) > COMMITMENT_MAX_LEAVES:
+        # The cap is ~3.7 years of settled days at three families a day. Past
+        # it the log FREEZES rather than dropping committed history: the
+        # already-committed days keep being verified, new days are no longer
+        # committed, and the freeze is said out loud on every run.
+        ordered = ordered[:COMMITMENT_MAX_LEAVES]
+        infos.append(
+            "commitment: the leaf cap (%d) is reached; days beyond it are no longer committed"
+            % COMMITMENT_MAX_LEAVES)
+    leaf_rows = [
+        [family, day, bucket["count"], bucket["digest"]]
+        for (family, day), bucket in ordered
+    ]
+    root = merkle_root([
+        _commitment_leaf_input(family, day, count, digest)
+        for family, day, count, digest in leaf_rows
+    ])
+    for family, day, expected, seen in mismatches[:COMMITMENT_FINDING_MAX]:
+        finding_ids.append(
+            "history-changed:%s:%s:%s" % (family, day, identity_digest(
+                [family, day, str(expected["count"]), expected["digest"]])))
+        if seen["count"] != expected["count"]:
+            change = "count %d -> %d" % (expected["count"], seen["count"])
+        else:
+            change = "digest %s -> %s" % (expected["digest"][:16], seen["digest"][:16])
+        alerts.append(
+            "history-changed: %s day %s %s "
+            "(a permanent delete after Object Lock retention, a rewrite, or a late arrival past the "
+            "%d-day settle horizon; sid-less events and heartbeats are named at count level)"
+            % (family, day, change, config.settle_horizon // 86400))
+    if len(mismatches) > COMMITMENT_FINDING_MAX:
+        folded = mismatches[COMMITMENT_FINDING_MAX:]
+        finding_ids.append("history-changed-overflow:" + identity_digest(
+            ["%s:%s" % (family, day) for family, day, _expected, _seen in folded]))
+        alerts.append(
+            "history-changed: %d further settled day(s) no longer match the commitment "
+            "(folded into one identity)" % len(folded))
+    commitment = {
+        "version": COMMITMENT_VERSION,
+        "root": root.hex(),
+        "size": len(leaf_rows),
+        "leaves": leaf_rows,
+    }
+    return commitment, finding_ids, alerts, infos
 
 
 def _collect_families(config, boundaries, now, fold):
@@ -7499,16 +7871,16 @@ def _delta_repair_sweep(config, observed, now):
     boundaries = observed.get("sweep_boundaries") if isinstance(observed.get("sweep_boundaries"), list) else []
     fold = AuditFold()
     recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(config, boundaries, now, fold)
-    hidden_objects = [
-        marker
-        for marker in audit_hidden + recording_hidden
-        if marker["key"].startswith(config.audit_prefix)
-        or marker["key"].startswith(config.recordings_prefix)
+    version_entries = [
+        entry
+        for entry in audit_hidden + recording_hidden
+        if entry["key"].startswith(config.audit_prefix)
+        or entry["key"].startswith(config.recordings_prefix)
     ]
     fold.recordings = dict(recording_objects or {})
     cursors = _cursors_from_listings(config, fold, recording_objects or {}, now)
     fold.finalize(now, config, cursors)
-    return fold, recording_objects, uploads, hidden_objects, cursors
+    return fold, recording_objects, uploads, version_entries, cursors
 
 
 def run_checks(config, now, plan):
@@ -7531,6 +7903,16 @@ def run_checks(config, now, plan):
     except OverflowError:
         candidate_floor = "19700101T000000Z"
     fold = None
+    # The version entries of THIS sweep's two version listings (#281 PR 2):
+    # every <Version> and <DeleteMarker> under a watched prefix. Delete
+    # markers feed the hidden-object check; a noncurrent <Version> feeds the
+    # object-rewritten comparison. Versions are sweep-only, so a delta carries
+    # the retained hidden set and never re-derives either.
+    version_entries = []
+    # The retained summary (the previous run's sidecar). A delta REQUIRES it;
+    # a sweep reads it best-effort, because it is what the commitment and the
+    # recordings map are compared against.
+    retained = plan.get("retained") if isinstance(plan.get("retained"), dict) else None
     # The recordings-discovery watermark (issue #228, red-team F1): a delta
     # lists the whole random-keyed prefix at most once per
     # `recordings_list_seconds`, so a per-run full listing cannot become an
@@ -7569,12 +7951,13 @@ def run_checks(config, now, plan):
         recording_objects, uploads, audit_hidden, recording_hidden = _collect_families(
             config, boundaries, now, fold)
         fold.recordings = dict(recording_objects or {})
-        hidden_objects = [
-            marker
-            for marker in audit_hidden + recording_hidden
-            if marker["key"].startswith(config.audit_prefix)
-            or marker["key"].startswith(config.recordings_prefix)
+        version_entries = [
+            entry
+            for entry in audit_hidden + recording_hidden
+            if entry["key"].startswith(config.audit_prefix)
+            or entry["key"].startswith(config.recordings_prefix)
         ]
+        hidden_objects = [entry for entry in version_entries if entry["delete_marker"]]
         view_dirty = True
         cursors = _cursors_from_listings(config, fold, recording_objects, now)
         fold.finalize(now, config, cursors)
@@ -7605,7 +7988,11 @@ def run_checks(config, now, plan):
         # the audit/heartbeat/session discovery in this run is unaffected.
         fold = fold_from_summary(summary, config)
         recording_objects = fold.recordings
-        hidden_objects = list(summary.get("hidden") or [])
+        # A retained hidden entry carries no `delete_marker` field (it IS a
+        # marker by construction), so the sweep's own field is defaulted true.
+        hidden_objects = [
+            dict(marker, delete_marker=marker.get("delete_marker", True))
+            for marker in (summary.get("hidden") or [])]
         uploads = list_uploads(config, config.recordings_prefix)
         heartbeat_cursor = cursors.get("audit_heartbeat") or ""
         session_cursor = cursors.get("audit_session") or ""
@@ -7685,7 +8072,9 @@ def run_checks(config, now, plan):
         except DeltaTooLong as exc:
             log("WARNING: delta listing overflowed (%s); falling back to a full sweep" % clip(exc, 200))
             plan["performed_sweep"] = True
-            fold, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+            fold, recording_objects, uploads, version_entries, cursors = _delta_repair_sweep(
+                config, observed, now)
+            hidden_objects = [entry for entry in version_entries if entry["delete_marker"]]
             new_audit = {}
             new_recordings = {}
             recordings_listed_epoch = now_epoch
@@ -7725,7 +8114,9 @@ def run_checks(config, now, plan):
             if violation:
                 log("WARNING: %s; repairing with a full sweep" % violation)
                 plan["performed_sweep"] = True
-                fold, recording_objects, uploads, hidden_objects, cursors = _delta_repair_sweep(config, observed, now)
+                fold, recording_objects, uploads, version_entries, cursors = _delta_repair_sweep(
+                    config, observed, now)
+                hidden_objects = [entry for entry in version_entries if entry["delete_marker"]]
                 new_audit = {}
                 new_recordings = {}
                 recordings_listed_epoch = now_epoch
@@ -7942,6 +8333,41 @@ def run_checks(config, now, plan):
         finding_ids.append(
             "contract-mismatch:" + drift_finding_id("unrecognized", unrecognized, unrecognized_coarse))
 
+    # A recording that was listed before and is gone now, with no delete marker
+    # in the version listing: under Object Lock that is a PERMANENT VERSION
+    # DELETE (only possible after the retention window), not a legitimate
+    # delete. The recordings map is exact, so the exact key can be named.
+    vanished = []
+    if run_mode == "sweep" and isinstance(retained, dict):
+        retained_recordings = retained.get("recordings")
+        if isinstance(retained_recordings, dict):
+            vanished = [key for key in retained_recordings if key not in recording_objects]
+            for key in vanished:
+                # Keep the expectation in the view: the finding then repeats
+                # every sweep with the same identity until the object is back
+                # (or the operator acks it) instead of firing exactly once, and
+                # the retained tar still satisfies its session's gap check, so
+                # the precise finding is the only one that fires.
+                recording_objects[key] = retained_recordings[key]
+                fold.recordings[key] = retained_recordings[key]
+    for key in sorted(vanished)[:VANISHED_FINDING_MAX]:
+        moment = fold.recordings.get(key)
+        sid_match = None
+        if key.startswith(config.recordings_prefix):
+            sid_match = RECORDING_KEY_RE.match(key[len(config.recordings_prefix):])
+        subject = sid_match.group("sid").lower() if sid_match else identity_digest([key])[:16]
+        alerts.append(
+            "recording-vanished: %s (last listed %s) is gone from the listing with no delete marker - "
+            "under Object Lock that is a permanent version delete after the retention window"
+            % (key, utc_stamp(moment) if isinstance(moment, datetime) else "unknown"))
+        finding_ids.append("recording-vanished:" + subject)
+    if len(vanished) > VANISHED_FINDING_MAX:
+        alerts.append(
+            "recording-vanished: %d further recording(s) are gone with no delete marker "
+            "(folded into one identity)" % (len(vanished) - VANISHED_FINDING_MAX))
+        finding_ids.append("recording-vanished-overflow:" + identity_digest(
+            sorted(vanished)[VANISHED_FINDING_MAX:]))
+
     # Completed recordings and in-progress uploads keyed by lowercased sid:
     # sessions are grouped case-insensitively, so an uppercase-sid tar or
     # upload must satisfy the gap check for the lowercased session id instead
@@ -8144,6 +8570,77 @@ def run_checks(config, now, plan):
             )
             finding_ids.append("open-upload-stale:" + sid)
 
+    # Noncurrent object versions (#281 PR 2, owner call 2): the shipper HEADs
+    # before PUT and writes a variant key on conflict, so a second version of
+    # one key is never a legitimate event. A retry after a lost PUT response
+    # leaves two versions with IDENTICAL content (an info-level duplicate-write
+    # record); anything else is a rewrite. The comparison is by content hash:
+    # a single-part upload's ETag IS the MD5 of the bytes, so it is
+    # content-exact; a multipart ETag appends `-<parts>` and commits to the
+    # part boundaries too, so those (and a missing/opaque ETag) are compared at
+    # (ETag, Size) level only and the detail says which basis was used. Never
+    # GET an object: the witness key is list-only by contract.
+    rewrites = []
+    duplicate_writes = []
+    if version_entries:
+        versions_by_key = {}
+        for entry in version_entries:
+            if entry["delete_marker"]:
+                continue
+            versions_by_key.setdefault(entry["key"], []).append(entry)
+        for key in sorted(versions_by_key):
+            versions = sorted(
+                versions_by_key[key],
+                key=lambda entry: (entry["last_modified"], entry["version_id"]))
+            if len(versions) < 2:
+                continue
+            newest = versions[-1]
+            for older in versions[:-1]:
+                basis, identical = _versions_identical(newest, older)
+                if identical:
+                    duplicate_writes.append((key, newest, older, basis))
+                else:
+                    rewrites.append((key, newest, older, basis))
+    for key, newest, older, basis in rewrites[:REWRITE_FINDING_MAX]:
+        alerts.append(
+            "object-rewritten: %s has %s version %s next to %s version %s and the content differs "
+            "(compared %s) - the shipper never writes one key twice, so a second write with different "
+            "content is a rewrite"
+            % (key, utc_stamp(newest["last_modified"]), clip(newest["version_id"], 40),
+               utc_stamp(older["last_modified"]), clip(older["version_id"], 40), basis))
+        finding_ids.append(
+            "object-rewritten:" + identity_digest(
+                [key, newest["version_id"], older["version_id"]]))
+    if len(rewrites) > REWRITE_FINDING_MAX:
+        alerts.append(
+            "object-rewritten: %d further rewritten key(s) (folded into one identity)"
+            % (len(rewrites) - REWRITE_FINDING_MAX))
+        finding_ids.append("object-rewritten-overflow:" + identity_digest(
+            sorted(key for key, _newest, _older, _basis in rewrites[REWRITE_FINDING_MAX:])))
+    for key, newest, older, basis in duplicate_writes[:REWRITE_FINDING_MAX]:
+        # Info only: an identical-content second version is a retry, not a
+        # rewrite. It never enters the finding set, so it can neither page nor
+        # move the signature; the run log and the ok detail carry it.
+        log("info: duplicate write of %s (%s version %s beside %s version %s, identical content by %s)"
+            % (clip(key, 120), utc_stamp(newest["last_modified"]), clip(newest["version_id"], 40),
+               utc_stamp(older["last_modified"]), clip(older["version_id"], 40), basis))
+
+    # The day-bucketed commitment (#281 PR 2). Only a sweep builds it: a delta
+    # never lists versions and never sees a deletion, so it carries the
+    # retained leaves unchanged. A seed is blind by construction and carries
+    # nothing.
+    commitment = None
+    commitment_infos = []
+    if run_mode == "sweep":
+        commitment, commitment_findings, commitment_alerts, commitment_infos = build_commitment(
+            fold, retained.get("commitment") if isinstance(retained, dict) else None, now, config)
+        alerts.extend(commitment_alerts)
+        finding_ids.extend(commitment_findings)
+        for line in commitment_infos:
+            log("WARNING: %s" % clip(line, 200))
+    elif isinstance(retained, dict) and isinstance(retained.get("commitment"), dict):
+        commitment = retained["commitment"]
+
     compact_blind = run_mode == "seed" or (
         run_mode == "delta" and bool((observed.get("coverage") or {}).get("compact_blind")))
     if compact_blind:
@@ -8191,6 +8688,9 @@ def run_checks(config, now, plan):
         "recordings_listed_epoch": recordings_listed_epoch,
         "boundaries": boundaries_out,
         "dirty": view_dirty,
+        # The day-bucketed commitment: the leaves (sidecar) and the O(1)
+        # (root, size) pair the record carries. None until the first sweep.
+        "commitment": commitment,
         # The bounded summary (never a per-key map) plus the hidden set and
         # the run's clock reading.
         "fold": fold if view_dirty else None,
@@ -8204,11 +8704,16 @@ def run_checks(config, now, plan):
         "ack_folded": ack_folded,
     }
     clock_line = "witness clock: anchor is %s B2" % render_clock_offset(clock_offset)
+    if commitment is not None:
+        clock_line = "%s; commitment root=%s size=%d" % (
+            clock_line, commitment["root"][:16], commitment["size"])
     if alerts:
         return "alert", "; ".join(alerts), finding_signature("alert", finding_ids), payload
     detail = "sessions=%d uploads=%d audit_objects=%d recordings_objects=%d heartbeat_age=%s; %s" % (
         len(sessions), len(uploads), fold.count, len(recording_objects),
         ("%ds" % heartbeat_age) if heartbeat_age is not None else "none", clock_line)
+    if duplicate_writes:
+        detail = "%s; duplicate writes: %d (identical content)" % (detail, len(duplicate_writes))
     return "ok", detail, finding_signature("ok", []), payload
 
 
@@ -8624,6 +9129,19 @@ def observed_problem(observed, record_run_seq, config=None, now=None):
             tolerance = config.clock_skew_tolerance if config is not None else 0
             if key_ts_is_future(now, value[len(prefixes[name]):], tolerance):
                 return "observed.cursors.%s is future-dated: %r" % (name, value)
+    commitment = observed.get("commitment")
+    if commitment is not None:
+        # The O(1) commitment pair (#281 PR 2). Absent is valid (a legacy block
+        # or a box that has not swept yet); a present one must be a 32-byte hex
+        # root and a leaf count, never a partial or a forged shape.
+        if not isinstance(commitment, dict):
+            return "observed.commitment is not a JSON object"
+        if not isinstance(commitment.get("root"), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", commitment.get("root") or ""):
+            return "observed.commitment.root is invalid: %r" % (commitment.get("root"),)
+        size = commitment.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return "observed.commitment.size is invalid: %r" % (size,)
     boundaries = observed.get("sweep_boundaries")
     if not isinstance(boundaries, list) or len(boundaries) > 32:
         return "observed.sweep_boundaries is invalid"
@@ -8675,6 +9193,19 @@ def build_observed(previous_observed, payload, now_epoch, run_seq, config):
             or legacy.get("recordings_listed_epoch", 0) or 0),
         "sweep_boundaries": payload.get("boundaries") or [],
     }
+    # The O(1) commitment state (#281 PR 2): the RFC 6962 root and the leaf
+    # count. The leaves themselves live in the sidecar (they are O(days), and
+    # state.json keeps its 1 MiB bound); this pair is what a future anchor-side
+    # verifier needs, and what the acceptance prints. Absent until the first
+    # sweep, and carried unchanged by a delta that did not rebuild it.
+    commitment = payload.get("commitment")
+    if isinstance(commitment, dict) and isinstance(commitment.get("root"), str):
+        observed["commitment"] = {
+            "root": commitment["root"],
+            "size": int(commitment.get("size") or 0),
+        }
+    elif isinstance(legacy.get("commitment"), dict):
+        observed["commitment"] = legacy["commitment"]
     if mode == "sweep":
         observed["last_sweep_ok_epoch"] = now_epoch
         observed["last_sweep_ok_run_seq"] = run_seq
@@ -8726,6 +9257,32 @@ def read_summary(path):
     heartbeat = data.get("heartbeat")
     if not isinstance(heartbeat, dict) or not isinstance(heartbeat.get("key"), str):
         raise WitnessError("summary heartbeat is not a JSON object")
+    # The day-bucketed commitment (#281 PR 2). Fail closed on every shape
+    # violation: the leaves are the expectation the next sweep compares
+    # against, so a partially trusted one could silently drop a settled day.
+    commitment = data.get("commitment")
+    if commitment is not None:
+        if not isinstance(commitment, dict):
+            raise WitnessError("summary commitment is not a JSON object")
+        if commitment.get("version") != COMMITMENT_VERSION:
+            raise WitnessError("summary commitment version is not %d" % COMMITMENT_VERSION)
+        leaves = commitment.get("leaves")
+        if not isinstance(leaves, list) or len(leaves) > COMMITMENT_MAX_LEAVES:
+            raise WitnessError("summary commitment leaves are invalid")
+        for entry in leaves:
+            if (not isinstance(entry, list) or len(entry) != 4
+                    or not isinstance(entry[0], str) or entry[0] not in COMMITMENT_FAMILIES
+                    or not isinstance(entry[1], str)
+                    or isinstance(entry[2], bool) or not isinstance(entry[2], int) or entry[2] < 0
+                    or not isinstance(entry[3], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", entry[3])):
+                raise WitnessError("summary commitment leaf is invalid: %r" % (entry,))
+        if not isinstance(commitment.get("root"), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", commitment.get("root") or ""):
+            raise WitnessError("summary commitment root is invalid")
+        if commitment.get("size") != len(leaves):
+            raise WitnessError("summary commitment size %r does not match its %d leaf(ves)" % (
+                commitment.get("size"), len(leaves)))
     try:
         data["recordings"] = {
             key: parse_timestamp(value) for key, value in data["recordings"].items()}
@@ -8771,8 +9328,14 @@ def write_summary(path, data):
 
 
 def fold_from_summary(summary, config):
-    """Rebuild the retained fold from a parsed summary (validated, fail-closed)."""
-    fold = AuditFold()
+    """Rebuild the retained fold from a parsed summary (validated, fail-closed).
+
+    `commit=False`: a delta never lists versions and never sees a deletion, so
+    it must not build day buckets. The retained commitment is carried through
+    unchanged (and re-serialized as-is), because only a sweep may move it.
+    """
+    fold = AuditFold(commit=False)
+    fold.commitment = summary.get("commitment")
     fold.count = int(summary.get("count") or 0)
     heartbeat = summary.get("heartbeat") or {}
     fold.heartbeat["key"] = str(heartbeat.get("key") or "")
@@ -9018,6 +9581,22 @@ def main():
                     plan = {"mode": "sweep"}
                 else:
                     plan = {"mode": "delta", "observed": observed, "summary": summary}
+    if plan.get("mode") == "delta" and isinstance(plan.get("summary"), dict):
+        # A delta carries its validated sidecar as the retained view, so a
+        # repair sweep inside the delta still compares against the committed
+        # leaves and the recordings map instead of starting blind.
+        plan["retained"] = plan["summary"]
+    elif config is not None and plan.get("mode") == "sweep":
+        # A sweep compares against the retained sidecar (the commitment leaves
+        # and the exact recordings map). Best effort: an unreadable or missing
+        # sidecar is not a failure here - the sweep rebuilds the view as found
+        # and the disclosure rides the run log.
+        try:
+            plan["retained"] = read_summary(summary_path)
+        except WitnessError as exc:
+            log("WARNING: retained summary unreadable, the sweep commits history as found: %s"
+                % clip(exc, 200))
+            plan["retained"] = None
 
     # One clock sample store per run: the offset is the median over THIS
     # run's B2 calls.

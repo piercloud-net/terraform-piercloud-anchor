@@ -268,7 +268,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1172
+MIN_CHECKS=1205
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -12430,6 +12430,282 @@ is "migration latch: the next run sweeps again (no delta from an unbuilt block)"
   "$(state_field observed.coverage.mode)"
 is "migration latch: the recovery sweep is green" "ok" "${CASE_STATE}"
 is "migration latch: the latch released" "False" "$(state_field observed.sweep_failed)"
+
+
+# ---- #281 PR 2: the day-bucketed commitment, history-changed, rewrites ----
+# The sweep commits one leaf per (family, UTC day) once the day is older than
+# the settle horizon, and keeps the RFC 6962 root plus the leaf count in the
+# record (O(1)). A settled day that changes afterwards is history-changed
+# (count drop, growth, or a digest change); a recording that vanishes from the
+# listing with no delete marker is recording-vanished; a second version of one
+# key is an object-rewritten alert when the content hash differs and an
+# info-level duplicate-write record when it does not.
+COMMIT_SETTLE_DAYS=40
+commit_day="$(python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=int(sys.argv[1]))).strftime("%Y%m%d"))' "$COMMIT_SETTLE_DAYS")"
+commit_fixture() { # $1 = variant: base|drop-event|moved-lm|grow|drop-tar|drop-session-key|late|rewrite|duplicate
+  python3 -I -B - "$HARNESS_DIR" "$commit_day" "$1" "$SID" <<'PY' | fixture
+import datetime
+import json
+import sys
+
+harness, day, variant, sid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sys.path.insert(0, harness)
+from shipper_keys import audit_key
+
+
+def at(stamp):
+    return "%s-%s-%sT%s:%s:%s.000Z" % (day[:4], day[4:6], day[6:8], stamp[:2], stamp[2:4], stamp[4:6])
+
+
+def event_key(seq, stamp):
+    return audit_key("user.login", day + "T" + stamp + "Z", "", seq, flat=True)
+
+
+objects = [
+    {"key": "audit/heartbeat/%sT120000Z.json" % day, "at": at("120000")},
+    {"key": audit_key("session.start", day + "T120000Z", sid, 0, "shell", flat=True), "at": at("120000")},
+    {"key": audit_key("session.data", day + "T120100Z", sid, 1, flat=True), "at": at("120100")},
+    {"key": audit_key("session.end", day + "T120200Z", sid, 2, "shell", flat=True), "at": at("120200")},
+    {"key": "recordings/%s.tar" % sid, "at": at("120300")},
+    {"key": event_key(5, "120100"), "at": at("120100")},
+    {"key": event_key(6, "120200"), "at": at("120200")},
+]
+if variant == "drop-event":
+    objects = [entry for entry in objects if not entry["key"].endswith("-user.login.5.json")]
+elif variant == "moved-lm":
+    for entry in objects:
+        if entry["key"].endswith("-user.login.5.json"):
+            entry["at"] = at("120900")
+elif variant == "grow":
+    objects.append({"key": event_key(9, "121000"), "at": at("121000")})
+elif variant == "drop-tar":
+    objects = [entry for entry in objects if not entry["key"].startswith("recordings/")]
+elif variant == "drop-session-key":
+    objects = [entry for entry in objects if ".%s.1.json" % sid not in entry["key"]]
+elif variant == "late":
+    recent = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    day_before = (recent - datetime.timedelta(days=1)).strftime("%Y%m%d")
+    objects.append({
+        "key": audit_key("user.login", day_before + "T" + recent.strftime("%H%M%S") + "Z", "", 9, flat=True),
+        "at": recent.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    })
+versions = []
+if variant in ("rewrite", "duplicate"):
+    key = event_key(5, "120100")
+    if variant == "duplicate":
+        etags = ("d41d8cd98f00b204e9800998ecf8427e", "d41d8cd98f00b204e9800998ecf8427e")
+    else:
+        etags = ("d41d8cd98f00b204e9800998ecf8427e", "0cc175b9c0f1b6a831c399e269772661")
+    versions = [
+        {"key": key, "version_id": "v1", "is_latest": False, "at": at("120100"),
+         "etag": etags[0], "size": 100},
+        {"key": key, "version_id": "v2", "is_latest": True, "at": at("120900"),
+         "etag": etags[1], "size": 100},
+    ]
+print(json.dumps({"bucket": "pc-admin-dr", "page_size": 50, "objects": objects,
+                  "versions": versions, "uploads": []}))
+PY
+}
+commit_run() { # $1 = state dir, $2 = variant; one sweep over that variant
+  commit_fixture "$2"
+  start_mock
+  RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS=3456000' run_case "$1"
+}
+commit_size() { # $1 = state dir; prints the committed leaf count
+  python3 -c '
+import json
+import sys
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    data = {}
+commitment = data.get("commitment") or {}
+print(commitment.get("size", "missing"))
+' "$1/summary.json" 2>/dev/null
+}
+commit_root() { # $1 = state dir; prints the committed RFC 6962 root
+  python3 -c '
+import json
+import sys
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    data = {}
+commitment = data.get("commitment") or {}
+print(commitment.get("root", "missing"))
+' "$1/summary.json" 2>/dev/null
+}
+commit_families() { # $1 = state dir; prints the sorted leaf families
+  python3 -c '
+import json
+import sys
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    data = {}
+commitment = data.get("commitment") or {}
+print(",".join(sorted(leaf[0] for leaf in commitment.get("leaves") or [])))
+' "$1/summary.json" 2>/dev/null
+}
+
+commit_dir="$WORK/state-commit"
+commit_run "$commit_dir" base
+is "commitment: the settled-day sweep is green" "ok" "$CASE_STATE"
+is "commitment: one leaf per family for the settled day" "3" "$(commit_size "$commit_dir")"
+is "commitment: the leaf list is the day's three family leaves" "event,heartbeat,session" \
+  "$(commit_families "$commit_dir")"
+commit_root_value="$(commit_root "$commit_dir")"
+commit_root_len="$(printf '%s' "$commit_root_value" | wc -c | tr -d ' ')"
+if [ "$commit_root_len" = "64" ]; then
+  ok "commitment: the RFC 6962 root is a 32-byte hex digest"
+else
+  bad "commitment: the root is $commit_root_value (expected 64 hex chars)"
+fi
+is "commitment: the record carries the O(1) root" "$commit_root_value" "$(state_field observed.commitment.root)"
+is "commitment: the record carries the leaf count" "3" "$(state_field observed.commitment.size)"
+case "$CASE_DETAIL" in
+  *"commitment root="*"size=3"*) ok "commitment: the ok detail prints the root and the leaf count" ;;
+  *) bad "commitment: the ok detail lost the commitment line: $CASE_DETAIL" ;;
+esac
+
+# (a) a settled sid-less key deleted with no delete marker: count level, as the
+# owner decided (no per-day key archive on the anchor).
+commit_run "$commit_dir" drop-event
+is "commitment: a deleted settled event alerts" "alert" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"history-changed: event day $commit_day count 2 -> 1"*)
+    ok "commitment: the deleted sid-less event is named at count level (count 2 -> 1)" ;;
+  *) bad "commitment: the deleted event detail reads: $CASE_DETAIL" ;;
+esac
+case "$(state_field ack_identities)" in
+  *"history-changed:"*) ok "commitment: history-changed is an ackable identity" ;;
+  *) bad "commitment: the history-changed finding has no ack identity" ;;
+esac
+is "commitment: the committed leaves do not move on a mismatch" "3" "$(commit_size "$commit_dir")"
+
+# (b) a re-PUT of a settled key (same count, moved LastModified): digest change.
+commit_run "$commit_dir" moved-lm
+is "commitment: a rewritten settled day alerts" "alert" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"history-changed: event day $commit_day digest "*) ok "commitment: the rewrite is a digest change at the same count" ;;
+  *) bad "commitment: the moved-LastModified detail reads: $CASE_DETAIL" ;;
+esac
+
+# (c) growth on a settled day (a key arriving more than the horizon late).
+commit_run "$commit_dir" grow
+is "commitment: growth on a settled day alerts" "alert" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"history-changed: event day $commit_day count 2 -> 3"*)
+    ok "commitment: growth is reported as a count change" ;;
+  *) bad "commitment: the growth detail reads: $CASE_DETAIL" ;;
+esac
+
+# (d) a late key INSIDE the settle horizon is not history-changed: the day is
+# still unsettled, so it is recomputed freely and never committed.
+commit_run "$commit_dir" late
+is "commitment: a late key inside the horizon stays green" "ok" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *history-changed*) bad "commitment: a within-horizon late key reported history-changed: $CASE_DETAIL" ;;
+  *) ok "commitment: a within-horizon late key adds no committed leaf" ;;
+esac
+is "commitment: the unsettled day adds no leaf" "3" "$(commit_size "$commit_dir")"
+
+# (e) a tar that vanishes with no delete marker: named exactly, and its session
+# is not also reported as a recording gap (the retained tar satisfies it).
+commit_run "$commit_dir" drop-tar
+is "commitment: a vanished recording alerts" "alert" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"recording-vanished: recordings/$SID.tar"*) ok "commitment: recording-vanished names the exact key" ;;
+  *) bad "commitment: the vanished recording detail reads: $CASE_DETAIL" ;;
+esac
+case "$CASE_DETAIL" in
+  *"recording-gap: shell session $SID"*) bad "commitment: a vanished tar double-fires recording-gap" ;;
+  *) ok "commitment: the vanished tar does not also fire recording-gap" ;;
+esac
+
+# (f) the session family still names its own evidence precisely: a deleted
+# mid-session key is a sequence-gap with the sid and the seq, not a day count.
+commit_run "$commit_dir" drop-session-key
+is "commitment: a deleted settled session key alerts" "alert" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"sequence-gap: session $SID missing <seq> 1-1"*) ok "commitment: the deleted session key is named by sid and seq" ;;
+  *) bad "commitment: the deleted session key detail reads: $CASE_DETAIL" ;;
+esac
+
+# (g) a delta carries the commitment unchanged: only a sweep may move it.
+commit_run "$commit_dir" base
+commit_before="$(state_field observed.commitment.root)"
+commit_fixture base
+start_mock
+RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_HEARTBEAT_MAX_AGE_SECONDS=3456000' run_delta "$commit_dir"
+is "commitment: the delta stays green" "ok" "$CASE_STATE"
+is "commitment: the delta does not move the committed root" "$commit_before" \
+  "$(state_field observed.commitment.root)"
+is "commitment: the delta keeps the leaf list" "3" "$(commit_size "$commit_dir")"
+
+# (h) a second version of one key with DIFFERENT content is a rewrite.
+commit_run "$commit_dir" rewrite
+is "commitment: a rewritten object version alerts" "alert" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"object-rewritten: audit/$commit_day"*"-user.login.5.json"*)
+    ok "commitment: object-rewritten names the key" ;;
+  *) bad "commitment: the object-rewritten detail reads: $CASE_DETAIL" ;;
+esac
+case "$CASE_DETAIL" in
+  *"content-exact (single-part ETag)"*) ok "commitment: the rewrite names the content-exact comparison" ;;
+  *) bad "commitment: the rewrite detail does not name its comparison basis: $CASE_DETAIL" ;;
+esac
+
+# (i) a second version with IDENTICAL content is an info-level duplicate write:
+# green, recorded in the detail, never in the finding set.
+commit_run "$commit_dir" duplicate
+is "commitment: a duplicate write stays green" "ok" "$CASE_STATE"
+case "$CASE_DETAIL" in
+  *"duplicate writes: 1"*) ok "commitment: the duplicate write is recorded in the ok detail" ;;
+  *) bad "commitment: the duplicate write is not recorded: $CASE_DETAIL" ;;
+esac
+case "$CASE_DETAIL" in
+  *object-rewritten*) bad "commitment: an identical-content second version read as a rewrite" ;;
+  *) ok "commitment: an identical-content second version is not a rewrite" ;;
+esac
+
+# (j) the append-only property the CT shape rests on, over the real tree.
+if python3 -I -B - "$WORK" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location(
+    "witness_merkle", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+leaves = [
+    module._commitment_leaf_input("event", "20261010", 2, "a" * 64),
+    module._commitment_leaf_input("heartbeat", "20261010", 1, "b" * 64),
+    module._commitment_leaf_input("session", "20261010", 3, "c" * 64),
+]
+root = module.merkle_root(leaves)
+if root.hex() != module.merkle_root(list(leaves)).hex():
+    raise SystemExit("the root is not deterministic")
+if module.merkle_root(leaves[:2]) == root:
+    raise SystemExit("a prefix hashed to the full-tree root")
+appended = leaves + [module._commitment_leaf_input("event", "20261011", 1, "d" * 64)]
+if not module.merkle_prefix_intact(leaves, appended, root, len(leaves)):
+    raise SystemExit("an append-only extension did not verify")
+changed = [leaves[0], leaves[1], b"x"] + appended[3:]
+if module.merkle_prefix_intact(leaves, changed, root, len(leaves)):
+    raise SystemExit("a changed old leaf still verified")
+if module.merkle_prefix_intact(leaves, appended, b"\x00" * 32, len(leaves)):
+    raise SystemExit("a forged old root still verified")
+if module.merkle_root([]).hex() != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855":
+    raise SystemExit("the empty tree does not hash to sha256()")
+PY
+then
+  ok "commitment: the tree is append-only verifiable (an append verifies, a changed old leaf and a forged root fail)"
+else
+  bad "commitment: the append-only property does not hold"
+fi
 
 # ---- wiring: the dispatch paths must carry the witness env -------------
 for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX \
