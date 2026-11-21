@@ -268,7 +268,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1172
+MIN_CHECKS=1185
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -2433,49 +2433,6 @@ run_case
 is "future heartbeat timestamp -> exit 2 (fail-closed)" "2" "${CASE_RC}"
 is "future heartbeat timestamp -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *"clock skew"*) ok "heartbeat skew detail names clock skew" ;; *) bad "heartbeat skew detail: ${CASE_DETAIL}" ;; esac
-# RT-4: a future-dated object is a CLOCK fault, so it must classify as cause
-# clock-skew - not as a generic exception:WitnessError, which would give the
-# same clock fault two tokens and delay a distinct WitnessError by a window.
-is "future heartbeat timestamp -> cause clock-skew, not a generic exception" \
-  "$(python3 - "${WORK}" <<'PY'
-import importlib.util
-import os
-import sys
-
-spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print(module.finding_signature("error", ["clock-skew", "sweep-latched"]))
-PY
-)" "$(state_field signature)"
-if python3 - "${WORK}" <<'PY'
-import importlib.util
-import os
-import sys
-
-spec = importlib.util.spec_from_file_location("wm_age", os.path.join(sys.argv[1], "witness_module.py"))
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
-future = now + module.timedelta(seconds=600)
-try:
-    module.age_seconds(now, future, "object", 300)
-except module.ClockSkewError as exc:
-    if module.error_cause_for(exc) != ["clock-skew"]:
-        raise SystemExit("a future timestamp did not classify as clock-skew")
-    if not isinstance(exc, module.WitnessError):
-        raise SystemExit("ClockSkewError must stay a WitnessError")
-except module.WitnessError:
-    raise SystemExit("a future timestamp raised a generic WitnessError")
-else:
-    raise SystemExit("a future timestamp did not raise")
-# Inside the tolerance it is still a plain age, never an exception.
-if module.age_seconds(now, now - module.timedelta(seconds=60), "object", 300) != 60:
-    raise SystemExit("a past timestamp did not yield its age")
-PY
-then ok "age_seconds: a future timestamp raises ClockSkewError (one cause token)"; else bad "age_seconds: a future timestamp is not classified as clock-skew"; fi
-
 fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
@@ -12475,6 +12432,59 @@ if module.clock_offset_seconds() is not None:
     raise SystemExit("an unparseable Date header was not skipped")
 PY
 then ok "clock bracket: the skip tests the bracket width (duration + 1 s), not the RTT"; else bad "clock bracket: the skip tests the request duration, not the bracket width"; fi
+
+# RT-4: a future-dated object is a CLOCK fault, so it must classify as cause
+# clock-skew - not as a generic exception:WitnessError, which would give the
+# same clock fault two tokens and delay a distinct WitnessError by a window.
+rt4_dir="${WORK}/state-future-object-cause"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":-3600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${rt4_dir}"
+is "future object: exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "future object: cause clock-skew, not a generic exception" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.finding_signature("error", ["clock-skew", "sweep-latched"]))
+PY
+)" "$(state_field signature)"
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm_age", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
+future = now + module.timedelta(seconds=600)
+try:
+    module.age_seconds(now, future, "object", 300)
+except module.ClockSkewError as exc:
+    if module.error_cause_for(exc) != ["clock-skew"]:
+        raise SystemExit("a future timestamp did not classify as clock-skew")
+    if not isinstance(exc, module.WitnessError):
+        raise SystemExit("ClockSkewError must stay a WitnessError")
+except module.WitnessError:
+    raise SystemExit("a future timestamp raised a generic WitnessError")
+else:
+    raise SystemExit("a future timestamp did not raise")
+# Inside the tolerance it is still a plain age, never an exception.
+if module.age_seconds(now, now - module.timedelta(seconds=60), "object", 300) != 60:
+    raise SystemExit("a past timestamp did not yield its age")
+PY
+then ok "age_seconds: a future timestamp raises ClockSkewError (one cause token)"; else bad "age_seconds: a future timestamp is not classified as clock-skew"; fi
 
 # (7) The cursor_version 1 -> 2 migration on a real (mock) bucket: the small
 # state.json decides, view.json is never read, the run is an ordinary sweep
