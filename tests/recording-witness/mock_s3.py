@@ -47,6 +47,8 @@ The fixture is JSON:
                                           # must fail closed on the missing
                                           # key marker)
       "fail_uploads": null | "malformed" | "error-doc" | "error-doc-in-list-root" | "truncated-no-token",
+      "date_omit": false,                   # optional; serve NO Date header at
+                                            # all (the clock-unverified path)
       "date_offset_seconds": 0,             # optional; shifts the served Date
                                             # header (the #281 clock self-check:
                                             # +400 must read as clock-skew, +150
@@ -148,6 +150,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # keep the harness output quiet
         pass
+
+    def send_response(self, code, message=None):
+        """Omit the Date header on demand (the #281 clock-unverified tooth).
+
+        Without a Date header no bracket is usable: the RT-2 hostile path. The
+        witness must report the clock as unverified, never stay green.
+        """
+        if not FIXTURE.get("date_omit"):
+            super().send_response(code, message)
+            return
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Server", self.version_string())
 
     def date_time_string(self, timestamp=None):
         """Serve the Date header with an optional fixture offset (#281).

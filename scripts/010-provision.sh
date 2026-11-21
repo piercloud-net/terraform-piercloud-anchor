@@ -5285,7 +5285,7 @@ ACK_FALLBACK_CLASS = "finding"
 # never a digest. Any class-only finding a future check emits must be added
 # here (the harness pins this tuple against the class-only finding ids the
 # checks actually append).
-ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale", "clock-drift")
+ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale", "clock-drift", "clock-unverified")
 # Per-run budget for the hidden-object identities. One id per delete-marker
 # identity is what makes the ack work on marker CHURN (a new marker is a new
 # id); a pathological marker set folds into ONE overflow id computed over the
@@ -7834,6 +7834,16 @@ def run_checks(config, now, plan):
     # (never a coin-flip that only trips when an object is in the future);
     # inside the tolerance but above the drift band it is an ackable alert.
     clock_offset = clock_offset_seconds()
+    if clock_offset is None:
+        # RT-2: no usable bracket is NOT a pass. An on-path attacker who keeps
+        # every signed response over CLOCK_BRACKET_MAX_SECONDS would otherwise
+        # remove the clock verdict this run exists to add, and the run would
+        # stay green. Report it as its own ackable state instead.
+        alerts.append(
+            "clock-unverified: no usable B2 Date bracket in this run (a response "
+            "without a Date header, or a bracket wider than %ds) - the clock "
+            "guards could not be evaluated" % int(CLOCK_BRACKET_MAX_SECONDS))
+        finding_ids.append("clock-unverified")
     if clock_offset is not None and abs(clock_offset) > config.clock_skew_tolerance:
         raise ClockSkewError(
             "witness clock: anchor is %s B2 (tolerance %ds) - the anchor clock is not disciplined"
@@ -9214,8 +9224,10 @@ def main():
         # cleared whenever the state is not error (Q2).
         "error_causes_notified": sorted(notified_causes) if state == "error" else [],
         # The run's median anchor-vs-B2 clock offset (None when no bracket was
-        # usable). Recorded so the acceptance can print it.
+        # usable), and whether the clock guards ran at all: a null offset is
+        # the explicit "clock unverified" state, never a silent pass.
         "clock_offset_seconds": clock_offset,
+        "clock_verified": clock_offset is not None,
     }
     if observed_out is not None:
         record["observed"] = observed_out
@@ -9622,7 +9634,9 @@ recording_witness_run_once() { # run one check now and surface the verdict
   # carries the offset and the verdict carries cause clock-skew.
   clock_offset="$(jq -r '.clock_offset_seconds // ""' "${RECORDING_WITNESS_STATE_DIR}/state.json" 2>/dev/null || true)"
   case "${clock_offset}" in
-    ""|null) ;;
+    ""|null)
+      log "witness clock: unverified (no usable B2 Date bracket this run; the clock guards did not run)"
+      ;;
     *)
       clock_word="$(python3 -c 'import sys
 value = float(sys.argv[1])

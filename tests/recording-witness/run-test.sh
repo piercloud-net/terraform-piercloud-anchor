@@ -12346,6 +12346,43 @@ case "${CASE_DETAIL}" in
   *) ok "clock clean: no clock finding below the band" ;;
 esac
 
+# RT-2: no usable Date bracket is NOT a pass. A path attacker who keeps every
+# signed response slow (or strips Date) would otherwise remove the clock
+# verdict entirely and leave the run green; the run must report the explicit
+# clock-unverified state instead.
+clock_unverified_dir="${WORK}/state-clock-unverified"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"date_omit":true,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${clock_unverified_dir}"
+is "clock unverified: no usable bracket -> exit 1 (never green)" "1" "${CASE_RC}"
+is "clock unverified: no usable bracket -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"clock-unverified: no usable B2 Date bracket"*) ok "clock unverified: the detail names the unverified clock" ;;
+  *) bad "clock unverified detail: ${CASE_DETAIL}" ;;
+esac
+is "clock unverified: the record says the clock was not verified" "False" \
+  "$(state_field clock_verified)"
+is "clock unverified: the record carries a null offset" "None" \
+  "$(state_field clock_offset_seconds)"
+is "clock unverified: the signature carries cause clock-unverified" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.finding_signature("alert", ["clock-unverified"]))
+PY
+)" "$(state_field signature)"
 
 # (7) The cursor_version 1 -> 2 migration on a real (mock) bucket: the small
 # state.json decides, view.json is never read, the run is an ordinary sweep
