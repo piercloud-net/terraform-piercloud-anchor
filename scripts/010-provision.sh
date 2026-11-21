@@ -5672,10 +5672,16 @@ def utc_stamp(instant):
 
 
 def age_seconds(now, moment, label, skew_tolerance):
-    """Signed age in seconds; a future timestamp beyond tolerance is an error."""
+    """Signed age in seconds; a future timestamp beyond tolerance is an error.
+
+    A future timestamp IS a clock fault, so it raises ClockSkewError (cause
+    `clock-skew`), never a generic WitnessError: the same anchor clock then
+    has one cause token instead of two, and a distinct clock fault is not
+    folded into the generic exception bucket (RT-4).
+    """
     age = int((now - moment).total_seconds())
     if age < -skew_tolerance:
-        raise WitnessError(
+        raise ClockSkewError(
             "%s timestamp %s is %ds in the future (clock skew beyond %ds)"
             % (label, utc_stamp(moment), -age, skew_tolerance)
         )
@@ -8931,6 +8937,10 @@ def main():
     # one-off full sweep that reports its OWN verdict, and the notify
     # bookkeeping is kept - so the upgrade adds no page and needs one dispatch.
     migration = False
+    # The validated legacy block, kept only so a FAILED migration sweep can
+    # still persist the sweep_failed latch (F1/RT-1): the block is discarded
+    # for the sweep itself, never for the record.
+    migration_block = None
     if previous_observed is not None and previous_observed.get("cursor_version") in LEGACY_CURSOR_VERSIONS:
         probe = dict(previous_observed)
         probe["cursor_version"] = CURSOR_VERSION
@@ -8939,6 +8949,7 @@ def main():
             observed_reason = migration_reason
         else:
             migration = True
+            migration_block = probe
             log("WARNING: observed cursor version %r is the pre-#281 layout; running the one-off migration sweep"
                 % (previous_observed.get("cursor_version"),))
             previous_observed = None
@@ -9175,6 +9186,18 @@ def main():
         observed_out = dict(observed_out)
         if plan.get("performed_sweep"):
             observed_out["sweep_failed"] = True
+    elif migration and migration_block is not None and plan.get("performed_sweep"):
+        # A failed migration sweep must persist the ordinary sweep_failed
+        # latch (F1/RT-1). The legacy block is discarded before the sweep, so
+        # without this the error record carries NO observed block and the
+        # next run cold-starts (a windowed seed at the production default of
+        # 13 h) instead of sweeping - the opposite of what docs and the
+        # design say. Carrying the validated block with cursor_version 2 and
+        # sweep_failed set makes every later run sweep until one succeeds;
+        # its cursors are never used, because the latch forces a sweep.
+        observed_out = dict(migration_block)
+        observed_out["cursor_version"] = CURSOR_VERSION
+        observed_out["sweep_failed"] = True
     record = {
         "version": STATE_VERSION,
         "state": state,

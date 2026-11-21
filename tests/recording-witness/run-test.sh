@@ -2433,6 +2433,48 @@ run_case
 is "future heartbeat timestamp -> exit 2 (fail-closed)" "2" "${CASE_RC}"
 is "future heartbeat timestamp -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *"clock skew"*) ok "heartbeat skew detail names clock skew" ;; *) bad "heartbeat skew detail: ${CASE_DETAIL}" ;; esac
+# RT-4: a future-dated object is a CLOCK fault, so it must classify as cause
+# clock-skew - not as a generic exception:WitnessError, which would give the
+# same clock fault two tokens and delay a distinct WitnessError by a window.
+is "future heartbeat timestamp -> cause clock-skew, not a generic exception" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.finding_signature("error", ["clock-skew", "sweep-latched"]))
+PY
+)" "$(state_field signature)"
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm_age", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
+future = now + module.timedelta(seconds=600)
+try:
+    module.age_seconds(now, future, "object", 300)
+except module.ClockSkewError as exc:
+    if module.error_cause_for(exc) != ["clock-skew"]:
+        raise SystemExit("a future timestamp did not classify as clock-skew")
+    if not isinstance(exc, module.WitnessError):
+        raise SystemExit("ClockSkewError must stay a WitnessError")
+except module.WitnessError:
+    raise SystemExit("a future timestamp raised a generic WitnessError")
+else:
+    raise SystemExit("a future timestamp did not raise")
+# Inside the tolerance it is still a plain age, never an exception.
+if module.age_seconds(now, now - module.timedelta(seconds=60), "object", 300) != 60:
+    raise SystemExit("a past timestamp did not yield its age")
+PY
+then ok "age_seconds: a future timestamp raises ClockSkewError (one cause token)"; else bad "age_seconds: a future timestamp is not classified as clock-skew"; fi
 
 fixture <<JSON
 {"bucket":"pc-admin-dr",
@@ -12411,11 +12453,16 @@ spec.loader.exec_module(module)
 print(module.finding_signature("error", ["listing-failed", "sweep-latched"]))
 PY
 )" "$(state_field signature)"
-# The migration discards the legacy block before it sweeps, so a failed
-# migration leaves an error record with NO observed block: the next run is a
-# cold start (a full sweep) rather than a delta from a block that was never
-# rebuilt. That is the latch, in this path's shape.
-is "migration latch: the failed migration left no block to delta from" "" "$(state_field observed)"
+# F1/RT-1: the migration discards the legacy block before it sweeps, so a
+# failed migration must still PERSIST the latch: the record carries the
+# validated legacy block with cursor_version 2 and sweep_failed set. Without
+# it the next run cold-starts (a windowed seed at the production 13 h
+# default) instead of sweeping, and the documented sweep_failed latch does
+# not exist.
+is "migration latch: the failed migration persisted the latch" "True" \
+  "$(state_field observed.sweep_failed)"
+is "migration latch: the persisted block is the migrated layout" "2" \
+  "$(state_field observed.cursor_version)"
 fixture <<JSON
 {"bucket":"pc-admin-dr","page_size":50,
  "objects":[
@@ -12425,9 +12472,14 @@ fixture <<JSON
  "uploads":[]}
 JSON
 start_mock
-run_delta "${latch_dir}"
-is "migration latch: the next run sweeps again (no delta from an unbuilt block)" "sweep" \
+# The production cold-start default (13 h): at 941a4ec the missing block makes
+# this run a windowed SEED; with the persisted latch it must be a full sweep.
+RECORDING_WITNESS_COLD_START_SECONDS=46800 run_delta "${latch_dir}"
+unset RECORDING_WITNESS_COLD_START_SECONDS
+is "migration latch: the next run sweeps again (no cold-start seed)" "sweep" \
   "$(state_field observed.coverage.mode)"
+is "migration latch: the recovery sweep is not a blind seed" "False" \
+  "$(state_field observed.coverage.compact_blind)"
 is "migration latch: the recovery sweep is green" "ok" "${CASE_STATE}"
 is "migration latch: the latch released" "False" "$(state_field observed.sweep_failed)"
 
