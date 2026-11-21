@@ -12016,6 +12016,60 @@ PY
 then ok "fold equivalence: sweep == paged == range-branch == prefix+delta (sessions, coverage, duplicates, hot tail)"; else bad "fold equivalence failed (the bounded summary cannot reproduce the sweep)"; fi
 
 
+# (4b) Hot-tail truncation is REPORTED, never silent (F3). Above the cap a
+# hot key that does not fit used to be dropped without a trace, and which keys
+# are dropped depends on listing order; the fold counts them, the summary
+# carries the count, and run_checks raises the ackable hot-tail-truncated
+# finding from it. The cap is lowered in-process (a 200k-key fixture would be
+# the only other way to reach it).
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+import types
+
+spec = importlib.util.spec_from_file_location("witness_hot", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+config = types.SimpleNamespace(
+    audit_prefix="audit/", recordings_prefix="recordings/", heartbeat_prefix="audit/heartbeat/")
+now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
+floor = "20260920T000000Z"
+module.HOT_TAIL_MAX_KEYS = 2
+fold = module.AuditFold()
+for index, ts in enumerate(("20260921T000000Z", "20260922T000000Z", "20260923T000000Z")):
+    fold._note_hot("audit/%s-session.data.9f8c0000-0000-4000-8000-000000000001.%d.json" % (ts, index),
+                   ts, now, floor)
+if fold.hot_dropped != 1:
+    raise SystemExit("the fold did not count the dropped hot key: %r" % (fold.hot_dropped,))
+if len(fold.hot) != 2:
+    raise SystemExit("the hot tail did not stop at the cap: %d" % len(fold.hot))
+summary = fold.to_summary({"generation": 1, "written_run_seq": 1}, [])
+if summary.get("hot_dropped") != 1:
+    raise SystemExit("the summary lost the dropped-key count: %r" % (summary.get("hot_dropped"),))
+back = module.fold_from_summary(summary, config)
+if back.hot_dropped != 1:
+    raise SystemExit("a delta fold lost the dropped-key count: %r" % (back.hot_dropped,))
+# A key below the floor is not a drop, and a healthy fold reports zero.
+below = module.AuditFold()
+below._note_hot("audit/20260101T000000Z-session.data.9f8c0000-0000-4000-8000-000000000001.1.json",
+                "20260101T000000Z", now, floor)
+if below.hot_dropped or below.hot:
+    raise SystemExit("a below-floor key was counted as a dropped hot key")
+# A malformed count fails the sidecar closed (the summary is the delta cache).
+for bad in (-1, "1", True):
+    try:
+        module.fold_from_summary(dict(summary, hot_dropped=bad), config)
+    except module.WitnessError:
+        continue
+    raise SystemExit("a %r hot_dropped value did not fail closed" % (bad,))
+if "hot-tail-truncated" not in module.ACK_CLASS_ONLY:
+    raise SystemExit("hot-tail-truncated is not an ackable class-only finding")
+PY
+then ok "hot-tail truncation: counted, carried in the summary, fails closed, ackable"; else bad "hot-tail truncation is silent or unserialized"; fi
+
+
 # (5) One page per error episode (#281 Q2). The rule: a new episode pages
 # once, a new CAUSE CLASS pages immediately, a shrinking/flipping cause set
 # stays quiet, the renotify window governs the repeat, an untrusted record's

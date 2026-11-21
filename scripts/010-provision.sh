@@ -5285,7 +5285,8 @@ ACK_FALLBACK_CLASS = "finding"
 # never a digest. Any class-only finding a future check emits must be added
 # here (the harness pins this tuple against the class-only finding ids the
 # checks actually append).
-ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale", "clock-drift", "clock-unverified")
+ACK_CLASS_ONLY = ("cold-start", "heartbeat-missing", "heartbeat-stale", "clock-drift",
+                  "clock-unverified", "hot-tail-truncated")
 # Per-run budget for the hidden-object identities. One id per delete-marker
 # identity is what makes the ack work on marker CHURN (a new marker is a new
 # id); a pathological marker set folds into ONE overflow id computed over the
@@ -6763,6 +6764,10 @@ class AuditFold(object):
         self.sessions = {}
         self.heartbeat = {"key": "", "last_modified": None, "drift": []}
         self.hot = {}
+        # Keys that wanted the hot tail but did not fit the cap. They are
+        # DISCLOSED, never silently dropped: the delta's dedup for them is
+        # sweep-bounded and which ones are dropped depends on listing order.
+        self.hot_dropped = 0
         self.recordings = {}
         self.count = 0
         self.drift = {"contract": [], "unrecognized": []}
@@ -6897,8 +6902,12 @@ class AuditFold(object):
     def _note_hot(self, key, ts, moment, candidate_floor):
         if not ts or candidate_floor is None:
             return
-        if ts >= candidate_floor and len(self.hot) < HOT_TAIL_MAX_KEYS:
+        if ts < candidate_floor:
+            return
+        if len(self.hot) < HOT_TAIL_MAX_KEYS:
             self.hot[key] = moment
+        else:
+            self.hot_dropped += 1
 
     def _note_audit_cursor(self, key, relative, now, config):
         tolerance = config.clock_skew_tolerance
@@ -7109,6 +7118,7 @@ class AuditFold(object):
             "generation": observed_out["generation"],
             "written_run_seq": observed_out["written_run_seq"],
             "count": self.count,
+            "hot_dropped": self.hot_dropped,
             "heartbeat": {
                 "key": self.heartbeat["key"],
                 "last_modified": stamp(self.heartbeat["last_modified"])
@@ -7834,6 +7844,16 @@ def run_checks(config, now, plan):
     # (never a coin-flip that only trips when an object is in the future);
     # inside the tolerance but above the drift band it is an ackable alert.
     clock_offset = clock_offset_seconds()
+    if fold.hot_dropped:
+        # F3: above the cap a hot key that does not fit used to be dropped in
+        # silence, and which keys are dropped depends on listing order. Report
+        # it as its own ackable finding (carried in the summary, so it stays
+        # reported until a sweep rebuilds the tail).
+        alerts.append(
+            "hot-tail-truncated: %d audit key(s) did not fit the hot tail (cap %d) - "
+            "delta dedup for them is sweep-bounded and the retained set depends on "
+            "listing order" % (fold.hot_dropped, HOT_TAIL_MAX_KEYS))
+        finding_ids.append("hot-tail-truncated")
     if clock_offset is None:
         # RT-2: no usable bracket is NOT a pass. An on-path attacker who keeps
         # every signed response over CLOCK_BRACKET_MAX_SECONDS would otherwise
@@ -8790,6 +8810,10 @@ def fold_from_summary(summary, config):
     """Rebuild the retained fold from a parsed summary (validated, fail-closed)."""
     fold = AuditFold()
     fold.count = int(summary.get("count") or 0)
+    dropped = summary.get("hot_dropped", 0)
+    if isinstance(dropped, bool) or not isinstance(dropped, int) or dropped < 0:
+        raise WitnessError("summary hot_dropped is invalid: %r" % (dropped,))
+    fold.hot_dropped = dropped
     heartbeat = summary.get("heartbeat") or {}
     fold.heartbeat["key"] = str(heartbeat.get("key") or "")
     fold.heartbeat["last_modified"] = heartbeat.get("last_modified")
