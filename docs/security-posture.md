@@ -6,6 +6,10 @@ This is the anchor repo's RT-1 standing-credential inventory: what long-lived cr
 
 The module provisions **no SSH access and no write-capable standing credentials for the anchor's infrastructure** — inbound or outbound. The one credential with a write surface is the ntfy publish token used by the alerting plane (row 2): it can publish to the tenant's notification topic, and nothing else. Nobody logs into the anchor: every change arrives through a per-run approved dispatch (the runner is the admin path), and the netcup device-flow token dies with the runner. Re-entry after the root lock is per-event; rescue mode stays the last resort and disables the netcup firewall (any rescue boot → rotate tang keys).
 
+## Outbound time sync (#281)
+
+The anchor disciplines its clock with chrony and **NTS only**: outbound TCP/4460 (NTS-KE) and UDP/123 (NTS-authenticated time packets) to three independent public time operators — NLnet Labs (`nts.time.nl`), Netnod (`nts.netnod.se`) and the German national metrology institute PTB (`ptbtime1.ptb.de`) — plus the resolver lookups those hostnames need. **No plaintext NTP server or pool is configured**, so the standing clock path is authenticated end to end; `nocerttimecheck 1` relaxes the certificate *time* check for the first clock update on a box whose clock is wrong, and every later sample is fully checked. This adds no credential, no inbound rule and no reach into another box, and `systemd-timesyncd` is masked so a package action cannot restore a second, unauthenticated clock owner. Disclosed residual: with NTS blocked the box has no clock source at all (provisioning refuses after 300 s; the witness reports `clock-skew` / `clock-unverified`).
+
 ## Standing-credential inventory
 
 | # | Credential | Where it lives | Capability | Blast radius if the anchor is compromised | Rotate / retire |
