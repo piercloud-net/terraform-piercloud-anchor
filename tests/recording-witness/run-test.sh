@@ -234,7 +234,9 @@ ROOT="$(cd "${HARNESS_DIR}/../.." && pwd)"
 PROVISION="${ROOT}/scripts/010-provision.sh"
 MOCK_S3="${HARNESS_DIR}/mock_s3.py"
 
-WORK="$(mktemp -d /tmp/recording-witness.XXXXXX)"
+# Honor TMPDIR (a shared box keeps its scratch space off /tmp); CI has it
+# unset and gets the conventional location.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/recording-witness.XXXXXX")"
 # No in-tree bytecode: a planted `__pycache__` entry (PEP 552 hash-based pyc
 # or a matching mtime/size header) is loaded instead of the source by the
 # normal imports, the `spec_from_file_location` loaders and the `python3 -I`
@@ -266,7 +268,7 @@ fail=0
 # CI ships shellcheck and runs the tooth), so the effective floor subtracts
 # the recorded skip (functional round-2 LOW: a 473-pass no-shellcheck run
 # hard-failed the 474 floor).
-MIN_CHECKS=1129
+MIN_CHECKS=1185
 SHELLCHECK_SKIPPED=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
@@ -1263,7 +1265,7 @@ cursors = existing.get("cursors") if isinstance(existing.get("cursors"), dict) e
 if not keep_cursors:
     cursors = {"audit_heartbeat": "", "audit_session": "", "recordings": ""}
 data["observed"] = {
-    "cursor_version": 1,
+    "cursor_version": 2,
     "generation": 1,
     "written_run_seq": run_seq,
     "last_sweep_ok_epoch": 0,
@@ -2431,7 +2433,6 @@ run_case
 is "future heartbeat timestamp -> exit 2 (fail-closed)" "2" "${CASE_RC}"
 is "future heartbeat timestamp -> error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in *"clock skew"*) ok "heartbeat skew detail names clock skew" ;; *) bad "heartbeat skew detail: ${CASE_DETAIL}" ;; esac
-
 fixture <<JSON
 {"bucket":"pc-admin-dr",
  "objects":[
@@ -4072,9 +4073,15 @@ PY
 then ok "stale pooled connection: one dropped attempt is followed by a served re-send"; else bad "stale-pool retry evidence missing"; fi
 
 # The displayed heartbeat age can tick across a whole second between two
-# runs (the bucket timestamps are second-resolution); the finding set is the
-# stable identity, so normalize only the age fragment before comparing.
-norm_detail() { printf '%s' "$1" | sed 's/heartbeat_age=[0-9]*s/heartbeat_age=X/'; }
+# runs (the bucket timestamps are second-resolution), and the clock line is a
+# median over that run's Date brackets (a 1 s Date resolution means the same
+# honest clock renders as "0 s" or "1 s ahead" on different runs). The finding
+# set is the stable identity, so normalize the age fragment and the clock
+# fragment before comparing; the clock's own teeth pin the wording.
+norm_detail() {
+  printf '%s' "$1" |
+    sed -e 's/heartbeat_age=[0-9]*s/heartbeat_age=X/' -e 's/; witness clock: anchor is [^;]*$//'
+}
 
 # Worker parity: the parallel family fan-out must not change the verdict,
 # detail or finding signature. Same fixture, fresh state dirs, workers 1 vs 4.
@@ -4159,13 +4166,16 @@ config = types.SimpleNamespace(
     recordings_prefix="recordings/",
     heartbeat_prefix="audit/heartbeat/",
     list_workers=4,
+    delta_overlap=0,
+    clock_skew_tolerance=300,
+    settle_horizon=604800,
 )
-module._collect_families(config, ["audit/mid"])
+module._collect_families(config, ["audit/mid"], module.datetime.now(module.timezone.utc), module.AuditFold())
 if seen.get("max_workers") != 4:
     raise SystemExit("configured workers=4 did not reach the executor (got %r)" % (seen.get("max_workers"),))
 seen.clear()
 config.list_workers = 1
-module._collect_families(config, ["audit/mid"])
+module._collect_families(config, ["audit/mid"], module.datetime.now(module.timezone.utc), module.AuditFold())
 if seen:
     raise SystemExit("workers=1 must stay serial (built a pool with max_workers=%r)" % seen.get("max_workers"))
 print("worker count: max_workers honored (4 -> pool, 1 -> serial)")
@@ -4726,7 +4736,7 @@ view_dir="${WORK}/state-badview"
 start_mock
 run_delta "${view_dir}"
 is "bad view: the warm sweep is green" "ok" "${CASE_STATE}"
-python3 - "${view_dir}/view.json" <<'PY'
+python3 - "${view_dir}/summary.json" <<'PY'
 import json
 import sys
 
@@ -4741,7 +4751,7 @@ run_delta "${view_dir}"
 is "bad view: exit 2 (repair, never green)" "2" "${CASE_RC}"
 is "bad view: error verdict" "error" "${CASE_STATE}"
 case "${CASE_DETAIL}" in
-  *"view.generation"*) ok "bad view: detail names the sidecar generation mismatch" ;;
+  *"summary.generation"*) ok "bad view: detail names the sidecar generation mismatch" ;;
   *) bad "bad view detail: ${CASE_DETAIL}" ;;
 esac
 is "bad view: the record is marked repaired" "True" "$(state_field repaired)"
@@ -5606,7 +5616,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
-data["observed"]["cursor_version"] = 2
+data["observed"]["cursor_version"] = 9
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(data, handle)
 PY
@@ -5902,7 +5912,7 @@ JSON
 start_mock
 run_delta "${delta_age_dir}"
 is "delta age: the warm sweep is green" "ok" "${CASE_STATE}"
-python3 - "${delta_age_dir}/view.json" <<'PY'
+python3 - "${delta_age_dir}/summary.json" <<'PY'
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -5910,9 +5920,9 @@ from datetime import datetime, timedelta, timezone
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 old = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()  # ci-allowlist: datetime.isoformat() is a stdlib call, not an SCP image reference.
-for key in list(data.get("audit_objects", {})):
-    if key.startswith("audit/heartbeat/"):
-        data["audit_objects"][key] = old
+# The retained summary carries the newest heartbeat (key + LastModified), not
+# a per-key heartbeat map (#281): age that one and the next delta reads it.
+data["heartbeat"]["last_modified"] = old
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(data, handle)
 PY
@@ -6609,12 +6619,12 @@ case "${CASE_DETAIL}" in
   *) bad "overlap disabled detail: ${CASE_DETAIL}" ;;
 esac
 is "overlap disabled: the run is still a delta (no repair)" "delta" "$(state_field observed.coverage.mode)"
-if python3 - "${late_off_dir}/view.json" "${LATE_START}" <<'PY'
+if python3 - "${late_off_dir}/summary.json" "${LATE_START}" <<'PY'
 import json
 import sys
 
 data = json.load(open(sys.argv[1], encoding="utf-8"))
-if sys.argv[2] in data.get("audit_objects", {}):
+if sys.argv[2] in data.get("hot", {}):
     raise SystemExit("the disabled overlap still merged the late key into the view")
 print("overlap disabled: the view never learned the late key")
 PY
@@ -11138,9 +11148,11 @@ def _fake_run_checks(config, now, plan):
             "dirty": True,
             "cursors": {"audit_heartbeat": "", "audit_session": "", "recordings": ""},
             "boundaries": [],
-            "audit_objects": {},
-            "recording_objects": {},
+            # A real (empty) fold: the #281 summary bookkeeping main() writes
+            # stays valid across the repeated main() calls this block drives.
+            "fold": module.AuditFold(),
             "hidden": [],
+            "clock_offset_seconds": None,
             "ack_ids": ack_ids,
             "ack_folded": ack_folded,
         },
@@ -11658,6 +11670,958 @@ print("signed_get refused 5 redirect codes; signed requests at the redirect orig
 PY
 then ok "signed S3 list GETs refuse redirects (no SigV4 Authorization forwarding)"; else bad "signed S3 redirect refusal failed"; fi
 
+
+# ---- #281: the bounded summary view, fold equivalence, paging, clock ------
+# The observed view is a bounded SUMMARY (per-session coverage + cursors + a
+# cursor-floor-bounded hot tail), never a per-key map, and the run mode is
+# decided by the small state.json (cursor_version 1 -> 2 is the one-off
+# migration). These teeth pin the bound, the fold equivalence it relies on,
+# the one-page-per-error-episode rule, the B2 Date-header clock self-check and
+# the migration trace.
+
+# (1) Bounded sidecar: the summary size follows the SESSION count, not the
+# key count. 200 sessions x 100 keys, then the same 200 sessions x 200 keys
+# (20k more keys): the sidecar must not grow with the keys, and 10 deltas must
+# not grow it either.
+bounded_dir="${WORK}/state-bounded-small"
+bounded_big_dir="${WORK}/state-bounded-big"
+bounded_fixture() { # $1 = data keys per session (200 sessions, recent stamps)
+  python3 -I -B - "${HARNESS_DIR}" "$1" <<'PY' | fixture
+import datetime
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from shipper_keys import audit_key
+
+per_session = int(sys.argv[2])
+# Inside the 7-day settle horizon, so every session stays UNFOLDED and the
+# summary keeps its exact coverage: the claim is about live structure.
+base = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)
+
+
+def stamp(offset):
+    return (base + datetime.timedelta(seconds=offset)).strftime("%Y%m%dT%H%M%SZ")
+
+
+objects = [{"key": "audit/heartbeat/%s.json" % stamp(0), "ago": 60}]
+for index in range(200):
+    sid = "%08x-0000-4000-8000-%012x" % (index, index)
+    objects.append({"key": audit_key("session.start", stamp(index), sid, 1, "shell", flat=True), "ago": 300})
+    for seq in range(2, per_session + 2):
+        objects.append({
+            "key": audit_key("session.data", stamp(index * 1000 + seq), sid, seq, flat=True),
+            "ago": 299,
+        })
+    objects.append({"key": "recordings/%s.tar" % sid, "ago": 297})
+print(json.dumps({"bucket": "pc-admin-dr", "page_size": 1000, "objects": objects, "uploads": []}))
+PY
+}
+bounded_summary_size() { # $1 = state dir; prints the sidecar byte size
+  wc -c <"$1/summary.json" 2>/dev/null | tr -d ' '
+}
+bounded_fixture 100
+start_mock
+RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=0' run_delta "${bounded_dir}"
+is "bounded sidecar: the 20k-key sweep is green" "ok" "${CASE_STATE}"
+bounded_small="$(bounded_summary_size "${bounded_dir}")"
+if [ -n "${bounded_small}" ] && [ "${bounded_small}" -lt 65536 ]; then
+  ok "bounded sidecar: 200 sessions / 20201 audit keys stay under 64 KiB (${bounded_small} B)"
+else
+  bad "bounded sidecar: 20k-key summary is ${bounded_small:-missing} B (bound 65536)"
+fi
+is "bounded sidecar: the fold counted every audit key" "20201" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["count"])' "${bounded_dir}/summary.json" 2>/dev/null)"
+bounded_fixture 200
+start_mock
+RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=0' run_delta "${bounded_big_dir}"
+is "bounded sidecar: the 40k-key sweep is green" "ok" "${CASE_STATE}"
+bounded_big="$(bounded_summary_size "${bounded_big_dir}")"
+if [ -n "${bounded_big}" ] && [ "${bounded_big}" -lt 65536 ] && [ "${bounded_big}" -le "$((bounded_small * 2))" ]; then
+  ok "bounded sidecar: doubling the keys (20201 -> 40201) does not grow the summary (${bounded_small} -> ${bounded_big} B)"
+else
+  bad "bounded sidecar: the summary grew with the key count (${bounded_small:-?} -> ${bounded_big:-?} B)"
+fi
+is "bounded sidecar: the doubled fold counted every audit key" "40201" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["count"])' "${bounded_big_dir}/summary.json" 2>/dev/null)"
+# The stamps are rendered by hand (the provisioning-only grep refuses the
+# stock method's name), so the shape is pinned here: every session start/end
+# and the heartbeat are UTC with a "+00:00" offset, and the reader parses
+# them back to the same instant.
+bounded_stamps="$(python3 -c '
+import json, re, sys
+data = json.load(open(sys.argv[1]))
+seen = []
+for entry in data["sessions"].values():
+    for key in ("start", "end"):
+        if entry.get(key):
+            seen.append(entry[key])
+if data.get("heartbeat", {}).get("last_modified"):
+    seen.append(data["heartbeat"]["last_modified"])
+shape = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{6})?\+00:00\Z")
+bad = [s for s in seen if not shape.match(s)]
+print("%d %d" % (len(seen), len(bad)))
+' "${bounded_big_dir}/summary.json" 2>/dev/null)"
+bounded_stamp_count="${bounded_stamps% *}"
+bounded_stamp_bad="${bounded_stamps#* }"
+if [ -n "${bounded_stamp_count}" ] && [ "${bounded_stamp_count:-0}" -gt 0 ] && [ "${bounded_stamp_bad}" = "0" ]; then
+  ok "bounded sidecar: every summary stamp is UTC +00:00 in the stock shape (${bounded_stamp_count} stamps)"
+else
+  bad "bounded sidecar: summary stamps are ${bounded_stamps:-unreadable} (expected N stamps, 0 off-shape)"
+fi
+# 10 deltas over the 20k-key fixture: each adds one heartbeat above the
+# cursor, so the summary is rewritten on every run and must stay bounded.
+bounded_fixture 100
+start_mock
+# run_case, not run_delta: this leg needs a FRESH sweep so the key count
+# baseline is the fixture, not the previous run's view.
+RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=0' run_case "${bounded_dir}"
+bounded_after_sweep="$(bounded_summary_size "${bounded_dir}")"
+bounded_ok=1
+bounded_fail=""
+for bounded_step in 1 2 3 4 5 6 7 8 9 10; do
+  python3 -I -B - "${FIXTURE}" "${bounded_step}" <<'PY'
+import datetime
+import json
+import sys
+
+path, step = sys.argv[1], int(sys.argv[2])
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+stamp = (datetime.datetime.now(datetime.timezone.utc)
+         - datetime.timedelta(seconds=120 - step)).strftime("%Y%m%dT%H%M%SZ")
+data["objects"].append({"key": "audit/heartbeat/%s.json" % stamp, "ago": 60})
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  start_mock
+  RECORDING_WITNESS_EXTRA_ENV='RECORDING_WITNESS_DELTA_OVERLAP_SECONDS=0' run_delta "${bounded_dir}"
+  if [ "${CASE_STATE}" != "ok" ] || [ "$(state_field observed.coverage.mode)" != "delta" ]; then
+    bounded_ok=0
+    bounded_fail="step ${bounded_step}: state=${CASE_STATE} mode=$(state_field observed.coverage.mode) detail=${CASE_DETAIL}"
+    break
+  fi
+done
+bounded_after_deltas="$(bounded_summary_size "${bounded_dir}")"
+is "bounded sidecar: 10 deltas all stay deltas and green" "1" "${bounded_ok}"
+if [ -n "${bounded_fail}" ]; then
+  bad "bounded sidecar: the delta loop broke at ${bounded_fail}"
+fi
+if [ -n "${bounded_after_deltas}" ] && [ "${bounded_after_deltas}" -lt 65536 ] \
+   && [ "${bounded_after_deltas}" -le "$((bounded_after_sweep + 4096))" ]; then
+  ok "bounded sidecar: 10 deltas do not grow the summary (${bounded_after_sweep} -> ${bounded_after_deltas} B)"
+else
+  bad "bounded sidecar: the deltas grew the summary (${bounded_after_sweep:-?} -> ${bounded_after_deltas:-?} B)"
+fi
+is "bounded sidecar: the delta fold still counts every audit key" "20211" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["count"])' "${bounded_dir}/summary.json" 2>/dev/null)"
+unset RECORDING_WITNESS_EXTRA_ENV
+
+
+# (2) Fold equivalence: one sweep fold == a paged fold == range-branch folds
+# == prefix fold + delta fold, over a key set that carries batched ranges, a
+# base/variant pair, a genuine same-seq duplicate, a sid-less event, a
+# heartbeat and a drift key. The retained identity set is what makes the
+# delta agree with the sweep.
+if python3 - "${WORK}" "${HARNESS_DIR}" <<'PY'
+import importlib.util
+import json
+import os
+import random
+import sys
+import types
+
+work, harness = sys.argv[1], sys.argv[2]
+sys.path.insert(0, harness)
+from shipper_keys import audit_key, disambiguate_key
+
+spec = importlib.util.spec_from_file_location("witness_fold", os.path.join(work, "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+config = types.SimpleNamespace(
+    audit_prefix="audit/", recordings_prefix="recordings/", heartbeat_prefix="audit/heartbeat/",
+    delta_overlap=86400, clock_skew_tolerance=300, settle_horizon=7 * 86400,
+)
+now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
+candidate_floor = (now - module.timedelta(
+    seconds=config.delta_overlap + 86400 + config.clock_skew_tolerance)).strftime("%Y%m%dT%H%M%SZ")
+
+sids = ["%08x-0000-4000-8000-%012x" % (index, index) for index in range(3)]
+entries = []
+
+
+def add(key, ago):
+    entries.append((key, now - module.timedelta(seconds=ago)))
+
+
+add("audit/heartbeat/20260925T140000Z.json", 60)
+for index, sid in enumerate(sids):
+    add(audit_key("session.start", "20260925T13%02d00Z" % (10 + index), sid, 1, "shell", flat=True), 300)
+    for seq in range(2, 8):
+        add(audit_key("session.data", "20260925T13%02d%02dZ" % (10 + index, seq), sid, seq, flat=True), 299)
+    # A batched range key covers its whole span as one identity.
+    add(audit_key("session.data", "20260925T13%02d20Z" % (10 + index), sid, 8, flat=True, seq_end=10), 298)
+    add(audit_key("session.end", "20260925T13%02d30Z" % (10 + index), sid, 11, "shell", flat=True), 297)
+    add("recordings/%s.tar" % sid, 296)
+# A replay-conflict variant of a real key: ONE identity with its base.
+base_key = audit_key("session.data", "20260925T140100Z", sids[0], 20, flat=True)
+add(base_key, 295)
+add(disambiguate_key(base_key, b"replayed bytes"), 295)
+# A genuine same-seq event at a different timestamp: a real duplicate.
+add(audit_key("session.data", "20260925T140200Z", sids[0], 20, flat=True), 294)
+# A documented sid-less event and a drift key.
+add(audit_key("session.rejected", "20260925T140300Z", "", 30, flat=True), 293)
+add("audit/notes.txt", 292)
+
+rng = random.Random(281)
+
+
+def fold_chunks(chunks):
+    fold = module.AuditFold()
+    for chunk in chunks:
+        fold.fold_page(chunk, config, now, candidate_floor)
+    return fold
+
+
+def finish(fold):
+    cursors = {name: fold.cursors[name] for name in fold.cursors}
+    fold.finalize(now, config, cursors)
+    return cursors
+
+
+def serialize(fold):
+    return fold.to_summary({"generation": 1, "written_run_seq": 1}, [])
+
+
+def chunked(size):
+    return [entries[index:index + size] for index in range(0, len(entries), size)]
+
+
+reference = fold_chunks([entries])
+final_cursors = finish(reference)
+reference_summary = serialize(reference)
+if not reference_summary["sessions"] or reference_summary["count"] != len(entries):
+    raise SystemExit("reference fold lost keys: %r of %d" % (reference_summary["count"], len(entries)))
+duplicates = 0
+for sid, entry in reference_summary["sessions"].items():
+    for low, high, count in entry.get("coverage") or []:
+        if count >= 2:
+            duplicates += count - 1
+if duplicates != 1:
+    raise SystemExit("reference fold found %d duplicates, expected 1" % duplicates)
+if not reference_summary["drift"]["contract"]["keys"]:
+    raise SystemExit("reference fold lost the drift key")
+
+# (a) page-sized folds must be byte-identical to the single-page fold.
+for size in (1, 2, 3, 7, len(entries)):
+    fold = fold_chunks(chunked(size))
+    finish(fold)
+    if serialize(fold) != reference_summary:
+        raise SystemExit("a %d-key page fold diverged from the sweep fold" % size)
+
+# (b) randomized page order and page sizes (listing order is not a contract;
+# the identity set must absorb base/variant either way).
+for _round in range(20):
+    shuffled = list(entries)
+    rng.shuffle(shuffled)
+    chunks = []
+    index = 0
+    while index < len(shuffled):
+        take = rng.randint(1, 9)
+        chunks.append(shuffled[index:index + take])
+        index += take
+    fold = fold_chunks(chunks)
+    finish(fold)
+    if serialize(fold) != reference_summary:
+        raise SystemExit("a randomized listing order diverged from the sweep fold")
+
+# (c) range-branch folds: split at random boundaries, fold each branch, merge.
+for _round in range(10):
+    boundaries = sorted(rng.sample(range(1, len(entries)), 2))
+    pieces = [entries[:boundaries[0]], entries[boundaries[0]:boundaries[1]], entries[boundaries[1]:]]
+    merged = module.AuditFold()
+    for piece in pieces:
+        merged.merge(fold_chunks([piece]))
+    finish(merged)
+    if serialize(merged) != reference_summary:
+        raise SystemExit("a range-branch fold diverged from the sweep fold")
+
+# (d) prefix fold + delta fold, through the sidecar: the delta must agree with
+# the sweep on sessions, coverage, duplicates and the hot tail.
+for cut in (1, 5, len(entries) // 2, len(entries) - 1):
+    prefix = fold_chunks([entries[:cut]])
+    prefix_cursors = finish(prefix)
+    # Through the REAL reader: the sidecar is parsed and validated exactly as
+    # a delta run does it (timestamps back to datetimes included).
+    sidecar = os.path.join(work, "fold-prefix-%d.json" % cut)
+    with open(sidecar, "w", encoding="utf-8") as handle:
+        json.dump(serialize(prefix), handle)
+    delta = module.fold_from_summary(module.read_summary(sidecar), config)
+    delta.fold_page(entries[cut:], config, now, candidate_floor)
+    # The delta advances each cursor exactly like run_checks does.
+    for name, value in delta.cursors.items():
+        if value and value > prefix_cursors.get(name, ""):
+            prefix_cursors[name] = value
+    delta.finalize(now, config, prefix_cursors)
+    if serialize(delta) != reference_summary:
+        raise SystemExit("the prefix(%d)+delta fold diverged from the sweep fold" % cut)
+
+print("fold equivalence: %d keys, 5 page sizes, 20 shuffled orders, 10 range splits, 4 prefix+delta cuts"
+      % len(entries))
+PY
+then ok "fold equivalence: sweep == paged == range-branch == prefix+delta (sessions, coverage, duplicates, hot tail)"; else bad "fold equivalence failed (the bounded summary cannot reproduce the sweep)"; fi
+
+
+# (4b) Hot-tail truncation is REPORTED, never silent (F3). Above the cap a
+# hot key that does not fit used to be dropped without a trace, and which keys
+# are dropped depends on listing order; the fold counts them, the summary
+# carries the count, and run_checks raises the ackable hot-tail-truncated
+# finding from it. The cap is lowered in-process (a 200k-key fixture would be
+# the only other way to reach it).
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+import types
+
+spec = importlib.util.spec_from_file_location("witness_hot", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+config = types.SimpleNamespace(
+    audit_prefix="audit/", recordings_prefix="recordings/", heartbeat_prefix="audit/heartbeat/")
+now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
+floor = "20260920T000000Z"
+module.HOT_TAIL_MAX_KEYS = 2
+fold = module.AuditFold()
+for index, ts in enumerate(("20260921T000000Z", "20260922T000000Z", "20260923T000000Z")):
+    fold._note_hot("audit/%s-session.data.9f8c0000-0000-4000-8000-000000000001.%d.json" % (ts, index),
+                   ts, now, floor)
+if fold.hot_dropped != 1:
+    raise SystemExit("the fold did not count the dropped hot key: %r" % (fold.hot_dropped,))
+if len(fold.hot) != 2:
+    raise SystemExit("the hot tail did not stop at the cap: %d" % len(fold.hot))
+summary = fold.to_summary({"generation": 1, "written_run_seq": 1}, [])
+if summary.get("hot_dropped") != 1:
+    raise SystemExit("the summary lost the dropped-key count: %r" % (summary.get("hot_dropped"),))
+back = module.fold_from_summary(summary, config)
+if back.hot_dropped != 1:
+    raise SystemExit("a delta fold lost the dropped-key count: %r" % (back.hot_dropped,))
+# A key below the floor is not a drop, and a healthy fold reports zero.
+below = module.AuditFold()
+below._note_hot("audit/20260101T000000Z-session.data.9f8c0000-0000-4000-8000-000000000001.1.json",
+                "20260101T000000Z", now, floor)
+if below.hot_dropped or below.hot:
+    raise SystemExit("a below-floor key was counted as a dropped hot key")
+# A malformed count fails the sidecar closed (the summary is the delta cache).
+for bad in (-1, "1", True):
+    try:
+        module.fold_from_summary(dict(summary, hot_dropped=bad), config)
+    except module.WitnessError:
+        continue
+    raise SystemExit("a %r hot_dropped value did not fail closed" % (bad,))
+if "hot-tail-truncated" not in module.ACK_CLASS_ONLY:
+    raise SystemExit("hot-tail-truncated is not an ackable class-only finding")
+PY
+then ok "hot-tail truncation: counted, carried in the summary, fails closed, ackable"; else bad "hot-tail truncation is silent or unserialized"; fi
+
+
+# (5) One page per error episode (#281 Q2). The rule: a new episode pages
+# once, a new CAUSE CLASS pages immediately, a shrinking/flipping cause set
+# stays quiet, the renotify window governs the repeat, an untrusted record's
+# bookkeeping is ignored (so it pages once), and a repaired record serves the
+# next run.
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+import types
+
+work = sys.argv[1]
+spec = importlib.util.spec_from_file_location("witness_paging", os.path.join(work, "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+captured = []
+
+
+class Response:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, hook):
+        self.hook = hook
+
+    def open(self, request, timeout=None):
+        return self.hook(request, timeout)
+
+
+def fake_urlopen(request, timeout=None):
+    captured.append(request)
+    return Response()
+
+
+module._NTFY_OPENER = FakeOpener(fake_urlopen)
+
+state_dir = os.path.join(work, "paging-state")
+os.environ.update({
+    "RECORDING_WITNESS_STATE_DIR": state_dir,
+    "RECORDING_WITNESS_ENDPOINT": "http://127.0.0.1:9",
+    "RECORDING_WITNESS_BUCKET": "pc-admin-dr",
+    "RECORDING_WITNESS_AUDIT_PREFIX": "audit/",
+    "RECORDING_WITNESS_RECORDINGS_PREFIX": "recordings/",
+    "RECORDING_WITNESS_KEY_ID": "k",
+    "RECORDING_WITNESS_KEY": "s",
+    "RECORDING_WITNESS_RENOTIFY_SECONDS": "1800",
+    "RECORDING_WITNESS_COLD_START_SECONDS": "0",
+    "NTFY_TOPIC": "pc-admin test",
+})
+for name in ("RECORDING_WITNESS_ACK_IDENTITIES", "RECORDING_WITNESS_QUIET_SIGNATURE"):
+    os.environ.pop(name, None)
+
+mode = {"kind": "witness"}
+plans = []
+
+
+def fake_run_checks(config, now, plan):
+    plans.append(plan.get("mode"))
+    if mode["kind"] == "skew":
+        raise module.ClockSkewError(
+            "witness clock: anchor is 400 s behind B2 (tolerance 300s)")
+    raise module.WitnessError("summary.generation 99 does not match observed.generation 1")
+
+
+module.run_checks = fake_run_checks
+
+
+def record():
+    # The CURRENT state dir from the environment: the migration leg below
+    # switches dirs, and a captured local would read the paging record.
+    with open(os.path.join(os.environ["RECORDING_WITNESS_STATE_DIR"], "state.json"),
+              encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def patch(mutate):
+    data = record()
+    mutate(data)
+    with open(os.path.join(os.environ["RECORDING_WITNESS_STATE_DIR"], "state.json"),
+              "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+
+
+# (a) an episode: six consecutive failing runs page exactly once.
+captured[:] = []
+codes = [module.main() for _ in range(6)]
+if codes != [2] * 6:
+    raise SystemExit("six failing runs did not all exit 2: %r" % (codes,))
+if len(captured) != 1:
+    raise SystemExit("six runs of one error episode pushed %d times (expected 1)" % len(captured))
+if record().get("error_causes_notified") != ["exception:WitnessError"]:
+    raise SystemExit("the landed push did not record its cause set: %r"
+                     % (record().get("error_causes_notified"),))
+
+# (b) a new cause class inside the episode pages immediately; flipping back to
+# the already-notified set stays quiet.
+mode["kind"] = "skew"
+codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("a new cause class did not page immediately (%d pushes)" % len(captured))
+if record().get("error_causes_notified") != ["clock-skew", "exception:WitnessError"]:
+    raise SystemExit("the new cause did not join the notified set: %r"
+                     % (record().get("error_causes_notified"),))
+mode["kind"] = "witness"
+codes.append(module.main())
+if len(captured) != 2:
+    raise SystemExit("flipping back to a notified subset pushed (%d)" % len(captured))
+
+# (c) the renotify window governs the repeat of an already-notified set.
+patch(lambda data: data.__setitem__("last_notify_epoch", int(data["last_notify_epoch"]) - 1801))
+codes.append(module.main())
+if len(captured) != 3:
+    raise SystemExit("the renotify window did not re-page an unchanged error (%d)" % len(captured))
+
+# (d) an unreadable state.json pages once; the repaired record serves the next
+# run (the same cause set is already notified).
+with open(os.path.join(state_dir, "state.json"), "w", encoding="utf-8") as handle:
+    handle.write("{not json")
+captured[:] = []
+codes = [module.main(), module.main()]
+if codes != [2, 2]:
+    raise SystemExit("an unreadable state did not fail closed twice: %r" % (codes,))
+if len(captured) != 1:
+    raise SystemExit("an unreadable state pushed %d times across two runs (expected 1)" % len(captured))
+if "state-unreadable" not in record().get("error_causes_notified", []):
+    raise SystemExit("the unreadable-state push did not record state-unreadable: %r"
+                     % (record().get("error_causes_notified"),))
+
+# (e) a parseable record whose bookkeeping is out of the enum is NOT trusted:
+# it behaves as an empty record, so the run pages once.
+def forge(data):
+    data["state"] = "error"
+    data["signature"] = "sha256:" + "a" * 64
+    data["last_notify_signature"] = "sha256:" + "a" * 64
+    data["last_notify_epoch"] = int(data.get("last_notify_epoch") or 0) + 3600
+    data["error_causes_notified"] = ["bogus-cause"]
+patch(forge)
+captured[:] = []
+codes = [module.main()]
+if len(captured) != 1:
+    raise SystemExit("a forged out-of-enum cause list was trusted (%d pushes)" % len(captured))
+
+# (7) The cursor_version 1 -> 2 migration: a KNOWN legacy block is a one-off
+# sweep with the sweep's OWN verdict, no repaired marker, no push when the
+# previous state and signature match, and view.json removed after both new
+# files land. A second run is a delta.
+def migrate_payload(now, plan):
+    fold = module.AuditFold()
+    return ("ok", "sessions=0 uploads=0 audit_objects=0 recordings_objects=0 heartbeat_age=none",
+            "sha256:" + "b" * 64,
+            {
+                "mode": "sweep",
+                "window_start": None,
+                "dirty": True,
+                "cursors": {"audit_heartbeat": "", "audit_session": "",
+                            "audit_session_dated": "", "recordings": ""},
+                "boundaries": [],
+                "fold": fold,
+                "hidden": [],
+                "clock_offset_seconds": 0.0,
+                "ack_ids": [],
+                "ack_folded": 0,
+            })
+
+
+migrate_dir = os.path.join(work, "migration-state")
+os.environ["RECORDING_WITNESS_STATE_DIR"] = migrate_dir
+
+
+def migrate_checks(config, now, plan):
+    plans.append(plan.get("mode"))
+    return migrate_payload(now, plan)
+
+
+module.run_checks = migrate_checks
+plans[:] = []
+captured[:] = []
+codes = [module.main()]
+if codes != [0]:
+    raise SystemExit("the seeding sweep did not return ok: %r" % (codes,))
+with open(os.path.join(migrate_dir, "view.json"), "w", encoding="utf-8") as handle:
+    # The legacy sidecar: never read again, and removed after the migration.
+    handle.write('{"legacy": "view"}')
+
+
+def downgrade(data):
+    data["observed"]["cursor_version"] = 1
+    data["state"] = "ok"
+    data["signature"] = "sha256:" + "b" * 64
+    data["last_notify_signature"] = "sha256:" + "b" * 64
+    data["last_notify_epoch"] = int(data.get("last_notify_epoch") or 0)
+    data["error_causes_notified"] = []
+
+
+patch(downgrade)
+plans[:] = []
+captured[:] = []
+codes = [module.main()]
+if codes != [0]:
+    raise SystemExit("the migration sweep did not report the sweep verdict: %r" % (codes,))
+if plans != ["sweep"]:
+    raise SystemExit("the migration run was not a full sweep: %r" % (plans,))
+if captured:
+    raise SystemExit("the migration run pushed %d time(s) on a matching state+signature" % len(captured))
+migrated = record()
+if migrated.get("repaired"):
+    raise SystemExit("the migration run set repaired (it is a known legacy block, not corruption)")
+if migrated["observed"].get("cursor_version") != 2:
+    raise SystemExit("the migration run did not write cursor_version 2: %r"
+                     % (migrated["observed"].get("cursor_version"),))
+if migrated.get("state") != "ok":
+    raise SystemExit("the migration run did not report the sweep's own verdict: %r" % (migrated.get("state"),))
+if os.path.exists(os.path.join(migrate_dir, "view.json")):
+    raise SystemExit("the migration run left view.json behind")
+if not os.path.exists(os.path.join(migrate_dir, "summary.json")):
+    raise SystemExit("the migration run did not write summary.json")
+plans[:] = []
+module.main()
+if plans != ["delta"]:
+    raise SystemExit("the run after the migration was not a delta: %r" % (plans,))
+
+print("paging: 6-run episode=1 push, new cause=1, flip back=0, renotify=1, "
+      "unreadable=1 then 0, forged bookkeeping=1; migration: 0 pushes, no repaired, "
+      "cursor_version 2, view.json removed, next run a delta")
+PY
+then ok "one page per error episode (new cause pages, subset/flip quiet, renotify, untrusted record) + the v1->v2 migration is a silent sweep"; else bad "error-episode paging or the cursor migration failed"; fi
+
+
+# (6) The B2 Date-header clock self-check (#281 Q3): the anchor's own clock is
+# a trust input, so a disciplined cross-check turns the coin-flip ("did any
+# listed object happen to be in the future?") into a deterministic verdict.
+# 400 s -> error with cause clock-skew; 150 s -> the ackable clock-drift
+# alert; 0 s -> green with the clock line and no finding.
+clock_dir="${WORK}/state-clock-skew"
+clock_drift_dir="${WORK}/state-clock-drift"
+clock_clean_dir="${WORK}/state-clock-clean"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"date_offset_seconds":400,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${clock_dir}"
+is "clock skew: 400 s behind B2 -> exit 2" "2" "${CASE_RC}"
+is "clock skew: 400 s behind B2 -> error verdict" "error" "${CASE_STATE}"
+# The Date bracket is 1 s resolution plus RTT, so the rendered offset may sit
+# a second off the injected one; the SHAPE and the band are what is pinned.
+case "${CASE_DETAIL}" in
+  *"witness clock: anchor is"*"s behind B2"*) ok "clock skew: the detail names the measured offset" ;;
+  *) bad "clock skew detail: ${CASE_DETAIL}" ;;
+esac
+clock_detail_seconds="${CASE_DETAIL#*anchor is }"
+clock_detail_seconds="${clock_detail_seconds%% s behind B2*}"
+if [ -n "${clock_detail_seconds}" ] && [ "${clock_detail_seconds}" -ge 398 ] && [ "${clock_detail_seconds}" -le 402 ]; then
+  ok "clock skew: the detail's offset is within a second of the injected 400 s (${clock_detail_seconds} s)"
+else
+  bad "clock skew: the detail's offset is ${clock_detail_seconds:-missing} s (expected about 400)"
+fi
+clock_recorded="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("clock_offset_seconds")))' "${clock_dir}/state.json" 2>/dev/null)"
+# The Date bracket is 1 s resolution plus RTT, so the recorded median may sit a
+# second off the injected offset; the bound is what matters, not the last digit.
+if [ -n "${clock_recorded}" ] && [ "${clock_recorded}" -ge -402 ] && [ "${clock_recorded}" -le -398 ]; then
+  ok "clock skew: the record carries the measured offset (${clock_recorded} s)"
+else
+  bad "clock skew: the recorded offset is ${clock_recorded:-missing} s (expected about -400)"
+fi
+is "clock skew: the error signature carries cause clock-skew" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+# The sweep completed before the clock verdict, so the run also latches
+# (a run with no verdict must not leave a block the next run would delta from).
+print(module.finding_signature("error", ["clock-skew", "sweep-latched"]))
+PY
+)" "$(state_field signature)"
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"date_offset_seconds":150,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${clock_drift_dir}"
+is "clock drift: 150 s behind B2 -> exit 1 (the ackable band)" "1" "${CASE_RC}"
+is "clock drift: 150 s behind B2 -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *clock-drift*"anchor clock is"*"s behind B2"*) ok "clock drift: the detail names clock-drift and the offset" ;;
+  *) bad "clock drift detail: ${CASE_DETAIL}" ;;
+esac
+
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${clock_clean_dir}"
+is "clock clean: a disciplined clock stays green" "ok" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"witness clock: anchor is"*) ok "clock clean: the ok detail carries the clock line" ;;
+  *) bad "clock clean detail: ${CASE_DETAIL}" ;;
+esac
+case "${CASE_DETAIL}" in
+  *clock-drift*) bad "clock clean: a 0 s offset raised clock-drift" ;;
+  *) ok "clock clean: no clock finding below the band" ;;
+esac
+
+# RT-2: no usable Date bracket is NOT a pass. A path attacker who keeps every
+# signed response slow (or strips Date) would otherwise remove the clock
+# verdict entirely and leave the run green; the run must report the explicit
+# clock-unverified state instead.
+clock_unverified_dir="${WORK}/state-clock-unverified"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"date_omit":true,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${clock_unverified_dir}"
+is "clock unverified: no usable bracket -> exit 1 (never green)" "1" "${CASE_RC}"
+is "clock unverified: no usable bracket -> alert verdict" "alert" "${CASE_STATE}"
+case "${CASE_DETAIL}" in
+  *"clock-unverified: no usable B2 Date bracket"*) ok "clock unverified: the detail names the unverified clock" ;;
+  *) bad "clock unverified detail: ${CASE_DETAIL}" ;;
+esac
+is "clock unverified: the record says the clock was not verified" "False" \
+  "$(state_field clock_verified)"
+is "clock unverified: the record carries a null offset" "None" \
+  "$(state_field clock_offset_seconds)"
+is "clock unverified: the signature carries cause clock-unverified" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.finding_signature("alert", ["clock-unverified"]))
+PY
+)" "$(state_field signature)"
+
+# F4: the skip test is on the BRACKET WIDTH, not on the request duration. The
+# bracket is [Date - finished, Date + 1 - started], so a 9.5 s response has a
+# 10.5 s bracket and must be skipped; a 9.0 s response has exactly 10.0 s and
+# must be kept. (At 941a4ec the 9.5 s case is kept, so brackets up to 11 s
+# count while the docs say 10 s.)
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm_bracket", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+DATE = "Sat, 21 Nov 2026 04:28:00 GMT"
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 1009.5)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("a 9.5 s response (a 10.5 s bracket) was not skipped")
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 1009.0)
+if module.clock_offset_seconds() is None:
+    raise SystemExit("a 9.0 s response (a 10.0 s bracket) was skipped")
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 1015.0)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("a 15 s bracket was not skipped")
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 999.0)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("a negative duration was not skipped")
+module.reset_clock_samples()
+module.observe_clock("not a date", 1000.0, 1001.0)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("an unparseable Date header was not skipped")
+PY
+then ok "clock bracket: the skip tests the bracket width (duration + 1 s), not the RTT"; else bad "clock bracket: the skip tests the request duration, not the bracket width"; fi
+
+# RT-4: a future-dated object is a CLOCK fault, so it must classify as cause
+# clock-skew - not as a generic exception:WitnessError, which would give the
+# same clock fault two tokens and delay a distinct WitnessError by a window.
+rt4_dir="${WORK}/state-future-object-cause"
+fixture <<JSON
+{"bucket":"pc-admin-dr",
+ "objects":[
+  {"key":"audit/heartbeat/20260925T140000Z.json","ago":-3600}],
+ "uploads":[]}
+JSON
+start_mock
+run_case "${rt4_dir}"
+is "future object: exit 2 (fail-closed)" "2" "${CASE_RC}"
+is "future object: cause clock-skew, not a generic exception" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.finding_signature("error", ["clock-skew", "sweep-latched"]))
+PY
+)" "$(state_field signature)"
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm_age", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+now = module.datetime(2026, 9, 25, 15, 0, 0, tzinfo=module.timezone.utc)
+future = now + module.timedelta(seconds=600)
+try:
+    module.age_seconds(now, future, "object", 300)
+except module.ClockSkewError as exc:
+    if module.error_cause_for(exc) != ["clock-skew"]:
+        raise SystemExit("a future timestamp did not classify as clock-skew")
+    if not isinstance(exc, module.WitnessError):
+        raise SystemExit("ClockSkewError must stay a WitnessError")
+except module.WitnessError:
+    raise SystemExit("a future timestamp raised a generic WitnessError")
+else:
+    raise SystemExit("a future timestamp did not raise")
+# Inside the tolerance it is still a plain age, never an exception.
+if module.age_seconds(now, now - module.timedelta(seconds=60), "object", 300) != 60:
+    raise SystemExit("a past timestamp did not yield its age")
+PY
+then ok "age_seconds: a future timestamp raises ClockSkewError (one cause token)"; else bad "age_seconds: a future timestamp is not classified as clock-skew"; fi
+
+# (7) The cursor_version 1 -> 2 migration on a real (mock) bucket: the small
+# state.json decides, view.json is never read, the run is an ordinary sweep
+# with its own verdict (never ERROR), and view.json is removed only after
+# summary.json + state.json landed. The next run is a delta.
+migrate_dir="${WORK}/state-cursor-migration"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${migrate_dir}"
+is "cursor migration: the warm sweep is green" "ok" "${CASE_STATE}"
+python3 - "${migrate_dir}" <<'PY'
+import json
+import os
+import sys
+
+state_dir = sys.argv[1]
+path = os.path.join(state_dir, "state.json")
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursor_version"] = 1
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+# The retired sidecar: a KNOWN legacy file, never read again.
+with open(os.path.join(state_dir, "view.json"), "w", encoding="utf-8") as handle:
+    handle.write('{"audit_objects": {"legacy": "never read"}}')
+PY
+SAVED_REQUEST_LOG="${REQUEST_LOG}"
+REQUEST_LOG="${WORK}/requests-cursor-migration.log"
+: >"${REQUEST_LOG}"
+start_mock
+run_delta "${migrate_dir}"
+REQUEST_LOG="${SAVED_REQUEST_LOG}"
+is "cursor migration: exit 0 (the sweep's own verdict, never ERROR)" "0" "${CASE_RC}"
+is "cursor migration: the migration run is green" "ok" "${CASE_STATE}"
+is "cursor migration: the run is not marked repaired" "" "$(state_field repaired)"
+is "cursor migration: the block is cursor_version 2" "2" "$(state_field observed.cursor_version)"
+is "cursor migration: the run was a full sweep" "sweep" "$(state_field observed.coverage.mode)"
+is "cursor migration: summary.json landed" "yes" \
+  "$([ -s "${migrate_dir}/summary.json" ] && echo yes || echo no)"
+is "cursor migration: view.json is removed" "gone" \
+  "$([ -e "${migrate_dir}/view.json" ] && echo present || echo gone)"
+if grep -q 'versions' "${WORK}/requests-cursor-migration.log"; then
+  ok "cursor migration: the migration sweep listed versions (hiding detection ran)"
+else
+  bad "cursor migration: the migration sweep did not list versions"
+fi
+run_delta "${migrate_dir}"
+is "cursor migration: the next run is a delta" "delta" "$(state_field observed.coverage.mode)"
+is "cursor migration: the next run is green" "ok" "${CASE_STATE}"
+
+# (8) A migration whose sweep fails latches: error with the listing cause plus
+# sweep-latched, and the next run sweeps again instead of serving a delta from
+# a block that was never rebuilt.
+latch_dir="${WORK}/state-cursor-migration-latch"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${latch_dir}"
+python3 - "${latch_dir}" <<'PY'
+import json
+import os
+import sys
+
+path = os.path.join(sys.argv[1], "state.json")
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+data["observed"]["cursor_version"] = 1
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,"fail_versions":"denied",
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+run_delta "${latch_dir}"
+is "migration latch: the failed migration sweep exits 2" "2" "${CASE_RC}"
+is "migration latch: the failed migration sweep is error" "error" "${CASE_STATE}"
+is "migration latch: the signature carries listing-failed + sweep-latched" \
+  "$(python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.finding_signature("error", ["listing-failed", "sweep-latched"]))
+PY
+)" "$(state_field signature)"
+# F1/RT-1: the migration discards the legacy block before it sweeps, so a
+# failed migration must still PERSIST the latch: the record carries the
+# validated legacy block with cursor_version 2 and sweep_failed set. Without
+# it the next run cold-starts (a windowed seed at the production 13 h
+# default) instead of sweeping, and the documented sweep_failed latch does
+# not exist.
+is "migration latch: the failed migration persisted the latch" "True" \
+  "$(state_field observed.sweep_failed)"
+is "migration latch: the persisted block is the migrated layout" "2" \
+  "$(state_field observed.cursor_version)"
+fixture <<JSON
+{"bucket":"pc-admin-dr","page_size":50,
+ "objects":[
+  {"key":"audit/heartbeat/${DELTA_HEARTBEAT_TS}.json","ago":60},
+  {"key":"audit/${DELTA_START_TS}-session.start.${SID}.0.json","ago":300},
+  {"key":"recordings/${SID}.tar","ago":297}],
+ "uploads":[]}
+JSON
+start_mock
+# The production cold-start default (13 h): at 941a4ec the missing block makes
+# this run a windowed SEED; with the persisted latch it must be a full sweep.
+RECORDING_WITNESS_COLD_START_SECONDS=46800 run_delta "${latch_dir}"
+unset RECORDING_WITNESS_COLD_START_SECONDS
+is "migration latch: the next run sweeps again (no cold-start seed)" "sweep" \
+  "$(state_field observed.coverage.mode)"
+is "migration latch: the recovery sweep is not a blind seed" "False" \
+  "$(state_field observed.coverage.compact_blind)"
+is "migration latch: the recovery sweep is green" "ok" "${CASE_STATE}"
+is "migration latch: the latch released" "False" "$(state_field observed.sweep_failed)"
+
 # ---- wiring: the dispatch paths must carry the witness env -------------
 for witness_var in RECORDING_WITNESS_ENDPOINT RECORDING_WITNESS_BUCKET RECORDING_WITNESS_AUDIT_PREFIX \
                    RECORDING_WITNESS_RECORDINGS_PREFIX RECORDING_WITNESS_KEY_ID RECORDING_WITNESS_KEY; do
@@ -11712,10 +12676,15 @@ if grep -q 'tests/recording-witness/run-test.sh' "${ROOT}/.github/workflows/ci.y
 else
   bad "ci.yml does not run the recording-witness harness"
 fi
-if grep -q 'origin-ca|recording-witness|broker-report)/' "${ROOT}/.github/workflows/ci.yml"; then
+if grep -q '|recording-witness|' "${ROOT}/.github/workflows/ci.yml"; then
   ok "ci.yml path gate includes tests/recording-witness/"
 else
   bad "ci.yml path gate missing tests/recording-witness/"
+fi
+if grep -q 'tests/time-sync/run-test.sh' "${ROOT}/.github/workflows/ci.yml"; then
+  ok "ci.yml runs the time-sync harness (the clock discipline has a gate)"
+else
+  bad "ci.yml does not run tests/time-sync/run-test.sh"
 fi
 
 if [ "$pass" -lt "$((MIN_CHECKS - SHELLCHECK_SKIPPED))" ]; then

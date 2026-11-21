@@ -26,13 +26,18 @@ The hard invariants of this module (review blockers — a PR breaking any of the
 > header is retired in this release and is not a gate. A pre-mTLS release, that is
 > one gated on that header alone, is never a valid rollback target. The anchor also
 > probes the tenant's public endpoints for availability (narrow firewall rules; no SSH inbound
-> from the main box either). Admin
+> from the main box either). It also reads time: outbound **TCP/4460 (NTS-KE) and
+> UDP/123 (NTS-authenticated time packets)** to three independent public time
+> operators (NLnet Labs `nts.time.nl`, Netnod `nts.netnod.se`, PTB
+> `ptbtime1.ptb.de`), plus the resolver lookups those names need; **no plaintext
+> NTP server or pool is configured**, so no unauthenticated clock source exists
+> to fall back on. Admin
 > of the anchor itself is **dispatch-only** (per-run approved runs; re-entry
 > per-event via SCP password-reset + re-dispatch; netcup console/rescue as
 > last resort). No standing SSH keys exist anywhere. *You administer the anchor;
 > the anchor administers nothing.*
 
-**Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. The dashboard is `:443`-only (`:80` serves tang + ACME; issue #225 removed the plain-HTTP dashboard handler). Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate admitting only those ranges and the main box and loopback by raw TCP peer, and requiring a client certificate at the TLS handshake from every peer), and inspection of the module surface.
+**Rationale.** The anchor is the deliberately weakest link: unencrypted, always-on, holds an unlock key, different jurisdiction, cheapest box. If it were an SSH path into the main box, anchor compromise would mean full server access, and the "can unlock a disk image but never obtain one" property would collapse. With the invariant, the worst an attacker gets from the anchor is the ability to answer a boot-time challenge (and tang's ECDH design means they'd need the booting box's cooperation anyway) — not a foothold inside your main box. The dashboard is `:443`-only (`:80` serves tang + ACME; issue #225 removed the plain-HTTP dashboard handler). Enforced by: the module's variable set (no SSH key inputs, no token inputs), the firewall policy (narrow TCP/80+443 ingress rules: main box + Cloudflare edge on :80; CloudFront origin-facing ranges + main box on :443, with the Caddy origin gate admitting only those ranges and the main box and loopback by raw TCP peer, and requiring a client certificate at the TLS handshake from every peer), and inspection of the module surface. The clock egress is a read-only time client with no inbound counterpart: three public NTS operators on TCP/4460 + UDP/123, no plaintext NTP source, no rule that admits anything.
 
 ### Scoped amendment — dynamic status-page endpoints (2026-10-12, issue #186)
 
