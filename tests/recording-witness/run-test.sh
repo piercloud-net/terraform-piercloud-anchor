@@ -12438,6 +12438,44 @@ print(module.finding_signature("alert", ["clock-unverified"]))
 PY
 )" "$(state_field signature)"
 
+# F4: the skip test is on the BRACKET WIDTH, not on the request duration. The
+# bracket is [Date - finished, Date + 1 - started], so a 9.5 s response has a
+# 10.5 s bracket and must be skipped; a 9.0 s response has exactly 10.0 s and
+# must be kept. (At 941a4ec the 9.5 s case is kept, so brackets up to 11 s
+# count while the docs say 10 s.)
+if python3 - "${WORK}" <<'PY'
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("wm_bracket", os.path.join(sys.argv[1], "witness_module.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+DATE = "Sat, 21 Nov 2026 04:28:00 GMT"
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 1009.5)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("a 9.5 s response (a 10.5 s bracket) was not skipped")
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 1009.0)
+if module.clock_offset_seconds() is None:
+    raise SystemExit("a 9.0 s response (a 10.0 s bracket) was skipped")
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 1015.0)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("a 15 s bracket was not skipped")
+module.reset_clock_samples()
+module.observe_clock(DATE, 1000.0, 999.0)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("a negative duration was not skipped")
+module.reset_clock_samples()
+module.observe_clock("not a date", 1000.0, 1001.0)
+if module.clock_offset_seconds() is not None:
+    raise SystemExit("an unparseable Date header was not skipped")
+PY
+then ok "clock bracket: the skip tests the bracket width (duration + 1 s), not the RTT"; else bad "clock bracket: the skip tests the request duration, not the bracket width"; fi
+
 # (7) The cursor_version 1 -> 2 migration on a real (mock) bucket: the small
 # state.json decides, view.json is never read, the run is an ordinary sweep
 # with its own verdict (never ERROR), and view.json is removed only after

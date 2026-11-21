@@ -5562,7 +5562,9 @@ def observe_clock(date_header, started, finished):
     The true offset lies in `[Date - finished, Date + 1 - started]`; the
     midpoint of that bracket is recorded. A bracket wider than
     `CLOCK_BRACKET_MAX_SECONDS` (a slow response) is skipped: it carries no
-    usable clock information. Date has 1 s resolution, hence the +1 s.
+    usable clock information. Date has 1 s resolution, hence the +1 s - and
+    the test is on the bracket's WIDTH (duration + 1 s), not on the request
+    duration alone, or a bracket up to 11 s would be kept.
     """
     if not date_header:
         return
@@ -5574,8 +5576,9 @@ def observe_clock(date_header, started, finished):
         return
     if server.tzinfo is None:
         server = server.replace(tzinfo=timezone.utc)
-    width = float(finished) - float(started)
-    if width < 0 or width > CLOCK_BRACKET_MAX_SECONDS:
+    duration = float(finished) - float(started)
+    width = duration + 1.0
+    if duration < 0 or width > CLOCK_BRACKET_MAX_SECONDS:
         return
     midpoint = (float(started) + float(finished)) / 2.0 - server.timestamp()
     with _CLOCK_LOCK:
@@ -9795,7 +9798,7 @@ time_sync_install() { # install + enable chrony and render the config
 }
 
 time_sync_converge() { # wait (bounded) for a disciplined clock, then refuse
-  local waited=0
+  local waited=0 measured=""
   time_sync_install
   # A while loop on purpose: the run-once acceptance pins exactly ONE C-style
   # arithmetic loop header in this script (the timer-drain loop, issue #143),
@@ -9808,7 +9811,8 @@ time_sync_converge() { # wait (bounded) for a disciplined clock, then refuse
     /usr/bin/env sleep 1
     waited=$((waited + 1))
   done
-  die "clock: chrony did not synchronize within ${TIME_SYNC_WAIT_SECONDS}s - refusing to provision with an undisciplined clock (the witness's skew bound, freshness clocks and ack windows all read it; check egress UDP/123 and TCP/4460 for NTS-KE)"
+  measured="$(time_sync_offset)"
+  die "clock: chrony did not synchronize within ${TIME_SYNC_WAIT_SECONDS}s (last measured offset: ${measured:-none}) - refusing to provision with an undisciplined clock (the witness's skew bound, freshness clocks and ack windows all read it; check egress UDP/123 and TCP/4460 for NTS-KE)"
 }
 # --- END CLOCK DISCIPLINE ---
 

@@ -96,6 +96,9 @@ waited=${SECONDS}
 is "an unsynchronized clock refuses the provision" "1" "${rc}"
 has "the refusal names the wait bound" "did not synchronize within 3s" "${converge_out}"
 has "the refusal names the NTS egress paths" "TCP/4460" "${converge_out}"
+# F4: the refusal path must print the measured offset, not only the success
+# path (the docs say the offset is logged on refusal too).
+has "the refusal prints the measured offset" "last measured offset: 0.000000000 seconds slow of NTP time" "${converge_out}"
 if [ "${waited}" -ge 2 ] && [ "${waited}" -le 6 ]; then
   ok "the wait is bounded by TIME_SYNC_WAIT_SECONDS (waited ${waited}s of 3s)"
 else
