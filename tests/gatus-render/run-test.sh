@@ -8,6 +8,17 @@
 #   (a) the LEGACY shape (STATUS_PULLER unset) still renders the platform row
 #       on every anchor, monitor-only on tenant shapes and alerting on the
 #       operator shape (call C1/C2);
+#   (a2) `main` measures the SLICE's own IdP over its own leaf, not the
+#       platform's retired landing and not the Cloudflare-fronted `.site`
+#       name: the URL is `https://id.<alias>.piercloud.net/healthz` with
+#       EXACTLY `[STATUS] == 204` and `client: ignore-redirect: true` (target
+#       ruled 2026-11-22, design check anchor-gatus-main-target, on the
+#       D4/D12/D13 monitoring model). It stays REACHABILITY ONLY, with no
+#       content pin: the endpoint has no body, and a tenant's own content edit
+#       must not page a class-5 row. The row must carry neither the orange
+#       `.piercloud.site` landing (Cloudflare in the path, tenant content,
+#       cacheable) nor the bare `<alias>.piercloud.net` homepage name, which
+#       is NXDOMAIN;
 #   (b) the alert shapes (call C9): class-5 rows (main/platform) publish
 #       through the ntfy-JSON custom bridge with TRIGGERED 5 / RESOLVED 3 and
 #       send-on-resolved; class-4 rows (GATUS_ENDPOINTS pairs, dashboard TLS)
@@ -122,6 +133,13 @@ lacks "tenant: platform row is monitor-only (no alerts)" "$platform_block" "aler
 has "tenant: skip-invalid-config-update present" "$(cat "$CFG")" "skip-invalid-config-update: true"
 has "tenant: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by: group"
 main_block="$(block main "$CFG")"
+has "main probes the slice's own IdP health route" "$main_block" "url: https://id.pier.piercloud.net/healthz"
+lacks "main does not probe the bare .net homepage name (NXDOMAIN)" "$main_block" "url: https://pier.piercloud.net"
+lacks "main stays off the Cloudflare-fronted .site landing" "$main_block" "piercloud.site"
+has "main keeps the exact 204 condition" "$main_block" '[STATUS] == 204'
+lacks "main does not accept a 200 (something else answering that path)" "$main_block" '[STATUS] == 200'
+has "main never follows a redirect" "$main_block" "ignore-redirect: true"
+lacks "main is reachability only (no content pin)" "$main_block" "[BODY]"
 has "main uses the ntfy-JSON bridge" "$main_block" "type: custom"
 has "main resolves at priority 3" "$main_block" 'RESOLVED: "3"'
 has "main triggers at priority 5" "$main_block" 'TRIGGERED: "5"'
@@ -155,6 +173,15 @@ has "operator: platform uses the bridge" "$platform_block" "type: custom"
 has "operator: platform threshold 3" "$platform_block" "failure-threshold: 3"
 has "operator: platform sends on resolve" "$platform_block" "send-on-resolved: true"
 has "operator: platform placeholders 5/3" "$platform_block" "RESOLVED: \"3\""
+# The operator shape is the one that pages: the retargeted row must be the same
+# row there (a2), not only on the tenant shape.
+main_block="$(block main "$CFG")"
+has "operator: main probes the slice's own IdP health route" "$main_block" "url: https://id.pier.piercloud.net/healthz"
+lacks "operator: main stays off the Cloudflare-fronted .site landing" "$main_block" "piercloud.site"
+has "operator: main keeps the exact 204 condition" "$main_block" '[STATUS] == 204'
+has "operator: main never follows a redirect" "$main_block" "ignore-redirect: true"
+lacks "operator: main is reachability only" "$main_block" "[BODY]"
+has "operator: main still pages at class 5" "$main_block" 'TRIGGERED: "5"'
 
 # ---- (b2) explicit tenant role + token header -----------------------------
 fixture_env

@@ -146,7 +146,14 @@
 #   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
 #    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)
 #   TENANT_USER                operator-set username (default monitor target:
-#                            https://<user>.piercloud.net, derived — no input).
+#                            id.<user>.piercloud.net/healthz over https — the
+#                            slice's own IdP over its own leaf, exactly 204 with
+#                            redirects not followed, derived, no input; target
+#                            ruled 2026-11-22 (design check
+#                            anchor-gatus-main-target) on the D4/D12/D13
+#                            monitoring model, because the .net homepage name it
+#                            used to probe no longer resolves and the .site
+#                            landing is tenant content behind Cloudflare).
 #   THUMBPRINT_FILE          artifact path for the captured tang thumbprint
 #                            (default ./thumbprint.txt; the value is public).
 #   PINNED_IP                runner IP pinned at open; provision re-fetches

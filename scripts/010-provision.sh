@@ -2465,16 +2465,66 @@ if [ "$PULLER_MODE" -eq 1 ]; then
   fi
   BUILTIN_NAMES=""
 else
-# Default target: the tenant homepage derives from TENANT_USER — no input
-# needed (pier → https://pier.piercloud.net). Skipped only for hand runs
-# without env (console fallback = self-check only, as documented).
+# Default target: the slice's own IdP derives from TENANT_USER — no input
+# needed (pier → https://id.pier.piercloud.net/healthz). Skipped only for hand
+# runs without env (console fallback = self-check only, as documented).
+#
+# TARGET RULED 2026-11-22 (design check anchor-gatus-main-target; owner
+# challenge on the first attempt at this retarget: "doesn't that add CDN in
+# front of the check so it wouldn't really help?"). The row measures the SLICE's
+# own IdP over the slice's own leaf: `id.<alias>.piercloud.net/healthz`. That
+# is the anchor monitoring model the earlier rounds already decided, applied to
+# the legacy shape rather than a new rule: D4 (owner 2026-10-12) pinned
+# `id.<alias>.piercloud.net` and ruled slice rows probe grey, slice-terminated
+# `.net` names with no tolerant conditions; D12 (owner 2026-10-12) made the
+# slice row content-free by putting its health on a bodyless `/healthz`; D13
+# (owner 2026-10-13) gave Cloudflare its own `public edge` row precisely so a
+# CF incident does not read as "my slice is red".
+#
+# WHY NOT `.site`: `<alias>.piercloud.site` is orange — Cloudflare in the path,
+# the viewer cert is CF's edge leaf, and the origin behind it serves TENANT-OWNED
+# landing copy. That target takes false reds from every Cloudflare incident (the
+# thing D13 split out) and from a tenant's own edit (a 404 today on the operator
+# anchor), and takes false greens from a cached or Always-Onlined HTML copy. It
+# also grades Cloudflare's cert, not the slice's.
+#
+# The measured NXDOMAIN history is why the row moved at all: it probed
+# `https://<alias>.piercloud.net`, a homepage name that no longer resolves
+# (measured 2026-11-22: NXDOMAIN for `test.` and `pier.`), so it had been aimed
+# at nothing since the landing moved to the `.site` zone (where the PLATFORM's
+# landing renderer answered, body sha256 846dc9ff..., and where that renderer
+# retires with the `.site` landing router). The `.net` name is not coming back
+# as a homepage.
+#
+# WHY /healthz AND EXACTLY 204: the test slice measured `id.test.piercloud.net/
+# healthz` = 204, 0 B, `cache-control: private, no-store`, no Cloudflare, LE
+# leaf SAN `id.test.piercloud.net` only, 3/3 at 0.13-0.15 s. The path proves
+# grey DNS + the platform front's SNI passthrough + slice Caddy + the slice's own
+# TLS key + the Pocket ID process; Pocket ID's SQLite lives on the LUKS root
+# (slice stack S6), so an answer also means the slice is booted and unlocked.
+# 204 exactly, not 200: it is what the purpose-built endpoint answers, and a 200
+# here would mean a catch-all or a login page is answering that path instead.
+# `/login` was rejected — it stays D4's `shared (gate)` claim; this row wants the
+# bodyless, uncacheable liveness route. `home.<alias>/ping` was rejected: one
+# app's proxy stays green while the IdP every sign-in needs is dead.
+#
+# REACHABILITY ONLY, deliberately: no body pin, no content assertion — the
+# endpoint has no body, and this row alerts on every anchor at class 5 (a
+# tenant's own content edit must never page). A puller anchor drops this row
+# entirely for `your piercloud` (`meta-<alias>.piercloud.site/healthz`, also
+# content-free).
 if [ -n "${TENANT_USER:-}" ]; then
-  case "$TENANT_USER" in ''|*[!a-zA-Z0-9_-]*) die "bad TENANT_USER for homepage URL (chars [a-zA-Z0-9_-] only)";; esac
+  # The alias is now a DNS label inside a hostname (not just a path segment), so
+  # this URL's guard is the puller's DNS-label charset `[a-z0-9-]` — stricter
+  # than the `[a-zA-Z0-9_-]` the `.site` label allowed (no `_`, no uppercase).
+  case "$TENANT_USER" in ''|*[!a-z0-9-]*) die "bad TENANT_USER for the id.<alias>.piercloud.net health URL (DNS label chars [a-z0-9-] only)";; esac
   ENDPOINTS_YAML="  - name: main
-    url: https://${TENANT_USER}.piercloud.net
+    url: https://id.${TENANT_USER}.piercloud.net/healthz
     interval: 60s
     conditions:
-      - \"[STATUS] == 200\"
+      - \"[STATUS] == 204\"
+    client:
+      ignore-redirect: true
 "
   if [ -n "${NTFY_TOPIC:-}" ]; then
     ENDPOINTS_YAML="${ENDPOINTS_YAML}    alerts:
@@ -2501,7 +2551,9 @@ BUILTIN_NAMES="platform"
 # Platform row (issue #134, calls C2/C3): the shared host's health as a
 # platform-level fact, built into the render (not a per-anchor secret). The
 # durable name is created S1-era on the control plane; tenant pages show it
-# monitor-only (host-down already reds `main`), the operator anchor alerts.
+# monitor-only (it tells "platform problem" from "my problem" — `main` measures
+# the slice's own IdP over its own leaf and says nothing about the platform
+# host), the operator anchor alerts.
 ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: platform
     url: https://platform.piercloud.net/healthz
     interval: 60s
