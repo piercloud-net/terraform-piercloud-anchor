@@ -85,6 +85,7 @@ All notable changes to this project will be documented in this file.
 - *(edge)* Remove the dead client-IP trust + the ungated :80 dashboard, add HSTS (closes #225)
 - *(a1)* Match exact steady-state policy names (closes #200)
 - *(witness)* See late-arriving audit keys and random-keyed recordings (closes #228)
+- *(gatus)* Main probes the slice's own IdP at id.<alias>.piercloud.net, per the target ruling (closes #285)
 
 ### 💼 Other
 
