@@ -2465,13 +2465,38 @@ if [ "$PULLER_MODE" -eq 1 ]; then
   fi
   BUILTIN_NAMES=""
 else
-# Default target: the tenant homepage derives from TENANT_USER — no input
-# needed (pier → https://pier.piercloud.net). Skipped only for hand runs
-# without env (console fallback = self-check only, as documented).
+# Default target: the tenant's own landing derives from TENANT_USER — no
+# input needed (pier → https://pier.piercloud.site). Skipped only for hand
+# runs without env (console fallback = self-check only, as documented).
+#
+# RETARGETED at the P3 cutover (pc-host #1443, step 8; the H4 line "the anchor
+# Gatus main probe retarget", OC-B's default taken). This row used to probe
+# `https://<alias>.piercloud.net`, a homepage name that no longer resolves at
+# all (measured 2026-11-22: NXDOMAIN for `test.` and `pier.piercloud.net`; the
+# landing had already moved to the `.site` zone, where the PLATFORM's landing
+# renderer answered it — the test slice's body there was sha256
+# 846dc9ffbe9decfb813c645d00f3fe125957c76c6e5575431c0c46e7ae8137f4, title
+# `<alias> · piercloud` — and that renderer retires with the `.site` landing
+# router). The probe now measures the SLICE's own landing at
+# `<alias>.piercloud.site`, which is what the anchor reports on: the tenant's
+# piercloud, served by the tenant's own slice and its own LE leaf. The URL is
+# rollback-neutral, and that was measured, not assumed: `test.piercloud.site`
+# answered 200 on both sides of the cutover (`<alias> · piercloud` before,
+# "Your piercloud" after — the P3 landing evidence), so only the origin behind
+# the name moves.
+#
+# REACHABILITY ONLY, deliberately: the landing is tenant-owned copy (the slice
+# seeds it, the tenant and their agent own it after that), so no content is
+# pinned — a tenant's own edit is not an outage, and this row alerts on every
+# anchor at class 5. The retired platform landing body is therefore not
+# asserted here either: the cutover's body discrimination is the evidence
+# lane's leg (pc-host #1443, L3), not a night-emergency page. A puller anchor
+# drops this row entirely for `your piercloud`
+# (`meta-<alias>.piercloud.site/healthz`, also content-free).
 if [ -n "${TENANT_USER:-}" ]; then
   case "$TENANT_USER" in ''|*[!a-zA-Z0-9_-]*) die "bad TENANT_USER for homepage URL (chars [a-zA-Z0-9_-] only)";; esac
   ENDPOINTS_YAML="  - name: main
-    url: https://${TENANT_USER}.piercloud.net
+    url: https://${TENANT_USER}.piercloud.site
     interval: 60s
     conditions:
       - \"[STATUS] == 200\"
@@ -2501,7 +2526,9 @@ BUILTIN_NAMES="platform"
 # Platform row (issue #134, calls C2/C3): the shared host's health as a
 # platform-level fact, built into the render (not a per-anchor secret). The
 # durable name is created S1-era on the control plane; tenant pages show it
-# monitor-only (host-down already reds `main`), the operator anchor alerts.
+# monitor-only (it tells "platform problem" from "my problem" — `main` measures
+# the tenant's own slice landing and says nothing about the platform host), the
+# operator anchor alerts.
 ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: platform
     url: https://platform.piercloud.net/healthz
     interval: 60s

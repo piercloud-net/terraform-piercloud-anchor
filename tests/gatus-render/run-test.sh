@@ -8,6 +8,13 @@
 #   (a) the LEGACY shape (STATUS_PULLER unset) still renders the platform row
 #       on every anchor, monitor-only on tenant shapes and alerting on the
 #       operator shape (call C1/C2);
+#   (a2) `main` measures the SLICE's own landing, not the platform's retired
+#       one (P3 cutover, pc-host #1443 step 8): the URL is
+#       `https://<alias>.piercloud.site`, never the `.net` homepage name that
+#       no longer resolves — and it stays REACHABILITY ONLY, with no content
+#       pin: the landing is tenant-owned copy, so a tenant's own edit must not
+#       page, and the retired platform landing body (846dc9ff) is
+#       discriminated by the cutover's evidence lane (L3), not by this row;
 #   (b) the alert shapes (call C9): class-5 rows (main/platform) publish
 #       through the ntfy-JSON custom bridge with TRIGGERED 5 / RESOLVED 3 and
 #       send-on-resolved; class-4 rows (GATUS_ENDPOINTS pairs, dashboard TLS)
@@ -122,6 +129,10 @@ lacks "tenant: platform row is monitor-only (no alerts)" "$platform_block" "aler
 has "tenant: skip-invalid-config-update present" "$(cat "$CFG")" "skip-invalid-config-update: true"
 has "tenant: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by: group"
 main_block="$(block main "$CFG")"
+has "main probes the slice's own .site landing" "$main_block" "url: https://pier.piercloud.site"
+lacks "main no longer probes the retired .net homepage" "$main_block" "pier.piercloud.net"
+has "main keeps the status condition" "$main_block" '[STATUS] == 200'
+lacks "main is reachability only (no content pin on tenant copy)" "$main_block" "[BODY]"
 has "main uses the ntfy-JSON bridge" "$main_block" "type: custom"
 has "main resolves at priority 3" "$main_block" 'RESOLVED: "3"'
 has "main triggers at priority 5" "$main_block" 'TRIGGERED: "5"'
@@ -155,6 +166,12 @@ has "operator: platform uses the bridge" "$platform_block" "type: custom"
 has "operator: platform threshold 3" "$platform_block" "failure-threshold: 3"
 has "operator: platform sends on resolve" "$platform_block" "send-on-resolved: true"
 has "operator: platform placeholders 5/3" "$platform_block" "RESOLVED: \"3\""
+# The operator shape is the one that pages: the retargeted row must be the same
+# row there (a2), not only on the tenant shape.
+main_block="$(block main "$CFG")"
+has "operator: main probes the slice's own .site landing" "$main_block" "url: https://pier.piercloud.site"
+lacks "operator: main is reachability only" "$main_block" "[BODY]"
+has "operator: main still pages at class 5" "$main_block" 'TRIGGERED: "5"'
 
 # ---- (b2) explicit tenant role + token header -----------------------------
 fixture_env
