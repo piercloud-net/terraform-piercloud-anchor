@@ -2950,7 +2950,9 @@ SITE_TYPES = frozenset(("public", "shared", "private"))
 # and the SSRF boundary is unchanged. Measured 2026-11-23: 200 with
 # {"component":{"id":"5wnz34mhfhrk","name":"CDN/Cache","status":"operational"}},
 # served by Google Frontend, not by Cloudflare's own edge.
-PUBLIC_EDGE_URL = "https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfhrk.json"
+PUBLIC_EDGE_COMPONENT = "5wnz34mhfhrk"
+PUBLIC_EDGE_URL = ("https://www.cloudflarestatus.com/api/v2/components/%s.json"
+                   % PUBLIC_EDGE_COMPONENT)
 # Row contract (design check section 7): `operational` is green and
 # `under_maintenance` on the GLOBAL CDN/Cache component is green (announced,
 # and the edge reroutes); `degraded_performance`, `partial_outage` and
@@ -2961,9 +2963,16 @@ PUBLIC_EDGE_URL = "https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfh
 # humans: faster polling only adds third-party load. Monitor-only on every
 # anchor (the row never pushes): nobody on our side can act on a Cloudflare
 # incident, and `platform` keeps paging the operator for host-down.
+#
+# The component identity is graded in the BODY as well as pinned in the URL:
+# the document names its own component, so a document about any other
+# component (a drifted path, a renamed id served from cache, a proxy answering
+# someone else's object) is red here instead of green on a status field that
+# says nothing about the orange proxy's serving path.
 PUBLIC_EDGE_INTERVAL = "300s"
 PUBLIC_EDGE_CONDITIONS = (
     "[STATUS] == 200",
+    "[BODY].component.id == %s" % PUBLIC_EDGE_COMPONENT,
     "[BODY].component.status == any(operational, under_maintenance)",
 )
 
@@ -3580,6 +3589,15 @@ def verify_fragment_text(text):
                 fields["group"] = line[len("    group: "):]
             elif line.startswith("    url: ") and fields["url"] is None:
                 fields["url"] = line[len("    url: "):]
+                # The target of the one anchor-pinned external row is part of
+                # its claim: `public edge` reads exactly the Statuspage
+                # component document (design check section 7). A fragment
+                # naming our own edge, another host or another component is
+                # refused, so "HTTP 200 plus some status field" cannot become
+                # the row by drifting the url alone.
+                if name == "public edge" and fields["url"] != PUBLIC_EDGE_URL:
+                    raise FragmentError(
+                        "row %r can only target the pinned Statuspage component document" % name)
             elif line.startswith("    interval: ") and fields["interval"] is None:
                 # One cadence per row shape, and `public edge` is the only
                 # 300 s row (design check section 7): a slower or faster
