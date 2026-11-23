@@ -8,23 +8,18 @@
 #   (a) the LEGACY shape (STATUS_PULLER unset) still renders the platform row
 #       on every anchor, monitor-only on tenant shapes and alerting on the
 #       operator shape (call C1/C2);
-#   (a2) `main` measures the SLICE's own IdP over its own leaf, not the
-#       platform's retired landing and not the Cloudflare-fronted `.site`
-#       name: the URL is `https://id.<alias>.piercloud.net/healthz` with
-#       EXACTLY `[STATUS] == 204` and `client: ignore-redirect: true` (target
-#       ruled 2026-11-22, design check anchor-gatus-main-target, on the
-#       D4/D12/D13 monitoring model). It stays REACHABILITY ONLY, with no
-#       content pin: the endpoint has no body, and a tenant's own content edit
-#       must not page a class-5 row. The row must carry neither the orange
-#       `.piercloud.site` landing (Cloudflare in the path, tenant content,
-#       cacheable) nor the bare `<alias>.piercloud.net` homepage name, which
-#       is NXDOMAIN;
-#   (b) the alert shapes (call C9): class-5 rows (main/platform) publish
+#   (a2) the legacy `main` row is DELETED outright (design check
+#       slice-health-endpoint-c §9, owner 2026-11-23 "deleted totally ... not
+#       there at all"), so no shape renders it and the span carries no builder
+#       or alert intent for it; a `main=` GATUS_ENDPOINTS pair is an ordinary
+#       tenant pair, and the mixed-case TENANT_USER guard that existed only for
+#       that row is gone with it (#288 G1);
+#   (b) the alert shapes (call C9): class-5 rows (platform) publish
 #       through the ntfy-JSON custom bridge with TRIGGERED 5 / RESOLVED 3 and
 #       send-on-resolved; class-4 rows (GATUS_ENDPOINTS pairs, dashboard TLS)
 #       use the native ntfy provider with provider-override priority 4;
-#   (c) the built-in-name collision guard (call C6): a `platform=` pair always
-#       fails, a `main=` pair fails only when the `main` built-in rendered;
+#   (c) the built-in-name collision guard (call C6): a `platform=` pair fails,
+#       case-folded;
 #   (d) the role gate fails closed on an unknown ANCHOR_ROLE;
 #   (e) with no NTFY_TOPIC the config is alert-free (checks only);
 #   (f) regression: tang + dashboard TLS rows and their conditions survive,
@@ -132,18 +127,13 @@ has "tenant: platform status condition" "$platform_block" '[STATUS] == 200'
 lacks "tenant: platform row is monitor-only (no alerts)" "$platform_block" "alerts:"
 has "tenant: skip-invalid-config-update present" "$(cat "$CFG")" "skip-invalid-config-update: true"
 has "tenant: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by: group"
-main_block="$(block main "$CFG")"
-has "main probes the slice's own IdP health route" "$main_block" "url: https://id.pier.piercloud.net/healthz"
-lacks "main does not probe the bare .net homepage name (NXDOMAIN)" "$main_block" "url: https://pier.piercloud.net"
-lacks "main stays off the Cloudflare-fronted .site landing" "$main_block" "piercloud.site"
-has "main keeps the exact 204 condition" "$main_block" '[STATUS] == 204'
-lacks "main does not accept a 200 (something else answering that path)" "$main_block" '[STATUS] == 200'
-has "main never follows a redirect" "$main_block" "ignore-redirect: true"
-lacks "main is reachability only (no content pin)" "$main_block" "[BODY]"
-has "main uses the ntfy-JSON bridge" "$main_block" "type: custom"
-has "main resolves at priority 3" "$main_block" 'RESOLVED: "3"'
-has "main triggers at priority 5" "$main_block" 'TRIGGERED: "5"'
-has "main sends on resolve" "$main_block" "send-on-resolved: true"
+# (a2) the legacy `main` row is deleted outright: no shape renders it, and no
+# builder is left in the span for a future edit to resurrect (design check
+# slice-health-endpoint-c §9, owner 2026-11-23). A `main=` pair is an ordinary
+# tenant pair — pinned in (e).
+lacks "main row is deleted from the tenant shape" "$(cat "$CFG")" "- name: main"
+lacks "the span carries no main row builder" "$(cat "${WORK}/span.src")" "name: main"
+lacks "the span carries no main alert intent" "$(cat "${WORK}/span.src")" "alert_intent main"
 pairs_block="$(block host "$CFG")"
 has "pairs use the native provider" "$pairs_block" "type: ntfy"
 has "pairs carry priority 4" "$pairs_block" "priority: 4"
@@ -175,13 +165,10 @@ has "operator: platform sends on resolve" "$platform_block" "send-on-resolved: t
 has "operator: platform placeholders 5/3" "$platform_block" "RESOLVED: \"3\""
 # The operator shape is the one that pages: the retargeted row must be the same
 # row there (a2), not only on the tenant shape.
-main_block="$(block main "$CFG")"
-has "operator: main probes the slice's own IdP health route" "$main_block" "url: https://id.pier.piercloud.net/healthz"
-lacks "operator: main stays off the Cloudflare-fronted .site landing" "$main_block" "piercloud.site"
-has "operator: main keeps the exact 204 condition" "$main_block" '[STATUS] == 204'
-has "operator: main never follows a redirect" "$main_block" "ignore-redirect: true"
-lacks "operator: main is reachability only" "$main_block" "[BODY]"
-has "operator: main still pages at class 5" "$main_block" 'TRIGGERED: "5"'
+# The operator shape is the one that pages: the deleted row must not be here
+# either, so a resurrection on the alerting shape is caught, not only on the
+# monitor-only one.
+lacks "main row is deleted from the operator shape" "$(cat "$CFG")" "- name: main"
 
 # ---- (b2) explicit tenant role + token header -----------------------------
 fixture_env
@@ -214,6 +201,7 @@ lacks "no-topic: no alerts anywhere" "$(cat "$CFG")" "alerts:"
 lacks "no-topic: no custom provider" "$(cat "$CFG")" "custom:"
 has "no-topic: warns instead of pushing" "$(cat "$CFG")" "No push channel"
 has "no-topic: platform row still rendered" "$(block platform "$CFG")" "name: platform"
+lacks "no-topic: main row is deleted" "$(cat "$CFG")" "- name: main"
 
 # ---- (c2) console-fallback shape with a topic: zero alert sites -----------
 fixture_env
@@ -222,6 +210,7 @@ export NTFY_TOPIC=pc-test-topic
 if render fallback_topic; then ok "console-fallback + topic renders"; else bad "console-fallback + topic renders"; fi
 has "fallback: zero stanzas names the configured channel" "$(cat "$WORK/fallback_topic/stderr.log")" "push channel configured; no alerting rows"
 lacks "fallback: does not claim no channel" "$(cat "$WORK/fallback_topic/stderr.log")" "no push channel configured"
+lacks "fallback: no main row" "$(cat "$WORK/fallback_topic/config.yaml")" "- name: main"
 
 # ---- (d) fail-closed role gate -------------------------------------------
 fixture_env
@@ -235,10 +224,25 @@ export GATUS_ENDPOINTS="platform=https://example.org/health"
 if render collide_platform; then bad "platform= pair fails closed"; else ok "platform= pair fails closed"; fi
 has "platform collision names the built-in" "$(cat "$WORK/collide_platform/stderr.log")" "collides with a built-in endpoint"
 
+# (e2) `main` is no built-in any more (the row is deleted), so a `main=` pair
+# is an ordinary tenant pair: it renders, keeps its url, and stays class 4.
 fixture_env
-export GATUS_ENDPOINTS="main=https://example.org/health"
-if render collide_main; then bad "main= pair fails closed with a tenant"; else ok "main= pair fails closed with a tenant"; fi
-has "main collision names the built-in" "$(cat "$WORK/collide_main/stderr.log")" "collides with a built-in endpoint"
+export NTFY_TOPIC=pc-test-topic GATUS_ENDPOINTS="main=https://example.org/health"
+if render main_pair_tenant; then ok "main= pair renders as an ordinary tenant pair"; else bad "main= pair renders as an ordinary tenant pair"; fi
+has "main= pair keeps its url" "$(block main "$WORK/main_pair_tenant/config.yaml")" "url: https://example.org/health"
+has "main= pair is class 4 (native provider)" "$(block main "$WORK/main_pair_tenant/config.yaml")" "type: ntfy"
+lacks "main= pair is not class 5 (no bridge)" "$(block main "$WORK/main_pair_tenant/config.yaml")" "type: custom"
+is "main= pair renders exactly one row named main" "1" "$(grep -c '^  - name: main$' "$WORK/main_pair_tenant/config.yaml" || true)"
+
+# (e3) the `main`-era TENANT_USER guard is gone with the row (#288 G1 =
+# UPPER-1): a mixed-case alias no longer aborts the render, because no row
+# derives a hostname from it any more. On main this dies 2400 lines into a
+# mutating run.
+fixture_env
+export TENANT_USER=Pier
+if render mixedcase_tenant; then ok "mixed-case TENANT_USER renders (the main-era guard is gone)"; else bad "mixed-case TENANT_USER renders (the main-era guard is gone)"; fi
+lacks "mixed-case alias renders no main row" "$(cat "$WORK/mixedcase_tenant/config.yaml")" "- name: main"
+has "mixed-case alias still renders the platform row" "$(block platform "$WORK/mixedcase_tenant/config.yaml")" "name: platform"
 
 fixture_env
 export GATUS_ENDPOINTS="Platform=https://example.org/health"
@@ -257,13 +261,14 @@ export GATUS_ENDPOINTS="bad.name=https://example.org"
 if render bad_pair; then bad "malformed pair fails closed"; else ok "malformed pair fails closed"; fi
 
 # ---- (g) the render-time assertion has teeth (C4) -------------------------
-# (g1) drop the first intent call (main's): the rendered count (4) then
-# exceeds the tracked intent (3) and the render must refuse to install.
+# (g1) drop the tenant pair's intent call: the rendered count (2) then exceeds
+# the tracked intent (1) and the render must refuse to install.
 fixture_env
 export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
-# Target main's call by name: the GATUS EXTERNAL sub-span (#51) carries an
-# earlier, item-driven alert_intent call that a first-match pick would hit.
-INTENT_LINE="$(grep -nxF '    alert_intent main' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+# Target the pair's call by name: the GATUS EXTERNAL sub-span (#51) carries an
+# earlier, item-driven alert_intent call that a first-match pick would hit, and
+# `alert_intent platform` is what (g3) drops instead.
+INTENT_LINE="$(grep -nxF '      alert_intent "$name"' "${WORK}/span.src" | head -1 | cut -d: -f1)"
 [ -n "$INTENT_LINE" ] || { printf 'FAIL harness could not find an intent call\n'; exit 1; }
 sed "${INTENT_LINE}d" "${WORK}/span.src" >"${WORK}/span-teeth.src"
 SPAN="${WORK}/span-teeth.src"
@@ -271,11 +276,11 @@ if render teeth_assertion; then bad "render assertion catches a missing intent";
 has "assertion failure names the counts" "$(cat "$WORK/teeth_assertion/stderr.log")" "render assertion failed"
 
 # (g2) a ledger name whose block carries no stanza: totals still match
-# (4 == 4), so only the per-name check catches it — the #136 review's
+# (2 == 2), so only the per-name check catches it — the #136 review's
 # swap/move class (an endpoint in the ledger, its block unalerted).
 fixture_env
 export NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator GATUS_ENDPOINTS="host=https://host.piercloud.net/healthz"
-awk '!done && /alert_intent main/ { sub(/alert_intent main/, "alert_intent moved-row"); done = 1 } { print }' \
+awk '!done && /alert_intent "\$name"/ { sub(/alert_intent "\$name"/, "alert_intent moved-row"); done = 1 } { print }' \
   "${WORK}/span.src" >"${WORK}/span-moved.src"
 SPAN="${WORK}/span-moved.src"
 if render moved_assertion; then bad "render assertion catches a ledger name without its stanza"; else ok "render assertion catches a ledger name without its stanza"; fi
