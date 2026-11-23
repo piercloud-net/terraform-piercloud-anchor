@@ -541,6 +541,7 @@ gatus_render() { # $1 label, $2 items file (one item) or '' -> sets G (config pa
   G="$WORK/g-$1/config.yaml"; mkdir -p "$WORK/g-$1"
   { cat "$WORK/stubs.src"
     printf '%s\n' 'caddy_status_names() { :; }'
+    printf '. %q\n' "$ROOT/scripts/lib/naming.sh"   # the alias gate's validator (010 carries a byte-identical copy)
     printf 'GATUS_CONFIG=%q\n' "$G"
     [ -n "$2" ] && printf 'gatus_ext_items+=("$(cat %q)")\n' "$2"
     cat "$WORK/gatus.src"; } >"$WORK/g-$1/run.sh"
@@ -576,7 +577,7 @@ cp "$WORK/gatus.orig" "$WORK/gatus.src"
 
 # ---- (h2) Gatus config mode + the token commit order in the real gatus span
 G2="$WORK/g-mode/config.yaml"; mkdir -p "$WORK/g-mode"; printf 'old: 1\n' >"$G2"; chmod 0644 "$G2"
-{ cat "$WORK/stubs.src"; printf '%s\n' 'caddy_status_names() { :; }'; printf 'GATUS_CONFIG=%q\n' "$G2"; cat "$WORK/gatus.src"; } >"$WORK/g-mode/run.sh"
+{ cat "$WORK/stubs.src"; printf '%s\n' 'caddy_status_names() { :; }'; printf '. %q\n' "$ROOT/scripts/lib/naming.sh"; printf 'GATUS_CONFIG=%q\n' "$G2"; cat "$WORK/gatus.src"; } >"$WORK/g-mode/run.sh"
 if ( export TENANT_USER=pier STATUS_HOST=pier.status.piercloud.net ANCHOR_HOSTNAME=anchor-01-pier; umask 022
   bash "$WORK/g-mode/run.sh" >"$WORK/g-mode/out.log" 2>&1 ); then ok "(h) render over a pre-existing 0644 config"; else bad "(h) render over a 0644 config"; fi
 is "(h) Gatus config tightened to 0600 (it holds bearer tokens)" 600 "$(stat -c %a "$G2")"
