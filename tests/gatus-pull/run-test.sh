@@ -62,7 +62,7 @@ command -v python3 >/dev/null 2>&1 || { printf 'FAIL python3 is required\n'; exi
 
 pass=0
 fail=0
-MIN_CHECKS=240
+MIN_CHECKS=269
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -126,7 +126,22 @@ has "module writes temp files that are not .yaml" "$(cat "${WORK}/module.py")" '
 for flag in '"--proto", "=https"' '"--max-redirs", "0"' '"--max-time", "20"' '"--max-filesize", str(MAX_BODY)' '"--speed-limit", "1000"' '"--speed-time", "10"' '"If-None-Match: " + etag'; do
   has "curl flag pinned: ${flag}" "$(cat "${WORK}/module.py")" "$flag"
 done
-has "module pins the public-edge target" "$(cat "${WORK}/module.py")" "https://edge.piercloud.site/healthz"
+# D13's public edge row reads Cloudflare's own Statuspage (design check
+# slice-health-endpoint-c section 7, owner 2026-11-23: it "currently goes down
+# when the host goes down"). The URL is anchor-pinned here, and the row's
+# cadence and conditions live beside it as constants the row renderer reads.
+has "module pins the public-edge target to Cloudflare's Statuspage component" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_URL = ("https://www.cloudflarestatus.com/api/v2/components/%s.json"'
+has "module pins that target to the component id, in one place" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_COMPONENT = "5wnz34mhfhrk"'
+# ... and the only surviving mention of the old target is the comment that
+# records why it left: the URL constant itself is Cloudflare's.
+lacks "module renders no row against our own edge" "$(cat "${WORK}/module.py")" "https://edge.piercloud.site/healthz"
+lacks "module's row target is not our edge" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_URL = "https://edge'
+has "module grades the component body, not only the status" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_CONDITIONS = ('
+has "module grades the document's component IDENTITY in the body" "$(cat "${WORK}/module.py")" '    "[BODY].component.id == %s" % PUBLIC_EDGE_COMPONENT,'
+has "module accepts operational" "$(cat "${WORK}/module.py")" '    "[BODY].component.status == any(operational, under_maintenance)",'
+has "module's grammar pins the row's url to that target" "$(cat "${WORK}/module.py")" "if name == \"public edge\" and fields[\"url\"] != PUBLIC_EDGE_URL:"
+has "module polls the third party every 300 s" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_INTERVAL = "300s"'
+has "module renders the row monitor-only" "$(cat "${WORK}/module.py")" 'rows.append(render_row("public edge", "platform", entry["url"], False))'
 has "module derives the shared gate login path" "$(cat "${WORK}/module.py")" "https://id.%s.piercloud.net/login"
 has "module requires the site class" "$(cat "${WORK}/module.py")" "type must be one of: public, shared, private"
 has "module cross-checks the class namespace" "$(cat "${WORK}/module.py")" "type public requires a <site>-<alias>.piercloud.site url"
@@ -379,6 +394,18 @@ esac
 # Alert classes (D5): class 5 (night-emergency bridge) on platform/slice/gate
 # rows, class 4 (native ntfy, priority 4, no resolve) on public tenant rows.
 row_block() { awk -v n="$1" '$0 == "  - name: " n { f=1 } f && /^  - name: / && $0 != "  - name: " n { exit } f { print }' "$FRAGMENT"; }
+# A per-row ABSENCE tooth is only evidence when the row is there to be read
+# (lens 292 r1 functional F1: an alerting revert makes the grammar refuse the
+# row, the fragment is held at the seed, and a bare `lacks` on an empty block
+# passes on nothing). This asserts presence first, then the absence.
+lacks_row() { # $1 label, $2 row name, $3 needle
+  local block; block="$(row_block "$2")"
+  case "$block" in
+    "  - name: $2"*) ;;
+    *) bad "$1 (no '$2' row in the fragment: the absence would be vacuous)"; return ;;
+  esac
+  case "$block" in *"$3"*) bad "$1 (unexpected: $3)" ;; *) ok "$1" ;; esac
+}
 has "class 4: tenant row uses native ntfy" "$(row_block blog)" "- type: ntfy"
 lacks "class 4: tenant row carries no resolve bridge" "$(row_block blog)" "send-on-resolved"
 has "class 4: tenant row pins priority 4" "$(row_block blog)" "priority: 4"
@@ -581,8 +608,11 @@ rc="$(pull_rc)"
 [ "$rc" = "0" ] && cmp -s "$FRAGMENT" "$CASE/before.yaml" && ok "platform disabled opt-out is accepted" \
   || bad "platform disabled opt-out is accepted"
 
-# D13: the platform's `edge: true` derives the `public edge` row (target
-# anchor-pinned; operator alerting, monitor-only on tenant anchors).
+# D13: the platform's `edge: true` derives the `public edge` row. Since the
+# 2026-11-23 re-ruling it grades Cloudflare's own Statuspage CDN/Cache
+# component, every 300 s, and is MONITOR-ONLY ON EVERY ANCHOR — the operator
+# anchor included, because nobody on our side can act on a Cloudflare
+# incident and `platform` keeps paging the operator for host-down.
 new_case platform-edge
 python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
 python3 "${HARNESS_DIR}/fixtures.py" platform edge >"$CASE/platform.json"
@@ -591,9 +621,19 @@ seed_once
 rc="$(pull_rc)"
 is "platform edge: pull exits 0" "0" "$rc"
 has "platform edge: row rendered" "$(cat "$FRAGMENT")" "  - name: public edge"
-has "platform edge: pinned target" "$(cat "$FRAGMENT")" "url: https://edge.piercloud.site/healthz"
+has "platform edge: pinned target is the Statuspage component" "$(row_block 'public edge')" "url: https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfhrk.json"
+lacks "platform edge: the row no longer probes our own edge" "$(row_block 'public edge')" "piercloud.site"
 has "platform edge: platform group" "$(row_block 'public edge')" "    group: platform"
-has "platform edge: operator alerting (class 5 bridge)" "$(row_block 'public edge')" "- type: custom"
+has "platform edge: 300 s cadence" "$(row_block 'public edge')" "    interval: 300s"
+has "platform edge: status condition" "$(row_block 'public edge')" '      - "[STATUS] == 200"'
+has "platform edge: body condition on the component" "$(row_block 'public edge')" '      - "[BODY].component.status == any(operational, under_maintenance)"'
+has "platform edge: body condition pins the component identity" "$(row_block 'public edge')" '      - "[BODY].component.id == 5wnz34mhfhrk"'
+has "platform edge: 200 alone is not enough" "$(row_block 'public edge')" '[BODY].component.status'
+has "platform edge: redirects not followed" "$(row_block 'public edge')" "      ignore-redirect: true"
+lacks_row "platform edge: monitor-only on the operator anchor (no alert stanza)" "public edge" "alerts:"
+lacks_row "platform edge: never pages through the class-5 bridge" "public edge" "- type: custom"
+lacks_row "platform edge: never pages through the class-4 provider" "public edge" "- type: ntfy"
+is "platform edge: the fragment still carries the platform row" "1" "$(grep -c '^  - name: platform$' "$FRAGMENT" || true)"
 
 new_case platform-edge-tenant-role
 python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
@@ -604,7 +644,8 @@ seed_once
 rc="$(pull_rc)"
 is "platform edge (tenant role): pull exits 0" "0" "$rc"
 has "platform edge (tenant role): row stays monitor-only" "$(cat "$FRAGMENT")" "  - name: public edge"
-lacks "platform edge (tenant role): no alert stanza" "$(row_block 'public edge')" "alerts:"
+lacks_row "platform edge (tenant role): no alert stanza" "public edge" "alerts:"
+has "platform edge (tenant role): same Statuspage target" "$(row_block 'public edge')" "5wnz34mhfhrk"
 
 new_case platform-edge-false
 python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
@@ -849,6 +890,90 @@ rc=0; seed || rc=$?
 is "seed: second seed exits 0" "0" "$rc"
 has "seed: second seed leaves the file untouched" "$(cat "$CASE/seed.err")" "already present"
 cmp -s "$FRAGMENT" "$CASE/seed.yaml" && ok "seed: bytes unchanged" || bad "seed: bytes unchanged"
+
+# ---- (m) the pinned-target contract: the url AND the body identity --------
+# `public edge` claims a specific document about a specific component (design
+# check slice-health-endpoint-c section 7). The url is pinned in the grammar and
+# the component identity is graded in the body, so "HTTP 200 plus some status
+# field" cannot become the row by drift. Every refusal tooth below is driven
+# against the REAL module's verify_fragment_text, and the unmutated fragment is
+# asserted ACCEPTED in the same case first, so a refusal cannot be a bare parse
+# error and an empty fragment cannot pass.
+new_case pinned-target
+python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
+python3 "${HARNESS_DIR}/fixtures.py" platform edge >"$CASE/platform.json"
+seed_once
+rc="$(pull_rc)"
+is "pinned target: pull exits 0" "0" "$rc"
+has "pinned target: the row is in the fragment" "$(cat "$FRAGMENT")" "  - name: public edge"
+cp "$FRAGMENT" "${WORK}/pinned-fragment.yaml"
+
+grammar_verdict() { # $1 = fragment file -> 'accepted' or 'refused: <reason>'
+  python3 - "$1" "${WORK}/module.py" <<'PY'
+import sys
+fragment_path, module_path = sys.argv[1], sys.argv[2]
+namespace = {"__name__": "puller"}
+with open(module_path, "r", encoding="utf-8") as handle:
+    exec(compile(handle.read(), module_path, "exec"), namespace)
+with open(fragment_path, "r", encoding="utf-8") as handle:
+    text = handle.read()
+try:
+    namespace["verify_fragment_text"](text)
+except namespace["FragmentError"] as exc:
+    print("refused: %s" % exc)
+else:
+    print("accepted")
+PY
+}
+mutated_fragment() { # $1 = dst, $2 = old text, $3 = new text (one substitution)
+  python3 - "${WORK}/pinned-fragment.yaml" "$1" "$2" "$3" <<'PY'
+import sys
+src, dst, old, new = sys.argv[1:5]
+text = open(src, encoding="utf-8").read()
+if text.count(old) != 1:
+    raise SystemExit("mutation anchor occurs %d times: %r" % (text.count(old), old))
+with open(dst, "w", encoding="utf-8") as handle:
+    handle.write(text.replace(old, new, 1))
+PY
+}
+refused_tooth() { # $1 label, $2 fragment file, $3 expected reason fragment
+  local verdict; verdict="$(grammar_verdict "$2")"
+  case "$verdict" in
+    *"$3"*) ok "$1" ;;
+    *) bad "$1 (verdict: ${verdict:-<empty>})" ;;
+  esac
+}
+mutation_tooth() { # $1 label, $2 dst file, $3 old, $4 new, $5 expected reason
+  if ! mutated_fragment "$2" "$3" "$4"; then
+    bad "$1 (the mutation anchor is absent from the rendered row)"
+    return
+  fi
+  refused_tooth "$1" "$2" "$5"
+}
+is "pinned target: the real fragment is accepted" "accepted" "$(grammar_verdict "${WORK}/pinned-fragment.yaml")"
+PINNED_URL='url: https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfhrk.json'
+PINNED_ID='      - "[BODY].component.id == 5wnz34mhfhrk"'
+mutation_tooth "pinned target: our own edge as the url is refused" \
+  "${WORK}/mut-url-own-edge.yaml" "$PINNED_URL" 'url: https://edge.piercloud.site/healthz' \
+  "pinned Statuspage component document"
+mutation_tooth "pinned target: a foreign host as the url is refused" \
+  "${WORK}/mut-url-foreign-host.yaml" "$PINNED_URL" 'url: https://example.org/whatever.json' \
+  "pinned Statuspage component document"
+# A CONSISTENT forgery (another component's id in both the url and the body)
+# is still refused: the url is pinned to exactly this component's document.
+mutation_tooth "pinned target: another component's document is refused" \
+  "${WORK}/mut-url-other-component.yaml" "$PINNED_URL" \
+  'url: https://www.cloudflarestatus.com/api/v2/components/abcd1234.json' \
+  "pinned Statuspage component document"
+mutation_tooth "pinned target: a mutated body component id is refused" \
+  "${WORK}/mut-body-id.yaml" "$PINNED_ID" '      - "[BODY].component.id == abcd1234"' \
+  "non-canonical condition"
+mutation_tooth "pinned target: dropping the body identity condition is refused" \
+  "${WORK}/mut-body-status-drop-id.yaml" "$PINNED_ID" '      - "[STATUS] == 200"' \
+  "non-canonical condition"
+mutation_tooth "pinned target: grading an outage as green is refused" \
+  "${WORK}/mut-status-widened.yaml" 'any(operational, under_maintenance)"' \
+  'any(operational, under_maintenance, major_outage)"' "non-canonical condition"
 
 # ---- CI wiring -------------------------------------------------------------
 has "CI runs this harness" "$(cat "$CI")" "tests/gatus-pull/run-test.sh"
