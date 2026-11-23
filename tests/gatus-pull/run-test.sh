@@ -62,7 +62,7 @@ command -v python3 >/dev/null 2>&1 || { printf 'FAIL python3 is required\n'; exi
 
 pass=0
 fail=0
-MIN_CHECKS=240
+MIN_CHECKS=257
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
 is()  { # $1 label, $2 expected, $3 actual
@@ -126,7 +126,20 @@ has "module writes temp files that are not .yaml" "$(cat "${WORK}/module.py")" '
 for flag in '"--proto", "=https"' '"--max-redirs", "0"' '"--max-time", "20"' '"--max-filesize", str(MAX_BODY)' '"--speed-limit", "1000"' '"--speed-time", "10"' '"If-None-Match: " + etag'; do
   has "curl flag pinned: ${flag}" "$(cat "${WORK}/module.py")" "$flag"
 done
-has "module pins the public-edge target" "$(cat "${WORK}/module.py")" "https://edge.piercloud.site/healthz"
+# D13's public edge row reads Cloudflare's own Statuspage (design check
+# slice-health-endpoint-c section 7, owner 2026-11-23: it "currently goes down
+# when the host goes down"). The URL is anchor-pinned here, and the row's
+# cadence and conditions live beside it as constants the row renderer reads.
+has "module pins the public-edge target to Cloudflare's Statuspage component" "$(cat "${WORK}/module.py")" "PUBLIC_EDGE_URL = \"https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfhrk.json\""
+# ... and the only surviving mention of the old target is the comment that
+# records why it left: the URL constant itself is Cloudflare's.
+lacks "module renders no row against our own edge" "$(cat "${WORK}/module.py")" "https://edge.piercloud.site/healthz"
+lacks "module's row target is not our edge" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_URL = "https://edge'
+has "module pins the CDN/Cache component id once" "$(cat "${WORK}/module.py")" "5wnz34mhfhrk"
+has "module grades the component body, not only the status" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_CONDITIONS = ('
+has "module accepts operational" "$(cat "${WORK}/module.py")" '    "[BODY].component.status == any(operational, under_maintenance)",'
+has "module polls the third party every 300 s" "$(cat "${WORK}/module.py")" 'PUBLIC_EDGE_INTERVAL = "300s"'
+has "module renders the row monitor-only" "$(cat "${WORK}/module.py")" 'rows.append(render_row("public edge", "platform", entry["url"], False))'
 has "module derives the shared gate login path" "$(cat "${WORK}/module.py")" "https://id.%s.piercloud.net/login"
 has "module requires the site class" "$(cat "${WORK}/module.py")" "type must be one of: public, shared, private"
 has "module cross-checks the class namespace" "$(cat "${WORK}/module.py")" "type public requires a <site>-<alias>.piercloud.site url"
@@ -581,8 +594,11 @@ rc="$(pull_rc)"
 [ "$rc" = "0" ] && cmp -s "$FRAGMENT" "$CASE/before.yaml" && ok "platform disabled opt-out is accepted" \
   || bad "platform disabled opt-out is accepted"
 
-# D13: the platform's `edge: true` derives the `public edge` row (target
-# anchor-pinned; operator alerting, monitor-only on tenant anchors).
+# D13: the platform's `edge: true` derives the `public edge` row. Since the
+# 2026-11-23 re-ruling it grades Cloudflare's own Statuspage CDN/Cache
+# component, every 300 s, and is MONITOR-ONLY ON EVERY ANCHOR — the operator
+# anchor included, because nobody on our side can act on a Cloudflare
+# incident and `platform` keeps paging the operator for host-down.
 new_case platform-edge
 python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
 python3 "${HARNESS_DIR}/fixtures.py" platform edge >"$CASE/platform.json"
@@ -591,9 +607,18 @@ seed_once
 rc="$(pull_rc)"
 is "platform edge: pull exits 0" "0" "$rc"
 has "platform edge: row rendered" "$(cat "$FRAGMENT")" "  - name: public edge"
-has "platform edge: pinned target" "$(cat "$FRAGMENT")" "url: https://edge.piercloud.site/healthz"
+has "platform edge: pinned target is the Statuspage component" "$(row_block 'public edge')" "url: https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfhrk.json"
+lacks "platform edge: the row no longer probes our own edge" "$(row_block 'public edge')" "piercloud.site"
 has "platform edge: platform group" "$(row_block 'public edge')" "    group: platform"
-has "platform edge: operator alerting (class 5 bridge)" "$(row_block 'public edge')" "- type: custom"
+has "platform edge: 300 s cadence" "$(row_block 'public edge')" "    interval: 300s"
+has "platform edge: status condition" "$(row_block 'public edge')" '      - "[STATUS] == 200"'
+has "platform edge: body condition on the component" "$(row_block 'public edge')" '      - "[BODY].component.status == any(operational, under_maintenance)"'
+has "platform edge: 200 alone is not enough" "$(row_block 'public edge')" '[BODY].component.status'
+has "platform edge: redirects not followed" "$(row_block 'public edge')" "      ignore-redirect: true"
+lacks "platform edge: monitor-only on the operator anchor (no alert stanza)" "$(row_block 'public edge')" "alerts:"
+lacks "platform edge: never pages through the class-5 bridge" "$(row_block 'public edge')" "- type: custom"
+lacks "platform edge: never pages through the class-4 provider" "$(row_block 'public edge')" "- type: ntfy"
+is "platform edge: the fragment still carries the platform row" "1" "$(grep -c '^  - name: platform$' "$FRAGMENT" || true)"
 
 new_case platform-edge-tenant-role
 python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"
@@ -605,6 +630,7 @@ rc="$(pull_rc)"
 is "platform edge (tenant role): pull exits 0" "0" "$rc"
 has "platform edge (tenant role): row stays monitor-only" "$(cat "$FRAGMENT")" "  - name: public edge"
 lacks "platform edge (tenant role): no alert stanza" "$(row_block 'public edge')" "alerts:"
+has "platform edge (tenant role): same Statuspage target" "$(row_block 'public edge')" "5wnz34mhfhrk"
 
 new_case platform-edge-false
 python3 "${HARNESS_DIR}/fixtures.py" tenant disabled-optout >"$CASE/tenant.json"

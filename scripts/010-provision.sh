@@ -2935,10 +2935,37 @@ ENTRY_KEYS = frozenset(("name", "url", "alerts", "disabled"))
 # get no per-site app-health row, only the derived gate rows below.
 TENANT_ENTRY_KEYS = frozenset(("name", "url", "alerts", "disabled", "type"))
 SITE_TYPES = frozenset(("public", "shared", "private"))
-# `public edge` (D13): the row target is anchor-pinned (never manifest-
-# controlled); the platform enables it with `edge: true` once it serves this
-# path through the public edge (a platform-side follow-up).
-PUBLIC_EDGE_URL = "https://edge.piercloud.site/healthz"
+# `public edge` (D13, re-ruled 2026-11-23 in design check
+# slice-health-endpoint-c section 7, owner: "the public edge endpoint also
+# should just follow cloudflare status (it currently goes down when the host
+# goes down lol)"). The row no longer probes anything we run. It used to read
+# the anchor-pinned `edge.<zone>/healthz` it probed until this change: Cloudflare in front of the static
+# vhost on the pc-control guest, which runs on our own host (pc-control #134),
+# so it reddened within a second of `platform` on all three measured host-down
+# events (2026-11-11T06:52, 2026-11-13T08:38, 2026-11-14T19:47) and said
+# nothing about Cloudflare. It reads Cloudflare's own Statuspage for the one
+# component that is the orange proxy's serving path — CDN/Cache, in the
+# `Cloudflare Sites and Services` group — and stays anchor-pinned (never
+# manifest-controlled), so a platform-side change cannot redirect the probe
+# and the SSRF boundary is unchanged. Measured 2026-11-23: 200 with
+# {"component":{"id":"5wnz34mhfhrk","name":"CDN/Cache","status":"operational"}},
+# served by Google Frontend, not by Cloudflare's own edge.
+PUBLIC_EDGE_URL = "https://www.cloudflarestatus.com/api/v2/components/5wnz34mhfhrk.json"
+# Row contract (design check section 7): `operational` is green and
+# `under_maintenance` on the GLOBAL CDN/Cache component is green (announced,
+# and the edge reroutes); `degraded_performance`, `partial_outage` and
+# `major_outage` are red. Cloudflare raises the global product component only
+# for an incident broad enough to affect the product, so PoP-level rerouting
+# does not page anyone — the tenant's own class-4 public-site rows are the
+# first-hand signal for their sites. 300 s because Statuspage is edited by
+# humans: faster polling only adds third-party load. Monitor-only on every
+# anchor (the row never pushes): nobody on our side can act on a Cloudflare
+# incident, and `platform` keeps paging the operator for host-down.
+PUBLIC_EDGE_INTERVAL = "300s"
+PUBLIC_EDGE_CONDITIONS = (
+    "[STATUS] == 200",
+    "[BODY].component.status == any(operational, under_maintenance)",
+)
 
 
 class PullError(Exception):
@@ -3423,17 +3450,30 @@ def validate_platform(doc, resolver):
 # ---------------------------------------------------------------------------
 # rendering
 # ---------------------------------------------------------------------------
+def row_interval(name):
+    """The row's cadence. `public edge` is the only 300 s row (section 7)."""
+    return PUBLIC_EDGE_INTERVAL if name == "public edge" else "60s"
+
+
+def row_conditions(name):
+    """The row's conditions. `public edge` is the only body-graded row."""
+    return PUBLIC_EDGE_CONDITIONS if name == "public edge" else ("[STATUS] == 200",)
+
+
 def render_row(name, group, url, alerting, alert_class=5):
     out = [
         "  - name: %s" % name,
         "    group: %s" % group,
         "    url: %s" % url,
-        "    interval: 60s",
+        "    interval: %s" % row_interval(name),
         "    conditions:",
-        '      - "[STATUS] == 200"',
+    ]
+    for condition in row_conditions(name):
+        out.append('      - "%s"' % condition)
+    out.extend([
         "    client:",
         "      ignore-redirect: true",
-    ]
+    ])
     if alerting:
         stanza = ALERT_STANZA if alert_class == 5 else ALERT_STANZA_CLASS4
         out.append(stanza.rstrip("\n"))
@@ -3457,10 +3497,13 @@ def render_fragment(alias, role, alerting, platform_entries, tenant_entries):
     rows.append(render_row("platform", "platform", platform_url,
                            alerting and role == "operator"))
     # D13 `public edge`: the platform declares the row in use; the target is
-    # anchor-pinned, so a platform-side change cannot redirect the probe.
+    # anchor-pinned, so a platform-side change cannot redirect the probe. Since
+    # the 2026-11-23 re-ruling (section 7) the row grades Cloudflare's own
+    # Statuspage component and is MONITOR-ONLY on every anchor, including the
+    # operator one: nobody on our side can act on a Cloudflare incident, and
+    # `platform` still pages the operator for host-down.
     for entry in edge_rows:
-        rows.append(render_row("public edge", "platform", entry["url"],
-                               alerting and role == "operator"))
+        rows.append(render_row("public edge", "platform", entry["url"], False))
     rows.append(render_row("your piercloud", alias,
                            "https://meta-%s.piercloud.site/healthz" % alias, alerting))
     rows.append(render_row("private (gate)", alias,
@@ -3537,12 +3580,21 @@ def verify_fragment_text(text):
                 fields["group"] = line[len("    group: "):]
             elif line.startswith("    url: ") and fields["url"] is None:
                 fields["url"] = line[len("    url: "):]
-            elif line == "    interval: 60s" and fields["interval"] is None:
+            elif line.startswith("    interval: ") and fields["interval"] is None:
+                # One cadence per row shape, and `public edge` is the only
+                # 300 s row (design check section 7): a slower or faster
+                # poll of a third party is a contract change, not a detail.
+                if line != "    interval: %s" % row_interval(name):
+                    raise FragmentError("row %r has a non-canonical interval" % name)
                 fields["interval"] = True
             elif line == "    conditions:" and not fields["condition"]:
-                index += 1
-                if index >= total or lines[index] != '      - "[STATUS] == 200"':
+                # The conditions are the row's claim, in order: a row that
+                # gains, loses or reorders one is refused here, so the
+                # renderer and this grammar stay one contract.
+                wanted = ['      - "%s"' % condition for condition in row_conditions(name)]
+                if lines[index + 1:index + 1 + len(wanted)] != wanted:
                     raise FragmentError("row %r has a non-canonical condition" % name)
+                index += len(wanted)
                 fields["condition"] = True
             elif line == "    client:" and not fields["client"]:
                 index += 1
@@ -3550,6 +3602,9 @@ def verify_fragment_text(text):
                     raise FragmentError("row %r must carry client.ignore-redirect" % name)
                 fields["client"] = True
             elif line == "    alerts:" and not fields["alerts"]:
+                if name == "public edge":
+                    raise FragmentError(
+                        "row %r is monitor-only and must not carry an alert stanza" % name)
                 index += 1
                 class5_stanza = ALERT_STANZA.rstrip("\n").split("\n")[1:]
                 class4_stanza = ALERT_STANZA_CLASS4.rstrip("\n").split("\n")[1:]
