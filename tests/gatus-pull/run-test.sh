@@ -819,6 +819,20 @@ has "install: env carries the tenant manifest URL" "$(cat "${WORK}/install/etc/g
 has "install: env carries the platform manifest URL" "$(cat "${WORK}/install/etc/gatus-pull.env")" "platform.piercloud.net/.well-known/pc-status.json"
 has "install: env carries the ntfy topic" "$(cat "${WORK}/install/etc/gatus-pull.env")" "NTFY_TOPIC=pc-test"
 has "install: seeded fragment carries the seeded rows" "$(cat "${WORK}/install/etc/gatus/tenant-endpoints.yaml")" "name: your piercloud"
+# (RT2, #291 r2 fold) The one tenant-controlled `.site` landing the SEED may
+# reach is the NAMED slice row: `your piercloud` at
+# meta-<alias>.piercloud.site/healthz (the D12 forcing function; design check
+# §5 piece 4 / A3 retargets it to health.<alias>.piercloud.net/healthz). A
+# seeded row aiming any other name at a `.site` landing is the #286/#289
+# defect class - an anchor-side row greening on a Cloudflare-fronted landing
+# whose content the publish path can change - and must be red here. (Manifest
+# `public` entries are the declared exception: D13 makes their `.site` URL the
+# site's own row.)
+site_owners() { awk '{ if ($0 ~ /^ *- name: /) { n = $0; sub(/^ *- name: /, "", n) } if ($0 ~ /url: .*\.piercloud\.site/) print n }' "$1"; }
+is "install: the seed reaches exactly one .site landing, and it is the named slice row" \
+  "your piercloud" "$(site_owners "${WORK}/install/etc/gatus/tenant-endpoints.yaml")"
+is "the .site owner tooth is not vacuous (a renamed row is caught)" "slice" \
+  "$(printf '  - name: slice\n    url: https://pier.piercloud.site/healthz\n' | site_owners /dev/stdin)"
 has "install: systemctl daemon-reload called" "$(cat "${WORK}/install/systemctl.log")" "daemon-reload"
 has "install: timer enabled" "$(cat "${WORK}/install/systemctl.log")" "enable piercloud-gatus-pull.timer"
 ( source "${WORK}/stubs.src"; source "${WORK}/span.src"; gatus_puller_disable ) \

@@ -145,11 +145,14 @@
 #                            Tang is unaffected either way.
 #   (No standing SSH keys by design 2026-09-08: mobile tenants can't use them;
 #    re-entry is SCP password-reset + re-dispatch; the runner is the admin path.)
-#   TENANT_USER                operator-set slice alias (lowercase, DNS-label
-#                            chars; feeds the slice names, never a monitor row
-#                            — the legacy `main` homepage row is deleted, design
-#                            check slice-health-endpoint-c §9, and the slice's
-#                            row is the puller's `your piercloud`).
+#   TENANT_USER                operator-set slice alias (lowercase, the
+#                            dispatcher grammar ^[a-z0-9]{3,15}$ — the Gatus
+#                            render refuses anything else BY NAME before it
+#                            renders, so a typo dies where it is typed rather
+#                            than into a hostname; feeds the slice names, never a
+#                            monitor row — the legacy `main` homepage row is
+#                            deleted, design check slice-health-endpoint-c §9, and
+#                            the slice's row is the puller's `your piercloud`).
 #   THUMBPRINT_FILE          artifact path for the captured tang thumbprint
 #                            (default ./thumbprint.txt; the value is public).
 #   PINNED_IP                runner IP pinned at open; provision re-fetches

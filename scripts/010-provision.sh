@@ -2404,6 +2404,36 @@ case "${STATUS_PULLER:-}" in
   1|true|yes|on)     PULLER_MODE=1 ;;
   *) die "bad STATUS_PULLER (want unset/true/false): ${STATUS_PULLER}" ;;
 esac
+# Alias gate (#291 r2 fold, red-team RT1; #288 G1's own fix direction). The
+# row deleted in A1 carried this render's last fail-closed check on
+# TENANT_USER, and what survives is a derivation, not a validation:
+# `caddy_status_names` lowercases and `sanitize_tenant` rewrites with `sed`,
+# which is line-oriented - a newline is never replaced, so a multi-line or
+# otherwise malformed alias rendered a config.yaml Gatus refuses (the run then
+# died at the post-restart poll, with the monitor unable to load a config)
+# where origin/main aborted before writing anything. Refuse VISIBLY here,
+# before any rendering and before any write: the exact alias grammar, never a
+# widened accept (owner rule - a validation defect gets a visible refusal, and
+# a silent lowercase-accept is what #288 G1 was filed against).
+# The validator is the canonical one (`scripts/lib/naming.sh`, carried
+# byte-identically in the NAMING block above; `tests/naming-scheme` pins the
+# two copies equal), applied to the RAW value - so a mixed-case, spaced,
+# hyphenated, dotted, too-short, too-long or reserved alias is refused by
+# name instead of being normalised into a hostname. Empty is ABSENT, not
+# malformed: 020 always exports TENANT_USER (empty when there is no alias),
+# and the no-alias console fallback is a pinned shape - it keeps its warning
+# and renders the anchor-local rows.
+if [ -n "${TENANT_USER:-}" ]; then
+  case "$TENANT_USER" in
+    *[![:print:]]*)
+      # Never echo the raw value into a log line: a newline in it forges lines.
+      _alias_shown="$(printf '%s' "$TENANT_USER" | LC_ALL=C tr -c '[:print:]' '?')"
+      die "bad TENANT_USER for the gatus render ('${_alias_shown}'): whitespace/control characters are not an alias (want ^[a-z0-9]{3,15}$) - refusing to render, nothing written" ;;
+    *)
+      validate_tenant_username "$TENANT_USER" \
+        || die "bad TENANT_USER for the gatus render ('${TENANT_USER}'): refusing to render - the alias grammar is ^[a-z0-9]{3,15}$ (lowercase), nothing written" ;;
+  esac
+fi
 log "Rendering dispatch-managed Gatus config (${GATUS_CONFIG})"
 mkdir -p "$(dirname "${GATUS_CONFIG}")"
 caddy_status_names

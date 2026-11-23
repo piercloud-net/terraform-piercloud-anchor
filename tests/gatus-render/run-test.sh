@@ -12,8 +12,13 @@
 #       slice-health-endpoint-c §9, owner 2026-11-23 "deleted totally ... not
 #       there at all"), so no shape renders it and the span carries no builder
 #       or alert intent for it; a `main=` GATUS_ENDPOINTS pair is an ordinary
-#       tenant pair, and the mixed-case TENANT_USER guard that existed only for
-#       that row is gone with it (#288 G1);
+#       tenant pair. The row is banned by SHAPE too, not only by name (r2 fold
+#       F2/RT2): no rendered row may probe the slice's own IdP or a
+#       tenant-controlled `.piercloud.site` landing;
+#   (a3) the ALIAS GATE (r2 fold RT1): an alias that is not the exact grammar
+#       ^[a-z0-9]{3,15}$ is refused by name, before anything renders, and no
+#       config is written (#288 G1's fix direction: a visible refusal, never a
+#       widened accept). Empty is ABSENT - the no-alias fallback still renders;
 #   (b) the alert shapes (call C9): class-5 rows (platform) publish
 #       through the ntfy-JSON custom bridge with TRIGGERED 5 / RESOLVED 3 and
 #       send-on-resolved; class-4 rows (GATUS_ENDPOINTS pairs, dashboard TLS)
@@ -52,6 +57,11 @@ lacks() { # $1 label, $2 haystack, $3 needle
 is() { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
+is_re() { # $1 label, $2 expected count, $3 haystack, $4 ERE (anchored by the caller)
+  local n
+  n="$(printf '%s\n' "$3" | grep -cE -- "$4" || true)"
+  is "$1" "$2" "$n"
+}
 
 [ -f "$PROVISION" ] || { printf 'FAIL provision script not found: %s\n' "$PROVISION"; exit 1; }
 
@@ -78,6 +88,10 @@ warn() { printf 'harness WARNING: %s\n' "$*" >&2; }
 die()  { printf 'FAIL(die): %s\n' "$*" >&2; exit 1; }
 caddy_status_names() { :; }   # STATUS_HOST/ANCHOR_HOSTNAME come from the fixture env
 EOF
+# The alias gate calls the REAL validator (`validate_tenant_username`), not a
+# stub: 010 carries a byte-identical copy of this block (tests/naming-scheme
+# pins the two equal), so the harness drives the grammar the dispatcher uses.
+printf '. %q\n' "$ROOT/scripts/lib/naming.sh" >>"${WORK}/stubs.src"
 
 render() { # $1 = case label; the caller exports the env for the case
   local dir="$WORK/$1"
@@ -131,9 +145,42 @@ has "tenant: ui default-sort-by group present" "$(cat "$CFG")" "default-sort-by:
 # builder is left in the span for a future edit to resurrect (design check
 # slice-health-endpoint-c §9, owner 2026-11-23). A `main=` pair is an ordinary
 # tenant pair — pinned in (e).
-lacks "main row is deleted from the tenant shape" "$(cat "$CFG")" "- name: main"
-lacks "the span carries no main row builder" "$(cat "${WORK}/span.src")" "name: main"
+# Anchored to the item line (r2 fold F3): a substring match on `name: main`
+# also fires on `maintenance`, `main-www` or any future row whose name merely
+# starts with it, and then reports something that is not true.
+is_re "main row is deleted from the tenant shape" "0" "$(cat "$CFG")" '^  - name: main$'
+# The builder tooth is anchored to the item text for the same reason, and is
+# proved NON-VACUOUS both ways: the deleted bytes match it, a longer name is
+# spared (a tooth that cannot fire is not a tooth).
+is_re "the span carries no main row builder" "0" "$(cat "${WORK}/span.src")" '- name: main([^a-z0-9_-]|$)'
+is_re "main-row builder matcher matches the deleted bytes (non-vacuous)" "1" \
+  'ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: main' '- name: main([^a-z0-9_-]|$)'
+is_re "main-row builder matcher spares a longer name" "0" \
+  'ENDPOINTS_YAML="${ENDPOINTS_YAML}  - name: maintenance' '- name: main([^a-z0-9_-]|$)'
 lacks "the span carries no main alert intent" "$(cat "${WORK}/span.src")" "alert_intent main"
+# (a2b) the row is banned by SHAPE, not only by name (r2 fold F2 + RT2). A row
+# RENAMED `slice` probing the same target passed the whole suite at 204dbf95,
+# so pin the targets the deleted bytes reached: the slice's own IdP at
+# id.<alias>.piercloud.net/healthz, and any tenant-controlled
+# `<site>.piercloud.site` landing (Cloudflare in front, content the publish
+# path can change). The one named `.site` row in the product is the puller's
+# seeded `your piercloud`, which this span never renders (single-owner rule,
+# pinned in tests/gatus-pull) and design check §5 piece 4 (A3) retargets to
+# health.<alias>.piercloud.net/healthz; until A3 lands, no row rendered here
+# may reach a `.site` landing at all.
+no_slice_target() { # $1 label, $2 config file
+  is_re "$1: no row probes the slice IdP (id.<alias>/healthz)" "0" "$(cat "$2")" \
+    '^    url: https://id\.[a-z0-9-]+\.piercloud\.net/healthz$'
+  is_re "$1: no row probes a .piercloud.site landing" "0" "$(cat "$2")" \
+    '^    url: https://[^ ]*\.piercloud\.site'
+}
+no_slice_target "tenant shape" "$CFG"
+is_re "shape tooth is not vacuous: the deleted row's target matches" "1" \
+  "$(printf '    url: https://id.pier.piercloud.net/healthz\n')" \
+  '^    url: https://id\.[a-z0-9-]+\.piercloud\.net/healthz$'
+is_re "shape tooth is not vacuous: a .site landing matches" "1" \
+  "$(printf '    url: https://pier.piercloud.site/healthz\n')" \
+  '^    url: https://[^ ]*\.piercloud\.site'
 pairs_block="$(block host "$CFG")"
 has "pairs use the native provider" "$pairs_block" "type: ntfy"
 has "pairs carry priority 4" "$pairs_block" "priority: 4"
@@ -163,12 +210,11 @@ has "operator: platform uses the bridge" "$platform_block" "type: custom"
 has "operator: platform threshold 3" "$platform_block" "failure-threshold: 3"
 has "operator: platform sends on resolve" "$platform_block" "send-on-resolved: true"
 has "operator: platform placeholders 5/3" "$platform_block" "RESOLVED: \"3\""
-# The operator shape is the one that pages: the retargeted row must be the same
-# row there (a2), not only on the tenant shape.
 # The operator shape is the one that pages: the deleted row must not be here
 # either, so a resurrection on the alerting shape is caught, not only on the
-# monitor-only one.
-lacks "main row is deleted from the operator shape" "$(cat "$CFG")" "- name: main"
+# monitor-only one - by name and by shape.
+is_re "main row is deleted from the operator shape" "0" "$(cat "$CFG")" '^  - name: main$'
+no_slice_target "operator shape" "$CFG"
 
 # ---- (b2) explicit tenant role + token header -----------------------------
 fixture_env
@@ -201,7 +247,8 @@ lacks "no-topic: no alerts anywhere" "$(cat "$CFG")" "alerts:"
 lacks "no-topic: no custom provider" "$(cat "$CFG")" "custom:"
 has "no-topic: warns instead of pushing" "$(cat "$CFG")" "No push channel"
 has "no-topic: platform row still rendered" "$(block platform "$CFG")" "name: platform"
-lacks "no-topic: main row is deleted" "$(cat "$CFG")" "- name: main"
+is_re "no-topic: main row is deleted" "0" "$(cat "$CFG")" '^  - name: main$'
+no_slice_target "no-topic shape" "$CFG"
 
 # ---- (c2) console-fallback shape with a topic: zero alert sites -----------
 fixture_env
@@ -210,7 +257,8 @@ export NTFY_TOPIC=pc-test-topic
 if render fallback_topic; then ok "console-fallback + topic renders"; else bad "console-fallback + topic renders"; fi
 has "fallback: zero stanzas names the configured channel" "$(cat "$WORK/fallback_topic/stderr.log")" "push channel configured; no alerting rows"
 lacks "fallback: does not claim no channel" "$(cat "$WORK/fallback_topic/stderr.log")" "no push channel configured"
-lacks "fallback: no main row" "$(cat "$WORK/fallback_topic/config.yaml")" "- name: main"
+is_re "fallback: no main row" "0" "$(cat "$WORK/fallback_topic/config.yaml")" '^  - name: main$'
+no_slice_target "console-fallback shape" "$WORK/fallback_topic/config.yaml"
 
 # ---- (d) fail-closed role gate -------------------------------------------
 fixture_env
@@ -234,15 +282,52 @@ has "main= pair is class 4 (native provider)" "$(block main "$WORK/main_pair_ten
 lacks "main= pair is not class 5 (no bridge)" "$(block main "$WORK/main_pair_tenant/config.yaml")" "type: custom"
 is "main= pair renders exactly one row named main" "1" "$(grep -c '^  - name: main$' "$WORK/main_pair_tenant/config.yaml" || true)"
 
-# (e3) the `main`-era TENANT_USER guard is gone with the row (#288 G1 =
-# UPPER-1): a mixed-case alias no longer aborts the render, because no row
-# derives a hostname from it any more. On main this dies 2400 lines into a
-# mutating run.
+# (e3) the ALIAS GATE (#291 r2 fold, red-team RT1). Deleting the `main` row
+# also deleted the render's only fail-closed check on TENANT_USER, and the
+# surviving derivation is a line-oriented `sed`, so a multi-line alias
+# rendered a config.yaml Gatus refuses - where origin/main aborted before
+# writing anything. #288 G1's fix direction was a visible refusal at the
+# entry point, never a widened accept, so every value that is not the exact
+# grammar is refused BY NAME, before anything renders, and nothing is
+# written. RED at 204dbf95: each of these rendered a config (the multi-line
+# one a broken YAML document); GREEN here.
+alias_refused() { # $1 label, $2 TENANT_USER value
+  fixture_env
+  export TENANT_USER="$2"
+  if render "alias_$1"; then bad "alias gate refuses a $1 TENANT_USER"; else ok "alias gate refuses a $1 TENANT_USER"; fi
+  has "alias gate names the $1 refusal" "$(cat "$WORK/alias_$1/stderr.log")" "bad TENANT_USER for the gatus render"
+  if [ -e "$WORK/alias_$1/config.yaml" ]; then bad "alias gate writes no config on a $1 alias"; else ok "alias gate writes no config on a $1 alias"; fi
+}
+alias_refused multiline "$(printf 'pier\n        - name: injected\n    url: https://evil.example/')"
+# A trailing newline survives the harness only as a literal (a $(...) strip
+# would swallow it, which is exactly the bug the gate has to see).
+alias_refused trailing_newline "pier"$'\n'
+alias_refused space "pi er"
+alias_refused uppercase "Pier"
+alias_refused too_short "pi"
+alias_refused too_long "pierextralongalias"
+alias_refused hyphen "pi-er"
+alias_refused underscore "pi_er"
+alias_refused dot "pi.er"
+alias_refused blank "   "
+# Empty is ABSENT, not malformed: 020 always exports TENANT_USER (empty when
+# there is no alias) and the no-alias console fallback is a pinned shape, so
+# a set-but-empty value must still render the anchor-local rows.
 fixture_env
-export TENANT_USER=Pier
-if render mixedcase_tenant; then ok "mixed-case TENANT_USER renders (the main-era guard is gone)"; else bad "mixed-case TENANT_USER renders (the main-era guard is gone)"; fi
-lacks "mixed-case alias renders no main row" "$(cat "$WORK/mixedcase_tenant/config.yaml")" "- name: main"
-has "mixed-case alias still renders the platform row" "$(block platform "$WORK/mixedcase_tenant/config.yaml")" "name: platform"
+export TENANT_USER=""
+if render alias_set_empty; then ok "set-but-empty TENANT_USER keeps the console fallback"; else bad "set-but-empty TENANT_USER keeps the console fallback"; fi
+has "set-but-empty alias still renders the platform row" "$(block platform "$WORK/alias_set_empty/config.yaml")" "name: platform"
+no_slice_target "set-but-empty alias shape" "$WORK/alias_set_empty/config.yaml"
+# The gate sits on the RAW value, so the sanitizer cannot widen it, and it
+# sits BEFORE the derivation that turns the alias into a hostname (a gate
+# below `caddy_status_names` would refuse after the value was already used).
+gate_ln="$(grep -n 'bad TENANT_USER for the gatus render' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+deriv_ln="$(grep -n '^caddy_status_names$' "${WORK}/span.src" | head -1 | cut -d: -f1)"
+if [ -n "$gate_ln" ] && [ -n "$deriv_ln" ] && [ "$gate_ln" -lt "$deriv_ln" ]; then
+  ok "the alias gate runs before the derivation (caddy_status_names)"
+else
+  bad "the alias gate runs before the derivation (gate=$gate_ln derivation=$deriv_ln)"
+fi
 
 fixture_env
 export GATUS_ENDPOINTS="Platform=https://example.org/health"
@@ -308,7 +393,8 @@ export STATUS_PULLER=on NTFY_TOPIC=pc-test-topic ANCHOR_ROLE=operator \
 if render puller_mode; then ok "puller-mode shape renders"; else bad "puller-mode shape renders"; fi
 CFG="$WORK/puller_mode/config.yaml"
 yaml_ok "puller-mode YAML parses" "$CFG"
-lacks "puller mode: no main row" "$(cat "$CFG")" "- name: main"
+is_re "puller mode: no main row" "0" "$(cat "$CFG")" '^  - name: main$'
+no_slice_target "puller-mode shape" "$CFG"
 lacks "puller mode: no platform row" "$(cat "$CFG")" "- name: platform"
 lacks "puller mode: no GATUS_ENDPOINTS rows" "$(cat "$CFG")" "blog"
 has "puller mode: tang row survives" "$(block "tang (via Caddy)" "$CFG")" "url: http://hostanchor/adv"
